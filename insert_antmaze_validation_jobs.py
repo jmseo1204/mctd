@@ -4,8 +4,7 @@ import json
 from datetime import datetime
 
 seeds = list(range(10))
-#task_ids = [1,2,3,4,5]
-task_ids = [1,3,4,5]
+task_ids = [1,2,3,4,5]
 
 wandb_entity = "jaesikyoon"
 wandb_project = "jaesik_mctd"
