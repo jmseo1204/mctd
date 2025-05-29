@@ -66,6 +66,7 @@ RUN apt install -y mesa-utils
 COPY ./ogbench-1.0.1-py3-none-any.whl .
 RUN pip3 install ./ogbench-1.0.1-py3-none-any.whl
 RUN pip3 install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+RUN pip3 install moviepy==1.0.3 imageio-ffmpeg
 
 # New User (Optional)
 ARG UNAME=jsyoon

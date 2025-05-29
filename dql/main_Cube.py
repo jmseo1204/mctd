@@ -24,7 +24,7 @@ import pdb
 import ogbench
 
 hyperparameters = {
-    "antmaze-medium-navigate-v0": {
+    "cube-single-play-v0": {
         "lr": 3e-4,
         "eta": 1.0,
         "max_q_backup": False,
@@ -35,30 +35,46 @@ hyperparameters = {
         "top_k": 1,
         "target_steps": 10,
         "p": 0.2,
+        "goal_dim": 3,
     },
-    "antmaze-large-navigate-v0": {
+    "cube-double-play-v0": {
         "lr": 3e-4,
         "eta": 1.0,
         "max_q_backup": False,
         "reward_tune": "cql_antmaze",
         "eval_freq": 100,
-        "num_epochs": 200,
+        "num_epochs": 2000,
         "gn": 7.0,
         "top_k": 1,
         "target_steps": 10,
         "p": 0.2,
+        "goal_dim": 3,
     },
-    "antmaze-giant-navigate-v0": {
+    "cube-triple-play-v0": {
         "lr": 3e-4,
         "eta": 1.0,
         "max_q_backup": False,
         "reward_tune": "cql_antmaze",
         "eval_freq": 100,
-        "num_epochs": 200,
+        "num_epochs": 2000,
         "gn": 7.0,
         "top_k": 1,
         "target_steps": 10,
         "p": 0.2,
+        "goal_dim": 3,
+    },
+    "cube-quadruple-play-v0": {
+        "lr": 3e-4,
+        "eta": 1.0,
+        "max_q_backup": False,
+        "reward_tune": "cql_antmaze",
+        "eval_freq": 100,
+        "num_epochs": 2000,
+        "gn": 7.0,
+        "top_k": 1,
+        "target_steps": 10,
+        "p": 0.2,
+        "goal_dim": 3,
     },
 }
 
@@ -91,6 +107,7 @@ def train_agent(env, state_dim, action_dim, max_action, device, output_dir, args
     from agents.ql_diffusion import Diffusion_QL as Agent
 
     agent = Agent(
+        env_name=args.env_name,
         state_dim=state_dim,
         action_dim=action_dim,
         max_action=max_action,
@@ -359,6 +376,7 @@ if __name__ == "__main__":
     args.gn = hyperparameters[args.env_name]["gn"]
     args.top_k = hyperparameters[args.env_name]["top_k"]
     args.p = hyperparameters[args.env_name]["p"]
+    args.goal_dim = hyperparameters[args.env_name]["goal_dim"]
 
     # Setup Logging
     file_name = f"{args.env_name}|{args.exp}|diffusion-{args.algo}|T-{args.T}"
@@ -384,7 +402,7 @@ if __name__ == "__main__":
     variant = vars(args)
 
     #env = gym.make(args.env_name)
-    env = ogbench.locomaze.maze.make_maze_env('ant','maze',maze_type=args.env_name.split("-")[1])
+    env, _, _ = ogbench.make_env_and_datasets(args.env_name, compact_dataset=False)
 
     #env.seed(args.seed)
     torch.manual_seed(args.seed)

@@ -32,6 +32,10 @@ OGBENCH_ENVS = [
     "antmaze-large-v0",
     "antmaze-giant-v0",
     "antmaze-teleport-v0",
+    "cube-single-play-v0",
+    "cube-double-play-v0",
+    "cube-triple-play-v0",
+    "cube-quadruple-play-v0",
 ]
 
 
@@ -260,19 +264,46 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
         fig, ax = plt.subplots()
         if is_grid_env(env_id):
             maze_grid = get_maze_grid(env_id)
+            plot_maze_layout(ax, maze_grid)
         else:
             maze_grid = None
-        plot_maze_layout(ax, maze_grid)
         if env_id in OGBENCH_ENVS: # OGBench envs
-            ax.scatter(trajectory[:, batch_idx, 0]/4+1, trajectory[:, batch_idx, 1]/4+1, c=np.arange(len(trajectory)), cmap="Reds"),
+            if "maze" in env_id:
+                ax.scatter(trajectory[:, batch_idx, 0]/4+1, trajectory[:, batch_idx, 1]/4+1, c=np.arange(len(trajectory)), cmap="Reds"),
+            elif "cube" in env_id:
+                num_poses = trajectory.shape[-1] // 3
+                # 3D plot
+                fig, ax = plt.subplots(subplot_kw={"projection": "3d"})
+                # background as gray
+                ax.set_facecolor("gray")
+                # set angle
+                ax.view_init(elev=20, azim=30)
+                ax.set_xlabel("X")
+                ax.set_ylabel("Y")
+                ax.set_zlabel("Z")
+                cmaps = ["Reds", "Blues", "Greens", "Oranges", "Purples", "Greys", "YlOrBr", "YlGn", "YlGnBu", "YlOrRd"]
+                for i in range(num_poses):
+                    ax.scatter(trajectory[:, batch_idx, i*3], trajectory[:, batch_idx, i*3+1], trajectory[:, batch_idx, i*3+2], c=np.arange(len(trajectory)), cmap=cmaps[i])
+                    #ax.scatter(trajectory[:50, batch_idx, i*3], trajectory[:50, batch_idx, i*3+1], trajectory[:50, batch_idx, i*3+2], c=np.arange(50), cmap=cmaps[i])
         else:
             ax.scatter(trajectory[:, batch_idx, 0], trajectory[:, batch_idx, 1], c=np.arange(len(trajectory)), cmap="Reds"),
         if plot_end_points:
             if env_id in OGBENCH_ENVS: # OGBench envs
-                start_goal = (np.array(start[batch_idx])/4+1, np.array(goal[batch_idx])/4+1)
+                if "maze" in env_id:
+                    start_goal = (np.array(start[batch_idx])/4+1, np.array(goal[batch_idx])/4+1)
+                    plot_start_goal(ax, start_goal)
+                elif "cube" in env_id:
+                    start = np.array(start[batch_idx])
+                    colors = ["red", "blue", "green", "orange", "purple", "gray", "brown", "yellow", "lime", "red"]
+                    for i in range(num_poses):
+                        # showing start fronter than trajectory
+                        ax.scatter(start[i*3], start[i*3+1], start[i*3+2], c=colors[i], s=100, marker="P")
+                    goal = np.array(goal[batch_idx])
+                    for i in range(num_poses):
+                        ax.scatter(goal[i*3], goal[i*3+1], goal[i*3+2], c=colors[i], s=100, marker='X')
             else:
                 start_goal = (start[batch_idx], goal[batch_idx])
-            plot_start_goal(ax, start_goal)
+                plot_start_goal(ax, start_goal)
         # plt.title(f"sample_{batch_idx}")
         fig.tight_layout()
         fig.canvas.draw()
@@ -282,6 +313,36 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
 
         plt.close()
     return images
+
+
+#def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end_points=True):
+#    images = []
+#    for batch_idx in range(batch_size):
+#        fig, ax = plt.subplots()
+#        if is_grid_env(env_id):
+#            maze_grid = get_maze_grid(env_id)
+#        else:
+#            maze_grid = None
+#        plot_maze_layout(ax, maze_grid)
+#        if env_id in OGBENCH_ENVS: # OGBench envs
+#            ax.scatter(trajectory[:, batch_idx, 0]/4+1, trajectory[:, batch_idx, 1]/4+1, c=np.arange(len(trajectory)), cmap="Reds"),
+#        else:
+#            ax.scatter(trajectory[:, batch_idx, 0], trajectory[:, batch_idx, 1], c=np.arange(len(trajectory)), cmap="Reds"),
+#        if plot_end_points:
+#            if env_id in OGBENCH_ENVS: # OGBench envs
+#                start_goal = (np.array(start[batch_idx])/4+1, np.array(goal[batch_idx])/4+1)
+#            else:
+#                start_goal = (start[batch_idx], goal[batch_idx])
+#            plot_start_goal(ax, start_goal)
+#        # plt.title(f"sample_{batch_idx}")
+#        fig.tight_layout()
+#        fig.canvas.draw()
+#        img_shape = fig.canvas.get_width_height()[::-1] + (4,)
+#        img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).copy().reshape(img_shape)
+#        images.append(img)
+#
+#        plt.close()
+#    return images
 
 
 def make_convergence_animation(

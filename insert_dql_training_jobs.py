@@ -4,13 +4,7 @@ import json
 from datetime import datetime
 
 configs = [
-    ###############################
-    # AntMaze
-    ###############################
-    # medium-navigate
-    {"env_name": "antmaze-medium-navigate-v0"},
-    {"env_name": "antmaze-large-navigate-v0",},
-    {"env_name": "antmaze-giant-navigate-v0",},
+    {"env_name": "cube-single-play-v0"},
 ]
 
 # Check there is the jobs folder

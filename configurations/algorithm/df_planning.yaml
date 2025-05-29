@@ -37,7 +37,7 @@ dql_model: null
 val_max_steps: 1000
 mctd: True
 mctd_guidance_scales: [0,0.1,0.5,1,2]
-mctd_max_search_num: 500
+mctd_max_search_num: 5000
 mctd_num_denoising_steps: 20
 mctd_skip_level_steps: 10
 sr_sampling: 1
@@ -50,7 +50,10 @@ parallel_multiple_visits: False
 early_stopping_condition: "solved"
 num_tries_for_bad_plans: 10
 sub_goal_interval: 10
+sub_goal_threshold: 1.0
 viz_plans: False
+cube_single_dql: False
+cube_viz: False
 
 diffusion:
   stabilization_level: 10

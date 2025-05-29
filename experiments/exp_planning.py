@@ -1,4 +1,4 @@
-from datasets import Maze2dOfflineRLDataset, OGMaze2dOfflineRLDataset, OGAntMazeOfflineRLDataset 
+from datasets import Maze2dOfflineRLDataset, OGMaze2dOfflineRLDataset, OGAntMazeOfflineRLDataset, OGCubeOfflineRLDataset
 from algorithms.diffusion_forcing import DiffusionForcingPlanning
 from .exp_base import BaseLightningExperiment
 
@@ -25,5 +25,9 @@ class PlanningExperiment(BaseLightningExperiment):
         og_antmaze_medium_navigate=OGAntMazeOfflineRLDataset,
         og_antmaze_large_navigate=OGAntMazeOfflineRLDataset,
         og_antmaze_giant_navigate=OGAntMazeOfflineRLDataset,
-        og_antmaze_teleport_navigate=OGAntMazeOfflineRLDataset,
+
+        og_cube_single_play=OGCubeOfflineRLDataset,
+        og_cube_double_play=OGCubeOfflineRLDataset,
+        og_cube_triple_play=OGCubeOfflineRLDataset,
+        og_cube_quadruple_play=OGCubeOfflineRLDataset,
     )

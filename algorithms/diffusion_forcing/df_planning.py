@@ -27,6 +27,10 @@ OGBENCH_ENVS = [
     "antmaze-large-v0",
     "antmaze-giant-v0",
     "antmaze-teleport-v0",
+    "cube-single-play-v0",
+    "cube-double-play-v0",
+    "cube-triple-play-v0",
+    "cube-quadruple-play-v0",
 ]
 
 
@@ -71,7 +75,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.early_stopping_condition = cfg.early_stopping_condition
         self.num_tries_for_bad_plans = cfg.num_tries_for_bad_plans
         self.sub_goal_interval = cfg.sub_goal_interval
+        self.sub_goal_threshold = cfg.sub_goal_threshold
         self.viz_plans = cfg.viz_plans
+        self.cube_single_dql = cfg.cube_single_dql
+        self.cube_viz = cfg.cube_viz
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal and self.guidance_scale != 0
 
@@ -296,6 +303,18 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         if guidance_scale is None:
             guidance_scale = self.guidance_scale
+        else:
+            if "cube" in self.env_id:
+                # object-wise guidance
+                cube_indices = []
+                new_guidance_scale = []
+                for b in range(batch_size):
+                    _cube_idx, _guidance_scale = guidance_scale[b].split("-")
+                    cube_indices.append(int(_cube_idx))
+                    new_guidance_scale.append(float(_guidance_scale))
+                guidance_scale = torch.tensor(new_guidance_scale).to(self.device)
+            else:
+                guidance_scale = torch.tensor(guidance_scale).to(start.device) # (batch_size,)
 
         def goal_guidance(x):
             # x is a tensor of shape [t b (fs c)]
@@ -306,6 +325,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 # sparse / no reward setting, guide with goal like diffuser
                 target = torch.stack([start] * self.frame_stack + [goal] * (h_padded))
                 dist = nn.functional.mse_loss(pred, target, reduction="none")  # (t fs) b c
+
+                if "cube" in self.env_id:
+                    for b in range(batch_size):
+                        _cube_idx = cube_indices[b]
+                        for i in range(dist.shape[-1]//3):
+                            if i != _cube_idx-1:
+                                dist[:, b, i*3:(i+1)*3] = 0
 
                 # guidance weight for observation and action
                 weight = np.array(
@@ -319,7 +345,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 
                 dist_o, dist_a, _ = self.split_bundle(dist)  # guidance observation and action with separate weights
                 dist_a = torch.sum(dist_a, -1, keepdim=True).sqrt()
-                dist_o = dist_o[:, :, : 2]
+                #dist_o = dist_o[:, :, : 2]
                 dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=1).sqrt()
                 dist_o = torch.tanh(dist_o / 2)  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
                 dist = dist_o
@@ -327,7 +353,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 weight[self.frame_stack :, 1:] = 8
                 weight[: self.frame_stack, 1:] = 2
                 weight = torch.ones_like(dist) * weight[:, None]
-                episode_return = -(dist * weight).mean(dim=(0, 2)) * 1000 * dist.shape[1] / 16
+                #episode_return = -(dist * weight).mean(dim=(0, 2)) * 1000 * dist.shape[1] / 16
+                episode_return = -(dist * weight).mean() * 1000 * dist.shape[1] / 16
             else:
                 raise NotImplementedError("reward guidance not officially supported yet, although implemented")
 
@@ -398,6 +425,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         return plan_hist
 
     def interact(self, batch_size: int, conditions=None, namespace="validation"):
+
+        assert batch_size == 1, f"Batch size must be 1 for Cube, got {batch_size}"
+
         try:
             import gym
             import ogbench
@@ -412,19 +442,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         if self.env_id in OGBENCH_ENVS:
             if "pointmaze" in self.env_id:
-                envs = DummyVecEnv([lambda: ogbench.locomaze.maze.make_maze_env('point','maze',maze_type=self.env_id.split("-")[1])] * batch_size)
+                env = ogbench.make_env_and_datasets(self.dataset)[0]
                 if self.action_dim == 2:
                     use_diffused_action = True
             elif "antmaze" in self.env_id:
-                envs = DummyVecEnv([lambda: ogbench.locomaze.maze.make_maze_env('ant','maze',maze_type=self.env_id.split("-")[1])] * batch_size)
+                env = ogbench.make_env_and_datasets(self.dataset)[0]
                 #use_diffused_action = True
                 from dql.main_Antmaze import hyperparameters
                 from dql.agents.ql_diffusion import Diffusion_QL as Agent
                 params = hyperparameters[self.dataset]
-                state_dim = envs.observation_space.shape[0]
-                action_dim = envs.action_space.shape[0]
-                max_action = float(envs.action_space.high[0])
+                state_dim = env.observation_space.shape[0]
+                action_dim = env.action_space.shape[0]
+                max_action = float(env.action_space.high[0])
                 agent = Agent(
+                    env_name=self.env_id,
                     state_dim=state_dim*2,
                     action_dim=action_dim,
                     max_action=max_action,
@@ -449,43 +480,82 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     dql_folder = "antmaze-large-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
                 elif self.dataset == "antmaze-giant-navigate-v0":
                     dql_folder = "antmaze-giant-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
-                else:
-                    raise ValueError(f"Dataset {self.dataset} not supported")
-                
                 import os
                 agent.load_model(os.path.join(os.getcwd(), "dql", "results", dql_folder), id=200)
-            for i, env in enumerate(envs.envs):
-                env.set_task(self.task_id + i)
-                #env.set_seed(self.interaction_seed)
-        else:
-            envs = DummyVecEnv([lambda: gym.make(self.env_id)] * batch_size)
-            envs.seed(self.interaction_seed)
 
-        terminate = False
+            elif "cube" in self.env_id:
+                assert batch_size == 1, f"Batch size must be 1 for Cube, got {batch_size}"
+                env = ogbench.make_env_and_datasets(self.dataset)[0]
+                from dql.main_Cube import hyperparameters
+                from dql.agents.ql_diffusion import Diffusion_QL as Agent
+                params = hyperparameters[self.dataset]
+                state_dim = env.observation_space.shape[0] if not self.cube_single_dql else 28
+                action_dim = env.action_space.shape[0]
+                max_action = float(env.action_space.high[0])
+                agent = Agent(
+                    env_name=self.env_id,
+                    state_dim=state_dim*2,
+                    action_dim=action_dim,
+                    max_action=max_action,
+                    device=0,
+                    discount=0.99,
+                    tau=0.005,
+                    max_q_backup=params["max_q_backup"],
+                    beta_schedule="vp",
+                    n_timesteps=5,
+                    eta=params["eta"],
+                    lr=params["lr"],
+                    lr_decay=False,
+                    lr_maxt=params["num_epochs"],
+                    grad_norm=params["gn"],
+                    goal_dim=params["goal_dim"] if self.cube_single_dql else self.observation_dim,
+                    lcb_coef=4.0,
+                )
+                # pretrained agent loading
+                import os
+                if self.dataset == "cube-single-play-v0" or self.cube_single_dql:
+                    dql_folder = "cube-single-play-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|3|1.0|False|cql_antmaze|0.2|4.0|10"
+                    agent.load_model(os.path.join(os.getcwd(), "dql", "results", dql_folder), id=200)
+                else:
+                    if self.dataset == "cube-double-play-v0":
+                        dql_folder = "cube-double-play-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|6|1.0|False|cql_antmaze|0.2|4.0|10"
+                        agent.load_model(os.path.join(os.getcwd(), "dql", "results", dql_folder), id=2000)
+                    elif self.dataset == "cube-triple-play-v0":
+                        dql_folder = "cube-triple-play-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|9|1.0|False|cql_antmaze|0.2|4.0|10"
+                        agent.load_model(os.path.join(os.getcwd(), "dql", "results", dql_folder), id=2000)
+                    elif self.dataset == "cube-quadruple-play-v0":
+                        dql_folder = "cube-quadruple-play-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|12|1.0|False|cql_antmaze|0.2|4.0|10"
+                        agent.load_model(os.path.join(os.getcwd(), "dql", "results", dql_folder), id=2000)
+        else:
+            raise NotImplementedError(f"Environment interaction not implemented for this environment {self.env_id}")
+
         obs_mean = self.data_mean[: self.observation_dim]
         obs_std = self.data_std[: self.observation_dim]
-        obs = envs.reset()
-        # Randomize the goal for each environment
-        if self.env_id in OGBENCH_ENVS: # OGBench goal setting is already done through set_task()   
-            pass
-        else:
-            if self.use_random_goals_for_interaction:
-                for env in envs.envs:
-                    env.set_target()
+        obs, info = env.reset(options=dict(task_id=self.task_id))
+        if "cube" in self.env_id:
+            num_cubes = (obs.shape[0] - 19) // 9
+        goal = info['goal']
 
+        obs = obs.reshape(1, -1)
+        goal = np.array(goal).reshape(1, -1)
+
+        origin_obs_numpy = obs.copy()
         obs = torch.from_numpy(obs).float().to(self.device)
-        start = obs.detach()
-        obs_normalized = ((obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]).detach()
-
-        if self.env_id in OGBENCH_ENVS: # OGBench
-            goal = np.vstack([envs.reset_infos[i]['goal'] for i in range(len(envs.reset_infos))])
+        if "cube" in self.env_id:
+            start = torch.cat([obs[:,19+i*9:19+i*9+3] for i in range(num_cubes)], dim=-1).detach()
+            obs_normalized = ((torch.cat([obs[:,19+i*9:19+i*9+3] for i in range(num_cubes)], dim=-1) - obs_mean[None])/obs_std[None]).detach()
         else:
-            goal = np.concatenate([[env.env._target] for env in envs.envs])
-        goal = torch.Tensor(goal).float().to(self.device)
-        goal = torch.cat([goal, torch.zeros_like(goal)], -1)
-        goal = goal[:, : self.observation_dim]
-        goal_normalized = ((goal - obs_mean[None]) / obs_std[None]).detach()
+            start = obs[:, : self.observation_dim]
+            obs_normalized = ((obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]).detach()
 
+        goal = torch.Tensor(goal).float().to(self.device)
+        if "cube" in self.env_id:
+            goal = torch.cat([goal[:,19+i*9:19+i*9+3] for i in range(num_cubes)], dim=-1).detach()
+        else:
+            goal = goal[:, : self.observation_dim]
+        goal_normalized = ((goal - obs_mean[None]) / obs_std[None]).detach() 
+
+        terminate = False
         steps = 0
         episode_reward = np.zeros(batch_size)
         episode_reward_if_stay = np.zeros(batch_size)
@@ -497,11 +567,31 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # run mpc with diffused actions
         assert (not self.mctd) or (self.sr_sampling == 1), "MCTD is only supported for single-step planning"
+
+        # Cube task visualization
+        if "cube" in self.env_id and self.cube_viz:
+            cube_visual_obss = [env.render()]
+
+        succeed_cube_list = []
+        target_cube_idx = -1
+
         planning_time = []
         while not terminate and steps < self.val_max_steps:
+            # list of the cubes achieved
+            if "cube" in self.env_id:
+                start_numpy = start.cpu().numpy()[:, :self.observation_dim]
+                goal_numpy = goal.cpu().numpy()[:, :self.observation_dim]   
+                for i in range(start_numpy.shape[1]//3):
+                    if np.linalg.norm(start_numpy[0, i*3:i*3+3] - goal_numpy[0, i*3:i*3+3]) < 0.15:
+                        succeed_cube_list.append(i)
+            else:
+                succeed_cube_list = None
+            print("#########################")
+            print(f"Plan at step {steps}")
+            print("#########################")
             planning_start_time = time.time()
             if self.mctd:
-                plan_hist = self.p_mctd_plan(obs_normalized, goal_normalized, self.episode_len, conditions, start.cpu().numpy()[:, :self.observation_dim], goal.cpu().numpy()[:, :self.observation_dim]) # fake plan_hist
+                plan_hist = self.p_mctd_plan(obs_normalized, goal_normalized, self.episode_len, conditions, start.cpu().numpy()[:, :self.observation_dim], goal.cpu().numpy()[:, :self.observation_dim], steps, succeed_cube_list, target_cube_idx) # fake plan_hist
                 plan_hist = self._unnormalize_x(plan_hist)
                 plan = plan_hist[-1] # (t b c)
             else:
@@ -525,15 +615,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     goal_numpy = goal.cpu().numpy()[:, : self.observation_dim]
                     for s in range(self.sr_sampling):
                         for t in range(1, o.shape[0]):
-                            #if t == 0:
-                            #    pos_diff = np.linalg.norm(o[t, s, :2] - start[0, :2], axis=-1)
-                            #else:
-                            pos_diff = np.linalg.norm(o[t, s, :2] - o[t - 1, s, :2], axis=-1)
+                            pos_diff = np.linalg.norm(o[t, s, :self.observation_dim] - o[t - 1, s, :self.observation_dim], axis=-1)
                             if pos_diff > 1.0:
                                 values[s] = 0
                                 info_for_debugging[s] = "Warp"
                                 break
-                            if np.linalg.norm(o[t, s, :2] - goal_numpy[0, :2], axis=-1) < 1.0:
+                            if np.linalg.norm(o[t, s, :self.observation_dim] - goal_numpy[0, :self.observation_dim], axis=-1) < 1.0:
                                 values[s] = (self.episode_len - t) / self.episode_len
                                 info_for_debugging[s] = "Achieved"
                                 break
@@ -541,14 +628,36 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     best_plan_idx = np.argmax(values)
                     plan = sr_plans[:, best_plan_idx, :].unsqueeze(1)
                     plan_hist = sr_plan_hist[:, :, best_plan_idx, :].unsqueeze(2)
-                    # Visualization
-                    start_numpy = start.cpu().numpy()[:, :2]
-                    image = make_trajectory_images(self.env_id, o[:,best_plan_idx:(best_plan_idx+1)], 1, start_numpy, goal_numpy, self.plot_end_points)[0]
-                    self.log_image(f"sr_plan/selected_{values[best_plan_idx]}", Image.fromarray(image))
+
+            # In Cube case, cropping the plan to the successful trajectory
+            if "cube" in self.env_id:
+                successes = [False] * num_cubes
+                plan_numpy = plan.detach().cpu().numpy()[:, :, :self.observation_dim]
+                goal_numpy = goal.cpu().numpy()[:, : self.observation_dim]
+                for t in range(plan.shape[0]):
+                    for i in range(num_cubes):
+                        if np.linalg.norm(plan_numpy[t, :, i*3:i*3+3] - goal_numpy[:, i*3:i*3+3], axis=-1) < 0.4:
+                            successes[i] = True
+                    if all(successes):
+                        break
+                plan = plan[:t+1, :, :]
+
+            # Getting the target_cube_idx for Object-wise plan
+            if "cube" in self.env_id and self.cube_single_dql:
+                target_cube_idx = -1
+                cube_stds = []
+                for i in range(plan.shape[-1]//3):
+                    if i in succeed_cube_list:
+                        cube_stds.append(0)
+                    else:
+                        cube_stds.append(torch.mean(torch.std(plan[:, :, 3*i:3*(i+1)], dim=0)).item())
+                target_cube_idx = np.argmax(cube_stds)
+                print(f"Target cube idx: {target_cube_idx}")
+
             # Visualization
-            start_numpy = start.cpu().numpy()[:, :2]
+            start_numpy = start.cpu().numpy()[:, : self.observation_dim]
             goal_numpy = goal.cpu().numpy()[:, : self.observation_dim]
-            image = make_trajectory_images(self.env_id, plan[:, :, :2].detach().cpu().numpy(), 1, start_numpy, goal_numpy, self.plot_end_points)[0]
+            image = make_trajectory_images(self.env_id, plan[:, :, :self.observation_dim].detach().cpu().numpy(), 1, start_numpy, goal_numpy, self.plot_end_points)[0]
             self.log_image(f"plan/plan_at_{steps}", Image.fromarray(image))
 
             planning_end_time = time.time()
@@ -559,62 +668,157 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 _plan = []
                 for t in range(plan.shape[0]):
                     for j in range(self.jump):
-                        _plan.append(plan[t, : , :2])
+                        _plan.append(plan[t, : , :self.observation_dim])
                 plan = torch.stack(_plan)
 
             all_plan_hist.append(plan_hist.cpu())
 
-            obs_numpy = obs.detach().cpu().numpy()
-            if "antmaze" in self.env_id:
-                #sub_goal = plan[self.open_loop_horizon - 1, :, :2].detach().cpu().numpy()
-                sub_goal = plan[self.sub_goal_interval, :, :2].detach().cpu().numpy()
-                sub_goal_step = self.sub_goal_interval
+            if self.cube_single_dql:
+                for release_idx in range(30): # Release cube
+                    # move to the next cube position
+                    obs_numpy = np.concatenate([origin_obs_numpy[:,:19]] + [origin_obs_numpy[:,19+target_cube_idx*9:19+target_cube_idx*9+9]], axis=-1)
+                    subgoal = plan[0, :, 3*target_cube_idx:3*target_cube_idx+3].detach().cpu()
+                    action = agent.sample_action(obs_numpy, subgoal)
+                    action[2] = 0.02
+                    action = torch.from_numpy(action).float().reshape(1, -1)
+                    origin_obs_numpy, reward, terminated, truncated, info = env.step(np.nan_to_num(action.numpy())[0])
+                    if self.cube_viz:
+                        cube_visual_obss.append(env.render())
+
+                    reached = np.logical_or(reached, reward >= 1.0)
+                    episode_reward += reward
+                    episode_reward_if_stay += np.where(~reached, reward, 1)
+                    first_reach += ~reached
+                    done = terminated or truncated
+                    if done:
+                        print(f"Terminated at step {t}")
+                        terminate = True
+                        break
+
+                    obs, reward, done = [torch.from_numpy(item).float() for item in [origin_obs_numpy, np.array(reward), np.array(done)]]
+                    obs = obs[None]
+                    bundle = self.make_bundle(obs, action, reward[..., None])
+                    trajectory.append(bundle)
+                    obs = obs.to(self.device)
+                    obs = torch.cat([obs[:,19+i*9:19+i*9+3] for i in range(num_cubes)], dim=-1)
+                    start = obs
+                    obs_normalized = ((obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]).detach()
+                    origin_obs_numpy = origin_obs_numpy[None]
+
+            if "antmaze" in self.env_id or "cube" in self.env_id:
+                if plan.shape[0] > self.sub_goal_interval:
+                    sub_goal = plan[self.sub_goal_interval, :, :self.observation_dim].detach().cpu().numpy()
+                    sub_goal_step = self.sub_goal_interval
+                else:
+                    sub_goal = plan[-1, :, :self.observation_dim].detach().cpu().numpy()
+                    sub_goal_step = plan.shape[0]
+
             for t in range(self.open_loop_horizon):
+                if terminate:
+                    break
                 if use_diffused_action:
                     _, action, _ = self.split_bundle(plan[t])
                 else:
-                    if "antmaze" in self.env_id:
-                        if np.linalg.norm(obs_numpy[0, :2] - sub_goal[0, :2]) < 1.0:
-                            print(f"sub_goal_step {sub_goal_step} achieved, next sub_goal_step {sub_goal_step + self.sub_goal_interval} in {plan.shape[0]} steps")
+                    if "antmaze" in self.env_id or "cube" in self.env_id:
+                        obs_numpy = obs.detach().cpu().numpy()
+                        if np.linalg.norm(obs_numpy[0, :self.observation_dim] - sub_goal[0, :self.observation_dim]) < 1.0:
+                            print(f"sub_goal_step {sub_goal_step} achieved at step {t}")
                             sub_goal_step += self.sub_goal_interval
                             if plan.shape[0] - sub_goal_step <= 0:
-                                sub_goal = plan[-1, :, :2].detach().cpu().numpy()
+                                sub_goal = plan[-1, :, :self.observation_dim].detach().cpu().numpy()
                             else:
-                                sub_goal = plan[sub_goal_step, :, :2].detach().cpu().numpy()
+                                sub_goal = plan[sub_goal_step, :, :self.observation_dim].detach().cpu().numpy()
                         assert obs_numpy.shape[0] == 1, f"Batch size must be 1 for AntMaze, got {obs_numpy.shape[0]}"
-                        action = agent.sample_action(obs_numpy, sub_goal)
+                        if "cube" in self.env_id and self.cube_single_dql:
+                            _sub_goal = sub_goal[:, 3*target_cube_idx:3*target_cube_idx+3]
+                            _obs_numpy = np.concatenate([origin_obs_numpy[:,:19]] + [origin_obs_numpy[:,19+target_cube_idx*9:19+target_cube_idx*9+9]], axis=-1)
+                            action = agent.sample_action(_obs_numpy, _sub_goal)
+                        else:
+                            action = agent.sample_action(origin_obs_numpy, sub_goal)
                         action = torch.from_numpy(action).float().reshape(1, -1)
                     else:
                         if t == 0:
-                            plan_vel = plan[t, :, :2] - obs[:, :2]
+                            plan_vel = plan[t, :, :self.observation_dim] - obs[:, :self.observation_dim]
                         else:
                             if t < plan.shape[0]:
-                                plan_vel = plan[t, :, :2] - plan[t - 1, :, :2]
+                                plan_vel = plan[t, :, :self.observation_dim] - plan[t - 1, :, :self.observation_dim]
                             else:
                                 plan_vel = 0
                         if t < plan.shape[0]:
-                            action = 12.5 * (plan[t, :, :2] - obs[:, :2]) + 1.2 * (plan_vel - obs[:, 2:])
+                            action = 12.5 * (plan[t, :, :self.observation_dim] - obs[:, :self.observation_dim]) + 1.2 * (plan_vel - obs[:, self.observation_dim:])
                         else:
-                            action = 12.5 * (plan[-1, :, :2] - obs[:, :2]) + 1.2 * (plan_vel - obs[:, 2:])
+                            action = 12.5 * (plan[-1, :, :self.observation_dim] - obs[:, :self.observation_dim]) + 1.2 * (plan_vel - obs[:, self.observation_dim:])
                 action = torch.clip(action, -1, 1).detach().cpu()
-                obs_numpy, reward, done, _ = envs.step(np.nan_to_num(action.numpy()))
+                origin_obs_numpy, reward, terminated, truncated, info = env.step(np.nan_to_num(action.numpy())[0])
+                if "cube" in self.env_id and self.cube_viz:
+                    cube_visual_obss.append(env.render())
 
                 reached = np.logical_or(reached, reward >= 1.0)
                 episode_reward += reward
                 episode_reward_if_stay += np.where(~reached, reward, 1)
                 first_reach += ~reached
 
-                if done.any():
+                done = terminated or  truncated
+                if done:
                     terminate = True
                     break
 
-                obs, reward, done = [torch.from_numpy(item).float() for item in [obs_numpy, reward, done]]
+                obs, reward, done = [torch.from_numpy(item).float() for item in [origin_obs_numpy, np.array(reward), np.array(done)]]
+                obs = obs[None]
                 bundle = self.make_bundle(obs, action, reward[..., None])
                 trajectory.append(bundle)
                 obs = obs.to(self.device)
+                if "cube" in self.env_id:
+                    obs = torch.cat([obs[:,19+i*9:19+i*9+3] for i in range(num_cubes)], dim=-1)
+                start = obs
                 obs_normalized = ((obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]).detach()
-
+                origin_obs_numpy = origin_obs_numpy[None]
                 steps += 1
+
+                if "cube" in self.env_id and self.cube_single_dql:
+                    if np.linalg.norm(origin_obs_numpy[:,19+target_cube_idx*9:19+target_cube_idx*9+3] - goal_numpy[:, 3*target_cube_idx:3*target_cube_idx+3]) < 0.2:
+                        print(f"Cube {target_cube_idx} reached at step {steps}")
+                        succeed_cube_list.append(target_cube_idx) # update the list when the cube is reached
+                        break
+
+            if self.cube_single_dql and target_cube_idx in succeed_cube_list: # when the target cube is reached
+                if not terminate:
+                    for release_idx in range(30): # Release cube
+                        if release_idx < 10:
+                            action = np.nan_to_num([0, 0, 1.0, 0, -1.0]).reshape(1,-1) # Open the gripper and move up
+                        else:
+                            action = np.nan_to_num([1.0, 0, 0, 0, -1.0]).reshape(1,-1) # Move back
+                        action = torch.from_numpy(action).float().reshape(1, -1)
+                        origin_obs_numpy, reward, terminated, truncated, info = env.step(np.nan_to_num(action.numpy())[0])
+                        if self.cube_viz:
+                            cube_visual_obss.append(env.render())
+
+                        reached = np.logical_or(reached, reward >= 1.0)
+                        episode_reward += reward
+                        episode_reward_if_stay += np.where(~reached, reward, 1)
+                        first_reach += ~reached
+                        done = terminated or truncated
+                        #done = terminated
+                        if done:
+                            print(f"Terminated at step {steps}")
+                            terminate = True
+                            break
+
+                        #obs, reward, done = [torch.from_numpy(item).float() for item in [obs, reward, done]]
+                        #bundle = self.make_bundle(obs, action, reward[..., None])
+                        obs, reward, done = [torch.from_numpy(item).float() for item in [origin_obs_numpy, np.array(reward), np.array(done)]]
+                        obs = obs[None]
+                        bundle = self.make_bundle(obs, action, reward[..., None])
+                        trajectory.append(bundle)
+                        obs = obs.to(self.device)
+                        if "cube" in self.env_id:
+                            obs = torch.cat([obs[:,19+i*9:19+i*9+3] for i in range(num_cubes)], dim=-1)
+                        start = obs
+                        obs_normalized = ((obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]).detach()
+                        origin_obs_numpy = origin_obs_numpy[None]
+                        steps += 1
+                target_cube_idx = -1
+
         self.log(f"{namespace}/planning_time", np.sum(planning_time))
         self.log(f"{namespace}/episode_reward", episode_reward.mean())
         self.log(f"{namespace}/episode_reward_if_stay", episode_reward_if_stay.mean())
@@ -625,8 +829,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         #samples = min(16, batch_size)
         samples = min(32, batch_size)
         trajectory = torch.stack(trajectory)
-        start = start[:, :2].cpu().numpy().tolist()
-        goal = goal[:, :2].cpu().numpy().tolist()
+        if "cube" in self.env_id:
+            trajectory = torch.cat([trajectory[:, :, 19+i*9:19+i*9+3] for i in range(num_cubes)], dim=-1)
+        start = start[:, :self.observation_dim].cpu().numpy().tolist()
+        goal = goal[:, :self.observation_dim].cpu().numpy().tolist()
         images = make_trajectory_images(self.env_id, trajectory, samples, start, goal, self.plot_end_points)
 
         for i, img in enumerate(images):
@@ -634,6 +840,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 f"{namespace}_interaction/sample_{i}",
                 Image.fromarray(img),
             )
+
+        if "cube" in self.env_id and self.cube_viz:
+            # Visual observation
+            visual_obss = np.array(cube_visual_obss).transpose(0, 3, 1, 2) # (t, c, h, w)
+            self.logger.experiment.log({
+                        f"validation_interaction_video/video": wandb.Video(visual_obss, fps=24),
+                        f"trainer/global_step": self.global_step,
+            })
 
         if self.debug:
             samples = min(16, batch_size)
@@ -732,7 +946,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         return noise_levels
 
-    def visualize_node_value_plans(self, search_num, values, names, plans, value_plans, starts, goals):
+    def visualize_node_value_plans(self, steps, search_num, values, names, plans, value_plans, starts, goals):
         if plans.shape[1] != starts.shape[0]:
             starts = starts.repeat(plans.shape[1], axis=0)
         if plans.shape[1] != goals.shape[0]:
@@ -750,7 +964,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             value_plan_image = value_plan_images[i]
             img = np.concatenate([plan_image, value_plan_image], axis=0)
             self.log_image(
-                f"mcts_plan/{search_num+i+1}_{names[i]}_V{values[i]}",
+                f"mcts_plan/{steps}_{search_num+i+1}_{names[i]}_V{values[i]}",
                 Image.fromarray(img),
             )
 
@@ -780,15 +994,168 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         return values, infos, achieved_ts
 
+    def calculate_values_cube(self, plans, starts, goals, obs_normalized, goal_normalized, succeed_cube_list):
+        if plans.shape[1] != starts.shape[0]:
+            starts = starts.repeat(plans.shape[1], axis=0)
+        if plans.shape[1] != goals.shape[0]:
+            goals = goals.repeat(plans.shape[1], axis=0)
 
-    def p_mctd_plan(self, obs_normalized, goal_normalized, horizon, conditions, start, goal):
+        normalized_plans = plans.clone()
+        plans = self._unnormalize_x(plans)
+        obs, _, _ = self.split_bundle(plans)
+        obs = obs.detach().cpu().numpy()[:-1, :]  # last observation is dummy
+        values = np.zeros(plans.shape[1])
+        infos = np.array(["NotReached"] * plans.shape[1])
+        achieved_ts = np.array([None] * plans.shape[1])
+        succeed_cube_indices = np.array([-1] * plans.shape[1])
+
+        for b in range(obs.shape[1]): # for each sample
+            fully_success = False
+            partial_success = False
+            not_stacked_list = []
+            terminal_ts = -1
+            for t in range(obs.shape[0]): # for each step
+                newly_succeeded = False
+                _successes = [False] * (plans.shape[-1]//3)
+                if t == 0:
+                    pos_diff = np.linalg.norm(obs[t, b, :] - starts[b, :], axis=-1)
+                else:
+                    pos_diff = np.linalg.norm(obs[t, b, :] - obs[t-1, b, :], axis=-1)
+                if pos_diff > self.warp_threshold:
+                    infos[b] = "Warp"
+                    values[b] = 0
+                    break
+                for i in range(plans.shape[-1]//3):
+                    if i in not_stacked_list:
+                        continue
+                    if np.linalg.norm(obs[t, b, 3*i:3*(i+1)] - goals[b, 3*i:3*(i+1)], axis=-1) < self.sub_goal_threshold:
+                        if i in succeed_cube_list: 
+                                _successes[i] = True
+                                continue
+                        if self.jump > 1: # When jump > 1, the value calculation is not correct due to the large jump
+                            obs_backup = obs[t, b, 3*i:3*(i+1)].copy()
+                            obs[t, b, 3*i:3*(i+1)] = goals[b, 3*i:3*(i+1)]
+                        if i not in succeed_cube_list:
+                            # Stacking check
+                            check_count = 1
+                            is_stacked = True
+                            below_cube_z = obs[t, b, 3*i+2].copy()
+                            while True:
+                                below_cube_z -= 0.5 * check_count
+                                if below_cube_z < -0.1:
+                                    #if check_count == 1:
+                                    #    print("The cube is on the floor: ", i, obs[t, b, 3*i:3*i+3])
+                                    break
+                                found_cube = False
+                                for j in range(plans.shape[-1]//3):
+                                    if i == j:
+                                        continue
+                                    if j in succeed_cube_list:
+                                        j_t = 0
+                                    else:
+                                        j_t = t
+                                    if abs(obs[j_t, b, 3*j+2] - below_cube_z) < 0.1 and np.linalg.norm(obs[j_t, b, 3*j:3*j+3] - obs[t, b, 3*i:3*i+3], axis=-1) < 0.6:
+                                        found_cube = True
+                                        print(f"Found below cube: {i}, {obs[t, b, 3*i:3*i+3]} - {j}, {obs[j_t, b, 3*j:3*j+3]}")
+                                        break
+                                    else:
+                                        print(f"Not Found below cube: {i}, {obs[t, b, 3*i:3*i+3]} compared with {j}, {obs[j_t, b, 3*j:3*j+3]}, z-axis diff: {abs(obs[j_t, b, 3*j+2] - below_cube_z)}, pos-diff: {np.linalg.norm(obs[j_t, b, 3*j:3*j+3] - obs[t, b, 3*i:3*i+3], axis=-1)}")
+                                if not found_cube:
+                                    is_stacked = False
+                                    break
+                                check_count += 1
+                            # Occlusion check
+                            is_occluded = False
+                            for j in range(plans.shape[-1]//3):
+                                if i == j:
+                                    continue
+                                #print(f"Check Occluded: {i}, {goals[b, 3*i:3*i+3]} - {j}, {obs[t, b, 3*j:3*j+3]}, {np.linalg.norm(obs[t, b, 3*j:3*j+3] - goals[b, 3*i:3*i+3], axis=-1)}")
+                                if np.linalg.norm(obs[t, b, 3*j:3*j+3] - goals[b, 3*i:3*i+3], axis=-1) < 0.15:
+                                    is_occluded = True
+                                    print(f"Occluded: {i}, {obs[t, b, 3*i:3*i+3]}")
+                                    break
+                            # If there is another cube on the top of the initial cube, then not success
+                            upper_cube_z = starts[b, 3*i+2] + 0.5
+                            cannot_move = False
+                            for j in range(plans.shape[-1]//3):
+                                if i == j:
+                                    continue
+                                #print(f"Check Cannot Move: {i}, {starts[b, 3*i:3*i+3]} - {j}, {starts[b, 3*j:3*j+3]}, {np.linalg.norm(starts[b, 3*j:3*j+3] - starts[b, 3*i:3*i+3], axis=-1)}")
+                                if abs(starts[b, 3*j+2] - upper_cube_z) < 0.1 and np.linalg.norm(starts[b, 3*j:3*j+3] - starts[b, 3*i:3*i+3], axis=-1) < 0.6:
+                                        cannot_move = True
+                                        print(f"Cannot Move: {i}, {starts[b, 3*i:3*i+3]} - {j}, {starts[b, 3*j:3*j+3]}")
+                                        break
+                            if is_stacked and (not is_occluded) and (not cannot_move):
+                                _successes[i] = True
+                                succeed_cube_indices[b] = i
+                                terminal_ts = t
+                                newly_succeeded = True
+                            else:
+                                print(f"Not Stacked: {i}, {obs[t, b, 3*i:3*i+3]}")
+                                not_stacked_list.append(i)
+                        if self.jump > 1:
+                            obs[t, b, 3*i:3*(i+1)] = obs_backup
+                fully_success = all(_successes)
+                partial_success = any(_successes) and not fully_success
+                if self.open_loop_horizon < self.val_max_steps and newly_succeeded: # In replanning scenario, it is okay to achieve partial success
+                    break
+                if fully_success:
+                    break
+            if fully_success: # Fully solved
+                values[b] = (obs.shape[0] - terminal_ts) / obs.shape[0]
+                infos[b] = "Achieved"
+                achieved_ts[b] = terminal_ts
+                break
+            if partial_success:
+                values[b] = 0.1 * sum(_successes)
+                infos[b] = "PartialAchieved"
+            if (self.open_loop_horizon < self.val_max_steps) and newly_succeeded:
+                infos[b] = "Achieved" # Record the partial success as achieved
+                achieved_ts[b] = terminal_ts
+                break
+
+        # Post-processing
+        for i in range(values.shape[0]):
+            info = infos[i]
+            achieved_t = achieved_ts[i]
+            if info == "Achieved": # Object-wise planning
+                if self.open_loop_horizon < self.val_max_steps: # When doing replanning, only one cube is handled per each planning
+                    for j in range(plans.shape[-1]//3):
+                        if j != succeed_cube_indices[i]:
+                            normalized_plans[:, i, 3*j:3*j+3] = obs_normalized[0, 3*j:3*j+3]
+                else: # If the object is almost not moving, then we use the goal position
+                    for t in range(plans.shape[0]):
+                        for j in range(plans.shape[-1]//3):
+                            if t == 0:
+                                pos_diff = torch.norm(goal_normalized[0, 3*j:(3*j+3)] - obs_normalized[0, 3*j:(3*j+3)], dim=-1)
+                            else:
+                                pos_diff = torch.norm(normalized_plans[t, i, 3*j:(3*j+3)] - normalized_plans[t-1, i, 3*j:(3*j+3)], dim=-1)
+                            if pos_diff < 0.08:
+                                normalized_plans[t, i, 3*j:(3*j+3)] = goal_normalized[0, 3*j:(3*j+3)]
+
+        return normalized_plans, values, infos, achieved_ts, succeed_cube_indices
+
+    def p_mctd_plan(self, obs_normalized, goal_normalized, horizon, conditions, start, goal, steps, succeed_cube_list=None, target_cube_idx=-1):
         assert start.shape[0] == 1, "the batch size must be 1"
         assert (not self.leaf_parallelization) or (self.parallel_search_num % len(self.mctd_guidance_scales) == 0), f"Parallel search num must be divisible by the number of guidance scales: {self.parallel_search_num} % {len(self.mctd_guidance_scales)} != 0"
+        assert ("cube" in self.env_id) == (succeed_cube_list is not None), "succeed_cube_list must be provided for cube task"
 
         horizon = self.episode_len if horizon is None else horizon
         plan_tokens = np.ceil(horizon / self.frame_stack).astype(int)
         noise_level = self._generate_scheduling_matrix(plan_tokens)
-        children_node_guidance_scales = self.mctd_guidance_scales
+        if "cube" in self.env_id:
+            if target_cube_idx == -1:
+                children_node_guidance_scales = []
+                for i in range(obs_normalized.shape[-1]//3):
+                    if i in succeed_cube_list:
+                        continue
+                    for j in list(self.mctd_guidance_scales):
+                        children_node_guidance_scales.append(f"{i+1}-{j}")
+            else:
+                children_node_guidance_scales = [f"{target_cube_idx+1}-{j}" for j in list(self.mctd_guidance_scales)]
+            print(f"Object-wise children_node_guidance_scales: {children_node_guidance_scales}")
+        else:
+            children_node_guidance_scales = self.mctd_guidance_scales
         max_search_num = self.mctd_max_search_num
         num_denoising_steps = self.mctd_num_denoising_steps
         skip_level_steps = self.mctd_skip_level_steps
@@ -812,7 +1179,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 if time.time() - self.start_time > self.time_limit:
                     break
             else:
-                #if search_num >= max_search_num:
                 if p_search_num >= max_search_num:
                     break
 
@@ -827,7 +1193,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 expandable_node_names = root_node.get_expandable_node_names()
                 #print(f"Expandable node names: {expandable_node_names}")
             selection_start_time = time.time()
-            print("============ Selection Start ============")
+            #print("============ Selection Start ============")
             psn = self.parallel_search_num
             selected_nodes, expanded_node_candidates = [], []
             while psn > 0:
@@ -867,7 +1233,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             if len(selected_nodes) == 0:
                 print("No more selected nodes")
                 break
-            print("============ Selection End ============")
+            #print("============ Selection End ============")
             selection_end_time = time.time()
             selection_time.append(selection_end_time - selection_start_time)
 
@@ -877,7 +1243,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 ###############################
                 # Expansion
                 expansion_start_time = time.time()
-                print("============ Expansion Start ============")
+                #print("============ Expansion Start ============")
                 expanded_node_plans = []
                 expanded_node_noise_levels = []
                 expanded_node_guidance_scales = []
@@ -885,13 +1251,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     if len(info["plan_history"]) == 0:
                         expanded_node_plans.append(None)
                     else:
-                        expanded_node_plans.append(info["plan_history"][-1][-1].unsqueeze(1))
+                        expanded_node_plans.append(info["plan_history"][-1][-1].unsqueeze(1).to(self.device))
                     _noise_level = noise_level[(info["depth"] - 1) * num_denoising_steps : (info["depth"] * num_denoising_steps + 1)]
                     #if info["depth"] == terminal_depth:
                     _noise_level = np.concatenate([_noise_level] + [noise_level[-1:]]*(num_denoising_steps - _noise_level.shape[0]+1))
                     expanded_node_noise_levels.append(_noise_level)
                     expanded_node_guidance_scales.append(info["guidance_scale"])
-                expanded_node_guidance_scales = torch.tensor(expanded_node_guidance_scales).to(obs_normalized.device) # (batch_size,)
                 expanded_node_noise_levels = np.array(expanded_node_noise_levels, dtype=np.int32) # (batch_size, height, width)
                 expanded_node_plan_hists = self.parallel_plan(
                     obs_normalized, goal_normalized, horizon, conditions,
@@ -899,8 +1264,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     noise_level=expanded_node_noise_levels,
                     plan=expanded_node_plans,
                 )
-                print(f"Expanded node plan hists: {expanded_node_plan_hists.shape}")
-                print("============ Expansion End ============")
+                #print(f"Expanded node plan hists: {expanded_node_plan_hists.shape}")
+                #print("============ Expansion End ============")
                 expansion_end_time = time.time()
                 expansion_time.append(expansion_end_time - expansion_start_time)
 
@@ -908,7 +1273,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 # Simulation
                 #  It includes the noise level zero-padding, finding the max denoising steps, simulation, value calculation and node allocation
                 simulation_start_time = time.time()
-                print("============ Simulation Start ============")
+                #print("============ Simulation Start ============")
 
                 # Pad the noise levels - Sequential
                 simul_noiselevel_zero_padding_start = time.time()
@@ -943,15 +1308,23 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     plan=value_estimation_plans,
                 )
                 simul_value_estimation_end = time.time()
-                print(f"Value estimation plan hist: {value_estimation_plan_hists.shape}")
+                #print(f"Value estimation plan hist: {value_estimation_plan_hists.shape}")
 
                 # check if any plan is good
+                #if "cube" in self.env_id and (self.open_loop_horizon < self.val_max_steps): # In cube case, testing through value
+                #    value_estimation_plans, values, infos, achieved_ts, succeed_cube_indices = self.calculate_values_cube(value_estimation_plan_hists[-1], start, goal, obs_normalized, goal_normalized, succeed_cube_list) # (plan_len, N, D), (N, D), (N, D)
+                #    for i in range(len(infos)):
+                #        if filtered_expanded_node_plan_hists[i] is None and infos[i] == "Achieved" and values[i] > 0.5:
+                #            filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[:, :, i]
+                #            filtered_value_estimation_plan_hists[i] = value_estimation_plan_hists[:, :, i]
+                #else:
                 plans = self._unnormalize_x(value_estimation_plan_hists[-1])[:-1].detach().cpu().numpy()
                 diffs = np.linalg.norm(plans[1:] - plans[:-1], axis=-1) # (plan_len-1, N)
                 for i in range(diffs.shape[1]):
                     if filtered_expanded_node_plan_hists[i] is None and not np.all(diffs[:, i] < 0.1):
                         filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[:, :, i]
                         filtered_value_estimation_plan_hists[i] = value_estimation_plan_hists[:, :, i]
+
                 if None in filtered_expanded_node_plan_hists:
                     print("No good plan found, resampling")
                     simulation_end_time = time.time()
@@ -968,15 +1341,29 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             # Value Calculation
             simul_value_calculation_start = time.time()
-            values, infos, achieved_ts = self.calculate_values(value_estimation_plan_hists[-1], start, goal) # (plan_len, N, D), (N, D), (N, D)
+            if "cube" in self.env_id:
+                value_estimation_plans, values, infos, achieved_ts, succeed_cube_indices = self.calculate_values_cube(value_estimation_plan_hists[-1], start, goal, obs_normalized, goal_normalized, succeed_cube_list) # (plan_len, N, D), (N, D), (N, D)
+            else:
+                values, infos, achieved_ts = self.calculate_values(value_estimation_plan_hists[-1], start, goal) # (plan_len, N, D), (N, D), (N, D)
+                value_estimation_plans = value_estimation_plan_hists[-1]
+
+            viz_value_estimation_plans = []
             for i in range(len(infos)):
                 info = infos[i]
                 achieved_t = achieved_ts[i]
                 if info == "Achieved":
-                    achieved_plans.append([value_estimation_plan_hists[-1, :achieved_t, i], values[i]])
+                    viz_value_estimation_plans.append(value_estimation_plans[:achieved_t, i])
+                else:
+                    viz_value_estimation_plans.append(value_estimation_plans[:, i])
+
+            for i in range(len(infos)):
+                info = infos[i]
+                achieved_t = achieved_ts[i]
+                if info == "Achieved":
+                    achieved_plans.append([value_estimation_plans[:achieved_t, i], values[i]])
                     achieved = True
                 elif info == "NotReached":
-                    not_reached_plans.append([value_estimation_plan_hists[-1, :, i], values[i]])
+                    not_reached_plans.append([value_estimation_plans[:, i], values[i]])
             print(f"Value Calculation: {values}, {infos}")
             simul_value_calculation_end = time.time()
 
@@ -992,22 +1379,22 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     expanded_node_infos[name]["plan_history"].append([])
                 value = values[i]
                 plan_hist = expanded_node_plan_hists[:, :, i]
-                value_estimation_plan = value_estimation_plan_hists[-1, :, i]
+                value_estimation_plan = value_estimation_plans[:, i]
                 if expanded_node_infos[name]["value"] is None:
                     expanded_node_infos[name]["value"] = value
-                    expanded_node_infos[name]["value_estimation_plan"] = value_estimation_plan
-                    expanded_node_infos[name]["plan_history"][-1] = plan_hist
+                    expanded_node_infos[name]["value_estimation_plan"] = value_estimation_plan.detach().cpu()
+                    expanded_node_infos[name]["plan_history"][-1] = plan_hist.detach().cpu()
                 else:
                     if value > expanded_node_infos[name]["value"]:
                         expanded_node_infos[name]["value"] = value
-                        expanded_node_infos[name]["value_estimation_plan"] = value_estimation_plan
-                        expanded_node_infos[name]["plan_history"][-1] = plan_hist
+                        expanded_node_infos[name]["value_estimation_plan"] = value_estimation_plan.detach().cpu()
+                        expanded_node_infos[name]["plan_history"][-1] = plan_hist.detach().cpu()
             for name in selected_nodes_for_expansion:
                 selected_nodes_for_expansion[name].expand(**expanded_node_infos[name])
             simul_node_allocation_end = time.time()
             simul_node_allocation_time.append(simul_node_allocation_end - simul_node_allocation_start)
 
-            print("============ Simulation End ============")
+            #print("============ Simulation End ============")
             simulation_end_time = time.time()
             simulation_time.append(simulation_end_time - simulation_start_time)
 
@@ -1016,25 +1403,38 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             #  When leaf parallelization is True, then the backpropagation is done in partially parallel (the leafs from same parent node are backpropagated at the same time)
             #  When leaf parallelization is False, then the backpropagation is done in fully sequential (only one node is backpropagated at a time)
             backprop_start_time = time.time()
-            print("============ Backpropagation Start ============")
+            #print("============ Backpropagation Start ============")
 
             distinct_selected_nodes = np.unique(selected_nodes)
             for selected_node in distinct_selected_nodes:
                 selected_node.backpropagate()
 
-            print("============ Backpropagation End ============")
+            #print("============ Backpropagation End ============")
             backprop_end_time = time.time()
             backprop_time.append(backprop_end_time - backprop_start_time)
 
             ######################
             # Early Termination
             early_termination_start_time = time.time()
-            print("============ Early Termination Start ============")
+            #print("============ Early Termination Start ============")
 
-            plans = torch.stack([info["plan_history"][-1][-1] for info in expanded_node_infos.values()], dim=1)
-            _, infos, achieved_ts = self.calculate_values(plans, start, goal) # (plan_len, N, D), (N, D), (N, D)
+            plans = torch.stack([info["plan_history"][-1][-1] for info in expanded_node_infos.values()], dim=1).to(self.device)
+            if "cube" in self.env_id:
+                plans, _, infos, achieved_ts, succeed_cube_indices = self.calculate_values_cube(plans, start, goal, obs_normalized, goal_normalized, succeed_cube_list) # (plan_len, N, D), (N, D), (N, D)
+            else:
+                _, infos, achieved_ts = self.calculate_values(plans, start, goal) # (plan_len, N, D), (N, D), (N, D)
             print(f"Early Termination: {infos}, {achieved_ts}")
             solved = False
+            viz_plans = []
+            for i in range(len(infos)):
+                info = infos[i]
+                achieved_t = achieved_ts[i]
+                if info == "Achieved":
+                    terminal_ts = achieved_t
+                    viz_plans.append(plans[:terminal_ts, i])
+                else:
+                    viz_plans.append(plans[:, i])
+
             for i in range(len(infos)):
                 info = infos[i]
                 achieved_t = achieved_ts[i]
@@ -1044,17 +1444,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     solved_plan = plans[:terminal_ts, i]
                     break
 
-            print("============ Early Termination End ============")
+            #print("============ Early Termination End ============")
             early_termination_end_time = time.time()
             early_termination_time.append(early_termination_end_time - early_termination_start_time)
 
             if self.viz_plans:
-                self.visualize_node_value_plans(search_num, values, 
-                    [info["name"] for info in expanded_node_infos.values()],
-                    expanded_node_plan_hists[-1], value_estimation_plan_hists[-1], start, goal)
+                for i in range(len(viz_plans)):
+                    names = [info["name"] for info in expanded_node_infos.values()]
+                    self.visualize_node_value_plans(steps, search_num+i+1, values[i][None], [names], viz_plans[i][:,None],
+                        viz_value_estimation_plans[i][:,None], start, goal)
 
             search_num += 1
             p_search_num += len(expanded_node_candidates)
+            if search_num % 100 == 0:
+                print(f"search_num: {search_num}, p_search_num: {p_search_num}")
 
             if (self.early_stopping_condition == "solved" and solved) or (self.early_stopping_condition == "achieved" and achieved):
                 break

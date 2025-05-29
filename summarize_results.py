@@ -10,19 +10,12 @@ wandb_entity = "jaesikyoon"
 wandb_project = "jaesik_mctd"
 
 group_names = [
-    "PMMN-PMCTD",
-    "PMLN-PMCTD",
-    "PMGN-PMCTD",
-    "PMMN-FMCTD",
-    "PMLN-FMCTD",
-    "PMGN-FMCTD",
-
-    "AMMN-PMCTD",
-    "AMLN-PMCTD",
-    "AMGN-PMCTD",
-    "AMMN-FMCTD",
-    "AMLN-FMCTD",
-    "AMGN-FMCTD",
+    "CS-PMCTD-Replanning",
+    "CD-PMCTD-Replanning",
+    "CT-PMCTD-Replanning",
+    "CS-FMCTD-Replanning",
+    "CD-FMCTD-Replanning",
+    "CT-FMCTD-Replanning",
 ]
 
 folder_name = "exp_results"

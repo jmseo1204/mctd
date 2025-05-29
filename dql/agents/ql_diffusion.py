@@ -135,6 +135,7 @@ class Critic(nn.Module):
 class Diffusion_QL(object):
     def __init__(
         self,
+        env_name,
         state_dim,
         action_dim,
         max_action,
@@ -156,7 +157,7 @@ class Diffusion_QL(object):
         goal_dim=0,
         lcb_coef=4.0,
     ):
-
+        self.env_name = env_name
         self.goal_dim = goal_dim
         if goal_dim:
             state_dim = state_dim // 2 + goal_dim
@@ -227,7 +228,13 @@ class Diffusion_QL(object):
                 batch_size
             )
             if self.goal_dim:
-                goal = goal[:, : self.goal_dim]
+                if "cube" in self.env_name:
+                    num_cubes = self.goal_dim // 3
+                    goal = torch.concat(
+                        [goal[:, 19 + i*9: 19 + i*9 + 3] for i in range(num_cubes)], axis=-1
+                    )
+                else:
+                    goal = goal[:, : self.goal_dim]
             state = torch.cat([state, goal], dim=-1)
             next_state = torch.cat([next_state, goal], dim=-1)
 
