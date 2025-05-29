@@ -1,0 +1,64 @@
+defaults:
+  - df_base
+
+# dataset info
+data_mean: null
+data_std: null
+reward_mean: ${dataset.reward_mean}
+reward_std: ${dataset.reward_std}
+observation_mean: ${dataset.observation_mean}
+observation_std: ${dataset.observation_std}
+action_mean: ${dataset.action_mean}
+action_std: ${dataset.action_std}
+gamma: ${dataset.gamma}
+episode_len: ${dataset.episode_len}
+env_id: ${dataset.env_id}
+dataset: ${dataset.dataset}
+# non dataset info
+x_shape: null
+frame_stack: 10
+context_frames: 1
+open_loop_horizon: 50 #fixme
+use_reward: False
+causal: False
+plot_start_goal: True
+padding_mode: same
+# training hyperparameters
+weight_decay: 1e-4
+warmup_steps: 10000
+# diffusion-related
+guidance_scale: 2.0
+chunk_size: ${dataset.episode_len}
+scheduling_matrix: pyramid
+interaction_seed: ${experiment.validation.seed}
+use_random_goals_for_interaction: False
+task_id: 1
+dql_model: null
+val_max_steps: 1000
+mctd: True
+mctd_guidance_scales: [0,0.1,0.5,1,2]
+mctd_max_search_num: 500
+mctd_num_denoising_steps: 20
+mctd_skip_level_steps: 10
+sr_sampling: 1
+time_limit: null
+parallel_search_num: 1
+virtual_visit_weight: 1.0
+warp_threshold: 1.0
+leaf_parallelization: False
+parallel_multiple_visits: False
+early_stopping_condition: "solved"
+num_tries_for_bad_plans: 10
+sub_goal_interval: 10
+viz_plans: False
+
+diffusion:
+  stabilization_level: 10
+  beta_schedule: linear
+  objective: pred_x0
+  ddim_sampling_eta: 0.0
+  architecture:
+    network_size: 128
+    num_layers: 12
+    attn_heads: 4
+    dim_feedforward: 512

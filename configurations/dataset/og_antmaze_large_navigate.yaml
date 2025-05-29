@@ -1,0 +1,16 @@
+defaults:
+  - base_dataset
+env_id:  "antmaze-large-v0"
+dataset: "antmaze-large-navigate-v0"
+save_dir: ~/.ogbench/data
+gamma: 1.0
+episode_len: 500
+observation_shape: [2]
+action_dim: 8
+goal_dim: 2
+observation_mean: [16.90072,11.440328]
+observation_std:  [10.48876,7.4409323]
+action_mean: []
+action_std:  []
+reward_mean: 0.081254
+reward_std: 0.27322477
