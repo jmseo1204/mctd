@@ -2,7 +2,7 @@
 
 This is the **official Pytorch implementation** of Monte Carlo Tree Diffusion (MCTD) and Fast Monte Carlo Tree Diffusion (Fast-MCTD).
 
-This code includes the implementation of MCTD and Fast-MCTD for cube tasks (robot arm manipulation tasks).
+This code includes the implementation of MCTD and Fast-MCTD for point and ant maze tasks.
 
 ## Monte Carlo Tree Diffusion (MCTD)
 
@@ -38,15 +38,15 @@ The WanDB is used for logging the training process.
 
 ### Pre-trained models
 
-You can evaluate the performances of MCTDs through the given pre-trained models in the [link](https://drive.google.com/drive/folders/1r8xTxvHS0HIE1jbskAVxr9jdM6UiQU6P?usp=share_link).
+You can evaluate the performances of MCTDs through the given pre-trained models in the [link](https://drive.google.com/drive/folders/1FoEkB83l1dNShupfKHmucchPJnbcLg3l?usp=share_link).
 
-`cube_dql_trained_models.tar.gz` contains the pre-trained models for DQL, and it should be uncompressed in the `./dql/` directory.
+`dql_trained_models.tar.gz` contains the pre-trained models for DQL, and it should be uncompressed in the `./dql/` directory.
 
-`cube_planner_trained_models.tar.gz` contains the pre-trained diffusion models for point and ant maze tasks. It should be uncompressed in the `./output/downloaded/<WANDB_ENTITY_NAME>/<WANDB_PROJECT_NAME>/` directory.
+`planner_trained_models.tar.gz` contains the pre-trained diffusion models for point and ant maze tasks. It should be uncompressed in the `./output/downloaded/<WANDB_ENTITY_NAME>/<WANDB_PROJECT_NAME>/` directory.
 
 ### Evaluation (Job creation and running)
 
-After uncompressing the files, you can evaluate the performances of MCTDs by running the job creation script and job runner script. The examples of the job creation scripts is in the `insert_cube_validation_jobs.py` file. You can create the job by modifying the wandb entity name, project name, and the job configurations.
+After uncompressing the files, you can evaluate the performances of MCTDs by running the job creation script and job runner script. The examples of the job creation scripts are in the `insert_point_maze_validation_jobs.py` and `insert_antmaze_validation_jobs.py` files. You can create the job by modifying the wandb entity name, project name, and the job configurations.
 
 After creating the job, you can run the job by running the job runner script. The job runner script is in the `run_jobs.py` file. You can run the jobs over multiple servers by setting the `available_gpus` variable in the script.
 
@@ -65,12 +65,12 @@ python summarize_results.py
 The results will be saved in the `exp_results` directory, and printed out in the terminal as follows.
 
 ```bash
-{'group': 'CS-PMCTD-Replanning', 'success_rate': '100±0', 'planning_time': '1.81±0.12'}
-{'group': 'CD-PMCTD-Replanning', 'success_rate': '82±0', 'planning_time': '4.92±1.11'}
-{'group': 'CT-PMCTD-Replanning', 'success_rate': '54±0', 'planning_time': '7.52±2.40'}
-{'group': 'CS-FMCTD-Replanning', 'success_rate': '100±0', 'planning_time': '1.79±0.06'}
-{'group': 'CD-FMCTD-Replanning', 'success_rate': '76±0', 'planning_time': '4.27±0.63'}
-{'group': 'CT-FMCTD-Replanning', 'success_rate': '48±0', 'planning_time': '6.21±1.36'}
+{'group': 'PMMN-PMCTD', 'success_rate': '100±0', 'planning_time': '11.11±2.13'}
+{'group': 'PMLN-PMCTD', 'success_rate': '98±0', 'planning_time': '8.41±1.34'}
+{'group': 'PMGN-PMCTD', 'success_rate': '98±0', 'planning_time': '9.68±0.51'}
+{'group': 'PMMN-FMCTD', 'success_rate': '100±0', 'planning_time': '1.91±0.20'}
+{'group': 'PMLN-FMCTD', 'success_rate': '82±0', 'planning_time': '2.06±0.08'}
+{'group': 'PMGN-FMCTD', 'success_rate': '98±0', 'planning_time': '2.71±0.28'}
 ```
 
 ## Training
@@ -91,5 +91,4 @@ After creating the job, you can run the job by running the job runner script. Th
 ```
 
 ## Acknowledgement
-
 This repo is forked from [Boyuan Chen](https://boyuan.space/)'s research template [repo](https://github.com/buoyancy99/research-template), especially, it is based on Diffusion Forcing source code, [repo](https://github.com/buoyancy99/diffusion-forcing/tree/main).
