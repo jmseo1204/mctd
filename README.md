@@ -6,7 +6,7 @@ This code includes the implementation of MCTD and Fast-MCTD for cube tasks (robo
 
 ## Monte Carlo Tree Diffusion (MCTD)
 
-Author: Jaesik Yoon, Hyeonseo Cho, Yoshua Bengio, Sungjin Ahn
+Author: Jaesik Yoon, Hyeonseo Cho, Doojin Baek, Yoshua Bengio, Sungjin Ahn
 
 *ICML 2025, Spotlight*
 
