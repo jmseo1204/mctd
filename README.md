@@ -82,7 +82,7 @@ After creating the job, you can run the job by running the job runner script. Th
 ## References
 
 ```bibtex
-@inproceedings{yoon2025mctd,
+@inproceedings{mctd,
   title={Monte Carlo Tree Diffusion for System 2 Planning},
   author={Yoon, Jaesik and Cho, Hyeonseo and Baek, Doojin and Bengio, Yoshua and Ahn, Sungjin},
   booktitle={International Conference on Machine Learning},
