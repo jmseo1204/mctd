@@ -90,5 +90,14 @@ After creating the job, you can run the job by running the job runner script. Th
 }
 ```
 
+```bibtex
+@article{fast-mctd,
+  title={Fast Monte Carlo Tree Diffusion: 100x Speedup via Parallel Sparse Planning},
+  author={Yoon, Jaesik* and Cho, Hyeonseo* and Bengio, Yoshua and Ahn, Sungjin},
+  journal={arXiv preprint arXiv:2506.09498},
+  year={2025}
+}
+```
+
 ## Acknowledgement
 This repo is forked from [Boyuan Chen](https://boyuan.space/)'s research template [repo](https://github.com/buoyancy99/research-template), especially, it is based on Diffusion Forcing source code, [repo](https://github.com/buoyancy99/diffusion-forcing/tree/main).
