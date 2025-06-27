@@ -503,7 +503,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 plan_hist = self._unnormalize_x(plan_hist)
                 plan = plan_hist[-1] # (t b c)
             else:
-                plan_hist = self.plan(obs_normalized, goal_normalized, self.episode_len - steps, conditions)
+                plan_hist = self.plan(obs_normalized, goal_normalized, self.episode_len, conditions)
                 plan_hist = self._unnormalize_x(plan_hist)  # (m t b c)
                 plan = plan_hist[-1]  # (t b c)
            # Visualization
