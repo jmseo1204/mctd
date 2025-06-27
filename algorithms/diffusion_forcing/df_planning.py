@@ -60,7 +60,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.mctd_max_search_num = cfg.mctd_max_search_num
         self.mctd_num_denoising_steps = cfg.mctd_num_denoising_steps
         self.mctd_skip_level_steps = cfg.mctd_skip_level_steps
-        self.sr_sampling = cfg.sr_sampling
         self.jump = cfg.jump
         self.time_limit = cfg.time_limit
         self.parallel_search_num = cfg.parallel_search_num
@@ -496,7 +495,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         all_plan_hist = []  # a list of plan histories, each history is a collection of m diffusion steps
 
         # run mpc with diffused actions
-        assert (not self.mctd) or (self.sr_sampling == 1), "MCTD is only supported for single-step planning"
         planning_time = []
         while not terminate and steps < self.val_max_steps:
             planning_start_time = time.time()
@@ -505,47 +503,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 plan_hist = self._unnormalize_x(plan_hist)
                 plan = plan_hist[-1] # (t b c)
             else:
-                if self.sr_sampling == 1:
-                    #plan_hist = self.plan(obs_normalized, goal_normalized, self.episode_len - steps, conditions)
-                    plan_hist = self.plan(obs_normalized, goal_normalized, self.episode_len, conditions)
-                    plan_hist = self._unnormalize_x(plan_hist)  # (m t b c)
-                    plan = plan_hist[-1]  # (t b c)
-                else:
-                    sr_obs_normalized = obs_normalized.repeat(self.sr_sampling, 1)
-                    sr_goal_normalized = goal_normalized.repeat(self.sr_sampling, 1)
-                    sr_plan_hist = self.plan(sr_obs_normalized, sr_goal_normalized, self.episode_len, conditions)
-                    sr_plan_hist = self._unnormalize_x(sr_plan_hist)  # (m t b c)
-                    sr_plans = sr_plan_hist[-1]  # (t b c)
-                    #sr_plans = sr_plans[self.frame_stack - 1 :]
-                    o, _, _ = self.split_bundle(sr_plans)
-                    o = o.detach().cpu().numpy()[:-1, :]  # last observation is dummy
-                    # Heuristic for selecting the best plan
-                    values = np.zeros(self.sr_sampling)
-                    info_for_debugging = ["NotReached"] * self.sr_sampling
-                    goal_numpy = goal.cpu().numpy()[:, : self.observation_dim]
-                    for s in range(self.sr_sampling):
-                        for t in range(1, o.shape[0]):
-                            #if t == 0:
-                            #    pos_diff = np.linalg.norm(o[t, s, :2] - start[0, :2], axis=-1)
-                            #else:
-                            pos_diff = np.linalg.norm(o[t, s, :2] - o[t - 1, s, :2], axis=-1)
-                            if pos_diff > 1.0:
-                                values[s] = 0
-                                info_for_debugging[s] = "Warp"
-                                break
-                            if np.linalg.norm(o[t, s, :2] - goal_numpy[0, :2], axis=-1) < 1.0:
-                                values[s] = (self.episode_len - t) / self.episode_len
-                                info_for_debugging[s] = "Achieved"
-                                break
-                    # find the best plan with highest value
-                    best_plan_idx = np.argmax(values)
-                    plan = sr_plans[:, best_plan_idx, :].unsqueeze(1)
-                    plan_hist = sr_plan_hist[:, :, best_plan_idx, :].unsqueeze(2)
-                    # Visualization
-                    start_numpy = start.cpu().numpy()[:, :2]
-                    image = make_trajectory_images(self.env_id, o[:,best_plan_idx:(best_plan_idx+1)], 1, start_numpy, goal_numpy, self.plot_end_points)[0]
-                    self.log_image(f"sr_plan/selected_{values[best_plan_idx]}", Image.fromarray(image))
-            # Visualization
+                plan_hist = self.plan(obs_normalized, goal_normalized, self.episode_len - steps, conditions)
+                plan_hist = self._unnormalize_x(plan_hist)  # (m t b c)
+                plan = plan_hist[-1]  # (t b c)
+           # Visualization
             start_numpy = start.cpu().numpy()[:, :2]
             goal_numpy = goal.cpu().numpy()[:, : self.observation_dim]
             image = make_trajectory_images(self.env_id, plan[:, :, :2].detach().cpu().numpy(), 1, start_numpy, goal_numpy, self.plot_end_points)[0]
