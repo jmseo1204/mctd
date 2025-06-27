@@ -40,7 +40,6 @@ mctd_guidance_scales: [0,0.1,0.5,1,2]
 mctd_max_search_num: 5000
 mctd_num_denoising_steps: 20
 mctd_skip_level_steps: 10
-sr_sampling: 1
 time_limit: null
 parallel_search_num: 1
 virtual_visit_weight: 1.0

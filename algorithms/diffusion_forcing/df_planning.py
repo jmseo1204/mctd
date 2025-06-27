@@ -64,7 +64,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.mctd_max_search_num = cfg.mctd_max_search_num
         self.mctd_num_denoising_steps = cfg.mctd_num_denoising_steps
         self.mctd_skip_level_steps = cfg.mctd_skip_level_steps
-        self.sr_sampling = cfg.sr_sampling
         self.jump = cfg.jump
         self.time_limit = cfg.time_limit
         self.parallel_search_num = cfg.parallel_search_num
@@ -565,9 +564,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         trajectory = []  # actual trajectory
         all_plan_hist = []  # a list of plan histories, each history is a collection of m diffusion steps
 
-        # run mpc with diffused actions
-        assert (not self.mctd) or (self.sr_sampling == 1), "MCTD is only supported for single-step planning"
-
         # Cube task visualization
         if "cube" in self.env_id and self.cube_viz:
             cube_visual_obss = [env.render()]
@@ -595,39 +591,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 plan_hist = self._unnormalize_x(plan_hist)
                 plan = plan_hist[-1] # (t b c)
             else:
-                if self.sr_sampling == 1:
-                    #plan_hist = self.plan(obs_normalized, goal_normalized, self.episode_len - steps, conditions)
-                    plan_hist = self.plan(obs_normalized, goal_normalized, self.episode_len, conditions)
-                    plan_hist = self._unnormalize_x(plan_hist)  # (m t b c)
-                    plan = plan_hist[-1]  # (t b c)
-                else:
-                    sr_obs_normalized = obs_normalized.repeat(self.sr_sampling, 1)
-                    sr_goal_normalized = goal_normalized.repeat(self.sr_sampling, 1)
-                    sr_plan_hist = self.plan(sr_obs_normalized, sr_goal_normalized, self.episode_len, conditions)
-                    sr_plan_hist = self._unnormalize_x(sr_plan_hist)  # (m t b c)
-                    sr_plans = sr_plan_hist[-1]  # (t b c)
-                    #sr_plans = sr_plans[self.frame_stack - 1 :]
-                    o, _, _ = self.split_bundle(sr_plans)
-                    o = o.detach().cpu().numpy()[:-1, :]  # last observation is dummy
-                    # Heuristic for selecting the best plan
-                    values = np.zeros(self.sr_sampling)
-                    info_for_debugging = ["NotReached"] * self.sr_sampling
-                    goal_numpy = goal.cpu().numpy()[:, : self.observation_dim]
-                    for s in range(self.sr_sampling):
-                        for t in range(1, o.shape[0]):
-                            pos_diff = np.linalg.norm(o[t, s, :self.observation_dim] - o[t - 1, s, :self.observation_dim], axis=-1)
-                            if pos_diff > 1.0:
-                                values[s] = 0
-                                info_for_debugging[s] = "Warp"
-                                break
-                            if np.linalg.norm(o[t, s, :self.observation_dim] - goal_numpy[0, :self.observation_dim], axis=-1) < 1.0:
-                                values[s] = (self.episode_len - t) / self.episode_len
-                                info_for_debugging[s] = "Achieved"
-                                break
-                    # find the best plan with highest value
-                    best_plan_idx = np.argmax(values)
-                    plan = sr_plans[:, best_plan_idx, :].unsqueeze(1)
-                    plan_hist = sr_plan_hist[:, :, best_plan_idx, :].unsqueeze(2)
+                plan_hist = self.plan(obs_normalized, goal_normalized, self.episode_len - steps, conditions)
+                plan_hist = self._unnormalize_x(plan_hist)  # (m t b c)
+                plan = plan_hist[-1]  # (t b c)
 
             # In Cube case, cropping the plan to the successful trajectory
             if "cube" in self.env_id:
