@@ -1,8 +1,6 @@
 # Monte Carlo Tree Diffusion (MCTD)
 
-This is the **official Pytorch implementation** of Monte Carlo Tree Diffusion (MCTD) and Fast Monte Carlo Tree Diffusion (Fast-MCTD).
-
-This code includes the implementation of MCTD and Fast-MCTD for cube tasks (robot arm manipulation tasks).
+This repository provides the official PyTorch implementation of Monte Carlo Tree Diffusion (MCTD) and Fast Monte Carlo Tree Diffusion (Fast-MCTD) for the robot arm manipulation tasks.
 
 ## Monte Carlo Tree Diffusion (MCTD)
 
@@ -14,7 +12,7 @@ Author: Jaesik Yoon, Hyeonseo Cho, Doojin Baek, Yoshua Bengio, Sungjin Ahn
 
 ![MCTD](./assets/MCTD_overview.png)
 
-Monte Carlo Tree Diffusion (MCTD) is a new framework to improve the inference-time scaling on Diffusion denoising process by combining Monte Carlo Tree Search (MCTS) and Diffusion models.
+Monte Carlo Tree Diffusion (MCTD) is a novel framework that improves the inference-time performance of diffusion models by integrating the denoising process with Monte Carlo Tree Search (MCTS).
 
 ## Fast Monte Carlo Tree Diffusion (Fast-MCTD)
 
@@ -22,48 +20,52 @@ Author: Jaesik Yoon*, Hyeonseo Cho*, Yoshua Bengio, Sungjin Ahn
 
 ![Fast-MCTD](./assets/Fast-MCTD_overview.png)
 
-Fast Monte Carlo Tree Diffusion (Fast-MCTD) is the improved version of MCTD to optimize it's efficiency through parallel tree search and abstract-level diffusion planning.
+Fast Monte Carlo Tree Diffusion (Fast-MCTD) is an enhanced version of MCTD that improves computational efficiency through parallel tree search and abstract-level diffusion planning.
 
 ## Installation
 
-You can set the environment through the given docker file. It includes the installation of the customized version of Offline Goal-Conditioned RL benchmark, [OGBench](https://seohong.me/projects/ogbench/) for giving the velocity information on the maze environment as the observation and removing the randomness on the start and goal positions to reduce the variance of the performance. Before building the docker image, you need to download the mujoco 2.1.0 binary files from the [link](https://drive.google.com/drive/folders/1gwXsIzpTILXG6kZv1EDrLBeEKYpPAl-G?usp=drive_link) and put it in the `./dockerfile/mujoco/` directory.
+The recommended method for setting up the environment is to use the provided Dockerfile.
+
+The Dockerfile installs a customized version of the [OGBench](https://seohong.me/projects/ogbench/) benchmark. This customization serves two purposes: it incorporates velocity into the maze environment's observation space and removes randomness from the start and goal positions to reduce performance variance.
+
+Before building the Docker image, download the MuJoCo 2.1.0 binaries from this [link](https://drive.google.com/drive/folders/1gwXsIzpTILXG6kZv1EDrLBeEKYpPAl-G?usp=drive_link) and place them in the `./dockerfile/mujoco/` directory.
 
 ```bash
 docker build -t fmctd:0.1 dockerfile
 ```
 
-The WanDB is used for logging the training process.
+This project uses Weights & Biases (WanDB) for logging experiments.
 
 ## Evaluation
 
 ### Pre-trained models
 
-You can evaluate the performances of MCTDs through the given pre-trained models in the [link](https://drive.google.com/drive/folders/1r8xTxvHS0HIE1jbskAVxr9jdM6UiQU6P?usp=share_link).
+Evaluate the performance of MCTD and Fast-MCTD using the pre-trained models available at this [link](https://drive.google.com/drive/folders/1r8xTxvHS0HIE1jbskAVxr9jdM6UiQU6P?usp=share_link).
 
-`cube_dql_trained_models.tar.gz` contains the pre-trained models for DQL, and it should be uncompressed in the `./dql/` directory.
+- `dql_trained_models.tar.gz`: Contains pre-trained models for DQL. Extract this archive to the ./dql/ directory.
 
-`cube_planner_trained_models.tar.gz` contains the pre-trained diffusion models for point and ant maze tasks. It should be uncompressed in the `./output/downloaded/<WANDB_ENTITY_NAME>/<WANDB_PROJECT_NAME>/` directory.
+- `planner_trained_models.tar.gz`: Contains pre-trained diffusion models for the point and ant maze tasks. Extract this archive to `./output/downloaded/<WANDB_ENTITY_NAME>/<WANDB_PROJECT_NAME>/`.
 
-### Evaluation (Job creation and running)
+### Running the Evaluation
 
-After uncompressing the files, you can evaluate the performances of MCTDs by running the job creation script and job runner script. The examples of the job creation scripts is in the `insert_cube_validation_jobs.py` file. You can create the job by modifying the wandb entity name, project name, and the job configurations.
+1. Create Jobs: After extracting the models, define the evaluation jobs. Example scripts, `insert_cube_validation_jobs.py`is provided. You will need to modify your WandB entity, project name, and other job configurations within these files.
 
-After creating the job, you can run the job by running the job runner script. The job runner script is in the `run_jobs.py` file. You can run the jobs over multiple servers by setting the `available_gpus` variable in the script.
+2. Run Jobs: Execute the created jobs using the `run_jobs.py` script. To distribute jobs across multiple servers, configure the `available_gpus` variable within the script.
+
 
 ### WanDB logs
 
-You can find the WanDB logs for the experiments through example job creation scripts in the [link](https://wandb.ai/jaesikyoon/jaesik_mctd).
+The Weights & Biases logs for the experiments reported in our paper are publicly available at this [link](https://wandb.ai/jaesikyoon/jaesik_mctd). These logs correspond to the configurations in the example job creation scripts.
 
 ### Summarize results
 
-You can summarize the results by running the `summarize_results.py` file by setting the `group_names` variable in the script.
+To aggregate the evaluation results, run the `summarize_results.py` script after setting the `group_names` variable.
 
 ```bash
 python summarize_results.py
 ```
 
-The results will be saved in the `exp_results` directory, and printed out in the terminal as follows.
-
+The results will be saved to the `exp_results` directory and printed to the terminal, as shown below:
 ```bash
 {'group': 'CS-PMCTD-Replanning', 'success_rate': '100±0', 'planning_time': '1.81±0.12'}
 {'group': 'CD-PMCTD-Replanning', 'success_rate': '82±0', 'planning_time': '4.92±1.11'}
@@ -75,9 +77,11 @@ The results will be saved in the `exp_results` directory, and printed out in the
 
 ## Training
 
-You can train the MCTD and Fast-MCTD by running the training scripts. The examples of the training scripts are in the `insert_diffusion_training_jobs.py` and `insert_dql_training_jobs.py` files. You can train the models by modifying the wandb entity name, project name, and the job configurations.
+To train MCTD and Fast-MCTD models from scratch, follow these steps:
 
-After creating the job, you can run the job by running the job runner script. The job runner script is in the `run_jobs.py` file. You can run the jobs over multiple servers by setting the `available_gpus` variable in the script.
+1. Create Jobs: Use the example scripts `insert_diffusion_training_jobs.py` and `insert_dql_training_jobs.py` to create training jobs. Before running, you must configure your WandB entity, project name, and job parameters within these scripts.
+
+2. Run Jobs: Once a job is created, execute it using the `run_jobs.py` script. To distribute training across multiple servers, configure the `available_gpus` variable within the script.
 
 ## References
 
@@ -87,6 +91,15 @@ After creating the job, you can run the job by running the job runner script. Th
   author={Yoon, Jaesik and Cho, Hyeonseo and Baek, Doojin and Bengio, Yoshua and Ahn, Sungjin},
   booktitle={International Conference on Machine Learning},
   year={2025},
+}
+```
+
+```bibtex
+@article{fast-mctd,
+  title={Fast Monte Carlo Tree Diffusion: 100x Speedup via Parallel Sparse Planning},
+  author={Yoon, Jaesik* and Cho, Hyeonseo* and Bengio, Yoshua and Ahn, Sungjin},
+  journal={arXiv preprint arXiv:2506.09498},
+  year={2025}
 }
 ```
 
