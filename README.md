@@ -8,7 +8,7 @@ Author: Jaesik Yoon, Hyeonseo Cho, Doojin Baek, Yoshua Bengio, Sungjin Ahn
 
 *ICML 2025, Spotlight*
 
-[[MCTD Paper]](https://arxiv.org/abs/2502.07202) [[MCTD project page]](https://sites.google.com/view/mctd-s2planning/home)
+[[MCTD Paper]](https://arxiv.org/abs/2502.07202) [[MCTD project page]](https://jaesikyoon.com/mctd-page/)
 
 ![MCTD](./assets/MCTD_overview.png)
 
@@ -17,6 +17,10 @@ Monte Carlo Tree Diffusion (MCTD) is a novel framework that improves the inferen
 ## Fast Monte Carlo Tree Diffusion (Fast-MCTD)
 
 Author: Jaesik Yoon*, Hyeonseo Cho*, Yoshua Bengio, Sungjin Ahn
+
+*Preprint*
+
+[[Fast-MCTD Paper]](https://arxiv.org/abs/2506.09498) [[Fast-MCTD project page]](https://jaesikyoon.com/fast-mctd-page/)
 
 ![Fast-MCTD](./assets/Fast-MCTD_overview.png)
 
