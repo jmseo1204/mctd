@@ -111,8 +111,6 @@ python summarize_results.py
 
 The results will be saved to the `exp_results` directory and printed to the terminal:
 
-Bash
-
 ```bash
 {'group': 'PMMN-PMCTD', 'success_rate': '100±0', 'planning_time': '11.11±2.13'}
 {'group': 'PMLN-PMCTD', 'success_rate': '98±0', 'planning_time': '8.41±1.34'}
