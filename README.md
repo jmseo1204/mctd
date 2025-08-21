@@ -85,17 +85,18 @@ python insert_antmaze_validation_jobs.py
 
 ### **3. Run the Evaluation**
 
-Execute the jobs using the `run_jobs.py` script.
+Execute the jobs using the `run_jobs.py` and `run_dql_jobs.py scripts.
 
-- Open `run_jobs.py` and configure the `available_gpus` variable to specify which GPUs to use.
+- Open the scripts and configure the `available_gpus` variable to specify which GPUs to use.
     
 - Run the script:
     
 ```bash
 python run_jobs.py
+python run_dql_jobs.py
 ```
 
-The script will automatically assign jobs to the available GPUs. To distribute jobs across multiple servers, run this script on each server with the appropriate `available_gpus` configuration.
+The scripts will automatically assign jobs to the available GPUs.
 
 ### **4. Summarize Results**
 
