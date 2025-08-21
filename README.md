@@ -6,9 +6,9 @@ This repository provides the **official PyTorch implementation** for Monte Carlo
 
 Author: Jaesik Yoon, Hyeonseo Cho, Doojin Baek, Yoshua Bengio, Sungjin Ahn
 
-*ICML 2025, Spotlight*
+_Published in the proceedings of the International Conference on Machine Learning (ICML) 2025, Spotlight._
 
-[[MCTD Paper]](https://arxiv.org/abs/2502.07202) [[MCTD project page]](https://jaesikyoon.com/mctd-page/)
+[[Paper]](https://arxiv.org/abs/2502.07202) [[Project Page]](https://jaesikyoon.com/mctd-page/)
 
 ![MCTD](./assets/MCTD_overview.png)
 
@@ -16,15 +16,16 @@ Monte Carlo Tree Diffusion (MCTD) is a novel framework that improves the inferen
 
 ## Fast Monte Carlo Tree Diffusion (Fast-MCTD)
 
-Author: Jaesik Yoon*, Hyeonseo Cho*, Yoshua Bengio, Sungjin Ahn
+Author: Jaesik Yoon*, Hyeonseo Cho*, Yoshua Bengio, Sungjin Ahn (* equal contribution)
 
-*Preprint*
+_Preprint, 2025._
 
-[[Fast-MCTD Paper]](https://arxiv.org/abs/2506.09498) [[Fast-MCTD project page]](https://jaesikyoon.com/fast-mctd-page/)
+[[Paper]](https://arxiv.org/abs/2506.09498) [[Project Page]](https://jaesikyoon.com/fast-mctd-page/)
 
 ![Fast-MCTD](./assets/Fast-MCTD_overview.png)
 
 Fast Monte Carlo Tree Diffusion (Fast-MCTD) is an enhanced version of MCTD that improves computational efficiency through parallel tree search and abstract-level diffusion planning.
+
 
 ## Installation
 
