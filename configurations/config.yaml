@@ -9,9 +9,9 @@ debug: false # global debug flag will be passed into configuration of experiment
 jump: 1 # global jump flag will be passed into configuration of experiment, dataset and algorithm
 
 wandb:
-  group: TransDF-test # wandb group name
-  entity: jaesikyoon # wandb account name / organization name [fixme]
-  project: jsik_e_mctd # wandb project name; if not provided, defaults to root folder name [fixme]
+  group: algorithm.task_id # wandb group name
+  entity: jmseo1204-seoul-national-university # wandb account name / organization name [fixme]
+  project: mctd_eval # wandb project name; if not provided, defaults to root folder name [fixme]
   mode: online # set wandb logging to online, offline or dryrun
 
 hostname: null # hostname to run the experiment on

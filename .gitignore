@@ -8,6 +8,10 @@ lightning_logs/
 datasets/offline_rl/viz
 jobs/
 dql_jobs/
+outputs/
+dql/backup/
+dql/results/
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

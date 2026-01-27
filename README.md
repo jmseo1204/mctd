@@ -38,7 +38,8 @@ Our Docker setup requires the MuJoCo 2.1.0 binaries. Please download them from t
 From the root of the repository, run the following command:
 
 ```bash
-docker build -t fmctd:0.1 . -f dockerfile/Dockerfile
+cd dockerfile
+docker build -t fmctd:0.1 . -f Dockerfile
 ```
 
 > **Note on the environment:** The Dockerfile installs a customized version of the [OGBench](https://seohong.me/projects/ogbench/) benchmark. This customization serves two purposes: it incorporates velocity into the maze environment's observation space and removes randomness from the start and goal positions to reduce performance variance.
@@ -59,7 +60,7 @@ Download the models from this [link](https://drive.google.com/drive/folders/1Fo
     
 - `planner_trained_models.tar.gz`: Contains pre-trained diffusion models. **This requires a specific directory structure to match our W&B logs.**
     
-    - **First, create a directory path:** `mkdir -p ./output/downloaded/<YOUR_WANDB_ENTITY>/<YOUR_WANDB_PROJECT>`
+    - **First, create a directory path:** `mkdir -p ./outputs/downloaded/<YOUR_WANDB_ENTITY>/<YOUR_WANDB_PROJECT>`
         
         - Replace `<YOUR_WANDB_ENTITY>` with your W&B username or entity name.
             

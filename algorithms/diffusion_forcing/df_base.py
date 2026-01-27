@@ -92,7 +92,12 @@ class DiffusionForcingBase(BasePytorchAlgo):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx, namespace="validation") -> STEP_OUTPUT:
-        xs, conditions, masks = self._preprocess_batch(batch)
+        xs, conditions, masks = self._preprocess_batch(batch) 
+        # xs: (T, B, fs * C)
+        # conditions: (T, B, fs * cond_dim)
+        # masks: (n_frames, B)
+ 
+
         n_frames, batch_size, *_ = xs.shape
         xs_pred = []
         curr_frame = 0
@@ -111,12 +116,12 @@ class DiffusionForcingBase(BasePytorchAlgo):
             assert horizon <= self.n_tokens, "horizon exceeds the number of tokens."
             scheduling_matrix = self._generate_scheduling_matrix(horizon)
 
-            chunk = torch.randn((horizon, batch_size, *self.x_stacked_shape), device=self.device)
+            chunk = torch.randn((horizon, batch_size, *self.x_stacked_shape), device=self.device) # T, B, fs*C 
             chunk = torch.clamp(chunk, -self.clip_noise, self.clip_noise)
             xs_pred = torch.cat([xs_pred, chunk], 0)
 
             # sliding window: only input the last n_tokens frames
-            start_frame = max(0, curr_frame + horizon - self.n_tokens)
+            start_frame = max(0, curr_frame + horizon - self.n_tokens) # if n_tokens cannot cover the horizon, start frame moves to 1+
 
             pbar.set_postfix(
                 {
@@ -184,7 +189,6 @@ class DiffusionForcingBase(BasePytorchAlgo):
             noise_levels = torch.where(discard, torch.full_like(noise_levels, self.timesteps - 1), noise_levels)
 
         return noise_levels
-
     def _generate_scheduling_matrix(self, horizon: int):
         match self.cfg.scheduling_matrix:
             case "pyramid":

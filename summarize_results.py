@@ -6,8 +6,8 @@ from collections import defaultdict
 import os
 import json
 
-wandb_entity = "jaesikyoon"
-wandb_project = "jaesik_mctd"
+wandb_entity = "jmseo1204-seoul-national-university"
+wandb_project = "mctd_eval"
 
 group_names = [
     "PMMN-PMCTD",

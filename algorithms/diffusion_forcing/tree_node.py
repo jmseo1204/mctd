@@ -78,7 +78,7 @@ class TreeNode():
             _node = child_node["node"]
             _value = _node.value
             _visit_count = _node.visit_count + _node.virtual_visit_count * self.virtual_visit_weight
-            uct_values.append(_value + exp_weight * np.sqrt(np.log(1e-6 + total_visit_count) / (1e-6 + _visit_count)))
+            uct_values.append(_value + exp_weight * np.sqrt(np.log(1e-6 + total_visit_count) / (1e-6 + _visit_count))) # UCT calculation
         selected_index = np.argmax(uct_values)
         if leaf_parallelization:
             self._children_nodes[selected_index]["node"].virtual_visit_count += len(self._children_nodes)

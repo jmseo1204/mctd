@@ -95,20 +95,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             raise ValueError("Number of frames - 1 must be divisible by frame stack size")
 
         nonterminals = torch.cat([torch.ones_like(nonterminals[:, : self.frame_stack]), nonterminals[:, :-1]], dim=1)
-        nonterminals = nonterminals.bool().permute(1, 0)
+        nonterminals = nonterminals.bool().permute(1, 0) # (T, B)
         masks = torch.cumprod(nonterminals, dim=0).contiguous()
         # masks = torch.cat([masks[:-self.frame_stack:self.jump], masks[-self.frame_stack:]], dim=0)
 
         rewards = rewards[:, :-1, None]
         actions = actions[:, :-1]
-        init_obs, observations = torch.split(observations, [1, n_frames - 1], dim=1)
+        init_obs, observations = torch.split(observations, [1, n_frames - 1], dim=1) # (b t c_o)
         bundles = self._normalize_x(self.make_bundle(observations, actions, rewards))  # (b t c)
         init_bundle = self._normalize_x(self.make_bundle(init_obs[:, 0]))  # (b c)
         init_bundle[:, self.observation_dim :] = 0  # zero out actions and rewards after normalization
         init_bundle = self.pad_init(init_bundle, batch_first=True)  # (b t c)
         bundles = torch.cat([init_bundle, bundles], dim=1)
         bundles = rearrange(bundles, "b (t fs) ... -> t b fs ...", fs=self.frame_stack)
-        bundles = bundles.flatten(2, 3).contiguous()
+        bundles = bundles.flatten(2, 3).contiguous() # t b fs c -> t b fs*c
 
         if self.cfg.external_cond_dim:
             raise ValueError("external_cond_dim not needed in planning")
@@ -335,7 +335,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         guidance_fn = goal_guidance if guidance_scale is not None else None
 
         plan_tokens = np.ceil(horizon / self.frame_stack).astype(int)
-        pad_tokens = 0 if self.causal else self.n_tokens - plan_tokens - 1
+        pad_tokens = 0 if self.causal else self.n_tokens - plan_tokens - 1 # 1 means init_token
         try:
             scheduling_matrix = noise_level
         except:
@@ -355,12 +355,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             else:
                 c = rearrange(plan[i], "(t fs) 1 c -> t 1 (fs c)", fs=self.frame_stack)
             chunk.append(c)
-        chunk = torch.cat(chunk, 1)
+        chunk = torch.cat(chunk, 1) # (T,B, fs*c)
         if len(chunk.shape) == 2:
             chunk = chunk.unsqueeze(0)
         pad = torch.zeros((pad_tokens, batch_size, *self.x_stacked_shape), device=self.device)
         init_token = rearrange(self.pad_init(start), "fs b c -> 1 b (fs c)")
-        plan = torch.cat([init_token, chunk, pad], 0)
+        plan = torch.cat([init_token, chunk, pad], 0) # (n_tokens, B, fs*c)
 
         plan_hist = [plan.detach().clone()[: self.n_tokens - pad_tokens]]
         stabilization = 0
@@ -369,19 +369,19 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             from_noise_levels = np.concatenate(
                 [
                     np.full((batch_size, 1), stabilization, dtype=np.int64),  # Shape (batch_size, 1)
-                    scheduling_matrix[:,m],
-                    np.full((batch_size, pad_tokens), self.sampling_timesteps, dtype=np.int64),  # Shape (batch_size, pad_tokens)
+                    scheduling_matrix[:,m], # initially (B, M, T) -> (B, T)
+                    np.full((batch_size, pad_tokens), self.sampling_timesteps, dtype=np.int64),  # Shape (batch_size, pad_tokens), num_denoising_steps means MAX_NOISE_LEVEL
                 ]
                 , axis=1
             )
             to_noise_levels = np.concatenate(
                 [
                     np.full((batch_size, 1), stabilization, dtype=np.int64),  # Shape (batch_size, 1)
-                    scheduling_matrix[:,m+1],
+                    scheduling_matrix[:,m+1], # (batch_size, T)
                     np.full((batch_size, pad_tokens), self.sampling_timesteps, dtype=np.int64),  # Shape (batch_size, pad_tokens)
                 ]
                 , axis=1
-            )
+            )# (B, T)
             from_noise_levels = torch.from_numpy(from_noise_levels).to(self.device)
             to_noise_levels = torch.from_numpy(to_noise_levels).to(self.device)
             from_noise_levels = rearrange(from_noise_levels, "b t -> t b", b=batch_size)
@@ -393,7 +393,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         plan_hist = torch.stack(plan_hist)
         plan_hist = rearrange(plan_hist, "m t b (fs c) -> m (t fs) b c", fs=self.frame_stack)
-        plan_hist = plan_hist[:, self.frame_stack : self.frame_stack + horizon]
+        plan_hist = plan_hist[:, self.frame_stack : self.frame_stack + horizon] # (m, init_token 제와한 1~T 개의 fs, b, c)
         return plan_hist
 
     def interact(self, batch_size: int, conditions=None, namespace="validation"):
@@ -538,7 +538,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         if np.linalg.norm(obs_numpy[0, :2] - sub_goal[0, :2]) < 1.0:
                             print(f"sub_goal_step {sub_goal_step} achieved, next sub_goal_step {sub_goal_step + self.sub_goal_interval} in {plan.shape[0]} steps")
                             sub_goal_step += self.sub_goal_interval
-                            if plan.shape[0] - sub_goal_step <= 0:
+                            if plan.shape[0] - sub_goal_step <= 0: # T
                                 sub_goal = plan[-1, :, :2].detach().cpu().numpy()
                             else:
                                 sub_goal = plan[sub_goal_step, :, :2].detach().cpu().numpy()
@@ -841,15 +841,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 print("============ Expansion Start ============")
                 expanded_node_plans = []
                 expanded_node_noise_levels = []
-                expanded_node_guidance_scales = []
+                expanded_node_guidance_scales = [] 
                 for info in expanded_node_candidates:
                     if len(info["plan_history"]) == 0:
                         expanded_node_plans.append(None)
                     else:
-                        expanded_node_plans.append(info["plan_history"][-1][-1].unsqueeze(1))
+                        expanded_node_plans.append(info["plan_history"][-1][-1].unsqueeze(1)) # plan_history shape: (D, M, T, B, C)-> MCA & fully denoised
                     _noise_level = noise_level[(info["depth"] - 1) * num_denoising_steps : (info["depth"] * num_denoising_steps + 1)]
                     #if info["depth"] == terminal_depth:
-                    _noise_level = np.concatenate([_noise_level] + [noise_level[-1:]]*(num_denoising_steps - _noise_level.shape[0]+1))
+                    _noise_level = np.concatenate([_noise_level] + [noise_level[-1:]]*(num_denoising_steps - _noise_level.shape[0]+1)) # (num_denoising_steps, T)
                     expanded_node_noise_levels.append(_noise_level)
                     expanded_node_guidance_scales.append(info["guidance_scale"])
                 expanded_node_guidance_scales = torch.tensor(expanded_node_guidance_scales).to(obs_normalized.device) # (batch_size,)

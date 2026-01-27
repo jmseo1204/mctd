@@ -35,6 +35,7 @@ RUN pip3 install pyrealsense2
 RUN pip3 install internetarchive
 
 # From extra requirements
+RUN pip3 install "numpy<2.0.0"
 RUN pip3 install cython==0.29.37
 RUN pip3 install setuptools==65.5.0 
 RUN pip3 install wheel==0.40.0
