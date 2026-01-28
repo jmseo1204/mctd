@@ -38,7 +38,7 @@ val_max_steps: 1000
 mctd: True
 mctd_guidance_scales: [0,0.1,0.5,1,2]
 mctd_max_search_num: 500
-mctd_num_denoising_steps: 20
+mctd_num_denoising_steps: 30
 mctd_skip_level_steps: 10
 time_limit: null
 parallel_search_num: 1
@@ -49,7 +49,7 @@ parallel_multiple_visits: False
 early_stopping_condition: "solved"
 num_tries_for_bad_plans: 10
 sub_goal_interval: 10
-viz_plans: False
+viz_plans: True
 
 diffusion:
   stabilization_level: 10

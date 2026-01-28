@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 
 # seeds 0 to 9 to match antmaze script
-seeds = list(range(3))
+seeds = list(range(1))
 # Task IDs 1 to 5 for Giant Maze (Environment requirement)
 task_ids = [1, 2, 3, 4, 5]
 
@@ -19,27 +19,27 @@ pmctd_giant_ckpt = "pzt9dsm4"
 fmctd_giant_ckpt = "uzrq13fa"
 
 basic_configs = [
-    {
-        "wandb.entity": wandb_entity,
-        "wandb.project": wandb_project,
-        "wandb.group": "AMGN-PMCTD",
-        "+name": "AMGN-PMCTD",
-        "experiment": "exp_planning",
-        "algorithm": "df_planning",
-        "algorithm.open_loop_horizon": 1500,
-        "algorithm.val_max_steps": 1500,
-        "algorithm.mctd": True,
-        "algorithm.parallel_search_num": 200,
-        "algorithm.mctd_max_search_num": 500,
-        "algorithm.mctd_guidance_scales": "[0,1,2,3,4,5]",
-        "algorithm.sub_goal_interval": 10,
-        "algorithm.warp_threshold": 0.5,
-        "dataset": "og_antmaze_giant_navigate",
-        "dataset.episode_len": 1000,
-        "experiment.tasks": ["validation"],
-        "experiment.validation.batch_size": 1,
-        "load": pmctd_giant_ckpt,
-    },
+    # {
+    #     "wandb.entity": wandb_entity,
+    #     "wandb.project": wandb_project,
+    #     "wandb.group": "AMGN-PMCTD",
+    #     "+name": "AMGN-PMCTD",
+    #     "experiment": "exp_planning",
+    #     "algorithm": "df_planning",
+    #     "algorithm.open_loop_horizon": 1500,
+    #     "algorithm.val_max_steps": 1500,
+    #     "algorithm.mctd": True,
+    #     "algorithm.parallel_search_num": 200,
+    #     "algorithm.mctd_max_search_num": 500,
+    #     "algorithm.mctd_guidance_scales": "[0,1,2,3,4,5]",
+    #     "algorithm.sub_goal_interval": 10,
+    #     "algorithm.warp_threshold": 0.5,
+    #     "dataset": "og_antmaze_giant_navigate",
+    #     "dataset.episode_len": 1000,
+    #     "experiment.tasks": ["validation"],
+    #     "experiment.validation.batch_size": 1,
+    #     "load": pmctd_giant_ckpt,
+    # },
     {
         "wandb.entity": wandb_entity,
         "wandb.project": wandb_project,
@@ -49,12 +49,12 @@ basic_configs = [
         "algorithm": "df_planning",
         "algorithm.guidance_scale": 2.0,
         "algorithm.mctd": True,
-        "algorithm.parallel_search_num": 200,
+        "algorithm.parallel_search_num": 50,
         "algorithm.open_loop_horizon": 1500,
         "algorithm.val_max_steps": 1500,
         "algorithm.warp_threshold": 2.0,
-        "algorithm.mctd_max_search_num": 500,
-        "algorithm.mctd_guidance_scales": "[0,1,2,3,4,5]",
+        "algorithm.mctd_max_search_num":50,
+        "algorithm.mctd_guidance_scales": "[0,1,2,3]",
         "algorithm.sub_goal_interval": 10,
         "dataset": "og_antmaze_giant_navigate",
         "dataset.jump": 5,

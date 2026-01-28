@@ -118,50 +118,62 @@ else:
 
 completed_jobs = 0
 
-while not queue_is_empty:
-    for gpu, exp_name in list(running_experiments.items()):
-        server, gpu_id = gpu.split(":")
-        if exp_name is not None and not is_experiment_running(server, exp_name):
-            running_experiments[gpu] = None  # Mark the GPU as available.
-            completed_jobs += 1
-            pbar.update(1)
-            pbar.set_postfix({"Last Completed": exp_name})
+try:
+    while not queue_is_empty:
+        for gpu, exp_name in list(running_experiments.items()):
+            server, gpu_id = gpu.split(":")
+            if exp_name is not None and not is_experiment_running(server, exp_name):
+                running_experiments[gpu] = None  # Mark the GPU as available.
+                completed_jobs += 1
+                pbar.update(1)
+                pbar.set_postfix({"Last Completed": exp_name})
 
-        if running_experiments[gpu] is None:
-            memory_used, memory_total = check_gpu_memory_usage(server, gpu_id)
-            if memory_used < 1000: # If the memory usage is less than 500MB, start a new experiment.
-                current_time = time.strftime("%Y%m%d-%H%M%S")
-                exp_name = f"exp_gpu{gpu_id}_{current_time}-{jobs_folder}"  # Unique container name.
-                
-                # Check again if file exists (to avoid collision with another process)
-                if not os.path.exists(f"{jobs_folder}/{config_file}"):
-                     config_files = sorted(os.listdir(f"{jobs_folder}/"))
-                     if not config_files:
-                         queue_is_empty = True
-                         break
-                     config_file = config_files[0]
-                     with open(f"{jobs_folder}/{config_file}", "r") as f:
-                         config = json.load(f)
+            if running_experiments[gpu] is None:
+                memory_used, memory_total = check_gpu_memory_usage(server, gpu_id)
+                if memory_used < 1000: # If the memory usage is less than 500MB, start a new experiment.
+                    current_time = time.strftime("%Y%m%d-%H%M%S")
+                    exp_name = f"exp_gpu{gpu_id}_{current_time}-{jobs_folder}"  # Unique container name.
+                    
+                    # Check again if file exists (to avoid collision with another process)
+                    if not os.path.exists(f"{jobs_folder}/{config_file}"):
+                         config_files = sorted(os.listdir(f"{jobs_folder}/"))
+                         if not config_files:
+                             queue_is_empty = True
+                             break
+                         config_file = config_files[0]
+                         with open(f"{jobs_folder}/{config_file}", "r") as f:
+                             config = json.load(f)
 
-                start_experiment(server, gpu_id, config, exp_name, current_time)
-                running_experiments[gpu] = exp_name  # Set the container name.
-                
-                try:
-                    os.remove(f"{jobs_folder}/{config_file}") # Remove the config file from the queue after running the experiment.
-                except FileNotFoundError:
-                    pass
+                    start_experiment(server, gpu_id, config, exp_name, current_time)
+                    running_experiments[gpu] = exp_name  # Set the container name.
+                    
+                    try:
+                        os.remove(f"{jobs_folder}/{config_file}") # Remove the config file from the queue after running the experiment.
+                    except FileNotFoundError:
+                        pass
 
-                time.sleep(1) # Interval between starting containers.
-                config_files = sorted(os.listdir(f"{jobs_folder}/"))
-                if config_files:
-                    config_file = config_files[0]
-                    # Read config file
-                    with open(f"{jobs_folder}/{config_file}", "r") as f:
-                        config = json.load(f)
-                else:
-                    queue_is_empty = True
-                    break
-    time.sleep(1)  # Check every 1 seconds.
+                    time.sleep(1) # Interval between starting containers.
+                    config_files = sorted(os.listdir(f"{jobs_folder}/"))
+                    if config_files:
+                        config_file = config_files[0]
+                        # Read config file
+                        with open(f"{jobs_folder}/{config_file}", "r") as f:
+                            config = json.load(f)
+                    else:
+                        queue_is_empty = True
+                        break
+        time.sleep(1)  # Check every 1 seconds.
+except KeyboardInterrupt:
+    print("\n\n!! KeyboardInterrupt detected. Cleaning up running docker containers... !!")
+    for gpu, exp_name in running_experiments.items():
+        if exp_name is not None:
+            server, _ = gpu.split(":")
+            print(f"Stopping container {exp_name} on {server}...")
+            if server == "localhost":
+                subprocess.run(["docker", "rm", "-f", exp_name], capture_output=True)
+            else:
+                subprocess.run(["ssh", server, "docker", "rm", "-f", exp_name], capture_output=True)
+    print("Cleanup complete. Exiting.")
 
 pbar.close()
 print(f"\nAll {total_jobs} jobs finished!")
