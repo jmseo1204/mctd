@@ -2,10 +2,14 @@ import numpy as np
 import math
 import torch
 import torch.nn
+from typing import Optional
 
 class TreeNode():
-    def __init__(self, name, depth, parent_node, children_node_guidance_scales, plan_history, guidance_scale=None, terminal_depth=None, 
-            value=None, value_estimation_plan=None, virtual_visit_weight=0.0):
+    def __init__(self, name: str, depth: int, parent_node: Optional['TreeNode'], 
+                 children_node_guidance_scales: list, plan_history: list, 
+                 guidance_scale: Optional[float] = None, terminal_depth: Optional[int] = None, 
+                 value: Optional[float] = None, value_estimation_plan: Optional[torch.Tensor] = None, 
+                 virtual_visit_weight: float = 0.0, current_levels: Optional[np.ndarray] = None):
         self.name = name
         self.depth = depth
         self._parent_node = parent_node
@@ -24,6 +28,9 @@ class TreeNode():
         self.value = value
         self.value_estimation_plan = value_estimation_plan
         self.visit_count = 0
+        
+        # Store denoising state for incremental segment-wise denoising in MCTD
+        self.current_levels = current_levels
 
     def __lt__(self, other):
         return self.name < other.name
@@ -113,7 +120,8 @@ class TreeNode():
             'guidance_scale': self._children_nodes[selected_index]['guidance_scale'],
             'value': None,
             'value_estimation_plan': None,
-            'virtual_visit_weight': self.virtual_visit_weight
+            'virtual_visit_weight': self.virtual_visit_weight,
+            'current_levels': self.current_levels  # Inherit parent's denoising state
         }
         # this function call means that the node is virtually visited in parallel search
         self._children_nodes[selected_index]['virtually_visited'] = True

@@ -22,7 +22,6 @@ open_loop_horizon: 50 #fixme
 use_reward: False
 causal: False
 plot_start_goal: True
-padding_mode: same
 # training hyperparameters
 weight_decay: 1e-4
 warmup_steps: 10000
@@ -36,26 +35,44 @@ task_id: 1
 dql_model: null
 val_max_steps: 1000
 mctd: True
-mctd_guidance_scales: [0,0.1,0.5,1,2]
-mctd_max_search_num: 500
-mctd_num_denoising_steps: 30
 mctd_skip_level_steps: 10
+mctd_denoising_steps_per_segment: 10
 time_limit: null
-parallel_search_num: 1
 virtual_visit_weight: 1.0
 warp_threshold: 1.0
 leaf_parallelization: False
 parallel_multiple_visits: False
 early_stopping_condition: "solved"
-num_tries_for_bad_plans: 10
 sub_goal_interval: 10
+
+parallel_search_num: 6
+mctd_max_search_num: 70
+mctd_guidance_scales: [0.5, 3.0]
+padding_mode: "same" # "zero" or "same"
 viz_plans: True
+bidirectional_search: True
+sequence_dividing_factor: 5
+is_unknown_final_token: True  # Test: Set to True if final_token stabilization causes confusion
+horizon_scale: 0.9
+mctd_num_denoising_steps: 50 # 90 for pyramid, matrix H = self.sampling_timesteps + uncertainty_scale * (horizon/frame_stack) = 90
+pyramid: True
+# mctd_reduction_amount: 1000 # Default to full denoising (matches self.sampling_timesteps)
+num_tries_for_bad_plans: 3
+
+# HILP value function guidance
+use_hilp_guidance: true  # Set to true to use HILP value function instead of MSE distance
+hilp_checkpoint_path: "td_models/hilp_ckpt_latest.pt"
+hilp_obs_dim: 29  # AntMaze observation dimension
+hilp_skill_dim: 32  # HILP phi representation dimension
 
 diffusion:
+  clip_noise: 20.0
   stabilization_level: 10
   beta_schedule: linear
   objective: pred_x0
-  ddim_sampling_eta: 0.0
+  use_snr_weighting: True
+  snr_clip: 5.0
+  ddim_sampling_eta: 0.1
   architecture:
     network_size: 128
     num_layers: 12

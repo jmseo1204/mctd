@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 
 # seeds 0 to 9 to match antmaze script
-seeds = list(range(1))
+seeds = list(range(3))
 # Task IDs 1 to 5 for Giant Maze (Environment requirement)
 task_ids = [1, 2, 3, 4, 5]
 
@@ -53,8 +53,8 @@ basic_configs = [
         "algorithm.open_loop_horizon": 1500,
         "algorithm.val_max_steps": 1500,
         "algorithm.warp_threshold": 2.0,
-        "algorithm.mctd_max_search_num":50,
-        "algorithm.mctd_guidance_scales": "[0,1,2,3]",
+        #"algorithm.mctd_max_search_num":50,
+        #"algorithm.mctd_guidance_scales": "[1000.0]",
         "algorithm.sub_goal_interval": 10,
         "dataset": "og_antmaze_giant_navigate",
         "dataset.jump": 5,

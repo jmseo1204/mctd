@@ -163,7 +163,8 @@ class Diffusion(nn.Module):
         model_output = self.model(x, t, external_cond, is_causal=self.is_causal)
 
         if self.objective == "pred_noise":
-            pred_noise = torch.clamp(model_output, -self.clip_noise, self.clip_noise)
+            # pred_noise = torch.clamp(model_output, -self.clip_noise, self.clip_noise)
+            pred_noise = model_output
             x_start = self.predict_start_from_noise(x, t, pred_noise)
 
         elif self.objective == "pred_x0":
@@ -431,14 +432,50 @@ class Diffusion(nn.Module):
                     t=clipped_curr_noise_level,
                     external_cond=external_cond,
                 )
+                
+                # Direct Reconstruction Guidance with Normalization
+                with torch.enable_grad():
+                    guidance_results = guidance_fn(model_pred.pred_x_start)
+                    
+                    if isinstance(guidance_results, dict):
+                        # Multi-component guidance: compute individual grads for logging and analysis
+                        grad = torch.zeros_like(x)
+                        norms = {}
+                        # Use retain_graph=True for all but the last component to get individual grads
+                        items = list(guidance_results.items())
+                        for i, (name, loss) in enumerate(items):
+                            is_last = (i == len(items) - 1)
+                            g = torch.autograd.grad(loss.sum(), x, retain_graph=not is_last)[0]
+                            grad = grad + g
+                            norms[name] = g.norm().item()
+                        
+                        # Log individual norm ratios for analysis
+                        total_norm = sum(norms.values())
+                        if total_norm > 1e-8:
+                            ratio_parts = [f"{k}: {v/total_norm:.2%}" for k, v in norms.items()]
+                            print(f"[GUIDANCE RATIO] " + " | ".join(ratio_parts))
+                    else:
+                        guidance_loss = guidance_results
+                        grad = torch.autograd.grad(guidance_loss.sum(), x)[0]
+                
+                # Guidance application: pred_noise = prior_noise - grad
+                # grad = d(-dist)/dx points towards the goal. Subtracting it from noise adds it to x.
+                pred_noise = model_pred.pred_noise - grad
+                
+                if pred_noise.abs().max() > self.clip_noise:
+                    pred_noise = torch.clamp(pred_noise, -self.clip_noise, self.clip_noise)
+                    # Warning: gradient is too large and being clipped
+                    print(f"[CLIP WARNING] Gradient clipped at noise limit {self.clip_noise}")
+                
+                # Logging: Only log when guidance is active
+                if guidance_fn is not None:
+                    # mask of the transition we care about (finalizing frames)
+                    mask_final = (curr_noise_level != next_noise_level)
+                    if mask_final.any():
+                        grad_norm = grad.norm(dim=-1) # (T, B)
+                        g_norm_val = grad_norm[mask_final].mean().item() 
+                        print(f"[GUIDANCE STATS] Grad Norm: {g_norm_val:.4f}")
 
-                guidance_loss = guidance_fn(model_pred.pred_x_start)
-                grad = -torch.autograd.grad(
-                    guidance_loss,
-                    x,
-                )[0]
-
-                pred_noise = model_pred.pred_noise + (1 - alpha_next).sqrt() * grad
                 x_start = self.predict_start_from_noise(x, clipped_curr_noise_level, pred_noise)
 
         else:
@@ -454,6 +491,18 @@ class Diffusion(nn.Module):
         noise = torch.clamp(noise, -self.clip_noise, self.clip_noise)
 
         x_pred = x_start * alpha_next.sqrt() + pred_noise * c + sigma * noise
+        
+        if guidance_fn is not None and torch.rand(1).item() < 0.05:
+            # Calculate the net coefficient of pred_noise in the update rule:
+            # x_pred = coeff * pred_noise + x_t_term
+            # From our derivation: coeff = c - sqrt(alpha_next) * sqrt_recipm1
+            sqrt_recipm1 = extract(self.sqrt_recipm1_alphas_cumprod, clipped_curr_noise_level, x.shape)
+            coeff = c - alpha_next.sqrt() * sqrt_recipm1
+            avg_coeff = coeff.mean().item()
+            
+            print(f"[DIFFUSION DEBUG] Net Guidance Coeff: {avg_coeff:.6f}")
+            print(f"[DIFFUSION DEBUG] Final x_pred norm: {x_pred.norm().item():.6f}")
+            print(f"[DIFFUSION DEBUG] x change norm: {(x_pred - x).norm().item():.6f}\n")
 
         # only update frames where the noise level decreases
         mask = curr_noise_level == next_noise_level
