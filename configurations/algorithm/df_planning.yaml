@@ -11,14 +11,12 @@ observation_std: ${dataset.observation_std}
 action_mean: ${dataset.action_mean}
 action_std: ${dataset.action_std}
 gamma: ${dataset.gamma}
-episode_len: ${dataset.episode_len}
 env_id: ${dataset.env_id}
 dataset: ${dataset.dataset}
 # non dataset info
 x_shape: null
 frame_stack: 10
 context_frames: 1
-open_loop_horizon: 50 #fixme
 use_reward: False
 causal: False
 plot_start_goal: True
@@ -27,13 +25,12 @@ weight_decay: 1e-4
 warmup_steps: 10000
 # diffusion-related
 guidance_scale: 2.0
-chunk_size: ${dataset.episode_len}
+chunk_size: 50
 scheduling_matrix: pyramid
 interaction_seed: ${experiment.validation.seed}
 use_random_goals_for_interaction: False
 task_id: 1
 dql_model: null
-val_max_steps: 1000
 mctd: True
 mctd_skip_level_steps: 10
 mctd_denoising_steps_per_segment: 10
@@ -45,25 +42,30 @@ parallel_multiple_visits: False
 early_stopping_condition: "solved"
 sub_goal_interval: 10
 
+pyramid: True
+mctd_num_denoising_steps: 100 # 90 for pyramid, matrix H = self.sampling_timesteps + uncertainty_scale * (horizon/frame_stack) = 90
 parallel_search_num: 6
 mctd_max_search_num: 70
-mctd_guidance_scales: [0.5, 3.0]
+mctd_guidance_scales: [0.0, 1.5]
 padding_mode: "same" # "zero" or "same"
 viz_plans: True
 bidirectional_search: True
-sequence_dividing_factor: 5
 is_unknown_final_token: True  # Test: Set to True if final_token stabilization causes confusion
-horizon_scale: 0.9
-mctd_num_denoising_steps: 50 # 90 for pyramid, matrix H = self.sampling_timesteps + uncertainty_scale * (horizon/frame_stack) = 90
-pyramid: True
+episode_len: ${dataset.episode_len} # self.n_tokens = self.episode_len // self.frame_stack
+horizon_scale: 0.8 # horizon = self.episode_len * horizon_scale
 # mctd_reduction_amount: 1000 # Default to full denoising (matches self.sampling_timesteps)
+sequence_dividing_factor: 4
 num_tries_for_bad_plans: 3
+open_loop_horizon: 1000 #fixme -> best: episode_len*horizon_scale
+val_max_steps: 1000 # fixme -> k*open_loop_horizon, k>=1
 
 # HILP value function guidance
 use_hilp_guidance: true  # Set to true to use HILP value function instead of MSE distance
 hilp_checkpoint_path: "td_models/hilp_ckpt_latest.pt"
 hilp_obs_dim: 29  # AntMaze observation dimension
 hilp_skill_dim: 32  # HILP phi representation dimension
+anchor_guidance_scale: 40.0
+rdf_guidance_scale: 2.0
 
 diffusion:
   clip_noise: 20.0

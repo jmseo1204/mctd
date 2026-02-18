@@ -41,7 +41,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.unstacked_dim = self.observation_dim + self.action_dim + int(self.use_reward)
         cfg.x_shape = (self.unstacked_dim,)
         self.episode_len = cfg.episode_len
-        self.n_tokens = self.episode_len // cfg.frame_stack + 1
+        
+        # Manually initialize frame_stack as requested to solve dependency order
+        self.frame_stack = cfg.frame_stack
+        assert self.episode_len % self.frame_stack == 0, "Episode length must be divisible by frame stack size"
+        self.n_tokens = self.episode_len // self.frame_stack
+        
         self.gamma = cfg.gamma
         self.reward_mean = cfg.reward_mean
         self.reward_std = cfg.reward_std
@@ -85,6 +90,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.hilp_obs_dim = cfg.get('hilp_obs_dim', 29)
         self.hilp_skill_dim = cfg.get('hilp_skill_dim', 32)
         self.hilp_value_fn = None  # Will be loaded lazily when needed
+        self.anchor_guidance_scale = cfg.get('anchor_guidance_scale', 40.0)
+        self.rdf_guidance_scale = cfg.get('rdf_guidance_scale', 2.0)
         
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal and self.guidance_scale != 0
@@ -101,6 +108,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
     def _preprocess_batch(self, batch):
         observations, actions, rewards, nonterminals = batch
+
         batch_size, n_frames = observations.shape[:2]
 
         observations = observations[..., : self.observation_dim]
@@ -150,8 +158,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         loss = self.reweight_loss(loss, weights)
 
-        if batch_idx % 100 == 0:
-            self.log("training/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
+        self.log("training/loss_epoch", loss, on_step=False, on_epoch=True, sync_dist=True)
 
         xs = self._unstack_and_unnormalize(xs)[self.frame_stack - 1 :]
         xs_pred = self._unstack_and_unnormalize(xs_pred)[self.frame_stack - 1 :]
@@ -306,7 +313,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
     def process_segment_noise_levels(self, level_array: np.ndarray, sequence_dividing_factor: int, from_start: bool, reduction_amount: Optional[int] = None) -> np.ndarray:
         
         plan_tokens = len(level_array) # T
-        segment_size = int(np.ceil(plan_tokens / sequence_dividing_factor))
+        assert plan_tokens % sequence_dividing_factor == 0, f"Plan tokens must be divisible by sequence dividing factor, but got {plan_tokens} and {sequence_dividing_factor}"
+        segment_size = plan_tokens // sequence_dividing_factor
         
         # Work with a copy
         steps = [level_array.copy()]
@@ -481,8 +489,21 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 )
                 to_levels_list.append(to_levels_b)
             
-            # to_levels_list is list of (M, T). We need to verify if all have same M.
-            # In bidirectional search, segment_size is constant, so M should be constant.
+            # Verify that all particles in the batch have the same number of steps (M)
+            # assert all(len(steps) == len(to_levels_list[0]) for steps in to_levels_list), \
+            #     f"Schedules in batch have inconsistent lengths: {[len(s) for s in to_levels_list]}"
+                
+                
+            # Determine the maximum number of steps (M) in this segment across the batch
+            max_m = max(len(steps) for steps in to_levels_list)
+            
+            # Pad schedules to max_m by repeating the last step
+            for b in range(batch_size):
+                if len(to_levels_list[b]) < max_m:
+                    padding = np.tile(to_levels_list[b][-1:], (max_m - len(to_levels_list[b]), 1))
+                    to_levels_list[b] = np.concatenate([to_levels_list[b], padding], axis=0)
+
+
             batch_steps = np.stack(to_levels_list, axis=1) # (M, B, T)
             
             # Append subsequent steps (index 0 is current_levels which is already in schedule)
@@ -543,6 +564,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 weight = torch.ones_like(dist) * weight[:, None] #  t b n
             return (dist * weight).mean(dim=dim) # * dist.shape[1] DO NOT DELETE THIS COMMENT
 
+        def _prepare_pred(x: torch.Tensor) -> torch.Tensor:
+            """Helper to rearrange and unnormalize predictions."""
+            # x is a tensor of shape [t b (fs c)]
+            pred = rearrange(x, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
+            return self._unnormalize_x(pred)
+
         def get_hilp_value_fn():
             """Lazy loader for HILP value function model."""
             if self.hilp_value_fn is None:
@@ -575,11 +602,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         def goal_guidance(x: torch.Tensor) -> torch.Tensor:
             """Target guidance to reach goal/start."""
-            print(f"\n[GUIDANCE DEBUG] goal_guidance called with x.shape={x.shape}")
-            print(f"[GUIDANCE DEBUG] guidance_scale={guidance_scale}")
+            # print(f"\n[GUIDANCE DEBUG] goal_guidance called with x.shape={x.shape}")
+            # print(f"[GUIDANCE DEBUG] guidance_scale={guidance_scale}")
             # x is a tensor of shape [t b (fs c)]
-            pred = rearrange(x, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
-            pred = self._unnormalize_x(pred)
+            pred = _prepare_pred(x)
             h_padded = pred.shape[0] - self.frame_stack  # include padding when horizon % frame_stack != 0
 
             if not self.use_reward:
@@ -637,11 +663,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     # Replicate to match MSE output shape (T, B, C)
                     dist_target = dist_target_hilp.expand(-1, -1, pred.shape[-1])  # (T, B, C)
                     
-                    print(f"[HILP DEBUG] Using HILP value function with zero-padding")
-                    print(f"[HILP DEBUG] pred_xy shape: {pred_xy.shape}, zeros_rest shape: {zeros_rest.shape}")
-                    print(f"[HILP DEBUG] pred_obs shape: {pred_obs.shape}, target_obs shape: {target_obs.shape}")
-                    print(f"[HILP DEBUG] v1 range: [{v1.min():.4f}, {v1.max():.4f}], v2 range: [{v2.min():.4f}, {v2.max():.4f}]")
-                    print(f"[HILP DEBUG] dist_target shape: {dist_target.shape}, range: [{dist_target.min():.4f}, {dist_target.max():.4f}]")
+                    # print(f"[HILP DEBUG] Using HILP value function with zero-padding")
+                    # print(f"[HILP DEBUG] pred_xy shape: {pred_xy.shape}, zeros_rest shape: {zeros_rest.shape}")
+                    # print(f"[HILP DEBUG] pred_obs shape: {pred_obs.shape}, target_obs shape: {target_obs.shape}")
+                    # print(f"[HILP DEBUG] v1 range: [{v1.min():.4f}, {v1.max():.4f}], v2 range: [{v2.min():.4f}, {v2.max():.4f}]")
+                    # print(f"[HILP DEBUG] dist_target shape: {dist_target.shape}, range: [{dist_target.min():.4f}, {dist_target.max():.4f}]")
                 else:
                     # Use traditional MSE distance
                     dist_target = nn.functional.mse_loss(pred, target_guidance, reduction="none")
@@ -674,8 +700,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         def anchor_dist_guidance(x: torch.Tensor) -> torch.Tensor:
             """Anchor distance regularization using segment heads."""
             # x is a tensor of shape [t b (fs c)]
-            pred = rearrange(x, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
-            pred = self._unnormalize_x(pred)
+            pred = _prepare_pred(x)
             h_padded = pred.shape[0] - self.frame_stack  # include padding when horizon % frame_stack != 0
 
             pred_detached = pred.detach()
@@ -699,15 +724,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             Repels current state from states in the window [idx-7-segment_size, idx-7].
             """
             # x is a tensor of shape [t b (fs c)]
-            pred = rearrange(x, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
-            pred = self._unnormalize_x(pred)
+            pred = _prepare_pred(x)
             total_T = pred.shape[0]
             
             # Extract observation part (first 2 dimensions for position)
             pred_obs = pred[:, :, :2]  # Shape: [T, B, 2]
             
             # Calculate segment size for window width
-            segment_size = horizon // self.sequence_dividing_factor
+            # segment_size = horizon // self.sequence_dividing_factor
+            segment_size = float('inf')
             
             # Create indices for pairwise comparison
             indices = torch.arange(total_T, device=x.device)
@@ -715,7 +740,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             k_idx = indices.view(1, -1)
             
             # Sliding window mask: k is between [j-7-segment_size, j-7]
-            ignore_latest = 5
+            ignore_latest = 5 * self.frame_stack
             pair_mask = (k_idx <= j_idx - ignore_latest) & (k_idx >= j_idx - ignore_latest - segment_size)
             
             # Only apply to states within the planning horizon (after conditioning frames)
@@ -730,21 +755,22 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             dist_sq = torch.cdist(pred_obs_b, pred_obs_b, p=2).pow(2)
             
             # RDF kernel matrix [B, T, T]
-            h = 4.0 # bandwidth
+            h = 2.0 # bandwidth
             rdf_matrix = torch.exp(-dist_sq / h)
             
             # Apply mask: set invalid pairs to 0
             masked_rdf = rdf_matrix * pair_mask.unsqueeze(0).float()
             
-            # For each j (dim 1), find max RDF among valid k's (dim 2)
-            max_rdf_per_j, _ = torch.max(masked_rdf, dim=2)
+            # For each j (dim 1), find mean of top 3 RDF among valid k's (dim 2)
+            topk_rdf, _ = torch.topk(masked_rdf, k=3, dim=2)
+            topk_rdf_mean_per_j = topk_rdf.mean(dim=2)
             
             # Average over j's that have at least one valid candidate k
             j_has_candidates = pair_mask.any(dim=1)
             if not j_has_candidates.any():
                 return torch.tensor(0.0, device=x.device, requires_grad=True)
                 
-            mean_loss = max_rdf_per_j[:, j_has_candidates].mean()
+            mean_loss = topk_rdf_mean_per_j[:, j_has_candidates].sum() / 1000
             
             # Return negative loss (gradient descent will minimize repulsion)
             return -mean_loss
@@ -775,9 +801,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         def combined_guidance(x_start: torch.Tensor) -> dict:
             return {
-                "anchor": 40 * anchor_dist_guidance(x_start),
+                "anchor":anchor_dist_guidance(x_start) * self.anchor_guidance_scale,
                 "goal": guidance_scale * goal_guidance(x_start),
-                "rdf": 20 * segment_rdf_guidance(x_start)
+                "rdf": segment_rdf_guidance(x_start) * self.rdf_guidance_scale
             }
         
         guidance_fn = combined_guidance
@@ -789,7 +815,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         
         plan_tokens = horizon // self.frame_stack
 
-        assert self.n_tokens - plan_tokens >= 2, "too long horizon (n_tokens - plan_tokens < 2)"
+        assert self.n_tokens - plan_tokens >= (1 if is_unknown_final_token else 2), f"too long horizon (n_tokens - plan_tokens < {1 if is_unknown_final_token else 2})"
         
         
 
@@ -835,7 +861,17 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         return plan_hist # m (t fs) b c
 
-    def _generate_plan_between_points(self, start_normalized, goal_normalized, start_raw, goal_raw, conditions, horizon_scale=None, tag="mcts_plan", from_start=True):
+    def _generate_plan_between_points(
+        self, 
+        start_normalized: torch.Tensor, 
+        goal_normalized: torch.Tensor, 
+        start_raw: np.ndarray, 
+        goal_raw: np.ndarray, 
+        conditions: Optional[Any], 
+        horizon_scale: Optional[float] = None, 
+        tag: str = "mcts_plan", 
+        from_start: bool = True
+    ) -> Tuple[torch.Tensor, Any]:
         if horizon_scale is None:
             horizon_scale = self.horizon_scale
         """
@@ -855,10 +891,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             plan: Unnormalized plan trajectory (t b c)
             plan_hist: Full plan history (m t b c) or (D, M, T, B, C) for MCTD
         """
+        horizon = int(self.episode_len * horizon_scale)
+        
         if self.mctd:
             plan_hist = self.p_mctd_plan(
                 start_normalized, goal_normalized, 
-                self.episode_len * horizon_scale, conditions, 
+                horizon, conditions, 
                 start_raw[:, :self.observation_dim], 
                 goal_raw[:, :self.observation_dim],
                 tag=tag,
@@ -869,14 +907,19 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         else:
             plan_hist = self.plan(
                 start_normalized, goal_normalized, 
-                self.episode_len * horizon_scale, conditions
+                horizon, conditions
             )
             plan_hist = self._unnormalize_x(plan_hist)  # (m t b c)
             plan = plan_hist[-1]  # (t b c)
         
         return plan, plan_hist
 
-    def interact(self, batch_size: int, conditions=None, namespace="validation"):
+    def interact(
+        self, 
+        batch_size: int, 
+        conditions: Optional[Any] = None, 
+        namespace: str = "validation"
+    ) -> None:
         try:
             import gym
             import ogbench
@@ -922,11 +965,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     lcb_coef=4.0,
                 )
                 # pretrained agent loading
-                if self.dataset == "antmaze-medium-navigate-v0":
+                if self.dataset == "antmaze-medium-navigate-v0" or self.dataset == "antmaze-medium-stitch-v0":
                     dql_folder = "antmaze-medium-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
-                elif self.dataset == "antmaze-large-navigate-v0":
+                elif self.dataset == "antmaze-large-navigate-v0" or self.dataset == "antmaze-large-stitch-v0":
                     dql_folder = "antmaze-large-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
-                elif self.dataset == "antmaze-giant-navigate-v0":
+                elif self.dataset == "antmaze-giant-navigate-v0" or self.dataset == "antmaze-giant-stitch-v0":
                     dql_folder = "antmaze-giant-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
                 else:
                     raise ValueError(f"Dataset {self.dataset} not supported")
@@ -985,7 +1028,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 start.cpu().numpy(), goal.cpu().numpy(),
                 conditions, horizon_scale=self.horizon_scale, tag="mcts_plan_from_start", from_start=True
             )
-            
+
+            """
             # Generate reverse plan (goal → start) for visualization
             if self.bidirectional_search:
                 # TODO: we havent utilize reverse_plan_hist yet
@@ -1001,10 +1045,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     goal.cpu().numpy(), start.cpu().numpy(),
                     conditions, horizon_scale=self.horizon_scale, tag="mcts_plan_from_goal", from_start=True
                 )
-            
+            """
+
            # Visualization with both forward and reverse trajectories
             start_numpy = start.cpu().numpy()[:, :2]
-            goal_numpy = goal.cpu().numpy()[:, : self.observation_dim]
+            goal_numpy = goal.cpu().numpy()[:, : 2]
             
             # Create forward trajectory image
             forward_image = make_trajectory_images(
@@ -1016,6 +1061,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             self.log_image(f"plan/plan_at_{steps}_from_start", Image.fromarray(forward_image))
 
             # Create reverse trajectory image (swap start and goal for visualization)
+            """
             reverse_image = make_trajectory_images(
                 self.env_id, 
                 reverse_plan[:, :, :2].detach().cpu().numpy(), 
@@ -1023,7 +1069,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 self.plot_end_points
             )[0]
             self.log_image(f"plan/plan_at_{steps}_from_goal", Image.fromarray(reverse_image))
-
+            """
             planning_end_time = time.time()
             planning_time.append(planning_end_time - planning_start_time)
 
@@ -1233,7 +1279,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         for i in range(len(plan_images)):
             img = plan_images[i]
             self.log_image(
-                f"{tag}/{search_num+i+1}_{names[i]}_V{values[i]}",
+                # f"{tag}/{search_num+i+1}_{names[i]}_V{values[i]}",
+                f"{tag}/{names[i]}_V{values[i]}",
                 Image.fromarray(img),
             )
 
@@ -1273,8 +1320,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
     def p_mctd_plan(self, obs_normalized, goal_normalized, horizon, conditions, start, goal, tag="mcts_plan", from_start=True):
         assert start.shape[0] == 1, "the batch size must be 1"
         assert (not self.leaf_parallelization) or (self.parallel_search_num % len(self.mctd_guidance_scales) == 0), f"Parallel search num must be divisible by the number of guidance scales: {self.parallel_search_num} % {len(self.mctd_guidance_scales)} != 0"
-        horizon = int(self.episode_len if horizon is None else horizon)
-        plan_tokens = np.ceil(horizon / self.frame_stack).astype(int)
+        
+        assert horizon <= self.episode_len, f"Horizon must be less than or equal to episode length: {horizon} <= {self.episode_len}"
+        assert horizon % self.frame_stack == 0, f"Horizon must be divisible by frame stack: {horizon} % {self.frame_stack} != 0"
+        
+        plan_tokens = horizon // self.frame_stack
         
         children_node_guidance_scales = self.mctd_guidance_scales
         max_search_num = self.mctd_max_search_num
@@ -1282,7 +1332,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         skip_level_steps = self.mctd_skip_level_steps
         
         if self.bidirectional_search:
-            plan_tokens = min(plan_tokens, self.n_tokens - 2)
+            # plan_tokens = min(plan_tokens, self.n_tokens - 1 if self.is_unknown_final_token else 2)
+            assert plan_tokens <= self.n_tokens - (1 if self.is_unknown_final_token else 2), f"Plan tokens must be less than or equal to {self.n_tokens - (1 if self.is_unknown_final_token else 2)}, but got {plan_tokens}"
             H = self.sequence_dividing_factor
             terminal_depth = H
             # noise_level = np.full((H + 1, plan_tokens), self.sampling_timesteps, dtype=np.int64)
@@ -1349,6 +1400,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 selected_node = root_node
                 while (not selected_node.is_expandable(consider_virtually_visited=(not self.parallel_multiple_visits))) and (not selected_node.is_terminal()) and (selected_node.is_selectable()):
                     selected_node = selected_node.select(leaf_parallelization=self.leaf_parallelization)
+                
+                # [DEBUG]
+                # nz = np.count_nonzero(selected_node.current_levels) if selected_node.current_levels is not None else "N/A"
+                # print(f"[DEBUG] Selected Node: {selected_node.name}, Depth: {selected_node.depth}/{selected_node.terminal_depth}, Non-zero tokens: {nz}")
+                
                 if selected_node.is_terminal() or (not selected_node.is_selectable() and not selected_node.is_expandable(consider_virtually_visited=(not self.parallel_multiple_visits))):
                     psn -= 1 if not self.leaf_parallelization else len(children_node_guidance_scales)
                     continue
@@ -1436,7 +1492,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     expanded_node_noise_levels = self._generate_bidirectional_schedule(
                         parent_levels, complete_denoising=False, from_start=from_start
                     ) # b, m, plan_tokens(=t)
-                    expanded_node_updated_levels = expanded_node_noise_levels[:, -1, :]
+                    expanded_node_updated_levels = expanded_node_noise_levels[:, -1, :] # b, plan_tokens
                 
                 # input plans.shape: b (t fs) 1 c
                 # output plan_hist.shape: m (t fs) b c
@@ -1509,7 +1565,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 
                 if self.bidirectional_search:
                     if expanded_node_updated_levels is not None:
-                         simulation_initial_levels = np.concatenate(simulation_initial_levels_list, axis=0)
+                         simulation_initial_levels = np.concatenate(simulation_initial_levels_list, axis=0) # b, plan_tokens
                          # Generate Schedule for Simulation (Complete Denoising)
                          value_estimation_noise_levels = self._generate_bidirectional_schedule(
                             simulation_initial_levels, complete_denoising=True, from_start=from_start

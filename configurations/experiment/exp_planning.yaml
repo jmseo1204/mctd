@@ -5,10 +5,11 @@ training:
   lr: 5e-4
   precision: 16-mixed
   batch_size: 1024 # will use 16G GPU memory;
-  max_steps: 200005 # 50k steps should be enough for large, and 100k for medium
+  max_steps: 200005 # 200k steps for full training
+  max_epochs: -1 # train until max_steps
 
   checkpointing:
-    every_n_train_steps: 10000 # save a checkpoint every n train steps
+    every_n_train_steps: 2000 # save a checkpoint every 2000 steps
 
 validation:
   precision: 32

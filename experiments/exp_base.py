@@ -9,6 +9,8 @@ from abc import ABC, abstractmethod
 from typing import Optional, Union, Literal, List, Dict
 import pathlib
 import os
+import sys
+from tqdm import tqdm
 
 import hydra
 import torch
@@ -19,7 +21,7 @@ from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities.types import TRAIN_DATALOADERS
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from utils.print_utils import cyan
 from utils.distributed_utils import is_rank_zero
@@ -166,6 +168,16 @@ class BaseLightningExperiment(BaseExperiment):
         if self.cfg.training.compile:
             self.algo = torch.compile(self.algo)
 
+        # Build dataloader to calculate total epochs from max_steps
+        train_loader = self._build_training_loader()
+        num_batches = len(train_loader)
+        
+        effective_max_steps = self.cfg.training.max_steps
+        if effective_max_steps > 0:
+            total_epochs = (effective_max_steps + num_batches - 1) // num_batches
+        else:
+            total_epochs = self.cfg.training.max_epochs
+
         callbacks = []
         if self.logger:
             callbacks.append(LearningRateMonitor("step", True))
@@ -173,9 +185,51 @@ class BaseLightningExperiment(BaseExperiment):
             callbacks.append(
                 ModelCheckpoint(
                     pathlib.Path(hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"]) / "checkpoints",
+                    save_last=True,
                     **self.cfg.training.checkpointing,
                 )
             )
+        
+        # Custom Callback for Overall Epoch Progress Bar
+        class OverallEpochProgressBar(pl.callbacks.Callback):
+            def __init__(self, total_epochs):
+                self.total_epochs = total_epochs
+                self.pbar = None
+
+            def on_train_start(self, trainer, pl_module):
+                if trainer.is_global_zero:
+                    # Define X-axis for WandB plots
+                    if trainer.logger and hasattr(trainer.logger.experiment, "define_metric"):
+                        trainer.logger.experiment.define_metric("training/loss", step_metric="epoch")
+                        trainer.logger.experiment.define_metric("training/loss_epoch", step_metric="epoch")
+                        trainer.logger.experiment.define_metric("trainer/global_step", step_metric="epoch")
+
+                    print(f"\n[Info] Starting Training. Total Epochs: {self.total_epochs}")
+                    sys.stdout.flush()
+                    self.pbar = tqdm(
+                        desc="Total Training Progress (Epochs)",
+                        total=self.total_epochs,
+                        unit="ep",
+                        initial=trainer.current_epoch,
+                        dynamic_ncols=True,
+                        leave=True,
+                        file=sys.stdout
+                    )
+                    self.pbar.refresh()
+
+            def on_train_epoch_end(self, trainer, pl_module):
+                if trainer.is_global_zero and self.pbar:
+                    self.pbar.update(1)
+                    metrics = trainer.callback_metrics
+                    loss = metrics.get("training/loss") or metrics.get("loss")
+                    if loss is not None:
+                        self.pbar.set_postfix({"loss": f"{loss:.4f}"}, refresh=True)
+
+            def on_train_end(self, trainer, pl_module):
+                if trainer.is_global_zero and self.pbar:
+                    self.pbar.close()
+
+        callbacks.append(OverallEpochProgressBar(total_epochs))
 
         trainer = pl.Trainer(
             accelerator="auto",
@@ -192,17 +246,15 @@ class BaseLightningExperiment(BaseExperiment):
             precision=self.cfg.training.precision,
             detect_anomaly=False,  # self.cfg.debug,
             num_sanity_val_steps=int(self.cfg.debug),
-            max_epochs=self.cfg.training.max_epochs,
-            max_steps=self.cfg.training.max_steps,
+            max_epochs=total_epochs,
+            max_steps=effective_max_steps,
             max_time=self.cfg.training.max_time,
+            enable_progress_bar=False, # Disable default batch-level bar
         )
-
-        # if self.debug:
-        #     self.logger.watch(self.algo, log="all")
 
         trainer.fit(
             self.algo,
-            train_dataloaders=self._build_training_loader(),
+            train_dataloaders=train_loader,
             val_dataloaders=self._build_validation_loader(),
             ckpt_path=self.ckpt_path,
         )
@@ -273,6 +325,21 @@ class BaseLightningExperiment(BaseExperiment):
 
     def _build_dataset(self, split: str) -> Optional[torch.utils.data.Dataset]:
         if split in ["training", "test", "validation"]:
-            return self.compatible_datasets[self.root_cfg.dataset._name](self.root_cfg.dataset, split=split)
+            # FIXME: changed the meaning of episode_len 
+            
+            # Decouple the dataset config from the root config to avoid side effects via interpolation
+            dataset_cfg_dict = OmegaConf.to_container(self.root_cfg.dataset, resolve=True)
+            dataset_cfg = OmegaConf.create(dataset_cfg_dict)
+            
+            # If the algorithm uses frame_stack, adjust the dataset's episode_len 
+            # so that it provides exactly (orig_ep_len - fs + 1) frames.
+            # This ensures that n_tokens = (frames - 1) // fs + 1 matches the original definition.
+            if hasattr(self.root_cfg, "algorithm") and hasattr(self.root_cfg.algorithm, "frame_stack"):
+                fs = self.root_cfg.algorithm.frame_stack
+                # Use the original episode_len from the algorithm config
+                orig_ep_len = self.root_cfg.algorithm.episode_len
+                dataset_cfg.episode_len = orig_ep_len - fs
+                
+            return self.compatible_datasets[dataset_cfg._name](dataset_cfg, split=split)
         else:
             raise NotImplementedError(f"split '{split}' is not implemented")

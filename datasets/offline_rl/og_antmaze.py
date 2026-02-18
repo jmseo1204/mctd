@@ -15,7 +15,7 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
     def __init__(self, cfg: DictConfig, split: str = "training"):
         super().__init__()
         self.cfg = cfg
-        #self.save_dir = cfg.save_dir # Using default save_dir, "~/.ogbench/data"
+        self.save_dir = cfg.save_dir # Using default save_dir, "~/.ogbench/data"
         self.env_id = cfg.env_id
         self.dataset_name = cfg.dataset
         self.n_frames = cfg.episode_len + 1
@@ -25,7 +25,7 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
             self.jump = 1
         else:
             self.jump = cfg.jump
-        #Path(self.save_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.save_dir).mkdir(parents=True, exist_ok=True)
         self.dataset = self.get_dataset()
         # Use [position, velocity] as observation
         self.dataset["observations"] = np.concatenate([self.dataset["qpos"], self.dataset["qvel"]], axis=-1)
@@ -88,6 +88,8 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
         print(f"Value shape: {self.values.shape}")
 
         self.total_samples = len(self.observations)
+        print(f"Total samples loaded for {self.dataset_name}: {self.total_samples}")
+        print(f"Observation shape: {self.observations.shape}")
 
     def compute_value(self, reward):
         # numerical stable way to compute value
@@ -112,7 +114,7 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
     def get_dataset(self):
         _, train_dataset, val_dataset = ogbench.make_env_and_datasets(
             self.dataset_name,
-            #self.save_dir, # Using default save_dir, "~/.ogbench/data"
+            self.save_dir, 
             compact_dataset=True,
         )
         if self.split == "training":

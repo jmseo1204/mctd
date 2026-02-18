@@ -121,6 +121,7 @@ class TreeNode():
             'value': None,
             'value_estimation_plan': None,
             'virtual_visit_weight': self.virtual_visit_weight,
+            'terminal_depth': self.terminal_depth,
             'current_levels': self.current_levels  # Inherit parent's denoising state
         }
         # this function call means that the node is virtually visited in parallel search

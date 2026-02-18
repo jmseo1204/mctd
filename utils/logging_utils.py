@@ -264,9 +264,9 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
             maze_grid = None
         plot_maze_layout(ax, maze_grid)
         if env_id in OGBENCH_ENVS: # OGBench envs
-            ax.scatter(trajectory[:, batch_idx, 0]/4+1, trajectory[:, batch_idx, 1]/4+1, c=np.arange(len(trajectory)), cmap="Reds"),
+            ax.scatter(trajectory[:, batch_idx, 0]/4+1, trajectory[:, batch_idx, 1]/4+1, c=np.arange(len(trajectory)), cmap="Reds", alpha=0.7),
         else:
-            ax.scatter(trajectory[:, batch_idx, 0], trajectory[:, batch_idx, 1], c=np.arange(len(trajectory)), cmap="Reds"),
+            ax.scatter(trajectory[:, batch_idx, 0], trajectory[:, batch_idx, 1], c=np.arange(len(trajectory)), cmap="Reds", alpha=0.7),
         if plot_end_points:
             if env_id in OGBENCH_ENVS: # OGBench envs
                 start_goal = (np.array(start[batch_idx])/4+1, np.array(goal[batch_idx])/4+1)
