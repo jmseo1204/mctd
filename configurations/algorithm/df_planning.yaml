@@ -49,7 +49,9 @@ mctd_max_search_num: 70
 mctd_guidance_scales: [0.0, 1.5]
 padding_mode: "same" # "zero" or "same"
 viz_plans: True
+DEBUG: True
 bidirectional_search: True
+meeting_delta: 2.0
 is_unknown_final_token: True  # Test: Set to True if final_token stabilization causes confusion
 episode_len: ${dataset.episode_len} # self.n_tokens = self.episode_len // self.frame_stack
 horizon_scale: 0.8 # horizon = self.episode_len * horizon_scale
@@ -66,6 +68,7 @@ hilp_obs_dim: 29  # AntMaze observation dimension
 hilp_skill_dim: 32  # HILP phi representation dimension
 anchor_guidance_scale: 40.0
 rdf_guidance_scale: 2.0
+mcts_use_sim: false
 
 diffusion:
   clip_noise: 20.0

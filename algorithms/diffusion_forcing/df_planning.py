@@ -1,4 +1,5 @@
-from typing import Optional, Any, List, Tuple
+from typing import Optional, Any, List, Tuple, Union
+from dataclasses import dataclass, field
 from omegaconf import DictConfig
 from tqdm import tqdm
 import time
@@ -29,6 +30,46 @@ OGBENCH_ENVS = [
     "antmaze-giant-v0",
     "antmaze-teleport-v0",
 ]
+
+
+@dataclass
+class MCTSTreeState:
+    """Container holding all state for a single MCTS tree instance."""
+    # --- Static config (set at init, never mutated) ---
+    root_node: TreeNode
+    plan_tokens: int
+    terminal_depth: int
+    noise_level: Optional[np.ndarray]          # unidirectional only; None when bidirectional_search=True
+    children_node_guidance_scales: list
+    max_search_num: int
+    num_denoising_steps: int
+    skip_level_steps: int
+    from_start: bool
+    tag: str
+    # Root observation (unnormalized): start for tree1, goal for tree2.
+    # Used to track agent positions across bidirectional expansion rounds.
+    tree_root_obs: Optional[np.ndarray] = None  # shape (obs_dim,)
+    # --- Mutable search state (updated by _run_mcts_search) ---
+    search_num: int = 0
+    p_search_num: int = 0
+    max_depth: int = 0
+    solved: bool = False
+    achieved: bool = False
+    solved_plan: Optional[torch.Tensor] = None
+    achieved_plans: List = field(default_factory=list)
+    not_reached_plans: List = field(default_factory=list)
+    pbar: Any = None
+    # --- Timing lists ---
+    selection_time: List = field(default_factory=list)
+    expansion_time: List = field(default_factory=list)
+    simulation_time: List = field(default_factory=list)
+    backprop_time: List = field(default_factory=list)
+    early_termination_time: List = field(default_factory=list)
+    simul_noiselevel_zero_padding_time: List = field(default_factory=list)
+    simul_value_estimation_time: List = field(default_factory=list)
+    simul_value_calculation_time: List = field(default_factory=list)
+    simul_node_allocation_time: List = field(default_factory=list)
+
 
 
 class DiffusionForcingPlanning(DiffusionForcingBase):
@@ -79,6 +120,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.sub_goal_interval = cfg.sub_goal_interval
         self.viz_plans = cfg.viz_plans
         self.bidirectional_search = cfg.bidirectional_search
+        self.meeting_delta = cfg.get('meeting_delta', 0.5)
+        self.debug = cfg.get('DEBUG', False)
         self.sequence_dividing_factor = cfg.sequence_dividing_factor
         self.is_unknown_final_token = cfg.get('is_unknown_final_token', False)
         self.horizon_scale = cfg.horizon_scale
@@ -92,9 +135,105 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.hilp_value_fn = None  # Will be loaded lazily when needed
         self.anchor_guidance_scale = cfg.get('anchor_guidance_scale', 40.0)
         self.rdf_guidance_scale = cfg.get('rdf_guidance_scale', 2.0)
+        self.mcts_use_sim = cfg.get('mcts_use_sim', True)
         
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal and self.guidance_scale != 0
+
+    def _get_hilp_value_fn(self):
+        """Lazy loader for HILP value function model."""
+        if self.hilp_value_fn is None:
+            import sys
+            import os
+            # Add algorithms directory to path to import cleandiffuser_ex
+            algorithms_dir = os.path.join(os.path.dirname(__file__), '..')
+            if algorithms_dir not in sys.path:
+                sys.path.insert(0, algorithms_dir)
+            from cleandiffuser_ex.hilp import HILP
+            
+            # Load HILP model
+            self.hilp_value_fn = HILP(
+                obs_dim=self.hilp_obs_dim,
+                skill_dim=self.hilp_skill_dim,
+                device=self.device,
+                value_hidden_dims=(512, 512, 512),
+                use_layer_norm=True
+            )
+            self.hilp_value_fn.load(self.hilp_checkpoint_path)
+            self.hilp_value_fn.eval()
+            
+            # Freeze all parameters to prevent gradient updates
+            for param in self.hilp_value_fn.parameters():
+                param.requires_grad = False
+            
+            print(f"[HILP] Loaded HILP value function from {self.hilp_checkpoint_path}")
+                
+        return self.hilp_value_fn
+
+    def _compute_hilp_values(
+        self, 
+        obs: Union[np.ndarray, torch.Tensor], 
+        goal: Union[np.ndarray, torch.Tensor], 
+        use_no_grad: bool = True
+    ) -> torch.Tensor:
+        """
+        Unified helper to compute pessimistic HILP values (min(v1, v2)).
+        STRICT: Only supports matching shapes (N, D) or (D,).
+        
+        Args:
+            obs: (N, D) or (D,)
+            goal: (N, D) or (D,)
+            use_no_grad: Whether to use torch.no_grad()
+            
+        Returns:
+            min_values: Tensor of pessimistic values, shape (N,).
+        """
+        hilp_value_fn = self._get_hilp_value_fn()
+        
+        # 1. Convert to torch and move to device
+        def _to_tensor(x):
+            if isinstance(x, np.ndarray):
+                return torch.from_numpy(x).float().to(self.device)
+            return x.float().to(self.device)
+
+        obs_t = _to_tensor(obs)
+        goal_t = _to_tensor(goal)
+
+        # 2. Add batch dimension if 1D
+        if obs_t.ndim == 1: obs_t = obs_t.unsqueeze(0)
+        if goal_t.ndim == 1: goal_t = goal_t.unsqueeze(0)
+
+        # 3. STRICT SHAPE ASSERTION
+        assert obs_t.shape == goal_t.shape, (
+            f"[HILP Shape Error] obs and goal must have matching shapes. "
+            f"Got obs: {obs_t.shape}, goal: {goal_t.shape}. "
+            f"Broadcasting/Expansion must be handled by the caller (e.g. for guidance (T,B,D))."
+        )
+        assert obs_t.ndim == 2, f"[HILP Shape Error] Expected 2D tensors (N, D), got {obs_t.shape}"
+
+        # 4. Padding/Cropping to self.hilp_obs_dim
+        def _pad(x):
+            if x.shape[-1] < self.hilp_obs_dim:
+                padding = torch.zeros((*x.shape[:-1], self.hilp_obs_dim - x.shape[-1]), device=x.device)
+                return torch.cat([x, padding], dim=-1)
+            return x[..., :self.hilp_obs_dim]
+
+        obs_t = _pad(obs_t)
+        goal_t = _pad(goal_t)
+
+        # 5. Compute values
+        if use_no_grad:
+            with torch.no_grad():
+                v1, v2 = hilp_value_fn(obs_t, goal_t)
+                res = torch.min(v1, v2)
+        else:
+            if hasattr(hilp_value_fn, 'value'):
+                v1, v2 = hilp_value_fn.value(obs_t, goal_t)
+            else:
+                v1, v2 = hilp_value_fn(obs_t, goal_t)
+            res = torch.min(v1, v2)
+            
+        return res
 
     def _build_model(self):
         mean = list(self.observation_mean) + list(self.action_mean)
@@ -363,52 +502,60 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         return np.stack(steps, axis=0) # (M, T)
     
     def _construct_noise_levels(
-        self, 
-        levels: np.ndarray, 
-        batch_size: int, 
+        self,
+        levels: np.ndarray,
+        batch_size: int,
         stabilization: int,
         pad_tokens: int,
         from_start: bool,
-        include_final_token: bool
+        include_final_token: bool,
+        include_init_token: bool = True,
     ) -> torch.Tensor:
         """
-        Construct noise levels including init_token, middle tokens, optional final_token, and padding.
-        
+        Construct noise levels for middle tokens, optional init/final tokens, and padding.
+
         Args:
             batch_size: Batch size
-            levels: Noise levels for middle tokens (batch_size, plan_tokens)
+            levels: Noise levels for plan tokens (batch_size, plan_tokens)
             stabilization: Noise level for stabilized tokens (init and final)
             pad_tokens: Number of padding tokens
             include_final_token: Whether to include final_token (bidirectional mode)
-            
+            include_init_token: Whether to prepend init_token slot (legacy format).
+                                Set False for pre-built sequences (new format).
+
         Returns:
             Noise levels array (batch_size, total_tokens)
         """
         if not from_start:
-            levels = np.flip(levels, axis=1)    
+            levels = np.flip(levels, axis=1)
 
-        components = [
-            np.full((batch_size, 1), stabilization, dtype=np.int64),  # init_token
-            levels,  # middle tokens
-        ]
-        
+        components = []
+        if include_init_token:
+            components.append(np.full((batch_size, 1), stabilization, dtype=np.int64))  # init_token
+        components.append(levels)  # plan tokens
+
         if include_final_token:
             components.append(np.full((batch_size, 1), stabilization, dtype=np.int64))  # final_token
-        
+
         components.append(np.full((batch_size, pad_tokens), self.sampling_timesteps, dtype=np.int64))  # padding
         components = torch.from_numpy(np.concatenate(components, axis=1)).to(self.device)
-        
+
         return rearrange(components, "b t -> t b", b=batch_size)
     
+
+    # DEPRECATED: This function is no longer called inside parallel_plan.
+    """
     def _construct_sequence(
-        self, 
-        start: torch.Tensor, 
-        goal: torch.Tensor, 
-        plan: list, 
-        plan_tokens: int, 
-        from_start: bool, 
-        reserve_final_token_space: bool
+        self,
+        start: torch.Tensor,
+        goal: torch.Tensor,
+        plan: list,
+        plan_tokens: int,
+        from_start: bool,
+        reserve_final_token_space: bool,
     ) -> tuple:
+        # Kept for reference only. New format pre-builds the full sequence in
+        # _build_plan_from_leaf and cats plans directly in parallel_plan.
         # input plan.shape: b (t fs) 1 c
 
         chunk = []
@@ -455,9 +602,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
 
         return plan_with_given_tokens # t b (fs c)
-
  
-    
+    """
 
 
 
@@ -541,8 +687,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         # start and goal are numpy arrays of shape (b, obs_dim)
 
         batch_size = len(plans)
-        start = torch.cat([start] * batch_size, 0)
-        goal = torch.cat([goal] * batch_size, 0)            
+        if start.dim() == 2 and start.shape[0] == batch_size:
+            pass
+        else:
+            start = torch.cat([start] * batch_size, 0)
+        
+        if goal.dim() == 2 and goal.shape[0] == batch_size:
+            pass
+        else:
+            goal = torch.cat([goal] * batch_size, 0)
 
         if guidance_scale is None:
             guidance_scale = self.guidance_scale
@@ -570,35 +723,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             pred = rearrange(x, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
             return self._unnormalize_x(pred)
 
-        def get_hilp_value_fn():
-            """Lazy loader for HILP value function model."""
-            if self.hilp_value_fn is None:
-                import sys
-                import os
-                # Add algorithms directory to path to import cleandiffuser_ex
-                algorithms_dir = os.path.join(os.path.dirname(__file__), '..')
-                if algorithms_dir not in sys.path:
-                    sys.path.insert(0, algorithms_dir)
-                from cleandiffuser_ex.hilp import HILP
-                
-                # Load HILP model
-                self.hilp_value_fn = HILP(
-                    obs_dim=self.hilp_obs_dim,
-                    skill_dim=self.hilp_skill_dim,
-                    device=self.device,
-                    value_hidden_dims=(512, 512, 512),
-                    use_layer_norm=True
-                )
-                self.hilp_value_fn.load(self.hilp_checkpoint_path)
-                self.hilp_value_fn.eval()
-                
-                # Freeze all parameters to prevent gradient updates
-                for param in self.hilp_value_fn.parameters():
-                    param.requires_grad = False
-                
-                print(f"[HILP] Loaded HILP value function from {self.hilp_checkpoint_path}")
-            
-            return self.hilp_value_fn
+        hilp_value_fn = self._get_hilp_value_fn() if self.use_hilp_guidance else None
 
         def goal_guidance(x: torch.Tensor) -> torch.Tensor:
             """Target guidance to reach goal/start."""
@@ -621,47 +746,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 
                 # Compute distance: either HILP value function or MSE
                 if self.use_hilp_guidance:
-                    # Use HILP value function for goal-conditioned distance
-                    hilp_value_fn = get_hilp_value_fn()
+                    T, B = pred.shape[0], pred.shape[1]
+                    # Shape strictness: Flatten (T, B, 2) and expand (B, 2) to match
+                    obs_flat = pred[:, :, :2].reshape(T * B, 2)
+                    goal_expanded = target[:, :2].unsqueeze(0).expand(T, -1, -1).reshape(T * B, 2)
                     
-                    # pred contains only x,y positions (2 dims)
-                    # Need to construct full 29-dim observation:
-                    # - Extract x,y from pred [:, :, :2]
-                    # - Pad remaining 27 dims with zeros
-                    
-                    pred_xy = pred[:, :, :2]  # (T, B, 2) - planned x,y positions
-                    T, B = pred_xy.shape[0], pred_xy.shape[1]
-                    
-                    # Zero-padding for remaining 27 dimensions (Option 2)
-                    zeros_rest = torch.zeros((B, self.hilp_obs_dim - 2), device=pred.device)
-                    zeros_rest_expanded = zeros_rest.unsqueeze(0).expand(T, -1, -1)
-                    
-                    # Construct full observation: [x_pred, y_pred, 0, 0, ...]
-                    pred_obs = torch.cat([pred_xy, zeros_rest_expanded], dim=-1)  # (T, B, 29)
-                    
-                    # Similarly for target: [x_target, y_target, 0, 0, ...]
-                    target_xy = target[:, :2]  # (B, 2)
-                    target_obs = torch.cat([target_xy, zeros_rest], dim=-1)  # (B, 29)
-                    
-                    # Reshape for batch processing
-                    pred_obs_flat = pred_obs.reshape(T * B, self.hilp_obs_dim)  # (T*B, 29)
-                    target_obs_expanded = target_obs.unsqueeze(0).expand(T, -1, -1).reshape(T * B, self.hilp_obs_dim)  # (T*B, 29)
-                    
-                    # Compute HILP value: v1, v2 = hilp_value_fn.value(obs, goal)
-                    # Returns (v1, v2) where each is (T*B,)
-                    # NOTE: No torch.no_grad() here! We need gradients to flow to pred_obs for guidance
-                    # HILP parameters are already frozen via requires_grad=False
-                    v1, v2 = hilp_value_fn.value(pred_obs_flat, target_obs_expanded)
-                    # Take ensemble average as in JAX implementation
-                    v = (v1 + v2) / 2  # (T*B,)
+                    v_flat = self._compute_hilp_values(obs_flat, goal_expanded, use_no_grad=False)
+                    v = v_flat.reshape(T, B)  # (T, B)
                     
                     # Convert value to distance: negate since v is negative distance
-                    # v = -||phi(s) - phi(g)||, so -v = ||phi(s) - phi(g)||
-                    dist_values = -v  # (T*B,), now positive distance
-                    dist_target_hilp = dist_values.reshape(T, B, 1)  # (T, B, 1)
+                    dist_values = -v  # (T, B)
+                    dist_target_hilp = dist_values.unsqueeze(-1)  # (T, B, 1)
                     
                     # Replicate to match MSE output shape (T, B, C)
-                    dist_target = dist_target_hilp.expand(-1, -1, pred.shape[-1])  # (T, B, C)
+                    dist_target = dist_target_hilp.expand(-1, -1, pred.shape[-1])
                     
                     # print(f"[HILP DEBUG] Using HILP value function with zero-padding")
                     # print(f"[HILP DEBUG] pred_xy shape: {pred_xy.shape}, zeros_rest shape: {zeros_rest.shape}")
@@ -812,107 +910,116 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
 
         assert horizon % self.frame_stack == 0, "horizon must be a multiple of frame_stack"
-        
+
         plan_tokens = horizon // self.frame_stack
 
-        assert self.n_tokens - plan_tokens >= (1 if is_unknown_final_token else 2), f"too long horizon (n_tokens - plan_tokens < {1 if is_unknown_final_token else 2})"
-        
-        
+        # Detect if plans are pre-built (new format: each plan is (n_tokens, 1, fs*c)).
+        # _build_plan_from_leaf returns this format for bidirectional search.
+        # Legacy format: plans is a list of None or (plan_tokens*fs, 1, c) tensors.
+        is_prebuilt = (
+            plans is not None
+            and len(plans) == batch_size
+            and all(
+                isinstance(p, torch.Tensor) and p.ndim == 3 and p.shape[0] == self.n_tokens
+                for p in plans
+            )
+        )
 
-        use_bidirectional_sequence = self.bidirectional_search and not is_unknown_final_token
+        if is_prebuilt:
+            # ---- New format: plans are fully pre-built (n_tokens, 1, fs*c) ----
+            assert self.n_tokens >= plan_tokens, f"too long horizon (n_tokens={self.n_tokens} < plan_tokens={plan_tokens})"
+            pad_tokens = max(0, self.n_tokens - plan_tokens)
+            plan_start_offset = 0      # no init_token slot
+            use_init_token_in_noise = False
+            use_final_token_in_noise = False
 
-        pad_tokens = max(0, self.n_tokens - plan_tokens - 2) if use_bidirectional_sequence else max(0, self.n_tokens - plan_tokens - 1)
+            plan_with_given_tokens = torch.cat(plans, dim=1)  # (n_tokens, b, fs*c)
 
-        # input plan.shape: b (t fs) 1 c
+        else:
+            # ---- Legacy format: inline equivalent of deprecated _construct_sequence ----
+            use_bidirectional_sequence = self.bidirectional_search and not is_unknown_final_token
+            assert self.n_tokens - plan_tokens >= (1 if is_unknown_final_token else 2), \
+                f"too long horizon (n_tokens - plan_tokens < {1 if is_unknown_final_token else 2})"
+            pad_tokens = max(0, self.n_tokens - plan_tokens - 2) if use_bidirectional_sequence else max(0, self.n_tokens - plan_tokens - 1)
+            plan_start_offset = 1      # init_token occupies position 0
+            use_init_token_in_noise = True
+            use_final_token_in_noise = use_bidirectional_sequence
+
+            chunk = []
+            for i in range(batch_size):
+                if plans is None or plans[i] is None:
+                    c = torch.randn((plan_tokens, 1, *self.x_stacked_shape), device=self.device)
+                    c = torch.clamp(c, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise)
+                else:
+                    c = rearrange(
+                        plans[i] if from_start else torch.flip(plans[i], [0]),
+                        "(t fs) 1 c -> t 1 (fs c)", fs=self.frame_stack,
+                    )
+                chunk.append(c)
+            chunk = torch.cat(chunk, 1)  # (plan_tokens, b, fs*c)
+
+            init_token_raw = self.pad_init(start)       # (fs, b, c)
+            final_token_raw = self.pad_init(goal, is_start=False)  # (fs, b, c)
+            if from_start:
+                processed_init_token = rearrange(init_token_raw, "fs b c -> 1 b (fs c)")
+                processed_final_token = rearrange(final_token_raw, "fs b c -> 1 b (fs c)")
+            else:
+                init_token_flipped_raw = torch.flip(init_token_raw, [0])
+                final_token_flipped_raw = torch.flip(final_token_raw, [0])
+                processed_init_token = rearrange(final_token_flipped_raw, "fs b c -> 1 b (fs c)")
+                processed_final_token = rearrange(init_token_flipped_raw, "fs b c -> 1 b (fs c)")
+
+            pad = torch.zeros((pad_tokens, batch_size, *self.x_stacked_shape), device=self.device)
+            if use_bidirectional_sequence:
+                plan_with_given_tokens = torch.cat([processed_init_token, chunk, processed_final_token, pad], 0)
+            else:
+                plan_with_given_tokens = torch.cat([processed_init_token, chunk, pad], 0)
+
+        # input plan.shape: b (t fs) 1 c  (legacy) or pre-built (n_tokens, 1, fs*c)
         # output plan_hist.shape: m (t fs) b c
 
-        plan_with_given_tokens = self._construct_sequence(
-            start, goal, plans, plan_tokens, from_start,
-            reserve_final_token_space=use_bidirectional_sequence  # Reserve only when final_token is used
-        ) # t b (fs c)
-
-        def flip_plan_for_insert_hist(processed_plan_for_diffusion, plan_tokens, from_start, fs):
-            chunk_tokens = processed_plan_for_diffusion[1 : 1+plan_tokens].detach().clone()
+        def flip_plan_for_insert_hist(processed_plan_for_diffusion, plan_tokens, from_start, fs, offset):
+            chunk_tokens = processed_plan_for_diffusion[offset : offset + plan_tokens].detach().clone()
             if not from_start:
                 chunk_tokens = torch.flip(rearrange(chunk_tokens, "t b (fs c) -> (t fs) b c", fs=fs), [0])
                 chunk_tokens = rearrange(chunk_tokens, "(t fs) b c -> t b (fs c)", fs=fs)
             return chunk_tokens
 
-        plan_hist = [flip_plan_for_insert_hist(plan_with_given_tokens, plan_tokens, from_start, self.frame_stack)]
-        
+        plan_hist = [flip_plan_for_insert_hist(plan_with_given_tokens, plan_tokens, from_start, self.frame_stack, plan_start_offset)]
+
         stabilization = 0
 
-         
-        # Original unidirectional mode
-        for m in range(noise_level.shape[1] - 1): 
+        for m in range(noise_level.shape[1] - 1):
             # noise_level.shape: b, m, plan_tokens(=t)
-            from_noise_levels = self._construct_noise_levels(noise_level[:,m], batch_size, stabilization, pad_tokens, from_start, use_bidirectional_sequence)
-            to_noise_levels = self._construct_noise_levels(noise_level[:,m+1], batch_size, stabilization, pad_tokens, from_start, use_bidirectional_sequence)
-            
-            plan_with_given_tokens[1: 1+plan_tokens] = self.diffusion_model.sample_step(
-                plan_with_given_tokens, conditions, from_noise_levels, to_noise_levels, guidance_fn=guidance_fn
-            )[1: 1+plan_tokens] # t b (fs c)
-            
-            plan_hist.append(flip_plan_for_insert_hist(plan_with_given_tokens, plan_tokens, from_start, self.frame_stack))
+            from_noise_levels = self._construct_noise_levels(
+                noise_level[:, m], batch_size, stabilization, pad_tokens,
+                from_start, use_final_token_in_noise, include_init_token=use_init_token_in_noise,
+            )
+            to_noise_levels = self._construct_noise_levels(
+                noise_level[:, m + 1], batch_size, stabilization, pad_tokens,
+                from_start, use_final_token_in_noise, include_init_token=use_init_token_in_noise,
+            )
 
+            sample = self.diffusion_model.sample_step(
+                plan_with_given_tokens, conditions, from_noise_levels, to_noise_levels, guidance_fn=guidance_fn
+            )  # (n_tokens, b, fs*c)
+
+            if is_prebuilt:
+                # Update only tokens whose noise level is actively decreasing this step.
+                # This preserves denoised_prefix (level=0) and obs_parent_token (level=0).
+                update_mask = (from_noise_levels > to_noise_levels).unsqueeze(-1)  # (n_tokens, b, 1)
+                plan_with_given_tokens = torch.where(update_mask, sample, plan_with_given_tokens)
+            else:
+                plan_with_given_tokens[plan_start_offset: plan_start_offset + plan_tokens] = \
+                    sample[plan_start_offset: plan_start_offset + plan_tokens]
+
+            plan_hist.append(flip_plan_for_insert_hist(plan_with_given_tokens, plan_tokens, from_start, self.frame_stack, plan_start_offset))
 
         plan_hist = torch.stack(plan_hist)
         plan_hist = rearrange(plan_hist, "m t b (fs c) -> m (t fs) b c", fs=self.frame_stack)
 
-        return plan_hist # m (t fs) b c
+        return plan_hist  # m (t fs) b c
 
-    def _generate_plan_between_points(
-        self, 
-        start_normalized: torch.Tensor, 
-        goal_normalized: torch.Tensor, 
-        start_raw: np.ndarray, 
-        goal_raw: np.ndarray, 
-        conditions: Optional[Any], 
-        horizon_scale: Optional[float] = None, 
-        tag: str = "mcts_plan", 
-        from_start: bool = True
-    ) -> Tuple[torch.Tensor, Any]:
-        if horizon_scale is None:
-            horizon_scale = self.horizon_scale
-        """
-        Helper function to generate a plan between two points.
-        
-        Args:
-            start_normalized: Normalized start observation
-            goal_normalized: Normalized goal observation
-            start_raw: Raw (unnormalized) start observation for MCTD
-            goal_raw: Raw (unnormalized) goal observation for MCTD
-            conditions: Planning conditions
-            horizon_scale: Multiplier for episode_len (default: 0.4)
-            tag: Tag for logging (used to determine direction in bidirectional mode)
-            from_start: Direction flag for bidirectional search (True: start->goal, False: goal->start)
-        
-        Returns:
-            plan: Unnormalized plan trajectory (t b c)
-            plan_hist: Full plan history (m t b c) or (D, M, T, B, C) for MCTD
-        """
-        horizon = int(self.episode_len * horizon_scale)
-        
-        if self.mctd:
-            plan_hist = self.p_mctd_plan(
-                start_normalized, goal_normalized, 
-                horizon, conditions, 
-                start_raw[:, :self.observation_dim], 
-                goal_raw[:, :self.observation_dim],
-                tag=tag,
-                from_start=from_start
-            )
-            plan_hist = self._unnormalize_x(plan_hist)
-            plan = plan_hist[-1]  # (t b c)
-        else:
-            plan_hist = self.plan(
-                start_normalized, goal_normalized, 
-                horizon, conditions
-            )
-            plan_hist = self._unnormalize_x(plan_hist)  # (m t b c)
-            plan = plan_hist[-1]  # (t b c)
-        
-        return plan, plan_hist
 
     def interact(
         self, 
@@ -1019,35 +1126,176 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # run mpc with diffused actions
         planning_time = []
+
+        # ----------------------------------------------------------------
+        # Bidirectional MCTS: initialize tree1/tree2 once before MPC loop.
+        # These trees are maintained across MPC steps and expanded
+        # alternately within each planning call.
+        # ----------------------------------------------------------------
+        horizon: int = int(self.episode_len * self.horizon_scale)
+        if self.bidirectional_search and self.mctd:
+            _bidir_start_np = start.cpu().numpy()[:, :self.observation_dim]  # (1, obs_dim)
+            _bidir_goal_np  = goal.cpu().numpy()[:, :self.observation_dim]   # (1, obs_dim)
+            # Capture initial physical state if available
+            initial_sim_state = self._get_sim_state(envs)
+
+            # Derive heuristic goal simulation state from initial state
+            goal_sim_state = {
+                "qpos": initial_sim_state["qpos"].copy(),
+                "qvel": np.zeros_like(initial_sim_state["qvel"])  # Goal is assumed static
+            }
+            # Replace x, y coordinates with goal coordinates
+            goal_sim_state["qpos"][:2] = _bidir_goal_np[0][:2]
+
+            bidir_tree1 = self._init_mcts_tree(
+                horizon, from_start=True,
+                tag="bidir_mcts_from_start",
+                root_obs=_bidir_start_np[0],
+                root_sim_state=initial_sim_state,
+            )
+            bidir_tree2 = self._init_mcts_tree(
+                horizon, from_start=True,
+                tag="bidir_mcts_from_goal",
+                root_obs=_bidir_goal_np[0],
+                root_sim_state=goal_sim_state,
+            )
+            # Flag: 0 → expand tree1 next, 1 → expand tree2 next
+            expanded_tree_idx: int = 0
+            # Configurable meeting threshold (Euclidean distance in unnormalized obs space)
+            _meeting_delta: float = getattr(self.cfg.planning, "meeting_delta", 2.0)
+        else:
+            bidir_tree1 = bidir_tree2 = None
+
         while not terminate and steps < self.val_max_steps:
             planning_start_time = time.time()
             
-            # Generate forward plan (start → goal)
-            plan, plan_hist = self._generate_plan_between_points(
-                obs_normalized, goal_normalized,
-                start.cpu().numpy(), goal.cpu().numpy(),
-                conditions, horizon_scale=self.horizon_scale, tag="mcts_plan_from_start", from_start=True
-            )
+            # Generate plan (start → goal)
+            # _generate_plan_between_points has been inlined here.
+            
+            if self.mctd and self.bidirectional_search:
+                # ------------------------------------------------------------------
+                # Bidirectional alternating MCTS planning
+                # ------------------------------------------------------------------
+                _start_np = start.cpu().numpy()[:, :self.observation_dim]
+                _goal_np  = goal.cpu().numpy()[:, :self.observation_dim]
 
-            """
-            # Generate reverse plan (goal → start) for visualization
-            if self.bidirectional_search:
-                # TODO: we havent utilize reverse_plan_hist yet
-                reverse_plan, _ = self._generate_plan_between_points(
+                # Collect opposite tree leaf nodes for dynamic goal selection and plan extraction
+                def _get_leaf_nodes(root_node: "TreeNode") -> List["TreeNode"]:
+                    leaves: List["TreeNode"] = []
+                    stack = [root_node]
+                    while stack:
+                        n = stack.pop()
+                        is_leaf = all(c["node"] is None for c in n._children_nodes)
+                        if is_leaf:
+                            leaves.append(n)
+                        else:
+                            for c in n._children_nodes:
+                                if c["node"] is not None:
+                                    stack.append(c["node"])
+                    return leaves
+
+                t1_leaf_nodes: List["TreeNode"] = _get_leaf_nodes(bidir_tree1.root_node)
+                t2_leaf_nodes: List["TreeNode"] = _get_leaf_nodes(bidir_tree2.root_node)
+                
+                # (leaf node lists are passed directly to _run_mcts_search as opposite_leaf_nodes)
+
+                # Use flag to decide whether to use simulation in search
+                _use_sim = getattr(self, "mcts_use_sim", True)
+
+                # Initialize infos dicts so {**infos1, **infos2} is safe even on the first step
+                expanded_node_infos1: Dict[str, dict] = {}
+                expanded_node_infos2: Dict[str, dict] = {}
+
+                # Alternate expansion: one single_step per MPC iteration
+                if expanded_tree_idx == 0:
+                    bidir_tree1, expanded_node_infos1 = self._run_mcts_search(
+                        bidir_tree1, horizon, conditions,
+                        _start_np, _goal_np,
+                        opposite_leaf_nodes=t2_leaf_nodes,
+                        single_step=True,
+                        use_simulation=_use_sim,
+                    )
+                    expanded_node_infos = expanded_node_infos1
+                else:
+                    bidir_tree2, expanded_node_infos2 = self._run_mcts_search(
+                        bidir_tree2, horizon, conditions,
+                        _goal_np, _start_np,
+                        opposite_leaf_nodes=t1_leaf_nodes,
+                        single_step=True,
+                        use_simulation=_use_sim,
+                    )
+                    expanded_node_infos = expanded_node_infos2
+
+                if self.debug:
+                    print(f"[DEBUG] [Step {step}] Bidir Turn: {'Tree1 (Forward)' if expanded_tree_idx == 0 else 'Tree2 (Backward)'}")
+                
+                # Per-leaf MPC rollout: update obs_pos and sim_state for newly expanded leaves
+                # Backup current physical state to avoid cross-leaf contamination
+                # _original_sim_state = self._get_sim_state(envs)
+
+                active_tree = bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2
+
+                for info in expanded_node_infos.values():
+                    parent_node: "TreeNode" = info["parent_node"]
+                    _child: Optional["TreeNode"] = info.get("node")  # set by expand()
+                    if _child is None:
+                        continue
+
+                    # Recompute plan tensor and denoised index range from stored plan_history
+                    plan_hist_last: torch.Tensor = info["plan_history"][-1][-1]  # (T_total*fs, c)
+                    plan: torch.Tensor = self._unnormalize_x(plan_hist_last.unsqueeze(1))  # (T_fs, 1, c)
+
+                    seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
+                    prefix_len = parent_node.depth * seg_size
+                    # +1 accounts for obs_parent_token
+                    new_denoised_start: int = prefix_len + 1
+                    new_denoised_end: int = prefix_len + 1 + seg_size
+
+                    _last_obs, _new_sim_state = self._rollout_leaf_plan(
+                        leaf_plan_tokens=plan,
+                        new_denoised_start_idx=new_denoised_start,
+                        new_denoised_end_idx=new_denoised_end,
+                        agent=agent,
+                        envs=envs,
+                        parent_sim_state=parent_node.sim_state,
+                    )
+                    _child.sim_state = _new_sim_state
+                    # Update obs_pos from reached sim_state if possible, else fallback to observation
+                    _child.obs_pos = _new_sim_state["qpos"][:2] if _new_sim_state else _last_obs[:2]
+
+                    if self.debug:
+                        print(f"  [DEBUG] Expanded Leaf '{_child.name}' updated with sim_state. Pos: {_child.obs_pos}")
+
+                # Restore original environment state after all individual rollouts
+                # if _original_sim_state is not None:
+                #     self._set_sim_state(envs, _original_sim_state)
+
+                # Extract plan by selecting best leaf and combining plans
+                best_info: dict = self._select_best_leaf(expanded_node_infos)
+                best_node: "TreeNode" = best_info["node"]
+                output_plan = self._extract_output_plan(best_node, plan_tokens=active_tree.plan_tokens, is_tree1=(expanded_tree_idx == 0))
+                
+                plan_hist = output_plan.unsqueeze(0)  # (1, T, 1, c)
+                plan_hist = self._unnormalize_x(plan_hist)
+                plan = plan_hist[-1]  # (T, 1, c)
+
+                # Flip for the next MPC step to alternate trees
+                expanded_tree_idx = (expanded_tree_idx + 1) % 2
+
+            elif self.mctd:
+                # --- Unidirectional MCTS (flag=False, original behavior) ---
+                plan_hist = self.p_mctd_plan(
                     obs_normalized, goal_normalized,
-                    start.cpu().numpy(), goal.cpu().numpy(),
-                    conditions, horizon_scale=self.horizon_scale, tag="mcts_plan_from_goal", from_start=False
+                    horizon, conditions,
+                    start.cpu().numpy()[:, :self.observation_dim],
+                    goal.cpu().numpy()[:, :self.observation_dim],
+                    tag="mcts_plan",
+                    from_start=True,
                 )
-            else:
-                # In unidirectional mode: swap start and goal
-                reverse_plan, _ = self._generate_plan_between_points(
-                    goal_normalized, obs_normalized,
-                    goal.cpu().numpy(), start.cpu().numpy(),
-                    conditions, horizon_scale=self.horizon_scale, tag="mcts_plan_from_goal", from_start=True
-                )
-            """
+                plan_hist = self._unnormalize_x(plan_hist)
+                plan = plan_hist[-1]  # (t b c)
 
-           # Visualization with both forward and reverse trajectories
+            # Visualization with both forward and reverse trajectories
             start_numpy = start.cpu().numpy()[:, :2]
             goal_numpy = goal.cpu().numpy()[:, : 2]
             
@@ -1093,6 +1341,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 sub_goal_idx = min(self.sub_goal_interval, plan.shape[0] - 1)
                 sub_goal = plan[sub_goal_idx, :, :2].detach().cpu().numpy()
                 sub_goal_step = sub_goal_idx
+            
             for t in range(self.open_loop_horizon):
                 if use_diffused_action:
                     _, action, _ = self.split_bundle(plan[t])
@@ -1310,68 +1559,223 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             infos[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = "Warp" # batch-wise indexing
             values[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = 0
             diff_from_goal = np.linalg.norm(obs[t] - goals, axis=-1)
-            values[(diff_from_goal < 2.0) * (infos == "NotReached")] = (plans.shape[0] - t) / plans.shape[0]
-            achieved_ts[(diff_from_goal < 2.0) * (infos == "NotReached")] = t
-            infos[(diff_from_goal < 2.0) * (infos == "NotReached")] = "Achieved"
+            values[(diff_from_goal < self.meeting_delta) * (infos == "NotReached")] = (plans.shape[0] - t) / plans.shape[0]
+            achieved_ts[(diff_from_goal < self.meeting_delta) * (infos == "NotReached")] = t
+            infos[(diff_from_goal < self.meeting_delta) * (infos == "NotReached")] = "Achieved"
 
         return values, infos, achieved_ts
 
 
-    def p_mctd_plan(self, obs_normalized, goal_normalized, horizon, conditions, start, goal, tag="mcts_plan", from_start=True):
-        assert start.shape[0] == 1, "the batch size must be 1"
-        assert (not self.leaf_parallelization) or (self.parallel_search_num % len(self.mctd_guidance_scales) == 0), f"Parallel search num must be divisible by the number of guidance scales: {self.parallel_search_num} % {len(self.mctd_guidance_scales)} != 0"
-        
-        assert horizon <= self.episode_len, f"Horizon must be less than or equal to episode length: {horizon} <= {self.episode_len}"
-        assert horizon % self.frame_stack == 0, f"Horizon must be divisible by frame stack: {horizon} % {self.frame_stack} != 0"
-        
-        plan_tokens = horizon // self.frame_stack
-        
-        children_node_guidance_scales = self.mctd_guidance_scales
-        max_search_num = self.mctd_max_search_num
-        num_denoising_steps = self.mctd_num_denoising_steps
-        skip_level_steps = self.mctd_skip_level_steps
-        
+    def calculate_values_bidir(
+        self,
+        expanded_node_candidates: List[dict],
+        expanded_plan_hists: torch.Tensor,
+        tree: "MCTSTreeState",
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Compute per-node values for bidirectional search by pairing current plan with
+        the target opposite-tree leaf node's plan.
+
+        For each expanded candidate i:
+          1. Slice plan_A from expanded_plan_hists (current tree, depth-based length).
+          2. Slice plan_B from target_node.plan_history (opposite tree, depth-based length).
+          3. Flip plan_B and concatenate: [plan_A_sliced | flip(plan_B_sliced)].
+          4. Delegate Warp/Achieved detection to calculate_values.
+
+        Args:
+            expanded_node_candidates: List of candidate dicts (each has 'parent_node').
+            expanded_plan_hists: Tensor of shape (m, T_total*fs, B, c) — fully denoised plan hists.
+            tree: MCTSTreeState for the current tree (provides plan_tokens, sequence_dividing_factor).
+
+        Returns:
+            values: np.ndarray shape (B,)
+            infos:  np.ndarray shape (B,), dtype str
+            achieved_ts: np.ndarray shape (B,)
+        """
+        seg_size: int = tree.plan_tokens // self.sequence_dividing_factor
+        B: int = len(expanded_node_candidates)
+
+        values: np.ndarray = np.zeros(B)
+        infos: np.ndarray = np.array(["NotReached"] * B)
+        achieved_ts: np.ndarray = np.array([None] * B)
+
+        for i, candidate in enumerate(expanded_node_candidates):
+            parent_node: "TreeNode" = candidate["parent_node"]
+            target_node: Optional["TreeNode"] = parent_node.target_node
+
+            assert target_node is not None, (
+                f"[BiDir Value] parent_node '{parent_node.name}' has no target_node. "
+                "target_node must be set by _select_dynamic_goal() before value calculation."
+            )
+            assert target_node.plan_history, (
+                f"[BiDir Value] target_node '{target_node.name}' has empty plan_history."
+            )
+
+            # --- Plan A: current tree's denoised plan, sliced to parent depth --- #
+            # expanded_plan_hists: (m, T_total*fs, B, c) -> last denoising step for candidate i
+            plan_a_full: torch.Tensor = expanded_plan_hists[-1, :, i]  # (T_total*fs, c)
+            a_len: int = parent_node.depth * seg_size * self.frame_stack
+            plan_a_sliced: torch.Tensor = plan_a_full[:a_len]  # (A_len, c)
+
+            # --- Plan B: opposite tree's last denoised plan, sliced to target depth --- #
+            plan_b_full: torch.Tensor = target_node.plan_history[-1][-1]  # (T_total*fs, c)
+            b_len: int = target_node.depth * seg_size * self.frame_stack
+            plan_b_sliced: torch.Tensor = plan_b_full[:b_len]  # (B_len, c)
+            # Flip plan_B so it runs from target_node -> root of opposite tree
+            plan_b_flipped: torch.Tensor = torch.flip(plan_b_sliced, [0])
+
+            # --- Concat and add batch dim -> (T_combined, 1, c) --- #
+            combined: torch.Tensor = torch.cat([plan_a_sliced, plan_b_flipped], dim=0).unsqueeze(1)
+
+            # --- Delegate Warp/Achieved detection to calculate_values --- #
+            # start = parent_node's physical position, goal = target_node's physical position
+            start_np: np.ndarray = parent_node.obs_pos[None, :self.observation_dim]  # (1, obs_dim)
+            goal_np: np.ndarray = target_node.obs_pos[None, :self.observation_dim]   # (1, obs_dim)
+            # Always evaluate as forward (plan_A is forward, plan_B already flipped)
+            _vals, _infos, _achieved_ts = self.calculate_values(
+                combined, start_np, goal_np, from_start=True
+            )
+            values[i] = _vals[0]
+            infos[i] = _infos[0]
+            achieved_ts[i] = _achieved_ts[0]
+
+        return values, infos, achieved_ts
+
+    def _init_mcts_tree(
+        self,
+        horizon: int,
+        from_start: bool,
+        tag: str,
+        root_obs: Optional[np.ndarray] = None,
+        root_sim_state: Optional[dict] = None,
+    ) -> MCTSTreeState:
+        """
+        (A function) Initialize a single MCTS tree and return its full state.
+
+        Args:
+            horizon: Planning horizon (must be divisible by frame_stack)
+            from_start: Direction flag (True: start→goal, False: goal→start)
+            tag: Tag string for tqdm progress bar labeling
+            root_obs: Unnormalized root observation, shape (obs_dim,).
+                      For tree1 (from_start=True) pass start coords;
+                      for tree2 (from_start=False) pass goal coords.
+                      Stored in root_node.obs_pos and tree.tree_root_obs.
+
+        Returns:
+            MCTSTreeState: Fully initialized tree state ready for _run_mcts_search
+        """
+        plan_tokens: int = horizon // self.frame_stack
+        children_node_guidance_scales: list = self.mctd_guidance_scales
+        max_search_num: int = self.mctd_max_search_num
+        num_denoising_steps: int = self.mctd_num_denoising_steps
+        skip_level_steps: int = self.mctd_skip_level_steps
+
         if self.bidirectional_search:
-            # plan_tokens = min(plan_tokens, self.n_tokens - 1 if self.is_unknown_final_token else 2)
-            assert plan_tokens <= self.n_tokens - (1 if self.is_unknown_final_token else 2), f"Plan tokens must be less than or equal to {self.n_tokens - (1 if self.is_unknown_final_token else 2)}, but got {plan_tokens}"
-            H = self.sequence_dividing_factor
-            terminal_depth = H
-            # noise_level = np.full((H + 1, plan_tokens), self.sampling_timesteps, dtype=np.int64)
-            
-            
-                
-            
+            assert plan_tokens <= self.n_tokens - (1 if self.is_unknown_final_token else 2), \
+                f"Plan tokens must be <= {self.n_tokens - (1 if self.is_unknown_final_token else 2)}, but got {plan_tokens}"
+            H: int = self.sequence_dividing_factor
+            terminal_depth: int = H
+            noise_level: Optional[np.ndarray] = None  # bidirectional uses dynamic schedule
         else:
             # Unidirectional mode: use original scheduling matrix
             noise_level = self._generate_scheduling_matrix(plan_tokens)
-            terminal_depth = np.ceil((noise_level.shape[0] - 1) / num_denoising_steps).astype(int)
-        
-        # Root Node (name, depth, parent_node, children_node_guidance_scale, plan_history)
+            terminal_depth = int(np.ceil((noise_level.shape[0] - 1) / num_denoising_steps))
+
+        # Root Node initialization
         # Initialize root's current_levels for bidirectional search
         if self.bidirectional_search:
             # current_levels only contains middle tokens (init/final tokens handled separately)
-            root_current_levels = np.full((1, plan_tokens), self.sampling_timesteps, dtype=np.int64)
+            root_current_levels: Optional[np.ndarray] = np.full((1, plan_tokens), self.sampling_timesteps, dtype=np.int64)
         else:
             root_current_levels = None
-        
-        root_node = TreeNode('0', 0, None, children_node_guidance_scales, [], 
-                            terminal_depth=terminal_depth, virtual_visit_weight=self.virtual_visit_weight,
-                            current_levels=root_current_levels)
-        root_node.set_value(0) # Initialize the value of the root node
 
-        # Search
-        search_num, p_search_num, max_depth, solved, achieved = 0, 0, 0, False, False
-        achieved_plans = [] # the plans that achieved the goal through the rollout
-        not_reached_plans = [] # the plans that did not achieve the goal, but there is no warp through the rollout
-        # lists for logging time
-        selection_time, expansion_time, simulation_time, backprop_time, early_termination_time = [], [], [], [], [] # sum of the time for each batch
-        simul_noiselevel_zero_padding_time = []
-        simul_value_estimation_time = []
-        simul_value_calculation_time = []
-        simul_node_allocation_time = []
-        
-        # Search visualization
+        root_node = TreeNode(
+            '0', 0, None, children_node_guidance_scales, [],
+            terminal_depth=terminal_depth, virtual_visit_weight=self.virtual_visit_weight,
+            current_levels=root_current_levels,
+            obs_pos=root_obs,  # Store root actual position for bidirectional meeting detection
+            sim_state=root_sim_state,
+        )
+        root_node.set_value(0)  # Initialize the value of the root node
+
         pbar = tqdm(total=max_search_num, desc=f"MCTS Search ({tag})", leave=False, dynamic_ncols=True)
+
+        return MCTSTreeState(
+            root_node=root_node,
+            plan_tokens=plan_tokens,
+            terminal_depth=terminal_depth,
+            noise_level=noise_level,
+            children_node_guidance_scales=children_node_guidance_scales,
+            max_search_num=max_search_num,
+            num_denoising_steps=num_denoising_steps,
+            skip_level_steps=skip_level_steps,
+            from_start=from_start,
+            tag=tag,
+            pbar=pbar,
+            tree_root_obs=root_obs,
+        )
+
+    def _run_mcts_search(
+        self,
+        tree: MCTSTreeState,
+        horizon: int,
+        conditions: Optional[Any],
+        start: np.ndarray,
+        goal: np.ndarray,
+        opposite_leaf_nodes: Optional[List["TreeNode"]] = None,
+        single_step: bool = False,
+        use_simulation: bool = True,
+    ) -> Tuple[MCTSTreeState, Dict[str, dict]]:
+        """
+        (B function) Run the MCTS search loop for a given tree state.
+
+        When `single_step=False` (default), runs until max_search_num or time_limit.
+        When `single_step=True`, executes exactly one Selection→Expansion→Simulation→
+        Backpropagation→EarlyTermination cycle and returns.
+
+        In bidirectional mode, `opposite_leaf_positions` provides the leaf positions
+        from the other tree so that dynamic goal selection can be performed via HILP.
+
+        Args:
+            tree: MCTSTreeState initialized by _init_mcts_tree
+            obs_normalized: Normalized start observation
+            goal_normalized: Normalized goal observation
+            horizon: Planning horizon
+            conditions: Planning conditions
+            start: Raw (unnormalized) start observation, shape (1, obs_dim)
+            goal: Raw (unnormalized) goal observation, shape (1, obs_dim)
+            opposite_leaf_nodes: List of TreeNode objects from the opposite tree's
+                                     current leaf nodes (used for dynamic goal selection).
+                                     None → use the fixed `goal` as target.
+            single_step: If True, run only one iteration of the MCTS loop then return.
+
+        Returns:
+            (MCTSTreeState, expanded_node_infos):
+                - updated tree state after search
+                - dict keyed by node name, each value is the candidate info dict with fields:
+                    {
+                      'node': TreeNode,            # the newly created child TreeNode (set after expand())
+                      'value': float,              # best value found across denoising steps
+                      'plan_history': list,        # nested plan tensors
+                      'parent_node': TreeNode,     # the parent node that was expanded
+                      'target_node': TreeNode|None,# dynamically selected opposite-tree leaf (bidir only)
+                      ... (other TreeNode constructor fields)
+                    }
+                  Empty dict when no expansion occurred (e.g. all candidates already expanded).
+        """
+        # Unpack frequently used tree fields for readability
+        root_node = tree.root_node
+        children_node_guidance_scales = tree.children_node_guidance_scales
+        num_denoising_steps = tree.num_denoising_steps
+        skip_level_steps = tree.skip_level_steps
+        noise_level = tree.noise_level
+        from_start = tree.from_start
+        terminal_depth = tree.terminal_depth
+
+        # Variable to hold expanded_node_updated_levels across the loop
+        expanded_node_updated_levels: Optional[np.ndarray] = None
+
+        # Holds the expanded node infos from the latest iteration (reset each iteration)
+        expanded_node_infos: Dict[str, dict] = {}
 
         while True:
             if self.time_limit is not None:
@@ -1379,7 +1783,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     break
             else:
                 #if search_num >= max_search_num:
-                if p_search_num >= max_search_num:
+                if tree.p_search_num >= tree.max_search_num:
                     break
 
             ## For checking the virtual visit count
@@ -1400,11 +1804,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 selected_node = root_node
                 while (not selected_node.is_expandable(consider_virtually_visited=(not self.parallel_multiple_visits))) and (not selected_node.is_terminal()) and (selected_node.is_selectable()):
                     selected_node = selected_node.select(leaf_parallelization=self.leaf_parallelization)
-                
+
                 # [DEBUG]
                 # nz = np.count_nonzero(selected_node.current_levels) if selected_node.current_levels is not None else "N/A"
                 # print(f"[DEBUG] Selected Node: {selected_node.name}, Depth: {selected_node.depth}/{selected_node.terminal_depth}, Non-zero tokens: {nz}")
-                
+
                 if selected_node.is_terminal() or (not selected_node.is_selectable() and not selected_node.is_expandable(consider_virtually_visited=(not self.parallel_multiple_visits))):
                     psn -= 1 if not self.leaf_parallelization else len(children_node_guidance_scales)
                     continue
@@ -1440,10 +1844,54 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 break
             print("============ Selection End ============")
             selection_end_time = time.time()
-            selection_time.append(selection_end_time - selection_start_time)
+            tree.selection_time.append(selection_end_time - selection_start_time)
+
+            # ------------------------------------------------------------------
+            # Dynamic Start & Goal Selection for each expansion candidate
+            # ------------------------------------------------------------------
+            eff_obs_norm_list, eff_goal_norm_list = [], []
+            eff_start_np_list, eff_goal_np_list = [], []
+
+            for info in expanded_node_candidates:
+                parent_node = info["parent_node"]
+                parent_obs_pos = parent_node.obs_pos
+                
+                # Start: Normalized parent position for planning context
+                eff_start_np_list.append(parent_obs_pos[None, :self.observation_dim])
+                p_norm = torch.tensor(
+                    (parent_obs_pos[:self.observation_dim] - self.obs_mean) / self.obs_std,
+                    dtype=torch.float32, device=self.device
+                ).unsqueeze(0)
+                eff_obs_norm_list.append(p_norm)
+                
+                # Goal: Dynamic selection if bidirectional, else the tree's target (global goal or global start)
+                if self.bidirectional_search:
+                    assert opposite_leaf_nodes is not None and len(opposite_leaf_nodes) > 0, "opposite_leaf_nodes is empty"
+                    target_node = self._select_dynamic_goal(
+                        current_leaf_obs=parent_obs_pos,
+                        opposite_leaf_nodes=opposite_leaf_nodes,
+                    )
+                    info["target_node"] = target_node  # Will be propagated to child TreeNode via expand()
+                    target_pos = target_node.obs_pos
+                else:
+                    target_node = None
+                    target_pos = goal[0] # The tree's target (global goal or global start)
+                
+                eff_goal_np_list.append(target_pos[None, :self.observation_dim])
+                g_norm = torch.tensor(
+                    (target_pos[:self.observation_dim] - self.obs_mean) / self.obs_std,
+                    dtype=torch.float32, device=self.device
+                ).unsqueeze(0)
+                eff_goal_norm_list.append(g_norm)
+                
+            effective_obs_normalized = torch.cat(eff_obs_norm_list, dim=0)    # (B, D)
+            effective_goal_normalized = torch.cat(eff_goal_norm_list, dim=0)   # (B, D)
+            effective_starts_np = np.concatenate(eff_start_np_list, axis=0)  # (B, D)
+            effective_goals_np = np.concatenate(eff_goal_np_list, axis=0)    # (B, D)
 
             filtered_expanded_node_plan_hists = [None] * len(expanded_node_candidates) # the elements can be left as None is every states are at the same point
             filtered_value_estimation_plan_hists = [None] * len(expanded_node_candidates)
+
             for _ in range(self.num_tries_for_bad_plans): # Trick used in MCTD to resample when the generated plan is terrible (e.g., not moving plans)
                 ###############################
                 # Expansion
@@ -1451,28 +1899,37 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 print("============ Expansion Start ============")
                 expanded_node_plans = []
                 expanded_node_noise_levels = []
-                expanded_node_guidance_scales = [] 
+                expanded_node_guidance_scales = []
                 for info in expanded_node_candidates:
-                    if len(info["plan_history"]) == 0:
-                        expanded_node_plans.append(None)
+                    if self.bidirectional_search:
+                        # Build plan from history and intermediate obs_pos
+                        seg_size = tree.plan_tokens // self.sequence_dividing_factor
+                        initial_plan = self._build_plan_from_leaf(
+                            parent_node=info["parent_node"],
+                            plan_tokens=tree.plan_tokens,
+                            segment_size=seg_size,
+                            from_start=from_start,
+                        ) # (plan_tokens * fs, 1, c)
+                        expanded_node_plans.append(initial_plan) # (T*fs, 1, c)
                     else:
-                        expanded_node_plans.append(info["plan_history"][-1][-1].unsqueeze(1)) 
-                        # D M (t fs) C -> MCA & fully denoised
-                        # -> (t fs) 1 C
+                        if len(info["plan_history"]) == 0:
+                            expanded_node_plans.append(None)
+                        else:
+                            expanded_node_plans.append(info["plan_history"][-1][-1].unsqueeze(1))
                     expanded_node_guidance_scales.append(info["guidance_scale"])
-                    
+
                     if not self.bidirectional_search:
                         _noise_level = noise_level[(info["depth"] - 1) * num_denoising_steps : (info["depth"] * num_denoising_steps + 1)]
                         #if info["depth"] == terminal_depth:
                         _noise_level = np.concatenate([_noise_level] + [noise_level[-1:]]*(num_denoising_steps - _noise_level.shape[0]+1)) # (num_denoising_steps, T)
                         expanded_node_noise_levels.append(_noise_level)
-                
+
                 expanded_node_guidance_scales = torch.tensor(expanded_node_guidance_scales).to(obs_normalized.device) # (batch_size,)
-                
+
                 if not self.bidirectional_search:
                     expanded_node_noise_levels = np.array(expanded_node_noise_levels, dtype=np.int32) # (batch_size, height, width)
-                
-                
+
+
                 if self.bidirectional_search:
                     parent_levels_list = []
                     for info in expanded_node_candidates: # b
@@ -1486,130 +1943,156 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                             # current_levels only contains middle tokens (excluding init/final tokens)
                             init_levels = np.full((1, plan_tokens), self.sampling_timesteps, dtype=np.int64)
                             parent_levels_list.append(init_levels)
-                    
-                    parent_levels = np.concatenate(parent_levels_list, axis=0) # (b, plan_tokens)
+
+                    parent_levels = np.concatenate(parent_levels_list, axis=0)  # (b, plan_tokens)
+
+                    # In the new sequence layout, obs_parent_token occupies position
+                    # prefix_len = parent_node.depth * seg_size within plan_tokens.
+                    # Set its noise level to 0 (it is a given/observed token, not to be denoised).
+                    _seg_size = tree.plan_tokens // self.sequence_dividing_factor
+                    for _b, _info in enumerate(expanded_node_candidates):
+                        _prefix_len_b = _info["parent_node"].depth * _seg_size
+                        if _prefix_len_b < parent_levels.shape[1]:
+                            parent_levels[_b, _prefix_len_b] = 0
+
                     # Generate Schedule for Bidirectional
                     expanded_node_noise_levels = self._generate_bidirectional_schedule(
                         parent_levels, complete_denoising=False, from_start=from_start
                     ) # b, m, plan_tokens(=t)
                     expanded_node_updated_levels = expanded_node_noise_levels[:, -1, :] # b, plan_tokens
-                
+
                 # input plans.shape: b (t fs) 1 c
                 # output plan_hist.shape: m (t fs) b c
                 # plan_hist = expanded_node_plan_hists[:, :, i] <- m (t fs) c
                 # expanded_node_infos[name]["plan_history"][-1] = plan_hist <- d m (t fs) c
 
                 expanded_node_plan_hists = self.parallel_plan(
-                    obs_normalized, goal_normalized, horizon, conditions,
+                    start=effective_obs_normalized, 
+                    goal=effective_goal_normalized, 
+                    horizon=horizon, 
+                    conditions=conditions,
                     guidance_scale=expanded_node_guidance_scales,
                     noise_level=expanded_node_noise_levels,
                     plans=expanded_node_plans,
                     from_start=from_start,
                     is_unknown_final_token=self.is_unknown_final_token
                 )
-                
+                if self.debug:
+                    print(f"  [DEBUG] [{tree.root_node.name}-Search] Expansion completed for {len(expanded_node_candidates)} nodes. plan_hists shape: {expanded_node_plan_hists.shape}")
+
                 print(f"Expanded node plan hists: {expanded_node_plan_hists.shape}")
                 print("============ Expansion End ============")
                 expansion_end_time = time.time()
-                expansion_time.append(expansion_end_time - expansion_start_time)
+                tree.expansion_time.append(expansion_end_time - expansion_start_time)
 
                 ###############################
                 # Simulation
                 #  It includes the noise level zero-padding, finding the max denoising steps, simulation, value calculation and node allocation
                 simulation_start_time = time.time()
-                print("============ Simulation Start ============")
+                
+                if use_simulation:
+                    print("============ Simulation Start ============")
+                    # Pad the noise levels - Sequential
+                    simul_noiselevel_zero_padding_start = time.time()
+                    value_estimation_plans, value_estimation_noise_levels = [], []
+                    max_denoising_steps = 0
+                    for i in range(len(expanded_node_candidates)): # find the max denoising steps
+                        if not self.bidirectional_search:
+                            _noise_level = np.concatenate(
+                                [noise_level[(expanded_node_candidates[i]["depth"] * num_denoising_steps)::skip_level_steps],
+                                noise_level[-1:]], axis=0)
+                            # update max denoising steps
+                            if _noise_level.shape[0] > max_denoising_steps:
+                                max_denoising_steps = _noise_level.shape[0]
+                            value_estimation_noise_levels.append(_noise_level)
 
+                        # expanded_node_plan_hists: m (t fs) b c
+                        # For bidirectional (pre-built format): wrap plan to (n_tokens, 1, fs*c).
+                        # For legacy format: keep as (t fs) 1 c.
+                        _plan_t_fs = expanded_node_plan_hists[-1, :, i].unsqueeze(1)  # (plan_tokens*fs, 1, c)
+                        if self.bidirectional_search:
+                            _plan_tokens_val = horizon // self.frame_stack
+                            _plan_rearranged = rearrange(_plan_t_fs, "(t fs) b c -> t b (fs c)", fs=self.frame_stack)  # (plan_tokens, 1, fs*c)
+                            _sim_pad_tokens = self.n_tokens - _plan_tokens_val
+                            _sim_pad = torch.zeros((_sim_pad_tokens, 1, _plan_rearranged.shape[-1]), device=self.device)
+                            value_estimation_plans.append(torch.cat([_plan_rearranged, _sim_pad], dim=0))  # (n_tokens, 1, fs*c)
+                        else:
+                            value_estimation_plans.append(_plan_t_fs)  # (t fs) 1 c — legacy format
 
-                # Pad the noise levels - Sequential
-                simul_noiselevel_zero_padding_start = time.time()
-                value_estimation_plans, value_estimation_noise_levels = [], []
-                max_denoising_steps = 0
-                for i in range(len(expanded_node_candidates)): # find the max denoising steps
                     if not self.bidirectional_search:
-                        _noise_level = np.concatenate(
-                            [noise_level[(expanded_node_candidates[i]["depth"] * num_denoising_steps)::skip_level_steps],
-                            noise_level[-1:]], axis=0)
-                        # update max denoising steps
-                        if _noise_level.shape[0] > max_denoising_steps:
-                            max_denoising_steps = _noise_level.shape[0]
-                        value_estimation_noise_levels.append(_noise_level)
-                    
-                    # expanded_node_plan_hists: m (t fs) b c
-                    # value_estimation_plans: b (t fs) 1 c  
-                    value_estimation_plans.append(expanded_node_plan_hists[-1, :, i].unsqueeze(1)) # added one dim: (t fs) 1 c
-                
-                if not self.bidirectional_search:
-                    for i in range(len(expanded_node_candidates)): # zero-padding
-                        length = value_estimation_noise_levels[i].shape[0]                
-                        if length < max_denoising_steps:
-                            value_estimation_noise_levels[i] = np.concatenate([
-                                value_estimation_noise_levels[i], 
-                                np.zeros((max_denoising_steps - length, value_estimation_noise_levels[i].shape[1]), dtype=np.int32)], 
-                                axis=0) # zero-padding
-                simul_noiselevel_zero_padding_end = time.time()
-                simul_noiselevel_zero_padding_time.append(simul_noiselevel_zero_padding_end - simul_noiselevel_zero_padding_start)
+                        for i in range(len(expanded_node_candidates)): # zero-padding
+                            length = value_estimation_noise_levels[i].shape[0]
+                            if length < max_denoising_steps:
+                                value_estimation_noise_levels[i] = np.concatenate([
+                                    value_estimation_noise_levels[i],
+                                    np.zeros((max_denoising_steps - length, value_estimation_noise_levels[i].shape[1]), dtype=np.int32)],
+                                    axis=0) # zero-padding
+                    simul_noiselevel_zero_padding_end = time.time()
+                    tree.simul_noiselevel_zero_padding_time.append(simul_noiselevel_zero_padding_end - simul_noiselevel_zero_padding_start)
 
-                # Simulation - Value Estimation
-                simul_value_estimation_start = time.time()
-                value_estimation_noise_levels = np.array(value_estimation_noise_levels, dtype=np.int32)
-                
-                # Prepare expanded node's denoising state for simulation
-                # We use the denoising state AFTER expansion (not parent's state)
-                # because simulation starts from already denoised plans
-                simulation_initial_levels_list = []
-                for i in range(len(expanded_node_candidates)):
-                    if expanded_node_updated_levels is not None:
-                        simulation_initial_levels_list.append(expanded_node_updated_levels[i:i+1])
-                    else:
-                        simulation_initial_levels_list.append(None)
-                
-                if self.bidirectional_search:
-                    if expanded_node_updated_levels is not None:
-                         simulation_initial_levels = np.concatenate(simulation_initial_levels_list, axis=0) # b, plan_tokens
-                         # Generate Schedule for Simulation (Complete Denoising)
-                         value_estimation_noise_levels = self._generate_bidirectional_schedule(
-                            simulation_initial_levels, complete_denoising=True, from_start=from_start
-                        )
-                    else:
-                         assert 0, "Should not happen if bidirectional"
-                         # value_estimation_noise_levels = self.sampling_timesteps # Fallback?
-                
-                # For value estimation, use expanded node levels (not parent levels)
-                 
-                # input plans.shape: b (t fs) 1 c
-                # output plan_hist.shape: m (t fs) b c
-                value_estimation_plan_hists = self.parallel_plan(
-                    obs_normalized, goal_normalized, horizon, conditions,
-                    guidance_scale=expanded_node_guidance_scales,
-                    noise_level=value_estimation_noise_levels,
-                    plans=value_estimation_plans,
-                    from_start=from_start,
-                    is_unknown_final_token=self.is_unknown_final_token
-                )
-                
-                
-                simul_value_estimation_end = time.time()
-                print(f"Value estimation plan hist: {value_estimation_plan_hists.shape}")
+                    # Simulation - Value Estimation
+                    simul_value_estimation_start = time.time()
+                    if not self.bidirectional_search:
+                        value_estimation_noise_levels = np.array(value_estimation_noise_levels, dtype=np.int32)
 
-                # check if any plan is good
-                plans = self._unnormalize_x(value_estimation_plan_hists[-1])[:-1].detach().cpu().numpy() # (t fs) b c
-                diffs = np.linalg.norm(plans[1:] - plans[:-1], axis=-1) # (plan_len-1, N) # N is the number of expanded nodes(=batch_size)
-                for i in range(diffs.shape[1]):
-                    if filtered_expanded_node_plan_hists[i] is None and not np.all(diffs[:, i] < 0.1):
-                        filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[:, :, i] # b m (t fs) c
-                        filtered_value_estimation_plan_hists[i] = value_estimation_plan_hists[:, :, i] # b m (t fs) c
-                
-                if None in filtered_expanded_node_plan_hists:
-                    print("No good plan found, resampling")
-                    simulation_end_time = time.time()
-                    simulation_time.append(simulation_end_time - simulation_start_time)
-                    continue
+                    # Prepare expanded node's denoising state for simulation
+                    simulation_initial_levels_list = []
+                    for i in range(len(expanded_node_candidates)):
+                        if expanded_node_updated_levels is not None:
+                            simulation_initial_levels_list.append(expanded_node_updated_levels[i:i+1])
+                        else:
+                            simulation_initial_levels_list.append(None)
+
+                    if self.bidirectional_search:
+                        if expanded_node_updated_levels is not None:
+                             simulation_initial_levels = np.concatenate(simulation_initial_levels_list, axis=0) # b, plan_tokens
+                             # Generate Schedule for Simulation (Complete Denoising)
+                             value_estimation_noise_levels = self._generate_bidirectional_schedule(
+                                simulation_initial_levels, complete_denoising=True, from_start=from_start
+                            )
+                        else:
+                             assert 0, "Should not happen if bidirectional"
+
+                    # input plans.shape: b (t fs) 1 c
+                    # output plan_hist.shape: m (t fs) b c
+                    value_estimation_plan_hists = self.parallel_plan(
+                        effective_obs_normalized, effective_goal_normalized, horizon, conditions,
+                        guidance_scale=expanded_node_guidance_scales,
+                        noise_level=value_estimation_noise_levels,
+                        plans=value_estimation_plans,
+                        from_start=from_start,
+                        is_unknown_final_token=self.is_unknown_final_token
+                    )
+
+                    simul_value_estimation_end = time.time()
+                    print(f"Value estimation plan hist: {value_estimation_plan_hists.shape}")
+
+                    # check if any plan is good
+                    plans = self._unnormalize_x(value_estimation_plan_hists[-1])[:-1].detach().cpu().numpy() # (t fs) b c
+                    diffs = np.linalg.norm(plans[1:] - plans[:-1], axis=-1) # (plan_len-1, N)
+                    for i in range(diffs.shape[1]):
+                        if filtered_expanded_node_plan_hists[i] is None and not np.all(diffs[:, i] < self.meeting_delta):
+                            filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[:, :, i]  # m (t fs) b c -> m (t fs) c
+                            filtered_value_estimation_plan_hists[i] = value_estimation_plan_hists[:, :, i]
+
+                    if None in filtered_expanded_node_plan_hists:
+                        print("No good plan found, resampling")
+                        simulation_end_time = time.time()
+                        tree.simulation_time.append(simulation_end_time - simulation_start_time)
+                        continue
+                    else:
+                        break
                 else:
+                    # Skip simulation: use HILP value directly for expansion results
+                    for i in range(len(expanded_node_candidates)):
+                        filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[:, :, i]
+                        # Create dummy value_estimation_plan_hists using expanded_node_plan_hists
+                        filtered_value_estimation_plan_hists[i] = expanded_node_plan_hists[:, :, i]
                     break
 
 
             #----------------------SIM (DDIM) LOOP END----------------------------------------
-            
+
             for i in range(len(filtered_expanded_node_plan_hists)):
                 if filtered_expanded_node_plan_hists[i] is None:
                     filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[:, :, i]
@@ -1617,42 +2100,48 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             expanded_node_plan_hists = torch.stack(filtered_expanded_node_plan_hists, dim=2) # m (t fs) 'B' c
             value_estimation_plan_hists = torch.stack(filtered_value_estimation_plan_hists, dim=2) # m (t fs) 'B' c
 
-            # Value Calculation
+            # TODO: Value Calculation
             simul_value_calculation_start = time.time()
             achieved_sim_indices = []
-            values, infos, achieved_ts = self.calculate_values(value_estimation_plan_hists[-1], start, goal, from_start=from_start) # (plan_len, N, D), (N, D), (N, D)
+            if self.bidirectional_search:
+                values, infos, achieved_ts = self.calculate_values_bidir(
+                    expanded_node_candidates, expanded_node_plan_hists, tree
+                )
+            else:
+                values, infos, achieved_ts = self.calculate_values(value_estimation_plan_hists[-1], effective_starts_np, effective_goals_np, from_start=from_start) # (plan_len, N, D), (N, D), (N, D)
             for i in range(len(infos)): # B
                 info = infos[i]
                 achieved_t = achieved_ts[i]
                 if info == "Achieved":
-                    achieved_plans.append([value_estimation_plan_hists[-1, :achieved_t, i], values[i]])
-                    achieved = True
+                    tree.achieved_plans.append([value_estimation_plan_hists[-1, :achieved_t, i], values[i]])
+                    tree.achieved = True
                     achieved_sim_indices.append(i)
                 elif info == "NotReached":
-                    not_reached_plans.append([value_estimation_plan_hists[-1, :, i], values[i]])
+                    tree.not_reached_plans.append([value_estimation_plan_hists[-1, :, i], values[i]])
             print(f"Value Calculation: {values}, {infos}")
             simul_value_calculation_end = time.time()
 
             # Node Allocation
             simul_node_allocation_start = time.time()
             selected_nodes_for_expansion = {}
-            expanded_node_infos = {} 
+            expanded_node_infos = {}
             for i in range(len(expanded_node_candidates)): # B
                 name = expanded_node_candidates[i]["name"]
                 if name not in expanded_node_infos:
                     selected_nodes_for_expansion[name] = selected_nodes[i]
                     expanded_node_infos[name] = expanded_node_candidates[i]
                     expanded_node_infos[name]["plan_history"].append([])
+                    expanded_node_infos[name]["is_tree1"] = tree.from_start
                 value = values[i]
                 plan_hist = expanded_node_plan_hists[:, :, i] # m (t fs) c
                 value_estimation_plan = value_estimation_plan_hists[-1, :, i]
-                
+
                 # Store updated denoising state for child node
                 if expanded_node_updated_levels is not None:
                     updated_level = expanded_node_updated_levels[i:i+1]  # Shape: (1, plan_tokens)
                 else:
                     updated_level = None
-                
+
                 if expanded_node_infos[name]["value"] is None:
                     expanded_node_infos[name]["value"] = value
                     expanded_node_infos[name]["value_estimation_plan"] = value_estimation_plan
@@ -1664,14 +2153,17 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         expanded_node_infos[name]["value_estimation_plan"] = value_estimation_plan
                         expanded_node_infos[name]["plan_history"][-1] = plan_hist
                         expanded_node_infos[name]["current_levels"] = updated_level
+
             for name in selected_nodes_for_expansion:
-                selected_nodes_for_expansion[name].expand(**expanded_node_infos[name])
+                child_node = selected_nodes_for_expansion[name].expand(**expanded_node_infos[name])
+                expanded_node_infos[name]["node"] = child_node
+
             simul_node_allocation_end = time.time()
-            simul_node_allocation_time.append(simul_node_allocation_end - simul_node_allocation_start)
+            tree.simul_node_allocation_time.append(simul_node_allocation_end - simul_node_allocation_start)
 
             print("============ Simulation End ============")
             simulation_end_time = time.time()
-            simulation_time.append(simulation_end_time - simulation_start_time)
+            tree.simulation_time.append(simulation_end_time - simulation_start_time)
 
             ######################
             # Backpropagation
@@ -1686,7 +2178,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             print("============ Backpropagation End ============")
             backprop_end_time = time.time()
-            backprop_time.append(backprop_end_time - backprop_start_time)
+            tree.backprop_time.append(backprop_end_time - backprop_start_time)
 
             ######################
             # Early Termination
@@ -1695,51 +2187,56 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             # plan_history: d m (t fs) c
             # plans: (t fs) B c
-            plans = torch.stack([info["plan_history"][-1][-1] for info in expanded_node_infos.values()], dim=1) 
-            _, infos, achieved_ts = self.calculate_values(plans, start, goal, from_start=from_start) # (plan_len, N, D), (N, D), (N, D)
+            plans = torch.stack([info["plan_history"][-1][-1] for info in expanded_node_infos.values()], dim=1)
+            if self.bidirectional_search:
+                _, infos, achieved_ts = self.calculate_values_bidir(
+                    expanded_node_candidates, expanded_node_plan_hists, tree
+                )
+            else:
+                _, infos, achieved_ts = self.calculate_values(plans, start, goal, from_start=from_start) # (plan_len, N, D), (N, D), (N, D)
             print(f"Early Termination: {infos}, {achieved_ts}")
-            solved = False
+            tree.solved = False
             achieved_indices = []
             early_termination_achieved_plans = []
             for i in range(len(infos)):
                 info = infos[i]
                 achieved_t = achieved_ts[i]
                 if info == "Achieved":
-                    solved = True
+                    tree.solved = True
                     terminal_ts = achieved_t
                     # early_termination_achieved_plans.append(plans[:terminal_ts, i]) # b (t fs) c
                     # solved_plan = plans[:terminal_ts, i]
                     achieved_indices.append(i)
 
-            if solved:
-                solved_plan = plans[:, achieved_indices[0]]
+            if tree.solved:
+                tree.solved_plan = plans[:, achieved_indices[0]]
             else:
-                solved_plan = None
+                tree.solved_plan = None
 
 
             print("============ Early Termination End ============")
             early_termination_end_time = time.time()
-            early_termination_time.append(early_termination_end_time - early_termination_start_time)
+            tree.early_termination_time.append(early_termination_end_time - early_termination_start_time)
 
 
-            search_num += 1
-            p_search_num += len(expanded_node_candidates)
-            pbar.update(len(expanded_node_candidates))
-            max_depth = max(max_depth, max([info["depth"] for info in expanded_node_candidates]))
-            is_early_termination = (self.early_stopping_condition == "solved" and solved) or (self.early_stopping_condition == "achieved" and achieved)
-            
+            tree.search_num += 1
+            tree.p_search_num += len(expanded_node_candidates)
+            tree.pbar.update(len(expanded_node_candidates))
+            tree.max_depth = max(tree.max_depth, max([info["depth"] for info in expanded_node_candidates]))
+            is_early_termination = (self.early_stopping_condition == "solved" and tree.solved) or (self.early_stopping_condition == "achieved" and tree.achieved)
+
             if self.viz_plans:
                 depths = [info["depth"] for info in expanded_node_candidates]
                 terminal_indices = [i for i, info in enumerate(expanded_node_candidates) if info["depth"] == terminal_depth]
-                
+
                 if is_early_termination:
-                    if self.early_stopping_condition == "solved" and solved:
+                    if self.early_stopping_condition == "solved" and tree.solved:
                         terminal_indices = list(set(terminal_indices) | set(achieved_indices))
-                    elif self.early_stopping_condition == "achieved" and achieved:
+                    elif self.early_stopping_condition == "achieved" and tree.achieved:
                         terminal_indices = list(set(terminal_indices) | set(achieved_sim_indices))
                     terminal_indices = sorted(terminal_indices)
-                
-                # print(f"[DEBUG] viz_plans=True at search_num={search_num}")
+
+                # print(f"[DEBUG] viz_plans=True at search_num={tree.search_num}")
                 # print(f"[DEBUG] terminal_depth={terminal_depth}")
                 # print(f"[DEBUG] expanded_node_candidates depths={depths}")
                 # print(f"[DEBUG] terminal_indices count={len(terminal_indices)}")
@@ -1747,62 +2244,435 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 if len(terminal_indices) > 0:
                     terminal_values = values[terminal_indices]
                     terminal_names = [expanded_node_candidates[i]["name"] for i in terminal_indices]
-                    terminal_expanded_hists = expanded_node_plan_hists[-1, :, terminal_indices]   # m (t fs) b c 
-                    # terminal_estimation_hists = value_estimation_plan_hists[-1, :, terminal_indices] # m (t fs) b c 
-                    self.visualize_node_value_plans(search_num, terminal_values, terminal_names, 
-                        terminal_expanded_hists, 
-                        #terminal_estimation_hists[-1], 
-                        start, goal, tag=tag)
-                
+                    terminal_expanded_hists = expanded_node_plan_hists[-1, :, terminal_indices]   # m (t fs) b c
+                    # terminal_estimation_hists = value_estimation_plan_hists[-1, :, terminal_indices] # m (t fs) b c
+                    self.visualize_node_value_plans(tree.search_num, terminal_values, terminal_names,
+                        terminal_expanded_hists,
+                        #terminal_estimation_hists[-1],
+                        start, goal, tag=tree.tag)
+
                 # elif is_early_termination and len(achieved_indices) > 0:
                 #     achieved_values = values[achieved_indices]
                 #     achieved_names = [expanded_node_candidates[i]["name"] for i in achieved_indices]
-                #     self.visualize_node_value_plans(search_num, achieved_values, achieved_names, 
-                #         plans[:, achieved_indices], 
-                #         start, goal, tag=tag)
+                #     self.visualize_node_value_plans(tree.search_num, achieved_values, achieved_names,
+                #         plans[:, achieved_indices],
+                #         start, goal, tag=tree.tag)
 
             if is_early_termination:
                 break
-        
-        pbar.close()
 
-        if solved:
-            output_plan = torch.cat([solved_plan[:,None], goal_normalized[None]], dim=0)[None] # (1, t, 1, c)
+            # ------------------------------------------------------------------
+            # single_step mode: exit after 1 iteration (expanded_node_infos already set)
+            # ------------------------------------------------------------------
+            if single_step:
+                break
+
+        tree.pbar.close()
+        return tree, expanded_node_infos
+
+    # =========================================================================
+    # Helper functions for bidirectional alternating MCTS
+    # =========================================================================
+
+    def _build_plan_from_leaf(
+        self,
+        parent_node: "TreeNode",
+        plan_tokens: int,
+        segment_size: int,
+        from_start: bool,
+    ) -> torch.Tensor:
+        # Assembles a diffusion sequence: [prior trajectory | current obs | random noise | padding]
+        """Construct the full plan_with_given_tokens for a new leaf node expansion.
+
+        Returns a tensor of shape (n_tokens, 1, fs*c) with layout:
+            [denoised_prefix(prefix_len) | obs_parent_token(1) | noisy_chunk | padding]
+        When denoised_prefix is empty (root depth=0):
+            [obs_parent_token(1) | noisy_chunk | padding]
+
+        This output is ready to be passed directly to parallel_plan (pre-built format).
+        """
+        if self.debug:
+            print(f"    [DEBUG] Building initial plan from leaf. Parent: {parent_node.name}, Depth: {parent_node.depth}, History Segments: {len(parent_node.plan_history)}")
+
+        # Build obs_parent_token: the parent node's current observation, tokenised.
+        parent_obs_pos = parent_node.obs_pos
+        parent_obs_tensor = torch.tensor(parent_obs_pos, dtype=torch.float32, device=self.device)
+        obs_parent_token_raw = self.pad_init(parent_obs_tensor.unsqueeze(0))  # (fs, 1, c)
+        if not from_start:
+            # Backward search: frames inside token are flipped to backward order.
+            obs_parent_token_raw = torch.flip(obs_parent_token_raw, [0])
+        obs_parent_token = rearrange(obs_parent_token_raw, "fs b c -> 1 b (fs c)")  # (1, 1, fs*c)
+
+        # --- Build denoised prefix from parent's plan_history ---
+        if parent_node.plan_history:
+            # plan_history stores plans in canonical (forward) order via flip_plan_for_insert_hist.
+            latest_plan_canonical = parent_node.plan_history[-1][-1]  # (plan_tokens*fs, c)
+            prefix_len_frames = parent_node.depth * segment_size * self.frame_stack
+            full_prefix_canonical = latest_plan_canonical[:prefix_len_frames].unsqueeze(1)  # (prefix_len*fs, 1, c)
+
+            # Normalize for diffusion model input.
+            full_prefix = self._normalize_x(full_prefix_canonical)  # (prefix_len*fs, 1, c)
+            denoised_prefix = rearrange(full_prefix, "(t fs) b c -> t b (fs c)", fs=self.frame_stack)  # (prefix_len, 1, fs*c)
+            prefix_len = denoised_prefix.shape[0]
+
+            if not from_start and prefix_len > 0:
+                # Canonical order is forward; convert back to backward order for the sequence.
+                denoised_prefix_raw = rearrange(denoised_prefix, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
+                denoised_prefix = rearrange(torch.flip(denoised_prefix_raw, [0]), "(t fs) b c -> t b (fs c)", fs=self.frame_stack)
         else:
-            if len(achieved_plans) != 0:
-                max_value = -1
-                max_plan = None
-                for plan, value in achieved_plans:
-                    assert value >= 0, f"The value is negative: {value}"
-                    if value > max_value:
-                        max_value = value
-                        max_plan = plan
-                output_plan = torch.cat([max_plan[:,None], goal_normalized[None]], dim=0)[None] # (1, t, 1, c)
-            elif len(not_reached_plans) != 0:
-                max_value = -1
-                max_plan = None
-                for plan, value in not_reached_plans:
-                    assert value >= 0, f"The value is negative: {value}"
-                    if value > max_value:
-                        max_value = value
-                        max_plan = plan
-                output_plan = max_plan[None,:,None] # (1, t, 1, c)
+            denoised_prefix = None
+            prefix_len = 0
+
+        # Layout within plan_tokens: [prefix(prefix_len) | obs_parent(1) | noisy(plan_tokens-1-prefix_len)]
+        # obs_parent_token takes 1 slot, leaving plan_tokens-1-prefix_len for noisy content.
+        noisy_total = plan_tokens - 1 - prefix_len
+        assert noisy_total >= 0, f"Noisy total must be non-negative: {noisy_total}"
+
+        batch_size = obs_parent_token.shape[1]  # always 1 per leaf
+        noisy_parts = torch.randn(
+            (noisy_total, batch_size, *self.x_stacked_shape),
+            device=self.device,
+        )
+        noisy_parts = torch.clamp(noisy_parts, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise)
+
+        # Assemble plan_tokens-length chunk: [prefix | obs_parent | noisy]
+        if denoised_prefix is not None:
+            plan_chunk = torch.cat([denoised_prefix, obs_parent_token, noisy_parts], dim=0)
+        else:
+            plan_chunk = torch.cat([obs_parent_token, noisy_parts], dim=0)
+
+        assert plan_chunk.shape[0] == plan_tokens, \
+            f"Plan chunk length mismatch: {plan_chunk.shape[0]} != {plan_tokens}"
+
+        # Append zero-padding to reach n_tokens.
+        pad_tokens = self.n_tokens - plan_tokens
+        assert pad_tokens >= 0, f"pad_tokens must be non-negative: {pad_tokens}"
+        pad = torch.zeros((pad_tokens, batch_size, *self.x_stacked_shape), device=self.device)
+
+        return torch.cat([plan_chunk, pad], dim=0)  # (n_tokens, 1, fs*c)
+
+    def _select_dynamic_goal(
+        self,
+        current_leaf_obs: np.ndarray,
+        opposite_leaf_nodes: List["TreeNode"],
+    ) -> "TreeNode":
+        """Select the best goal from the opposite tree's leaf nodes using HILP value.
+
+        Computes V(current_leaf_obs, candidate.obs_pos) for each candidate in
+        `opposite_leaf_nodes` and returns the node with the highest value
+        (i.e., temporally closest to `current_leaf_obs`).
+
+        Args:
+            current_leaf_obs: Unnormalized observation of the leaf node being expanded,
+                              shape (obs_dim,).
+            opposite_leaf_nodes: List of TreeNode objects from the opposite tree's leaf nodes.
+
+        Returns:
+            best_node: The TreeNode from opposite_leaf_nodes with the highest HILP value.
+        """
+        targets = np.stack([n.obs_pos for n in opposite_leaf_nodes]) # (N, D)
+        obs_expanded = np.tile(current_leaf_obs, (targets.shape[0], 1)) # (N, D)
+        values = self._compute_hilp_values(obs_expanded, targets, use_no_grad=True)
+        
+        best_idx = torch.argmax(values).item()
+        best_value = values[best_idx].item()
+        best_node = opposite_leaf_nodes[best_idx]
+        
+        if self.debug:
+            print(f"      [DEBUG] Dynamic Goal Selection: Evaluated {len(opposite_leaf_nodes)} candidates. Best Value: {best_value:.4f}")
+        return best_node
+
+    def _rollout_leaf_plan(
+        self,
+        leaf_plan_tokens: torch.Tensor,
+        new_denoised_start_idx: int,
+        new_denoised_end_idx: int,
+        agent: Any,
+        envs: Any,
+        parent_sim_state: Optional[dict] = None,
+    ) -> Tuple[np.ndarray, Optional[dict]]:
+        """
+        Execute a freshly denoised plan segment in the actual environment.
+        Restores the parent's physical state before stepping to ensure consistency.
+
+        Args:
+            leaf_plan_tokens: Fully assembled plan tensor, shape (T, 1, c) unnormalized.
+            new_denoised_start_idx: Start token index of the freshly denoised chunk.
+            new_denoised_end_idx: End token index (exclusive) of the freshly denoised chunk.
+            agent: RL agent (used for antmaze sub-goal following).
+            envs: Vectorized environment.
+            parent_sim_state: Physical state (qpos/qvel) of the parent node to restore.
+
+        Returns:
+            Tuple containing:
+              - last_obs: shape (obs_dim,) — agent's position after the rollout.
+              - final_sim_state: dictionary containing reached qpos/qvel.
+        """
+        # Restore parent's physical state before simulation
+        assert parent_sim_state is not None, "Parent sim state must be provided for rollout"
+        
+        self._set_sim_state(envs, parent_sim_state)
+        
+        # Construct initial observation from restored sim state
+        full_obs = np.concatenate([parent_sim_state["qpos"], parent_sim_state["qvel"]])
+        obs_numpy = full_obs[:self.observation_dim][None, :]
+
+        plan_slice = leaf_plan_tokens[new_denoised_start_idx:new_denoised_end_idx]  # (chunk_t, 1, c)
+        last_obs = obs_numpy[0].copy()  # default: no movement
+
+        if plan_slice.shape[0] == 0:
+            return last_obs, self._get_sim_state(envs)
+
+        plan_slice_np = plan_slice[:, 0, :].detach().cpu().numpy()  # (chunk_t, c)
+
+        for t in range(plan_slice.shape[0]):
+            if "antmaze" in self.env_id:
+                sub_goal = plan_slice_np[t, :2]
+                action = agent.sample_action(obs_numpy, sub_goal[None])
+                action = torch.from_numpy(action).float().reshape(1, -1)
             else:
-                print("Failed to find the plan")
-                output_plan = torch.cat([obs_normalized[None]]*horizon, dim=0)[None] # (1, t, 1, c) failed to find the plan
+                if t == 0:
+                    obs_t = torch.from_numpy(obs_numpy).float()
+                    plan_vel = plan_slice[t, :, :2] - obs_t[:, :2]
+                else:
+                    plan_vel = plan_slice[t, :, :2] - plan_slice[t - 1, :, :2]
+                action = 12.5 * (plan_slice[t, :, :2] - torch.from_numpy(obs_numpy).float()[:, :2]) + \
+                         1.2 * (plan_vel - torch.from_numpy(obs_numpy).float()[:, 2:4])
+                action = torch.clip(action, -1, 1)
 
-        self.log(f"validation/search_num", search_num)
-        self.log(f"validation/p_search_num", p_search_num)
-        self.log(f"validation/max_depth", max_depth)
+            action_np = action.detach().cpu().numpy()
+            obs_numpy, _, done, _ = envs.step(np.nan_to_num(action_np))
+            last_obs = obs_numpy[0].copy()
+            if done.any():
+                break
 
-        self.log(f"validation_time/selection_time", np.sum(selection_time))
-        self.log(f"validation_time/expansion_time", np.sum(expansion_time))
-        self.log(f"validation_time/simulation_time", np.sum(simulation_time))
-        self.log(f"validation_time/backprop_time", np.sum(backprop_time))
-        self.log(f"validation_time/early_termination_time", np.sum(early_termination_time))
+        # Capture reached physical state
+        final_sim_state = self._get_sim_state(envs)
 
-        self.log(f"validation_time/simul_noiselevel_zero_padding_time", np.sum(simul_noiselevel_zero_padding_time))
-        self.log(f"validation_time/simul_value_estimation_time", np.sum(simul_value_estimation_time))
-        self.log(f"validation_time/simul_value_calculation_time", np.sum(simul_value_calculation_time))
-        self.log(f"validation_time/simul_node_allocation_time", np.sum(simul_node_allocation_time))
+        return last_obs, final_sim_state
+
+
+    def _select_best_leaf(
+        self,
+        expanded_node_infos: Dict[str, dict],
+    ) -> dict:
+        """
+        Select the best expanded node info from an expanded_node_infos dict.
+
+        Selects the candidate with the highest 'value' field.
+        The returned dict contains a 'node' key with the actual child TreeNode.
+
+        Args:
+            expanded_node_infos: Dict[name -> info_dict] as returned by _run_mcts_search.
+
+        Returns:
+            The info dict with the highest value.
+        """
+        return max(
+            expanded_node_infos.values(),
+            key=lambda info: info["value"] if info.get("value") is not None else float("-inf"),
+        )
+
+    def _extract_output_plan(
+        self,
+        best_node: "TreeNode",
+        plan_tokens: int,
+        is_tree1: bool,
+    ) -> torch.Tensor:
+
+        """
+        Construct the final output plan from the best selected leaf TreeNode.
+
+        In bidirectional mode (best_node.target_node is not None):
+            - Takes plan_A from best_node (forward tree leaf) sliced by depth.
+            - Takes plan_B from best_node.target_node (backward tree leaf) sliced by depth, then flipped.
+            - Returns the concatenated plan: plan_A + flip(plan_B).
+
+        In unidirectional mode (best_node.target_node is None):
+            - Returns plan_A only (forward tree leaf sliced by depth).
+
+        Args:
+            best_node: The selected best leaf TreeNode (from _select_best_leaf).
+            plan_tokens: Total number of plan tokens for the tree (determines seg_size).
+
+        Returns:
+            output_plan: Tensor of shape (T, 1, c), where T = combined path length.
+        """
+        seg_size: int = plan_tokens // self.sequence_dividing_factor
+
+        # --- Plan A: forward tree leaf ---
+        plan_a_full: torch.Tensor = best_node.plan_history[-1][-1]  # (T_total*fs, c)
+        a_len: int = best_node.depth * seg_size * self.frame_stack
+        t1_segments: torch.Tensor = plan_a_full[:a_len]  # (A_len, c)
+
+        if best_node.target_node is None:
+            # --- Unidirectional: use plan_A only ---
+            combined = t1_segments
+        else:
+            # --- Bidirectional: flip plan_B and concat ---
+            plan_b_full: torch.Tensor = best_node.target_node.plan_history[-1][-1]  # (T_total*fs, c)
+            b_len: int = best_node.target_node.depth * seg_size * self.frame_stack
+            t2_flipped: torch.Tensor = torch.flip(plan_b_full[:b_len], [0])  # (B_len, c)
+
+            if self.debug:
+                print(
+                    f"[DEBUG] [Extract Plan] A_len={a_len}, B_len={b_len}, "
+                    f"Combined={a_len + b_len}"
+                )
+
+            combined = torch.cat([t1_segments, t2_flipped], dim=0)
+
+        if not is_tree1:
+            combined = torch.flip(combined, [0])
+        return combined.unsqueeze(1)  # (T_combined, 1, c)
+
+
+
+############### DEPRECATED ###############
+    def p_mctd_plan(
+        self,
+        obs_normalized: torch.Tensor,
+        goal_normalized: torch.Tensor,
+        horizon: int,
+        conditions: Optional[Any],
+        start: np.ndarray,
+        goal: np.ndarray,
+        tag: str = "mcts_plan",
+        from_start: bool = True,
+    ) -> torch.Tensor:
+        """
+        Orchestrator for MCTS-based diffusion planning.
+
+        When bidirectional_search=False:
+            - Initializes one tree (T1, from_start=True) and runs the full search.
+        When bidirectional_search=True:
+            - Initializes two trees: T1 (from_start=True) and T2 (from_start=False).
+            - Runs the full search on T1, then the full search on T2 (each up to max_search_num).
+            - TODO: bidirectional meeting point (connect T1 and T2 plans).
+            - Currently returns T1's result as the output plan.
+
+        Args:
+            obs_normalized: Normalized start observation, shape (1, obs_dim)
+            goal_normalized: Normalized goal observation, shape (1, obs_dim)
+            horizon: Planning horizon (must be divisible by frame_stack)
+            conditions: Planning conditions
+            start: Raw (unnormalized) start observation, shape (1, obs_dim)
+            goal: Raw (unnormalized) goal observation, shape (1, obs_dim)
+            tag: Tag string for logging
+            from_start: Ignored when bidirectional_search=True (both directions are used);
+                        used as-is when bidirectional_search=False.
+
+        Returns:
+            output_plan: shape (1, t, 1, c)
+        """
+        assert start.shape[0] == 1, "the batch size must be 1"
+        assert (not self.leaf_parallelization) or (self.parallel_search_num % len(self.mctd_guidance_scales) == 0), \
+            f"Parallel search num must be divisible by the number of guidance scales: {self.parallel_search_num} % {len(self.mctd_guidance_scales)} != 0"
+
+        assert horizon <= self.episode_len, f"Horizon must be less than or equal to episode length: {horizon} <= {self.episode_len}"
+        assert horizon % self.frame_stack == 0, f"Horizon must be divisible by frame stack: {horizon} % {self.frame_stack} != 0"
+
+        def _get_all_leaves(root: "TreeNode") -> List["TreeNode"]:
+            res = []
+            s = [root]
+            while s:
+                n = s.pop()
+                if all(c["node"] is None for c in n._children_nodes): res.append(n)
+                else:
+                    for c in n._children_nodes:
+                        if c["node"] is not None: s.append(c["node"])
+            return res
+
+        if self.bidirectional_search:
+            # --- Bidirectional mode: two trees, each searched independently ---
+            tree1 = self._init_mcts_tree(horizon, from_start=True,  tag=tag + "_from_start")
+            tree2 = self._init_mcts_tree(horizon, from_start=False, tag=tag + "_from_goal")
+
+            tree1, infos1 = self._run_mcts_search(tree1, horizon, conditions, start, goal)
+            tree2, infos2 = self._run_mcts_search(tree2, horizon, conditions, start, goal)
+
+            _all_infos: Dict[str, dict] = {}
+            _all_infos.update(infos1 if infos1 else {})
+            _all_infos.update(infos2 if infos2 else {})
+            if _all_infos:
+                _best_info = self._select_best_leaf(_all_infos)
+                output_plan = self._extract_output_plan(_best_info["node"], plan_tokens=tree1.plan_tokens, is_tree1=_best_info["is_tree1"])
+            else:
+                # Fallback: no expansions occurred
+                output_plan = torch.zeros((horizon, 1, tree1.plan_tokens // horizon * self.frame_stack), device=self.device)
+            output_plan = output_plan.unsqueeze(0) # (1, T, 1, c)
+
+
+            # Logging: sum both trees' stats
+            self.log(f"validation/search_num",  tree1.search_num  + tree2.search_num)
+            self.log(f"validation/p_search_num", tree1.p_search_num + tree2.p_search_num)
+            self.log(f"validation/max_depth",    max(tree1.max_depth, tree2.max_depth))
+
+            self.log(f"validation_time/selection_time",       np.sum(tree1.selection_time)       + np.sum(tree2.selection_time))
+            self.log(f"validation_time/expansion_time",       np.sum(tree1.expansion_time)       + np.sum(tree2.expansion_time))
+            self.log(f"validation_time/simulation_time",      np.sum(tree1.simulation_time)      + np.sum(tree2.simulation_time))
+            self.log(f"validation_time/backprop_time",        np.sum(tree1.backprop_time)        + np.sum(tree2.backprop_time))
+            self.log(f"validation_time/early_termination_time", np.sum(tree1.early_termination_time) + np.sum(tree2.early_termination_time))
+
+            self.log(f"validation_time/simul_noiselevel_zero_padding_time", np.sum(tree1.simul_noiselevel_zero_padding_time) + np.sum(tree2.simul_noiselevel_zero_padding_time))
+            self.log(f"validation_time/simul_value_estimation_time",        np.sum(tree1.simul_value_estimation_time)        + np.sum(tree2.simul_value_estimation_time))
+            self.log(f"validation_time/simul_value_calculation_time",       np.sum(tree1.simul_value_calculation_time)       + np.sum(tree2.simul_value_calculation_time))
+            self.log(f"validation_time/simul_node_allocation_time",         np.sum(tree1.simul_node_allocation_time)         + np.sum(tree2.simul_node_allocation_time))
+
+        else:
+            # --- Unidirectional mode: single tree, identical to original behavior ---
+            tree1 = self._init_mcts_tree(horizon, from_start=from_start, tag=tag)
+            tree1, infos1 = self._run_mcts_search(tree1, horizon, conditions, start, goal)
+            if infos1:
+                _best_info = self._select_best_leaf(infos1)
+                output_plan = self._extract_output_plan(_best_info["node"], plan_tokens=tree1.plan_tokens, is_tree1=_best_info["is_tree1"])
+            else:
+                # Fallback: no expansions occurred
+                output_plan = torch.zeros((horizon, 1, tree1.plan_tokens // horizon * self.frame_stack), device=self.device)
+            output_plan = output_plan.unsqueeze(0) # (1, T, 1, c)
+
+            # Logging: single tree stats
+            self.log(f"validation/search_num",  tree1.search_num)
+            self.log(f"validation/p_search_num", tree1.p_search_num)
+            self.log(f"validation/max_depth",    tree1.max_depth)
+
+            self.log(f"validation_time/selection_time",          np.sum(tree1.selection_time))
+            self.log(f"validation_time/expansion_time",          np.sum(tree1.expansion_time))
+            self.log(f"validation_time/simulation_time",         np.sum(tree1.simulation_time))
+            self.log(f"validation_time/backprop_time",           np.sum(tree1.backprop_time))
+            self.log(f"validation_time/early_termination_time",  np.sum(tree1.early_termination_time))
+
+            self.log(f"validation_time/simul_noiselevel_zero_padding_time", np.sum(tree1.simul_noiselevel_zero_padding_time))
+            self.log(f"validation_time/simul_value_estimation_time",        np.sum(tree1.simul_value_estimation_time))
+            self.log(f"validation_time/simul_value_calculation_time",       np.sum(tree1.simul_value_calculation_time))
+            self.log(f"validation_time/simul_node_allocation_time",         np.sum(tree1.simul_node_allocation_time))
+
         return output_plan
+
+    def _get_sim_state(self, envs: Any) -> Optional[dict]:
+        """Extract current qpos/qvel from envs (DummyVecEnv)."""
+        try:
+            # get_attr returns a list of attributes for each env in the vector
+            # We assume batch size 1 for SimState restoration as per requirements
+            data = envs.get_attr("data")
+            if data and len(data) > 0:
+                return {
+                    "qpos": data[0].qpos.copy(),
+                    "qvel": data[0].qvel.copy()
+                }
+        except Exception as e:
+            if self.debug:
+                print(f"  [DEBUG] Failed to get sim_state: {e}")
+        return None
+
+    def _set_sim_state(self, envs: Any, sim_state: Optional[dict]) -> None:
+        """Restore qpos/qvel to envs (DummyVecEnv)."""
+        if sim_state is None:
+            return
+        try:
+            # env_method calls the method on each env in the vector
+            envs.env_method("set_state", sim_state["qpos"], sim_state["qvel"])
+        except Exception as e:
+            if self.debug:
+                print(f"  [DEBUG] Failed to set sim_state: {e}")
+
