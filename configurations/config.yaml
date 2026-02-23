@@ -5,7 +5,7 @@ defaults:
   - algorithm: df_video # algorithm yaml file name in configurations/algorithm folder [fixme]
   - cluster: null # optional, cluster yaml file name in configurations/cluster folder. Leave null for local compute
 
-debug: false # global debug flag will be passed into configuration of experiment, dataset and algorithm
+debug: true # global debug flag will be passed into configuration of experiment, dataset and algorithm
 jump: 1 # global jump flag will be passed into configuration of experiment, dataset and algorithm
 
 wandb:

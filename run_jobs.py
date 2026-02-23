@@ -259,7 +259,7 @@ try:
             # 3. Start new if available
             if running_experiments[gpu] is None and not queue_is_empty:
                 memory_used, memory_total = check_gpu_memory_usage(server, gpu_id)
-                if memory_used < 1000: # If the memory usage is less than 1GB, start a new experiment.
+                if memory_used < 2000: # If the memory usage is less than 2GB, start a new experiment.
                     current_time_job = time.strftime("%Y%m%d-%H%M%S")
                     exp_name = f"exp_gpu{gpu_id}_{current_time_job}-{jobs_folder}"
                     

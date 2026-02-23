@@ -17,7 +17,6 @@ experimental_config = {
     "algorithm.val_max_steps": 100,
 
     # Algorithm specific
-    "algorithm.mctd": True,
     "algorithm.parallel_search_num": 10,
     "algorithm.mctd_max_search_num": 20,
     "algorithm.mctd_guidance_scales": "[0,1]",

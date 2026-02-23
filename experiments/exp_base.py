@@ -263,6 +263,31 @@ class BaseLightningExperiment(BaseExperiment):
         """
         All validation happens here
         """
+        # Initialize Tracer for MCTS tree quality analysis
+        from utils.tracer import Tracer, set_default_tracer
+
+        try:
+            tracer = Tracer(
+                run_id="validation_run",
+                purpose="bidirectional_mcts_tree_quality",
+                log_dir="logs",
+                extra_meta={"description": "MCTS tree quality analysis"},
+            )
+            set_default_tracer(tracer)
+            # Wrap validation with tracer context
+            self._run_validation_with_tracer(tracer)
+        except Exception as e:
+            # Fallback: run validation without tracer if initialization fails
+            print(f"[WARNING] Tracer initialization failed: {e}. Running validation without logging.")
+            self._validation_impl()
+
+    def _run_validation_with_tracer(self, tracer) -> None:
+        """Internal helper to run validation within tracer context."""
+        with tracer:
+            self._validation_impl()
+
+    def _validation_impl(self) -> None:
+        """Actual validation implementation (extracted from original validation())."""
         if not self.algo:
             self.algo = self._build_algo()
         if self.cfg.validation.compile:

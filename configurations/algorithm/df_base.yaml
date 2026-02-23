@@ -34,7 +34,7 @@ diffusion:
   cum_snr_decay: 0.98
   timesteps: 1000
   # sampling
-  sampling_timesteps: 50 # fixme, numer of diffusion steps, should be increased
+  sampling_timesteps: 100 # Must be >= mctd_num_denoising_steps for MCTS planning
   ddim_sampling_eta: 1.0
   stabilization_level: 10
   # architecture

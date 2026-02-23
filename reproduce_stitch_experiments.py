@@ -20,7 +20,6 @@ configs = [
         "+name": "Reproduction-Maze2D-Medium",
         "experiment": "exp_planning",
         "algorithm": "df_planning",
-        "algorithm.mctd": True,
         "algorithm.parallel_search_num": 50, # Reduced for quick check
         "algorithm.open_loop_horizon": 500,
         "algorithm.val_max_steps": 500,
@@ -41,7 +40,6 @@ configs = [
         "algorithm": "df_planning",
         "algorithm.open_loop_horizon": 500, # Reduced horizon for quick check? No, keep logic similar.
         "algorithm.val_max_steps": 1000,
-        "algorithm.mctd": True,
         "algorithm.parallel_search_num": 50,
         "algorithm.mctd_max_search_num": 100,
         "algorithm.mctd_guidance_scales": "[0,1,2,3,4,5]",

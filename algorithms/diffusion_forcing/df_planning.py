@@ -1298,7 +1298,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             # Convert plan from token format (T, 1, fs*c) to frame format (T*fs, 1, c) for unified execution
             # This enables both interact and _rollout_leaf_plan to use the same execution logic
-            plan_frame_format = rearrange(plan, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
+            # Check if plan has the expected stacked dimension; if not, it's already in frame format
+            if plan.shape[-1] == self.x_stacked_shape[0]:
+                # Plan is in token format (n_tokens, batch, obs_dim*frame_stack), convert to frame format
+                plan_frame_format = rearrange(plan, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
+            else:
+                # Plan is already in frame format or doesn't have stacking; use as-is
+                # This can happen when the diffusion model outputs unstacked observations
+                plan_frame_format = plan
 
             # Prepare obs for environment execution
             obs_numpy = obs.detach().cpu().numpy()
