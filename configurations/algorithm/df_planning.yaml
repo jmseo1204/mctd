@@ -42,12 +42,16 @@ sub_goal_interval: 10
 
 pyramid: True
 mctd_num_denoising_steps: 100 # 90 for pyramid, matrix H = self.sampling_timesteps + uncertainty_scale * (horizon/frame_stack) = 90
-parallel_search_num: 6
+parallel_search_num: 2
 mctd_max_search_num: 70
 mctd_guidance_scales: [0.0]
 padding_mode: "same" # "zero" or "same"
 viz_plans: True
 DEBUG: True
+debug_log_level: 2 # 0=off, 1=basic (allocations), 2=detailed (memory tracking), 3=verbose (every step)
+debug_log_interval: 10 # Log every N MCTS iterations
+debug_memory_profile: True # Enable GPU/CPU memory profiling
+max_plan_hist_keep: 1 # Keep only last N plan histories (memory optimization)
 meeting_delta: 2.0
 episode_len: ${dataset.episode_len} # self.n_tokens = self.episode_len // self.frame_stack
 horizon_scale: 0.8 # horizon = self.episode_len * horizon_scale

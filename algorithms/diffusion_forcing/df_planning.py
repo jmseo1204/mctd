@@ -18,6 +18,7 @@ from utils.logging_utils import (
     make_convergence_animation,
     make_mpc_animation,
 )
+from utils.tracer import Tracer, set_default_tracer, get_tracer
 from .tree_node import TreeNode
 from . import guidance
 
@@ -122,6 +123,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.viz_plans = cfg.viz_plans
         self.meeting_delta = cfg.get("meeting_delta", 0.5)
         self.debug = cfg.get("DEBUG", False)
+        self.debug_log_level = cfg.get("debug_log_level", 0)  # 0=off, 1=basic, 2=detailed, 3=verbose
+        self.debug_log_interval = cfg.get("debug_log_interval", 10)  # Log every N iterations
+        self.debug_memory_profile = cfg.get("debug_memory_profile", False)
+        self.max_plan_hist_keep = cfg.get("max_plan_hist_keep", 1)  # Memory optimization: limit history
         self.sequence_dividing_factor = cfg.sequence_dividing_factor
         self.horizon_scale = cfg.horizon_scale
         self.pyramid = cfg.get("pyramid", False)
@@ -140,6 +145,24 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal
+        
+        # Initialize memory profiler for debugging
+        if self.debug_memory_profile:
+            from utils.memory_profiler import init_profiler
+            self.profiler = init_profiler(self.device, debug_level=self.debug_log_level)
+            if self.debug_log_level >= 1:
+                import sys
+                print(f"[DEBUG] Memory profiler initialized (level={self.debug_log_level})", file=sys.stderr, flush=True)
+        else:
+            self.profiler = None
+        
+        # Log initialization config
+        if self.debug_log_level >= 1:
+            import sys
+            print(f"[DEBUG] DiffusionForcingPlanning initialized:", file=sys.stderr, flush=True)
+            print(f"  parallel_search_num: {self.parallel_search_num}", file=sys.stderr, flush=True)
+            print(f"  mctd_max_search_num: {self.mctd_max_search_num}", file=sys.stderr, flush=True)
+            print(f"  max_plan_hist_keep: {self.max_plan_hist_keep}", file=sys.stderr, flush=True)
 
     def _get_hilp_value_fn(self):
         """Lazy loader for HILP value function model."""
@@ -902,6 +925,17 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 prefix_len_list,
             )
         ] # (plan_tokens, b, fs*c)
+        
+        # [MEMORY DEBUG] Log initial plan_hist allocation
+        if self.profiler:
+            self.profiler.snapshot(
+                f"parallel_plan_start_batch{batch_size}",
+                phase="plan_hist_init"
+            )
+            if self.debug_log_level >= 2:
+                import sys
+                print(f"[DEBUG] parallel_plan: Created initial plan_hist (batch={batch_size})", 
+                      file=sys.stderr, flush=True)
 
         stabilization = 0
 
@@ -945,9 +979,27 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     prefix_len_list,
                 ) # (plan_tokens, b, fs*c)
             )
+            
+            # [MEMORY DEBUG] Periodical memory logging during denoising
+            if self.profiler and (m + 1) % max(1, noise_level.shape[1] // 5) == 0:
+                self.profiler.snapshot(
+                    f"parallel_plan_denoise_step{m+1}",
+                    phase=f"denoise_step_{m+1}/{noise_level.shape[1]-1}"
+                )
 
         # Stack all denoising steps
         plan_hist = torch.stack(plan_hist)  # (m+1, plan_tokens, b, fs*c)
+        
+        # [MEMORY OPTIMIZATION] Keep only last N histories to save memory
+        if self.max_plan_hist_keep > 0 and plan_hist.shape[0] > self.max_plan_hist_keep:
+            if self.debug_log_level >= 2:
+                import sys
+                old_size = plan_hist.shape[0]
+                new_size = self.max_plan_hist_keep
+                print(f"[DEBUG] Truncating plan_hist: {old_size} -> {new_size} steps", 
+                      file=sys.stderr, flush=True)
+            plan_hist = plan_hist[-self.max_plan_hist_keep:]
+        
         # Rearrange to expand tokens into frame stacks
         plan_hist = rearrange(
             plan_hist,
@@ -964,6 +1016,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         assert plan_hist.shape[2] == batch_size, (
             f"plan_hist.shape[2]={plan_hist.shape[2]}, expected batch_size={batch_size}"
         )
+        
+        # [MEMORY DEBUG] Log final plan_hist
+        if self.profiler:
+            self.profiler.snapshot(
+                f"parallel_plan_end_batch{batch_size}",
+                phase="plan_hist_final"
+            )
 
         return plan_hist  # (m+1, plan_tokens*fs, b, c)
 
@@ -985,427 +1044,512 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         print("Interacting with environment... This may take a couple minutes.")
 
-        use_diffused_action = False
+        # [TRACER SETUP] Initialize structured memory logger
+        tracer = Tracer(
+            run_id=f"interact_{int(time.time())}",
+            purpose="memory_efficiency_diagnosis",
+            log_dir="logs_memory_debug",
+            extra_meta={
+                "env_id": self.env_id,
+                "batch_size": batch_size,
+                "frame_stack": self.frame_stack,
+                "episode_len": self.episode_len,
+            }
+        )
+        set_default_tracer(tracer)
 
-        if self.env_id in OGBENCH_ENVS:
-            if "pointmaze" in self.env_id:
-                envs = DummyVecEnv(
-                    [
-                        lambda: ogbench.locomaze.maze.make_maze_env(
-                            "point", "maze", maze_type=self.env_id.split("-")[1]
-                        )
-                    ]
-                    * batch_size
+        with tracer:
+            # [MEMORY DEBUG] Log interaction start
+            if self.profiler:
+                self.profiler.snapshot(
+                    "interact_start",
+                    phase="interact_init"
                 )
-                if self.action_dim == 2:
-                    use_diffused_action = True
-            elif "antmaze" in self.env_id:
-                envs = DummyVecEnv(
-                    [
-                        lambda: ogbench.locomaze.maze.make_maze_env(
-                            "ant", "maze", maze_type=self.env_id.split("-")[1]
-                        )
-                    ]
-                    * batch_size
-                )
-                # use_diffused_action = True
-                from dql.main_Antmaze import hyperparameters
-                from dql.agents.ql_diffusion import Diffusion_QL as Agent
+                if self.debug_log_level >= 1:
+                    import sys
+                    print(f"[DEBUG] interact() starting with batch_size={batch_size}",
+                          file=sys.stderr, flush=True)
 
-                params = hyperparameters[self.dataset]
-                state_dim = envs.observation_space.shape[0]
-                action_dim = envs.action_space.shape[0]
-                max_action = float(envs.action_space.high[0])
-                agent = Agent(
-                    state_dim=state_dim * 2,
-                    action_dim=action_dim,
-                    max_action=max_action,
-                    device=0,
-                    discount=0.99,
-                    tau=0.005,
-                    max_q_backup=params["max_q_backup"],
-                    beta_schedule="vp",
-                    n_timesteps=5,
-                    eta=params["eta"],
-                    lr=params["lr"],
-                    lr_decay=False,
-                    lr_maxt=params["num_epochs"],
-                    grad_norm=params["gn"],
-                    goal_dim=2,
-                    lcb_coef=4.0,
-                )
-                # pretrained agent loading
-                if (
-                    self.dataset == "antmaze-medium-navigate-v0"
-                    or self.dataset == "antmaze-medium-stitch-v0"
-                ):
-                    dql_folder = "antmaze-medium-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
-                elif (
-                    self.dataset == "antmaze-large-navigate-v0"
-                    or self.dataset == "antmaze-large-stitch-v0"
-                ):
-                    dql_folder = "antmaze-large-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
-                elif (
-                    self.dataset == "antmaze-giant-navigate-v0"
-                    or self.dataset == "antmaze-giant-stitch-v0"
-                ):
-                    dql_folder = "antmaze-giant-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
+            tracer.log(
+                "interact.start",
+                {"batch_size": batch_size, "env_id": self.env_id},
+                step=0,
+                depth=0
+            )
+
+            use_diffused_action = False
+
+            # [ENV CACHING] Check if environment is cached and batch_size matches
+            env_cache_key = f"{self.env_id}_{batch_size}"
+            if (
+                hasattr(self, "_cached_envs")
+                and hasattr(self, "_cached_env_key")
+                and self._cached_env_key == env_cache_key
+            ):
+                # Reuse cached environment
+                envs = self._cached_envs
+                envs.reset()
+                if not (self.env_id in OGBENCH_ENVS):
+                    envs.seed(self.interaction_seed)
+                if self.debug_log_level >= 1:
+                    import sys
+                    print(
+                        f"[MEM] Reusing cached environment (batch_size={batch_size})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            else:
+                # Create new environment and cache it
+                if self.env_id in OGBENCH_ENVS:
+                    if "pointmaze" in self.env_id:
+                        envs = DummyVecEnv(
+                            [
+                                lambda: ogbench.locomaze.maze.make_maze_env(
+                                    "point", "maze", maze_type=self.env_id.split("-")[1]
+                                )
+                            ]
+                            * batch_size
+                        )
+                        if self.action_dim == 2:
+                            use_diffused_action = True
+                    elif "antmaze" in self.env_id:
+                        envs = DummyVecEnv(
+                            [
+                                lambda: ogbench.locomaze.maze.make_maze_env(
+                                    "ant", "maze", maze_type=self.env_id.split("-")[1]
+                                )
+                            ]
+                            * batch_size
+                        )
+                        # use_diffused_action = True
+                        from dql.main_Antmaze import hyperparameters
+                        from dql.agents.ql_diffusion import Diffusion_QL as Agent
+
+                        params = hyperparameters[self.dataset]
+                        state_dim = envs.observation_space.shape[0]
+                        action_dim = envs.action_space.shape[0]
+                        max_action = float(envs.action_space.high[0])
+                        agent = Agent(
+                            state_dim=state_dim * 2,
+                            action_dim=action_dim,
+                            max_action=max_action,
+                            device=0,
+                            discount=0.99,
+                            tau=0.005,
+                            max_q_backup=params["max_q_backup"],
+                            beta_schedule="vp",
+                            n_timesteps=5,
+                            eta=params["eta"],
+                            lr=params["lr"],
+                            lr_decay=False,
+                            lr_maxt=params["num_epochs"],
+                            grad_norm=params["gn"],
+                            goal_dim=2,
+                            lcb_coef=4.0,
+                        )
+                        # pretrained agent loading
+                        if (
+                            self.dataset == "antmaze-medium-navigate-v0"
+                            or self.dataset == "antmaze-medium-stitch-v0"
+                        ):
+                            dql_folder = "antmaze-medium-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
+                        elif (
+                            self.dataset == "antmaze-large-navigate-v0"
+                            or self.dataset == "antmaze-large-stitch-v0"
+                        ):
+                            dql_folder = "antmaze-large-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
+                        elif (
+                            self.dataset == "antmaze-giant-navigate-v0"
+                            or self.dataset == "antmaze-giant-stitch-v0"
+                        ):
+                            dql_folder = "antmaze-giant-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
+                        else:
+                            raise ValueError(f"Dataset {self.dataset} not supported")
+
+                        import os
+
+                        agent.load_model(
+                            os.path.join(os.getcwd(), "dql", "results", dql_folder), id=200
+                        )
                 else:
-                    raise ValueError(f"Dataset {self.dataset} not supported")
+                    envs = DummyVecEnv([lambda: gym.make(self.env_id)] * batch_size)
+                    envs.seed(self.interaction_seed)
 
-                import os
+                # Cache the environment
+                self._cached_envs = envs
+                self._cached_env_key = env_cache_key
+                if self.debug_log_level >= 1:
+                    import sys
+                    print(
+                        f"[MEM] Created and cached new environment (batch_size={batch_size})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
-                agent.load_model(
-                    os.path.join(os.getcwd(), "dql", "results", dql_folder), id=200
+            # [ENV CACHING END] Environment setup complete (cached or new)
+
+            # Set task IDs for OGBench environments
+            if self.env_id in OGBENCH_ENVS:
+                for i, env in enumerate(envs.envs):
+                    # Convert 0-based task_id to 1-based indexing for ogbench
+                    actual_task_id = self.task_id + i + 1
+                    import sys
+                    print(
+                        f"[DEBUG Task] Setting task_id={actual_task_id} (base task_id={self.task_id}, i={i})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    env.set_task(actual_task_id)
+                    # env.set_seed(self.interaction_seed)
+        
+            # [MEMORY DEBUG] Log environment initialization
+            if self.profiler:
+                self.profiler.snapshot(
+                    "interact_envs_created",
+                    phase=f"env_creation(batch={batch_size})"
                 )
-            for i, env in enumerate(envs.envs):
-                # Convert 0-based task_id to 1-based indexing for ogbench
-                actual_task_id = self.task_id + i + 1
-                import sys
-                print(f"[DEBUG Task] Setting task_id={actual_task_id} (base task_id={self.task_id}, i={i})", file=sys.stderr, flush=True)
-                env.set_task(actual_task_id)
-                # env.set_seed(self.interaction_seed)
-        else:
-            envs = DummyVecEnv([lambda: gym.make(self.env_id)] * batch_size)
-            envs.seed(self.interaction_seed)
+                if self.debug_log_level >= 1:
+                    import sys
+                    print(f"[DEBUG] Created {batch_size} environment instances", 
+                          file=sys.stderr, flush=True)
 
-        terminate = False
-        obs_mean = self.data_mean[: self.observation_dim]
-        obs_std = self.data_std[: self.observation_dim]
-        obs = envs.reset()
-        # Randomize the goal for each environment
-        if (
-            self.env_id in OGBENCH_ENVS
-        ):  # OGBench goal setting is already done through set_task()
-            pass
-        else:
-            if self.use_random_goals_for_interaction:
-                for env in envs.envs:
-                    env.set_target()
+            terminate = False
+            obs_mean = self.data_mean[: self.observation_dim]
+            obs_std = self.data_std[: self.observation_dim]
+            obs = envs.reset()
+            # Randomize the goal for each environment
+            if (
+                self.env_id in OGBENCH_ENVS
+            ):  # OGBench goal setting is already done through set_task()
+                pass
+            else:
+                if self.use_random_goals_for_interaction:
+                    for env in envs.envs:
+                        env.set_target()
 
-        obs = torch.from_numpy(obs).float().to(self.device)
-        start = obs.detach()
-        obs_normalized = (
-            (obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]
-        ).detach()
+            obs = torch.from_numpy(obs).float().to(self.device)
+            start = obs.detach()
+            obs_normalized = (
+                (obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]
+            ).detach()
 
-        if self.env_id in OGBENCH_ENVS:  # OGBench
-            goal = np.vstack(
-                [envs.reset_infos[i]["goal"] for i in range(len(envs.reset_infos))]
-            )
-        else:
-            goal = np.concatenate([[env.env._target] for env in envs.envs])
-        goal = torch.Tensor(goal).float().to(self.device)
-        goal = torch.cat([goal, torch.zeros_like(goal)], -1)
-        goal = goal[:, : self.observation_dim]
-        goal_normalized = ((goal - obs_mean[None]) / obs_std[None]).detach()
+            if self.env_id in OGBENCH_ENVS:  # OGBench
+                goal = np.vstack(
+                    [envs.reset_infos[i]["goal"] for i in range(len(envs.reset_infos))]
+                )
+            else:
+                goal = np.concatenate([[env.env._target] for env in envs.envs])
+            goal = torch.Tensor(goal).float().to(self.device)
+            goal = torch.cat([goal, torch.zeros_like(goal)], -1)
+            goal = goal[:, : self.observation_dim]
+            goal_normalized = ((goal - obs_mean[None]) / obs_std[None]).detach()
 
-        steps = 0
-        episode_reward = np.zeros(batch_size)
-        episode_reward_if_stay = np.zeros(batch_size)
-        reached = np.zeros(batch_size, dtype=bool)
-        first_reach = np.zeros(batch_size)
+            steps = 0
+            episode_reward = np.zeros(batch_size)
+            episode_reward_if_stay = np.zeros(batch_size)
+            reached = np.zeros(batch_size, dtype=bool)
+            first_reach = np.zeros(batch_size)
 
-        trajectory = []  # actual trajectory
-        all_plan_hist = []  # a list of plan histories, each history is a collection of m diffusion steps
+            trajectory = []  # actual trajectory
+            all_plan_hist = []  # a list of plan histories, each history is a collection of m diffusion steps
 
-        # run mpc with diffused actions
-        planning_time = []
+            # run mpc with diffused actions
+            planning_time = []
 
-        # ----------------------------------------------------------------
-        # Bidirectional MCTS: initialize tree1/tree2 once before MPC loop.
-        # These trees are maintained across MPC steps and expanded
-        # alternately within each planning call.
-        # ----------------------------------------------------------------
-        horizon: int = int(self.episode_len * self.horizon_scale)
-        _bidir_start_np = start.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
-        _bidir_goal_np = goal.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
-        # Capture initial physical state if available
-        initial_sim_state = self._get_sim_state(envs)
-        assert initial_sim_state is not None, "Failed to capture initial sim state"
-        assert np.allclose(initial_sim_state["qpos"][:2], _bidir_start_np[0][:2], atol=1e-5), \
-            f"Physical start position {initial_sim_state['qpos'][:2]} does not match observation start position {_bidir_start_np[0][:2]}"
+            # ----------------------------------------------------------------
+            # Bidirectional MCTS: initialize tree1/tree2 once before MPC loop.
+            # These trees are maintained across MPC steps and expanded
+            # alternately within each planning call.
+            # ----------------------------------------------------------------
+            horizon: int = int(self.episode_len * self.horizon_scale)
+            _bidir_start_np = start.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
+            _bidir_goal_np = goal.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
+            # Capture initial physical state if available
+            initial_sim_state = self._get_sim_state(envs)
+            assert initial_sim_state is not None, "Failed to capture initial sim state"
+            assert np.allclose(initial_sim_state["qpos"][:2], _bidir_start_np[0][:2], atol=1e-5), \
+                f"Physical start position {initial_sim_state['qpos'][:2]} does not match observation start position {_bidir_start_np[0][:2]}"
 
-        # Derive heuristic goal simulation state from initial state
-        goal_sim_state = {
-            "qpos": initial_sim_state["qpos"].copy(),
-            "qvel": np.zeros_like(initial_sim_state["qvel"]),  # Goal is assumed static
-        }
-        # Replace x, y coordinates with goal coordinates
-        goal_sim_state["qpos"][:2] = _bidir_goal_np[0][:2]
+            # Derive heuristic goal simulation state from initial state
+            goal_sim_state = {
+                "qpos": initial_sim_state["qpos"].copy(),
+                "qvel": np.zeros_like(initial_sim_state["qvel"]),  # Goal is assumed static
+            }
+            # Replace x, y coordinates with goal coordinates
+            goal_sim_state["qpos"][:2] = _bidir_goal_np[0][:2]
 
-        bidir_tree1 = self._init_mcts_tree(
-            horizon,
-            tag="bidir_mcts_from_start",
-            root_obs=_bidir_start_np[0],
-            root_sim_state=initial_sim_state,
-        )
-        bidir_tree2 = self._init_mcts_tree(
-            horizon,
-            tag="bidir_mcts_from_goal",
-            root_obs=_bidir_goal_np[0],
-            root_sim_state=goal_sim_state,
-        )
-        # Flag: 0 → expand tree1 next, 1 → expand tree2 next
-        expanded_tree_idx: int = 0
-        # Configurable meeting threshold (Euclidean distance in unnormalized obs space)
-        _meeting_delta: float = getattr(self.cfg, "meeting_delta", 2.0)
-
-        while not terminate and steps < self.val_max_steps:
-            planning_start_time = time.time()
-
-            # Generate plan (start → goal)
-            # _generate_plan_between_points has been inlined here.
-
-            # ------------------------------------------------------------------
-            # Bidirectional alternating MCTS planning
-            # ------------------------------------------------------------------
-            _start_np = start.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
-            _goal_np = goal.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
-
-            # Collect opposite tree leaf nodes for dynamic goal selection and plan extraction
-            def _get_leaf_nodes(root_node: "TreeNode") -> List["TreeNode"]:
-                leaves: List["TreeNode"] = []
-                stack = [root_node]
-                while stack:
-                    n = stack.pop()
-                    is_leaf = all(c["node"] is None for c in n._children_nodes)
-                    if is_leaf:
-                        leaves.append(n)
-                    else:
-                        for c in n._children_nodes:
-                            if c["node"] is not None:
-                                stack.append(c["node"])
-                return leaves
-
-            t1_leaf_nodes: List["TreeNode"] = _get_leaf_nodes(bidir_tree1.root_node)
-            t2_leaf_nodes: List["TreeNode"] = _get_leaf_nodes(bidir_tree2.root_node)
-
-            # (leaf node lists are passed directly to _run_mcts_search as opposite_leaf_nodes)
-
-            # Initialize infos dicts so {**infos1, **infos2} is safe even on the first step
-
-            # Alternate expansion: one single_step per MPC iteration
-            active_tree, expanded_node_infos = self._run_mcts_search(
-                bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2,
+            bidir_tree1 = self._init_mcts_tree(
                 horizon,
-                conditions,
-                _start_np,
-                _goal_np,
-                opposite_leaf_nodes=t2_leaf_nodes if expanded_tree_idx == 0 else t1_leaf_nodes,
-                single_step=True,
+                tag="bidir_mcts_from_start",
+                root_obs=_bidir_start_np[0],
+                root_sim_state=initial_sim_state,
             )
+            bidir_tree2 = self._init_mcts_tree(
+                horizon,
+                tag="bidir_mcts_from_goal",
+                root_obs=_bidir_goal_np[0],
+                root_sim_state=goal_sim_state,
+            )
+            # Flag: 0 → expand tree1 next, 1 → expand tree2 next
+            expanded_tree_idx: int = 0
+            # Configurable meeting threshold (Euclidean distance in unnormalized obs space)
+            _meeting_delta: float = getattr(self.cfg, "meeting_delta", 2.0)
 
-            if self.debug:
-                print(
-                    f"[DEBUG] [Step {steps}] Bidir Turn: {'Tree1 (Forward)' if expanded_tree_idx == 0 else 'Tree2 (Backward)'}"
-                )
+            while not terminate and steps < self.val_max_steps:
+                planning_start_time = time.time()
 
-            # Per-leaf MPC rollout: update obs_pos and sim_state for newly expanded leaves
+                # Generate plan (start → goal)
+                # _generate_plan_between_points has been inlined here.
 
-            for info in expanded_node_infos.values():
-                parent_node: "TreeNode" = info["parent_node"]
-                _child: Optional["TreeNode"] = info.get("node")  # set by expand()
-                if _child is None:
-                    continue
+                # ------------------------------------------------------------------
+                # Bidirectional alternating MCTS planning
+                # ------------------------------------------------------------------
+                _start_np = start.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
+                _goal_np = goal.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
 
-                # Recompute plan tensor and denoised index range from stored plan_history
-                plan_hist_last: torch.Tensor = info["plan_history"][-1][-1]  # (t*fs, c)
-                plan_unnormalized: torch.Tensor = self._unnormalize_x(
-                    plan_hist_last.unsqueeze(1)
-                )  # (t*fs, 1, c)
+                # Collect opposite tree leaf nodes for dynamic goal selection and plan extraction
+                def _get_leaf_nodes(root_node: "TreeNode") -> List["TreeNode"]:
+                    leaves: List["TreeNode"] = []
+                    stack = [root_node]
+                    while stack:
+                        n = stack.pop()
+                        is_leaf = all(c["node"] is None for c in n._children_nodes)
+                        if is_leaf:
+                            leaves.append(n)
+                        else:
+                            for c in n._children_nodes:
+                                if c["node"] is not None:
+                                    stack.append(c["node"])
+                    return leaves
 
-                seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
-                new_denoised_start: int = parent_node.depth * seg_size * self.frame_stack
-                new_denoised_end: int = (parent_node.depth + 1) * seg_size * self.frame_stack
+                t1_leaf_nodes: List["TreeNode"] = _get_leaf_nodes(bidir_tree1.root_node)
+                t2_leaf_nodes: List["TreeNode"] = _get_leaf_nodes(bidir_tree2.root_node)
 
-                _new_sim_state = self._rollout_leaf_plan(
-                    leaf_plan_unnormalized=plan_unnormalized,
-                    new_denoised_start_idx=new_denoised_start,
-                    new_denoised_end_idx=new_denoised_end,
-                    agent=agent,
-                    envs=envs,
-                    parent_sim_state=parent_node.sim_state,
-                )
-                _child.sim_state = _new_sim_state
-                # Update obs_pos from reached sim_state if possible
-                _child.obs_pos = (
-                    _new_sim_state["qpos"][:2] if _new_sim_state is not None else None
+                # (leaf node lists are passed directly to _run_mcts_search as opposite_leaf_nodes)
+
+                # Initialize infos dicts so {**infos1, **infos2} is safe even on the first step
+
+                # Alternate expansion: one single_step per MPC iteration
+                active_tree, expanded_node_infos = self._run_mcts_search(
+                    bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2,
+                    horizon,
+                    conditions,
+                    _start_np,
+                    _goal_np,
+                    opposite_leaf_nodes=t2_leaf_nodes if expanded_tree_idx == 0 else t1_leaf_nodes,
+                    single_step=True,
                 )
 
                 if self.debug:
                     print(
-                        f"  [DEBUG] Expanded Leaf '{_child.name}' updated with sim_state. Pos: {_child.obs_pos}"
+                        f"[DEBUG] [Step {steps}] Bidir Turn: {'Tree1 (Forward)' if expanded_tree_idx == 0 else 'Tree2 (Backward)'}"
                     )
 
-            # Extract plan by selecting best leaf and combining plans
-            best_info: dict = self._select_best_leaf(expanded_node_infos)
-            best_node: "TreeNode" = best_info["node"]
-            output_plan = self._extract_output_plan(
-                best_node,
-                plan_tokens=active_tree.plan_tokens,
-                is_tree1=(expanded_tree_idx == 0),
-            )
+                # Per-leaf MPC rollout: update obs_pos and sim_state for newly expanded leaves
 
-            plan_hist = output_plan.unsqueeze(0)  # (1, T_combined, 1, c)
-            plan_hist = self._unnormalize_x(plan_hist)
-            plan = plan_hist[-1]  # (T_combined, 1, c)
+                for info in expanded_node_infos.values():
+                    parent_node: "TreeNode" = info["parent_node"]
+                    _child: Optional["TreeNode"] = info.get("node")  # set by expand()
+                    if _child is None:
+                        continue
 
-            # Flip for the next MPC step to alternate trees
-            expanded_tree_idx = (expanded_tree_idx + 1) % 2
+                    # Recompute plan tensor and denoised index range from stored plan_history
+                    plan_hist_last: torch.Tensor = info["plan_history"][-1][-1]  # (t*fs, c)
+                    plan_unnormalized: torch.Tensor = self._unnormalize_x(
+                        plan_hist_last.unsqueeze(1)
+                    )  # (t*fs, 1, c)
 
-            # Visualization with both forward and reverse trajectories
-            start_numpy = start.cpu().numpy()[:, :2]
-            goal_numpy = goal.cpu().numpy()[:, :2]
+                    seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
+                    new_denoised_start: int = parent_node.depth * seg_size * self.frame_stack
+                    new_denoised_end: int = (parent_node.depth + 1) * seg_size * self.frame_stack
 
-            # Create forward trajectory image
-            forward_image = make_trajectory_images(
-                self.env_id,
-                plan[:, :, :2].detach().cpu().numpy(),
-                1,
-                start_numpy,
-                goal_numpy,
-                self.plot_end_points,
-            )[0]
-            self.log_image(
-                f"plan/plan_at_{steps}_from_start", Image.fromarray(forward_image)
-            )
+                    _new_sim_state = self._rollout_leaf_plan(
+                        leaf_plan_unnormalized=plan_unnormalized,
+                        new_denoised_start_idx=new_denoised_start,
+                        new_denoised_end_idx=new_denoised_end,
+                        agent=agent,
+                        envs=envs,
+                        parent_sim_state=parent_node.sim_state,
+                    )
+                    _child.sim_state = _new_sim_state
+                    # Update obs_pos from reached sim_state if possible
+                    _child.obs_pos = (
+                        _new_sim_state["qpos"][:2] if _new_sim_state is not None else None
+                    )
 
-            # Create reverse trajectory image (swap start and goal for visualization)
-            """
-            reverse_image = make_trajectory_images(
-                self.env_id, 
-                reverse_plan[:, :, :2].detach().cpu().numpy(), 
-                1, start_numpy, goal_numpy, 
-                self.plot_end_points
-            )[0]
-            self.log_image(f"plan/plan_at_{steps}_from_goal", Image.fromarray(reverse_image))
-            """
-            planning_end_time = time.time()
-            planning_time.append(planning_end_time - planning_start_time)
+                    if self.debug:
+                        print(
+                            f"  [DEBUG] Expanded Leaf '{_child.name}' updated with sim_state. Pos: {_child.obs_pos}"
+                        )
 
-            # TODO: we don't have to do below process if the output plan is infeasible(unachieved) (break or continue)
+                # Extract plan by selecting best leaf and combining plans
+                best_info: dict = self._select_best_leaf(expanded_node_infos)
+                best_node: "TreeNode" = best_info["node"]
+                output_plan = self._extract_output_plan(
+                    best_node,
+                    plan_tokens=active_tree.plan_tokens,
+                    is_tree1=(expanded_tree_idx == 0),
+                )
 
-            # jumpy case (fill the gap)
-            if self.jump > 1:
-                _plan = []
-                for t in range(plan.shape[0]):
-                    for j in range(self.jump):
-                        _plan.append(plan[t, :, :2])
-                plan = torch.stack(_plan)
+                plan_hist = output_plan.unsqueeze(0)  # (1, T_combined, 1, c)
+                plan_hist = self._unnormalize_x(plan_hist)
+                plan = plan_hist[-1]  # (T_combined, 1, c)
 
-            all_plan_hist.append(plan_hist.cpu())
+                # Flip for the next MPC step to alternate trees
+                expanded_tree_idx = (expanded_tree_idx + 1) % 2
 
-            # Convert plan from token format (T, 1, fs*c) to frame format (T*fs, 1, c) for unified execution
-            # This enables both interact and _rollout_leaf_plan to use the same execution logic
-            # Check if plan has the expected stacked dimension; if not, it's already in frame format
-            if plan.shape[-1] == self.x_stacked_shape[0]:
-                # Plan is in token format (n_tokens, batch, obs_dim*frame_stack), convert to frame format
-                plan_frame_format = rearrange(plan, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
-            else:
-                # Plan is already in frame format or doesn't have stacking; use as-is
-                # This can happen when the diffusion model outputs unstacked observations
-                plan_frame_format = plan
+                # Visualization with both forward and reverse trajectories
+                start_numpy = start.cpu().numpy()[:, :2]
+                goal_numpy = goal.cpu().numpy()[:, :2]
 
-            # Prepare obs for environment execution
-            obs_numpy = obs.detach().cpu().numpy()
-
-            # Use unified plan execution function
-            trajectory_exec, reward_dict = self._execute_plan_in_env(
-                plan_frame_format=plan_frame_format,
-                envs=envs,
-                agent=agent if "antmaze" in self.env_id else None,
-                use_diffused_action=use_diffused_action,
-                return_trajectory=True,
-                return_rewards=True,
-            )
-
-            # Process returned rewards and trajectory
-            if reward_dict is not None:
-                reached = np.logical_or(reached, reward_dict["reached"])
-                episode_reward += reward_dict["episode_reward"]
-                episode_reward_if_stay += reward_dict["episode_reward_if_stay"]
-                first_reach += reward_dict["first_reach"]
-
-                # Check if episode terminated
-                if (reward_dict["reached"] >= 1.0).any():
-                    terminate = True
-
-            # Process trajectory
-            if trajectory_exec is not None:
-                trajectory.extend(trajectory_exec)
-                steps += len(trajectory_exec)
-
-                # Update obs and obs_normalized for next planning iteration (if not terminated)
-                if not terminate and len(trajectory_exec) > 0:
-                    # Get final obs from last trajectory bundle
-                    final_bundle = trajectory_exec[-1]
-                    # Extract obs from bundle (bundle = [obs, action, reward])
-                    obs, _, _ = self.split_bundle(final_bundle)
-                    obs = obs.to(self.device)
-                    obs_normalized = (
-                        (obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]
-                    ).detach()
-        self.log(f"{namespace}/planning_time", np.sum(planning_time))
-        self.log(f"{namespace}/episode_reward", episode_reward.mean())
-        self.log(f"{namespace}/episode_reward_if_stay", episode_reward_if_stay.mean())
-        self.log(f"{namespace}/first_reach", first_reach.mean())
-        self.log(f"{namespace}/success_rate", sum(episode_reward >= 1.0) / batch_size)
-
-        # Visualization
-        # samples = min(16, batch_size)
-        samples = min(32, batch_size)
-        trajectory = torch.stack(trajectory)
-        start = start[:, :2].cpu().numpy().tolist()
-        goal = goal[:, :2].cpu().numpy().tolist()
-        images = make_trajectory_images(
-            self.env_id, trajectory, samples, start, goal, self.plot_end_points
-        )
-
-        for i, img in enumerate(images):
-            self.log_image(
-                f"{namespace}_interaction/sample_{i}",
-                Image.fromarray(img),
-            )
-
-        if self.debug:
-            samples = min(16, batch_size)
-            indicies = list(range(samples))
-
-            for i in indicies:
-                filename = make_convergence_animation(
+                # Create forward trajectory image
+                forward_image = make_trajectory_images(
                     self.env_id,
-                    all_plan_hist,
-                    trajectory,
-                    start,
-                    goal,
-                    self.open_loop_horizon,
-                    namespace=namespace,
-                    batch_idx=i,
-                )
-                self.logger.experiment.log(
-                    {
-                        f"convergence/{namespace}_{i}": wandb.Video(filename, fps=4),
-                        f"trainer/global_step": self.global_step,
-                    }
+                    plan[:, :, :2].detach().cpu().numpy(),
+                    1,
+                    start_numpy,
+                    goal_numpy,
+                    self.plot_end_points,
+                )[0]
+                self.log_image(
+                    f"plan/plan_at_{steps}_from_start", Image.fromarray(forward_image)
                 )
 
-                filename = make_mpc_animation(
-                    self.env_id,
-                    all_plan_hist,
-                    trajectory,
-                    start,
-                    goal,
-                    self.open_loop_horizon,
-                    namespace=namespace,
-                    batch_idx=i,
+                # Create reverse trajectory image (swap start and goal for visualization)
+                """
+                reverse_image = make_trajectory_images(
+                    self.env_id, 
+                    reverse_plan[:, :, :2].detach().cpu().numpy(), 
+                    1, start_numpy, goal_numpy, 
+                    self.plot_end_points
+                )[0]
+                self.log_image(f"plan/plan_at_{steps}_from_goal", Image.fromarray(reverse_image))
+                """
+                planning_end_time = time.time()
+                planning_time.append(planning_end_time - planning_start_time)
+
+                # TODO: we don't have to do below process if the output plan is infeasible(unachieved) (break or continue)
+
+                # jumpy case (fill the gap)
+                if self.jump > 1:
+                    _plan = []
+                    for t in range(plan.shape[0]):
+                        for j in range(self.jump):
+                            _plan.append(plan[t, :, :2])
+                    plan = torch.stack(_plan)
+
+                all_plan_hist.append(plan_hist.cpu())
+
+                # Convert plan from token format (T, 1, fs*c) to frame format (T*fs, 1, c) for unified execution
+                # This enables both interact and _rollout_leaf_plan to use the same execution logic
+                # Check if plan has the expected stacked dimension; if not, it's already in frame format
+                if plan.shape[-1] == self.x_stacked_shape[0]:
+                    # Plan is in token format (n_tokens, batch, obs_dim*frame_stack), convert to frame format
+                    plan_frame_format = rearrange(plan, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
+                else:
+                    # Plan is already in frame format or doesn't have stacking; use as-is
+                    # This can happen when the diffusion model outputs unstacked observations
+                    plan_frame_format = plan
+
+                # Prepare obs for environment execution
+                obs_numpy = obs.detach().cpu().numpy()
+
+                # Use unified plan execution function
+                trajectory_exec, reward_dict = self._execute_plan_in_env(
+                    plan_frame_format=plan_frame_format,
+                    envs=envs,
+                    agent=agent if "antmaze" in self.env_id else None,
+                    use_diffused_action=use_diffused_action,
+                    return_trajectory=True,
+                    return_rewards=True,
                 )
-                self.logger.experiment.log(
-                    {
-                        f"mpc/{namespace}_{i}": wandb.Video(filename, fps=24),
-                        f"trainer/global_step": self.global_step,
-                    }
+
+                # Process returned rewards and trajectory
+                if reward_dict is not None:
+                    reached = np.logical_or(reached, reward_dict["reached"])
+                    episode_reward += reward_dict["episode_reward"]
+                    episode_reward_if_stay += reward_dict["episode_reward_if_stay"]
+                    first_reach += reward_dict["first_reach"]
+
+                    # Check if episode terminated
+                    if (reward_dict["reached"] >= 1.0).any():
+                        terminate = True
+
+                # Process trajectory
+                if trajectory_exec is not None:
+                    trajectory.extend(trajectory_exec)
+                    steps += len(trajectory_exec)
+
+                    # Update obs and obs_normalized for next planning iteration (if not terminated)
+                    if not terminate and len(trajectory_exec) > 0:
+                        # Get final obs from last trajectory bundle
+                        final_bundle = trajectory_exec[-1]
+                        # Extract obs from bundle (bundle = [obs, action, reward])
+                        obs, _, _ = self.split_bundle(final_bundle)
+                        obs = obs.to(self.device)
+                        obs_normalized = (
+                            (obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]
+                        ).detach()
+            self.log(f"{namespace}/planning_time", np.sum(planning_time))
+            self.log(f"{namespace}/episode_reward", episode_reward.mean())
+            self.log(f"{namespace}/episode_reward_if_stay", episode_reward_if_stay.mean())
+            self.log(f"{namespace}/first_reach", first_reach.mean())
+            self.log(f"{namespace}/success_rate", sum(episode_reward >= 1.0) / batch_size)
+
+            # Visualization
+            # samples = min(16, batch_size)
+            samples = min(32, batch_size)
+            trajectory = torch.stack(trajectory)
+            start = start[:, :2].cpu().numpy().tolist()
+            goal = goal[:, :2].cpu().numpy().tolist()
+            images = make_trajectory_images(
+                self.env_id, trajectory, samples, start, goal, self.plot_end_points
+            )
+
+            for i, img in enumerate(images):
+                self.log_image(
+                    f"{namespace}_interaction/sample_{i}",
+                    Image.fromarray(img),
                 )
+
+            if self.debug:
+                samples = min(16, batch_size)
+                indicies = list(range(samples))
+
+                for i in indicies:
+                    filename = make_convergence_animation(
+                        self.env_id,
+                        all_plan_hist,
+                        trajectory,
+                        start,
+                        goal,
+                        self.open_loop_horizon,
+                        namespace=namespace,
+                        batch_idx=i,
+                    )
+                    self.logger.experiment.log(
+                        {
+                            f"convergence/{namespace}_{i}": wandb.Video(filename, fps=4),
+                            f"trainer/global_step": self.global_step,
+                        }
+                    )
+
+                    filename = make_mpc_animation(
+                        self.env_id,
+                        all_plan_hist,
+                        trajectory,
+                        start,
+                        goal,
+                        self.open_loop_horizon,
+                        namespace=namespace,
+                        batch_idx=i,
+                    )
+                    self.logger.experiment.log(
+                        {
+                            f"mpc/{namespace}_{i}": wandb.Video(filename, fps=24),
+                            f"trainer/global_step": self.global_step,
+                        }
+                    )
 
     def pad_init(self, x, is_start=True, batch_first=False):
         x = repeat(x, "b ... -> fs b ...", fs=self.frame_stack).clone()
@@ -1772,6 +1916,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # Holds the expanded node infos from the latest iteration (reset each iteration)
         expanded_node_infos: dict = {}
+        
+        # [MEMORY DEBUG] Log tree search start
+        if self.profiler:
+            self.profiler.snapshot(
+                f"mcts_search_start_{tree.tag}",
+                phase=f"tree_search_init({tree.tag})"
+            )
 
         # [LOGGING] Record search start
         from utils.tracer import get_tracer
@@ -1842,6 +1993,18 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     step=tree.search_num,
                     depth=1,
                 )
+
+            # [MEMORY DEBUG] Periodic memory logging
+            if self.profiler and (tree.search_num > 0) and (tree.search_num % self.debug_log_interval == 0):
+                self.profiler.snapshot(
+                    f"mcts_search_iter_{tree.search_num}_{tree.tag}",
+                    phase=f"mcts_iter_{tree.search_num}"
+                )
+
+            if self.debug_log_level >= 2:
+                import sys
+                print(f"[DEBUG] MCTS search {tree.tag}: iteration {tree.search_num}/{tree.max_search_num}", 
+                      file=sys.stderr, flush=True)
 
             ###############################
             # Selection
@@ -3301,6 +3464,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         )
 
         return output_plan
+    
+    def _print_memory_report(self) -> None:
+        """Print memory usage report if profiler is enabled."""
+        if self.profiler:
+            import sys
+            report = self.profiler.report()
+            print(report, file=sys.stderr, flush=True)
 
     def _get_sim_state(self, envs: Any) -> Optional[dict]:
         """Extract current qpos/qvel from envs (DummyVecEnv)."""
@@ -3325,3 +3495,43 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         except Exception as e:
             if self.debug:
                 print(f"  [DEBUG] Failed to set sim_state: {e}")
+
+# ============================================================================
+# MEMORY MONITORING HELPER FUNCTIONS
+# ============================================================================
+
+def log_memory_stats(tracer, tag_prefix: str, step: Optional[int] = None):
+    """Log current GPU and system memory statistics."""
+    if tracer is None:
+        return
+    
+    try:
+        import torch
+        import psutil
+        
+        data = {}
+        
+        # GPU memory stats
+        if torch.cuda.is_available():
+            data["gpu_allocated_mb"] = torch.cuda.memory_allocated() / 1e6
+            data["gpu_reserved_mb"] = torch.cuda.memory_reserved() / 1e6
+            data["gpu_max_allocated_mb"] = torch.cuda.max_memory_allocated() / 1e6
+        
+        # System memory stats
+        try:
+            mem = psutil.virtual_memory()
+            data["system_memory_used_pct"] = mem.percent
+            data["system_memory_used_gb"] = mem.used / 1e9
+            data["system_memory_available_gb"] = mem.available / 1e9
+        except:
+            pass
+        
+        tracer.log(
+            f"{tag_prefix}.memory_stats",
+            data,
+            step=step,
+            depth=1
+        )
+    except Exception as e:
+        pass
+

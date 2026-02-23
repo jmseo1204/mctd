@@ -10,6 +10,7 @@ import json
 import time
 import signal
 import atexit
+import logging
 import traceback
 import contextlib
 from datetime import datetime
@@ -20,33 +21,24 @@ from typing import Any, Optional, Dict
 SLP_VERSION = "1.0"
 
 # ── DEBUG_MODE 전역 플래그 ────────────────────────────────────────────────────
-# 환경변수 또는 코드에서 설정 가능
 DEBUG_MODE: bool = os.environ.get("DEBUG_MODE", "1").strip() == "1"
 
 
 class _NullScope:
     """DEBUG_MODE=False 시 완전한 no-op context manager."""
     def __enter__(self): return self
-    def __exit__(self, *_args): pass  # Context manager protocol
-    def log(self, *_args, **_kwargs): pass
+    def __exit__(self, *args): pass
+    def log(self, *args, **kwargs): pass
 
 
 class Tracer:
-    """
-    실험 run 단위 Stateful Logger.
-
-    사용법:
-        tracer = Tracer(run_id="my_exp", purpose="loss_nan_diagnosis")
-        with tracer:
-            with tracer.scope("train_loop", phase="train"):
-                tracer.log("loss.train.total", {"value": loss.item()}, step=step)
-    """
+    """실험 run 단위 Stateful Logger."""
 
     def __init__(
         self,
         run_id: Optional[str] = None,
         purpose: str = "general_monitoring",
-        log_dir: str = "logs",
+        log_dir: str = "logs_memory_debug",
         debug_mode: Optional[bool] = None,
         extra_meta: Optional[Dict[str, Any]] = None,
     ):
@@ -57,12 +49,10 @@ class Tracer:
         self.extra_meta = extra_meta or {}
 
         self._log_path: Optional[Path] = None
-        self._fh: Optional[Any] = None  # file handle
+        self._fh: Optional[Any] = None
         self._current_phase: str = "init"
         self._current_group: str = ""
         self._active: bool = False
-
-    # ── 생명주기 ──────────────────────────────────────────────────────────────
 
     def __enter__(self):
         if not self.debug_mode:
@@ -70,29 +60,27 @@ class Tracer:
         self._setup()
         return self
 
-    def __exit__(self, exc_type, exc_val, _exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         if not self.debug_mode:
             return False
         if exc_type is not None:
-            self.log_exception(exc_type, exc_val, _exc_tb)
+            self.log_exception(exc_type, exc_val, exc_tb)
         self._flush_and_close()
-        return False  # 예외를 억제하지 않음
+        return False
 
     def _setup(self):
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._log_path = self.log_dir / f"{self.run_id}.jsonl"
-        self._fh = open(self._log_path, "a", buffering=1)  # line-buffered
+        self._fh = open(self._log_path, "a", buffering=1)
         self._active = True
 
-        # atexit + signal 등록: 비정상 종료 시에도 flush 보장
         atexit.register(self._flush_and_close)
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
                 signal.signal(sig, self._signal_handler)
             except (OSError, ValueError):
-                pass  # non-main thread 등 signal 설정 불가 환경 무시
+                pass
 
-        # run 시작 메타데이터 기록
         self._write({
             "ts": time.time(),
             "level": "INFO",
@@ -113,7 +101,6 @@ class Tracer:
 
     def _signal_handler(self, signum, frame):
         self._flush_and_close()
-        # 기본 핸들러 복원 후 재발생
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
 
@@ -135,20 +122,8 @@ class Tracer:
             self._fh.close()
             self._active = False
 
-    # ── scope context manager ─────────────────────────────────────────────────
-
     @contextlib.contextmanager
     def scope(self, group: str, phase: Optional[str] = None, depth: int = 0):
-        """
-        같은 디버깅 목적의 로그를 묶는 scope.
-
-        Args:
-            group: 로그 그룹명 (예: "optimizer", "data_pipeline")
-            phase: 실험 단계 (예: "train", "eval"). None이면 현재 phase 유지
-            depth: 0=coarse(INFO), 1+=fine(DEBUG)
-
-        DEBUG_MODE=False 시 완전한 no-op.
-        """
         if not self.debug_mode:
             yield _NullScope()
             return
@@ -164,8 +139,6 @@ class Tracer:
             self._current_group = prev_group
             self._current_phase = prev_phase
 
-    # ── 로깅 메서드 ──────────────────────────────────────────────────────────
-
     def log(
         self,
         tag: str,
@@ -174,16 +147,6 @@ class Tracer:
         depth: int = 0,
         source: Optional[str] = None,
     ):
-        """
-        구조화된 레코드를 jsonl에 기록.
-
-        Args:
-            tag: 점(dot) 계층 구조의 고유 식별자 (예: "loss.train.total")
-            data: 기록할 값 딕셔너리
-            step: 현재 iteration/epoch
-            depth: 0=coarse(INFO), 1+=fine(DEBUG)
-            source: "파일명:라인번호" 문자열 (None이면 자동 추론)
-        """
         if not self.debug_mode:
             return
 
@@ -214,7 +177,6 @@ class Tracer:
         self._write(record)
 
     def log_exception(self, exc_type, exc_val, exc_tb):
-        """예외 발생 시 ERROR 레벨로 기록."""
         if not self.debug_mode:
             return
         tb_str = "".join(traceback.format_exception(exc_type, exc_val, exc_tb))
@@ -236,93 +198,44 @@ class Tracer:
             "purpose": self.purpose,
         })
 
-    def log_tensor_stats(
-        self,
-        tag: str,
-        tensor,
-        step: Optional[int] = None,
-        depth: int = 1,
-        label: Optional[str] = None,
-    ):
-        """
-        텐서 통계를 fine 레벨로 기록.
-        PyTorch tensor를 가정하나, numpy array도 처리.
-
-        분해-재조립 무결성: 텐서를 detach/cpu 복사본에서만 통계 추출.
-        원본 tensor는 절대 변경하지 않는다.
-        """
+    def log_tensor_stats(self, tag: str, tensor, step: Optional[int] = None, depth: int = 1, label: Optional[str] = None):
         if not self.debug_mode:
             return
-
         try:
-            # numpy 또는 torch tensor 모두 처리
-            try:
-                import torch
-                if isinstance(tensor, torch.Tensor):
-                    t = tensor.detach().float()
-                    data = {
-                        "shape": list(t.shape),
-                        "dtype": str(tensor.dtype),
-                        "mean": float(t.mean()) if t.numel() > 0 else None,
-                        "std": float(t.std()) if t.numel() > 1 else None,
-                        "min": float(t.min()) if t.numel() > 0 else None,
-                        "max": float(t.max()) if t.numel() > 0 else None,
-                        "nan_count": int(torch.isnan(t).sum()),
-                        "inf_count": int(torch.isinf(t).sum()),
-                        "norm": float(t.norm()) if t.numel() > 0 else None,
-                    }
-                    if label:
-                        data["label"] = label
-                    self.log(tag, data, step=step, depth=depth)
-                    return
-            except ImportError:
-                pass
-
-            import numpy as np
-            arr = np.asarray(tensor).astype(float)
-            data = {
-                "shape": list(arr.shape),
-                "dtype": str(tensor.dtype) if hasattr(tensor, "dtype") else str(arr.dtype),
-                "mean": float(np.mean(arr)) if arr.size > 0 else None,
-                "std": float(np.std(arr)) if arr.size > 1 else None,
-                "min": float(np.min(arr)) if arr.size > 0 else None,
-                "max": float(np.max(arr)) if arr.size > 0 else None,
-                "nan_count": int(np.isnan(arr).sum()),
-                "inf_count": int(np.isinf(arr).sum()),
-                "norm": float(np.linalg.norm(arr)) if arr.size > 0 else None,
-            }
-            if label:
-                data["label"] = label
-            self.log(tag, data, step=step, depth=depth)
-
-        except Exception as e:
-            self.log(
-                f"{tag}.stats_error",
-                {"error": str(e)},
-                step=step,
-                depth=depth,
-            )
-
-    # ── 내부 write ────────────────────────────────────────────────────────────
+            import torch
+            if isinstance(tensor, torch.Tensor):
+                t = tensor.detach().float()
+                data = {
+                    "shape": list(t.shape),
+                    "dtype": str(tensor.dtype),
+                    "mean": float(t.mean()) if t.numel() > 0 else None,
+                    "std": float(t.std()) if t.numel() > 1 else None,
+                    "min": float(t.min()) if t.numel() > 0 else None,
+                    "max": float(t.max()) if t.numel() > 0 else None,
+                    "nan_count": int(torch.isnan(t).sum()),
+                    "inf_count": int(torch.isinf(t).sum()),
+                    "norm": float(t.norm()) if t.numel() > 0 else None,
+                }
+                if label:
+                    data["label"] = label
+                self.log(tag, data, step=step, depth=depth)
+                return
+        except ImportError:
+            pass
 
     def _write(self, record: Dict[str, Any]):
         if self._fh and not self._fh.closed:
             try:
                 self._fh.write(json.dumps(record, default=str) + "\n")
             except Exception:
-                pass  # write 실패가 실험을 중단시켜서는 안 됨
+                pass
 
 
-# ── 편의 함수: 모듈 수준 기본 tracer ─────────────────────────────────────────
 _default_tracer: Optional[Tracer] = None
 
-
 def get_tracer() -> Optional[Tracer]:
-    """모듈 수준의 기본 tracer를 반환. 없으면 None."""
     return _default_tracer
 
-
 def set_default_tracer(tracer: Tracer):
-    """모듈 수준의 기본 tracer 설정."""
     global _default_tracer
     _default_tracer = tracer
