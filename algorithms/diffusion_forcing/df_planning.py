@@ -3090,6 +3090,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             action_np = action.detach().cpu().numpy()
             obs_numpy, reward, done, _ = envs.step(np.nan_to_num(action_np))
 
+            # Ensure obs_numpy is 2D: (batch_size, obs_dim)
+            if obs_numpy.ndim == 1:
+                obs_numpy = obs_numpy[None, :]  # Add batch dimension
+
             # Track rewards if requested
             if return_rewards:
                 reached = np.logical_or(reached, reward >= 1.0)
