@@ -1077,6 +1077,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 depth=0
             )
 
+            # [MEMORY] Log initial GPU state
+            log_memory_stats(tracer, "interact.init", step=0)
+
             use_diffused_action = False
 
             # [ENV CACHING] Check if environment is cached and batch_size matches
@@ -1178,6 +1181,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 # Cache the environment
                 self._cached_envs = envs
                 self._cached_env_key = env_cache_key
+
+                # [MEMORY] Log after environment creation
+                log_memory_stats(tracer, "interact.envs_created", step=0)
+
                 if self.debug_log_level >= 1:
                     import sys
                     print(
@@ -1395,6 +1402,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 plan_hist = self._unnormalize_x(plan_hist)
                 plan = plan_hist[-1]  # (T_combined, 1, c)
 
+                # [MEMORY] Log after plan extraction
+                log_memory_stats(tracer, f"interact.plan_extracted", step=steps)
+
                 # Flip for the next MPC step to alternate trees
                 expanded_tree_idx = (expanded_tree_idx + 1) % 2
 
@@ -1451,6 +1461,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     # This can happen when the diffusion model outputs unstacked observations
                     plan_frame_format = plan
 
+                # [MEMORY] Log before plan execution
+                log_memory_stats(tracer, f"interact.before_plan_exec", step=steps)
+
                 # Prepare obs for environment execution
                 obs_numpy = obs.detach().cpu().numpy()
 
@@ -1474,6 +1487,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     # Check if episode terminated
                     if (reward_dict["reached"] >= 1.0).any():
                         terminate = True
+
+                # [MEMORY] Log after plan execution
+                log_memory_stats(tracer, f"interact.after_plan_exec", step=steps)
 
                 # Process trajectory
                 if trajectory_exec is not None:
