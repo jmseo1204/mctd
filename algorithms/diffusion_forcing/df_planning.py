@@ -2325,10 +2325,35 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             # ------------------------------------------------------------------
             # Dynamic Start & Goal Selection for each expansion candidate
             # ------------------------------------------------------------------
+            # Filter out nodes with uninitialized obs_pos
+            valid_candidates = []
+            for info in expanded_node_candidates:
+                if info["parent_node"].obs_pos is not None:
+                    valid_candidates.append(info)
+                elif self.debug_log_level >= 1:
+                    import sys
+                    print(
+                        f"[WARN] Parent node '{info['parent_node'].name}' has no obs_pos. Skipping.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+            # If no valid candidates (all had None obs_pos), skip diffusion and continue
+            if not valid_candidates:
+                if self.debug_log_level >= 1:
+                    import sys
+                    print(
+                        f"[WARN] No valid expansion candidates (all nodes missing obs_pos). "
+                        f"Skipping expansion round.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                break  # Exit search loop
+
             eff_obs_norm_list, eff_goal_norm_list = [], []
             eff_start_np_list, eff_goal_np_list = [], []
 
-            for info in expanded_node_candidates:
+            for info in valid_candidates:
                 parent_node = info["parent_node"]
                 parent_obs_pos = parent_node.obs_pos
 
@@ -2373,10 +2398,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             effective_goals_np = np.concatenate(eff_goal_np_list, axis=0)  # (B, D)
 
             filtered_expanded_node_plan_hists = [None] * len(
-                expanded_node_candidates
+                valid_candidates
             )  # the elements can be left as None is every states are at the same point
             filtered_value_estimation_plan_hists = [None] * len(
-                expanded_node_candidates
+                valid_candidates
             )
 
             assert tree.plan_tokens % self.sequence_dividing_factor == 0, (
