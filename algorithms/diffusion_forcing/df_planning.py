@@ -1350,7 +1350,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     _start_np,
                     _goal_np,
                     opposite_leaf_nodes=t2_leaf_nodes if expanded_tree_idx == 0 else t1_leaf_nodes,
-                    single_step=True,
+                    single_step=False,  # Allow multiple iterations to reach terminal_depth
                 )
 
                 if self.debug:
@@ -1397,6 +1397,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
                 # Extract plan by selecting best leaf and combining plans
                 best_info: dict = self._select_best_leaf(expanded_node_infos)
+
+                # If no valid node was expanded (e.g., tree fully explored), skip this planning iteration
+                if best_info is None:
+                    if self.debug_log_level >= 1:
+                        import sys
+                        print(
+                            f"[WARN] No expandable nodes found at tree depth {active_tree.max_depth}. "
+                            f"Tree fully explored. Skipping plan extraction.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    # Use the previous plan if available, or continue without new plan
+                    continue
+
                 best_node: "TreeNode" = best_info["node"]
                 output_plan = self._extract_output_plan(
                     best_node,
@@ -3315,8 +3329,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             expanded_node_infos: Dict[name -> info_dict] as returned by _run_mcts_search.
 
         Returns:
-            The info dict with the highest value.
+            The info dict with the highest value, or None if expanded_node_infos is empty.
         """
+        if not expanded_node_infos:
+            # No nodes were expanded (e.g., tree reached terminal_depth with no selectable nodes)
+            # Return None to signal that no valid plan was found
+            return None
+
         return max(
             expanded_node_infos.values(),
             key=lambda info: info["value"]
