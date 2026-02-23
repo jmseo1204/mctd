@@ -3036,7 +3036,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             - reward_dict: Dict with keys 'reached', 'episode_reward', etc., or None if return_rewards=False
         """
         trajectory = [] if return_trajectory else None
-        obs_numpy = envs.reset()[0]  # (1, obs_size)
+        obs_reset = envs.reset()
+        # Handle both DummyVecEnv (returns (obs, info)) and single env (returns obs)
+        obs_numpy = obs_reset[0] if isinstance(obs_reset, tuple) else obs_reset
+        # Ensure obs_numpy is 2D: (batch_size, obs_dim)
+        if obs_numpy.ndim == 1:
+            obs_numpy = obs_numpy[None, :]  # Add batch dimension: (obs_dim,) → (1, obs_dim)
 
         # Initialize reward tracking
         batch_size = obs_numpy.shape[0]
