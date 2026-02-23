@@ -41,7 +41,7 @@ parallel_multiple_visits: False
 sub_goal_interval: 10
 
 pyramid: True
-mctd_num_denoising_steps: 100 # 90 for pyramid, matrix H = self.sampling_timesteps + uncertainty_scale * (horizon/frame_stack) = 90
+mctd_num_denoising_steps: 50 # Reduced from 100 to 50 for memory optimization (50% less GPU memory for diffusion inference)
 parallel_search_num: 2
 mctd_max_search_num: 70
 mctd_guidance_scales: [0.0]

@@ -1080,6 +1080,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             # [MEMORY] Log initial GPU state
             log_memory_stats(tracer, "interact.init", step=0)
 
+            # [MEMORY CLEANUP] Clear caches before interaction
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             use_diffused_action = False
 
             # [ENV CACHING] Check if environment is cached and batch_size matches
@@ -1491,6 +1497,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 # [MEMORY] Log after plan execution
                 log_memory_stats(tracer, f"interact.after_plan_exec", step=steps)
 
+                # [MEMORY CLEANUP] Clear caches after plan execution
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
                 # Process trajectory
                 if trajectory_exec is not None:
                     trajectory.extend(trajectory_exec)
@@ -1582,10 +1593,36 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         return x
 
     def split_bundle(self, bundle):
-        if self.use_reward:
-            return torch.split(bundle, [self.observation_dim, self.action_dim, 1], -1)
+        """
+        Split bundle into [obs, action, reward?] components.
+
+        Handles both token-format obs (stacked with frame_stack) and non-stacked obs.
+        Automatically detects which format based on bundle size.
+        """
+        # Determine obs dimension: either self.observation_dim or self.x_stacked_shape[0]
+        bundle_size = bundle.shape[-1]
+
+        # Check if bundle contains frame-stacked obs (larger dimension)
+        if bundle_size == self.x_stacked_shape[0] + self.action_dim + (1 if self.use_reward else 0):
+            # Frame-stacked obs format: (batch, x_stacked_shape[0] + action_dim + reward?)
+            obs_dim = self.x_stacked_shape[0]
+        elif bundle_size == self.observation_dim + self.action_dim + (1 if self.use_reward else 0):
+            # Non-stacked obs format: (batch, observation_dim + action_dim + reward?)
+            obs_dim = self.observation_dim
         else:
-            o, a = torch.split(bundle, [self.observation_dim, self.action_dim], -1)
+            # Fallback: try to infer from bundle_size
+            # Assume: bundle_size = obs_dim + action_dim + (1 if reward else 0)
+            remainder = bundle_size - self.action_dim - (1 if self.use_reward else 0)
+            if remainder > 0:
+                obs_dim = remainder
+            else:
+                # Last resort: use x_stacked_shape[0]
+                obs_dim = self.x_stacked_shape[0]
+
+        if self.use_reward:
+            return torch.split(bundle, [obs_dim, self.action_dim, 1], -1)
+        else:
+            o, a = torch.split(bundle, [obs_dim, self.action_dim], -1)
             return o, a, None
 
     def make_bundle(
