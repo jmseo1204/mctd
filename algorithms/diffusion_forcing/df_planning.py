@@ -1122,6 +1122,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         _bidir_goal_np = goal.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
         # Capture initial physical state if available
         initial_sim_state = self._get_sim_state(envs)
+        assert initial_sim_state is not None, "Failed to capture initial sim state"
+        assert np.allclose(initial_sim_state["qpos"][:2], _bidir_start_np[0][:2], atol=1e-5), \
+            f"Physical start position {initial_sim_state['qpos'][:2]} does not match observation start position {_bidir_start_np[0][:2]}"
 
         # Derive heuristic goal simulation state from initial state
         goal_sim_state = {
@@ -1293,71 +1296,49 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             all_plan_hist.append(plan_hist.cpu())
 
+            # Convert plan from token format (T, 1, fs*c) to frame format (T*fs, 1, c) for unified execution
+            # This enables both interact and _rollout_leaf_plan to use the same execution logic
+            plan_frame_format = rearrange(plan, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
+
+            # Prepare obs for environment execution
             obs_numpy = obs.detach().cpu().numpy()
-            if "antmaze" in self.env_id:
-                # sub_goal = plan[self.open_loop_horizon - 1, :, :2].detach().cpu().numpy()
-                sub_goal_idx = min(self.sub_goal_interval, plan.shape[0] - 1)
-                sub_goal = plan[sub_goal_idx, :, :2].detach().cpu().numpy()
-                sub_goal_step = sub_goal_idx
 
-            for t in range(self.open_loop_horizon):
-                if use_diffused_action:
-                    _, action, _ = self.split_bundle(plan[t])
-                else:
-                    if "antmaze" in self.env_id:
-                        if np.linalg.norm(obs_numpy[0, :2] - sub_goal[0]) < 1.0:
-                            if sub_goal_step < plan.shape[0] - self.sub_goal_interval:
-                                print(f"sub_goal_step {sub_goal_step} achieved...")
-                                sub_goal_step += self.sub_goal_interval
-                                sub_goal = (
-                                    plan[sub_goal_step, :, :2].detach().cpu().numpy()
-                                )
-                            else:
-                                sub_goal = plan[-1, :, :2].detach().cpu().numpy()
-                        assert obs_numpy.shape[0] == 1, (
-                            f"Batch size must be 1 for AntMaze, got {obs_numpy.shape[0]}"
-                        )
-                        action = agent.sample_action(obs_numpy, sub_goal)
-                        action = torch.from_numpy(action).float().reshape(1, -1)
-                    else:
-                        if t == 0:
-                            plan_vel = plan[t, :, :2] - obs[:, :2]
-                        else:
-                            if t < plan.shape[0]:
-                                plan_vel = plan[t, :, :2] - plan[t - 1, :, :2]
-                            else:
-                                plan_vel = 0
-                        if t < plan.shape[0]:
-                            action = 12.5 * (plan[t, :, :2] - obs[:, :2]) + 1.2 * (
-                                plan_vel - obs[:, 2:]
-                            )
-                        else:
-                            action = 12.5 * (plan[-1, :, :2] - obs[:, :2]) + 1.2 * (
-                                plan_vel - obs[:, 2:]
-                            )
-                action = torch.clip(action, -1, 1).detach().cpu()
-                obs_numpy, reward, done, _ = envs.step(np.nan_to_num(action.numpy()))
+            # Use unified plan execution function
+            trajectory_exec, reward_dict = self._execute_plan_in_env(
+                plan_frame_format=plan_frame_format,
+                envs=envs,
+                agent=agent if "antmaze" in self.env_id else None,
+                use_diffused_action=use_diffused_action,
+                return_trajectory=True,
+                return_rewards=True,
+            )
 
-                reached = np.logical_or(reached, reward >= 1.0)
-                episode_reward += reward
-                episode_reward_if_stay += np.where(~reached, reward, 1)
-                first_reach += ~reached
+            # Process returned rewards and trajectory
+            if reward_dict is not None:
+                reached = np.logical_or(reached, reward_dict["reached"])
+                episode_reward += reward_dict["episode_reward"]
+                episode_reward_if_stay += reward_dict["episode_reward_if_stay"]
+                first_reach += reward_dict["first_reach"]
 
-                if done.any():
+                # Check if episode terminated
+                if (reward_dict["reached"] >= 1.0).any():
                     terminate = True
-                    break
 
-                obs, reward, done = [
-                    torch.from_numpy(item).float() for item in [obs_numpy, reward, done]
-                ]
-                bundle = self.make_bundle(obs, action, reward[..., None])
-                trajectory.append(bundle)
-                obs = obs.to(self.device)
-                obs_normalized = (
-                    (obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]
-                ).detach()
+            # Process trajectory
+            if trajectory_exec is not None:
+                trajectory.extend(trajectory_exec)
+                steps += len(trajectory_exec)
 
-                steps += 1
+                # Update obs and obs_normalized for next planning iteration (if not terminated)
+                if not terminate and len(trajectory_exec) > 0:
+                    # Get final obs from last trajectory bundle
+                    final_bundle = trajectory_exec[-1]
+                    # Extract obs from bundle (bundle = [obs, action, reward])
+                    obs, _, _ = self.split_bundle(final_bundle)
+                    obs = obs.to(self.device)
+                    obs_normalized = (
+                        (obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]
+                    ).detach()
         self.log(f"{namespace}/planning_time", np.sum(planning_time))
         self.log(f"{namespace}/episode_reward", episode_reward.mean())
         self.log(f"{namespace}/episode_reward_if_stay", episode_reward_if_stay.mean())
@@ -2854,6 +2835,172 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             )
         return best_node
 
+    def _execute_plan_in_env(
+        self,
+        plan_frame_format: torch.Tensor,  # (T*fs, 1, c) - frame format
+        envs: Any,
+        agent: Optional[Any] = None,
+        use_diffused_action: bool = False,
+        return_trajectory: bool = False,
+        return_rewards: bool = False,
+    ) -> tuple[Optional[List[torch.Tensor]], Optional[dict]]:
+        """
+        Execute a plan segment in environment with unified action computation.
+
+        Handles both antmaze and pointmaze with:
+        - Sub-goal interval updates for antmaze
+        - PID controller for pointmaze
+        - Optional trajectory and reward collection
+
+        Args:
+            plan_frame_format: Plan in frame format, shape (T*fs, 1, c)
+            envs: Vectorized environment
+            agent: RL agent for antmaze (None for pointmaze)
+            use_diffused_action: If True, use action directly from diffusion
+            return_trajectory: If True, collect trajectory bundles
+            return_rewards: If True, track reward statistics
+
+        Returns:
+            (trajectory_list or None, reward_dict or None)
+            - trajectory_list: List of trajectory bundles, or None if return_trajectory=False
+            - reward_dict: Dict with keys 'reached', 'episode_reward', etc., or None if return_rewards=False
+        """
+        trajectory = [] if return_trajectory else None
+        obs_numpy = envs.reset()[0]  # (1, obs_size)
+
+        # Initialize reward tracking
+        batch_size = obs_numpy.shape[0]
+        reached = np.zeros(batch_size, dtype=bool) if return_rewards else None
+        episode_reward = np.zeros(batch_size) if return_rewards else None
+        episode_reward_if_stay = np.zeros(batch_size) if return_rewards else None
+        first_reach = np.zeros(batch_size) if return_rewards else None
+
+        # Initialize sub_goal for antmaze
+        plan_slice_np = None
+        sub_goal = None
+        sub_goal_step = None
+        if "antmaze" in self.env_id:
+            plan_slice_np = plan_frame_format[:, 0, :].detach().cpu().numpy()  # (T*fs, c)
+            sub_goal_idx = min(self.sub_goal_interval, plan_frame_format.shape[0] - 1)
+            sub_goal = plan_slice_np[sub_goal_idx, :2]
+            sub_goal_step = sub_goal_idx
+
+        # Execute plan: iterate over frame indices, but step every frame_stack
+        plan_prev_frame = None
+        for t_token_idx, t_frame in enumerate(range(0, plan_frame_format.shape[0], self.frame_stack)):
+            # Extract frame for action computation
+            plan_frame = plan_frame_format[t_frame : t_frame + 1, :, :]  # (1, 1, c)
+            plan_frame = plan_frame.squeeze(1)  # (1, c)
+
+            # Update sub_goal for antmaze (with interval logic)
+            if "antmaze" in self.env_id:
+                if np.linalg.norm(obs_numpy[0, :2] - sub_goal[0]) < 1.0:
+                    if sub_goal_step < plan_frame_format.shape[0] - self.sub_goal_interval:
+                        sub_goal_step += self.sub_goal_interval
+                        sub_goal = plan_slice_np[sub_goal_step, :2]
+                    else:
+                        sub_goal = plan_slice_np[-1, :2]
+
+            # Compute action using unified function
+            action = self._compute_action_from_plan(
+                obs_numpy=obs_numpy,
+                plan_frame=plan_frame,
+                plan_prev_frame=plan_prev_frame,
+                agent=agent,
+                sub_goal=sub_goal,
+                use_diffused_action=use_diffused_action,
+            )
+
+            # Execute action in environment
+            action_np = action.detach().cpu().numpy()
+            obs_numpy, reward, done, _ = envs.step(np.nan_to_num(action_np))
+
+            # Track rewards if requested
+            if return_rewards:
+                reached = np.logical_or(reached, reward >= 1.0)
+                episode_reward += reward
+                episode_reward_if_stay += np.where(~reached, reward, 1)
+                first_reach += ~reached
+
+            # Collect trajectory if requested
+            if return_trajectory:
+                obs_torch = torch.from_numpy(obs_numpy).float()
+                bundle = self.make_bundle(obs_torch, action, reward[..., None])
+                trajectory.append(bundle)
+
+            # Update prev_frame for velocity calculation
+            plan_prev_frame = plan_frame
+
+            # Check for episode termination
+            if done.any():
+                break
+
+        # Return results
+        reward_dict = None
+        if return_rewards:
+            reward_dict = {
+                "reached": reached,
+                "episode_reward": episode_reward,
+                "episode_reward_if_stay": episode_reward_if_stay,
+                "first_reach": first_reach,
+            }
+
+        return trajectory, reward_dict
+
+    def _compute_action_from_plan(
+        self,
+        obs_numpy: np.ndarray,  # (1, obs_size)
+        plan_frame: torch.Tensor,  # (1, c)
+        plan_prev_frame: Optional[torch.Tensor],  # (1, c) or None
+        agent: Optional[Any] = None,
+        sub_goal: Optional[np.ndarray] = None,  # (2,) for antmaze
+        use_diffused_action: bool = False,
+    ) -> torch.Tensor:
+        """
+        Compute action for a single timestep given current observation and plan frame.
+
+        Unified function supporting both antmaze and pointmaze:
+        - antmaze: Uses agent.sample_action with sub_goal
+        - pointmaze: Uses PID-like controller
+
+        Args:
+            obs_numpy: Current observation, shape (1, obs_size)
+            plan_frame: Plan frame at current timestep, shape (1, c)
+            plan_prev_frame: Plan frame at previous timestep (for velocity calculation), shape (1, c) or None
+            agent: RL agent for antmaze (None for pointmaze)
+            sub_goal: Goal position for antmaze, shape (2,)
+            use_diffused_action: If True, use action directly from diffusion output
+
+        Returns:
+            action: (1, action_dim) - clipped to [-1, 1]
+        """
+        if use_diffused_action:
+            # Direct action from diffusion model
+            _, action, _ = self.split_bundle(plan_frame)
+            return action
+
+        if "antmaze" in self.env_id:
+            # AntMaze: agent-based action
+            assert agent is not None, "agent must be provided for antmaze"
+            assert sub_goal is not None, "sub_goal must be provided for antmaze"
+            action = agent.sample_action(obs_numpy, sub_goal)
+            return torch.from_numpy(action).float().reshape(1, -1)
+        else:
+            # PointMaze: PID-like controller
+            obs_t = torch.from_numpy(obs_numpy).float()
+
+            if plan_prev_frame is None:
+                # First step: compute velocity from obs to plan
+                plan_vel = plan_frame[:, :2] - obs_t[:, :2]
+            else:
+                # Subsequent steps: compute velocity from previous plan frame
+                plan_vel = plan_frame[:, :2] - plan_prev_frame[:, :2]
+
+            action = 12.5 * (plan_frame[:, :2] - obs_t[:, :2]) + 1.2 * (
+                plan_vel - obs_t[:, 2:4]
+            )
+            return torch.clip(action, -1, 1)
+
     def _rollout_leaf_plan(
         self,
         leaf_plan_unnormalized: torch.Tensor,
@@ -2885,52 +3032,37 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         self._set_sim_state(envs, parent_sim_state)
 
-        # Construct initial observation from restored sim state
-        full_obs = np.concatenate([parent_sim_state["qpos"], parent_sim_state["qvel"]])
-
-        # For antmaze, use full observation (not just obs_dim) since DQL agent was trained with full obs
-        # obs_numpy should have shape (1, full_obs_size) not (1, obs_dim)
-        obs_numpy = full_obs[None, :]  # shape (1, full_obs_size)
-
         plan_slice = leaf_plan_unnormalized[
             new_denoised_start_idx:new_denoised_end_idx
-        ]  # (chunk_t, 1, c)
+        ]  # (chunk_t*fs, 1, c) in frame format
 
         if plan_slice.shape[0] == 0:
             return self._get_sim_state(envs)
 
-        plan_slice_np = plan_slice[:, 0, :].detach().cpu().numpy()  # (chunk_t*fs, c)
+        # Override envs.reset() temporarily to use the restored state
+        # Instead of resetting, we'll run the plan execution loop directly
+        # The observation is constructed from parent_sim_state
+        full_obs = np.concatenate([parent_sim_state["qpos"], parent_sim_state["qvel"]])
+        obs_numpy = full_obs[None, :]  # shape (1, full_obs_size)
 
-        # Note: plan_slice has shape (T*fs, 1, c), but we only sample actions every frame_stack steps (per token)
-        # Only iterate over token indices, sampling the last frame of each token
-        for t_token_idx, t_frame in enumerate(range(0, plan_slice.shape[0], self.frame_stack)):
-            if "antmaze" in self.env_id:
-                sub_goal = plan_slice_np[t_frame, :2]
+        # Prepare initial obs for _execute_plan_in_env by setting it properly
+        # We need to patch envs to return correct initial obs
+        original_reset = envs.reset
+        envs.reset = lambda: (obs_numpy, None)
 
-                import sys
-                print(f"[DEBUG Rollout] obs_numpy.shape={obs_numpy.shape}, sub_goal.shape={sub_goal.shape}, observation_dim={self.observation_dim}, frame_stack={self.frame_stack}", file=sys.stderr, flush=True)
-                print(f"[DEBUG Agent] agent input obs_numpy dtype={obs_numpy.dtype}, min={obs_numpy.min():.4f}, max={obs_numpy.max():.4f}", file=sys.stderr, flush=True)
-
-                action = agent.sample_action(obs_numpy, sub_goal[None])
-                action = torch.from_numpy(action).float().reshape(1, -1)
-            else:
-                if t_token_idx == 0:
-                    obs_t = torch.from_numpy(obs_numpy).float()
-                    plan_vel = plan_slice[t_frame, :, :2] - obs_t[:, :2]
-                else:
-                    prev_t_frame = t_frame - self.frame_stack
-                    plan_vel = plan_slice[t_frame, :, :2] - plan_slice[prev_t_frame, :, :2]
-                action = 12.5 * (
-                    plan_slice[t_frame, :, :2] - torch.from_numpy(obs_numpy).float()[:, :2]
-                ) + 1.2 * (plan_vel - torch.from_numpy(obs_numpy).float()[:, 2:4])
-                action = torch.clip(action, -1, 1)
-
-            action_np = action.detach().cpu().numpy()
-            obs_numpy, _, done, _ = envs.step(np.nan_to_num(action_np))
-            # obs_numpy already has full observation shape from environment step
-
-            if done.any():
-                break
+        try:
+            # Execute plan using unified function
+            _, _ = self._execute_plan_in_env(
+                plan_frame_format=plan_slice,
+                envs=envs,
+                agent=agent if "antmaze" in self.env_id else None,
+                use_diffused_action=False,
+                return_trajectory=False,
+                return_rewards=False,
+            )
+        finally:
+            # Restore original reset function
+            envs.reset = original_reset
 
         # Capture reached physical state (contains qpos/qvel with position info)
         final_sim_state = self._get_sim_state(envs)
