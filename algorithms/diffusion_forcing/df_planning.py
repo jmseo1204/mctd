@@ -3292,14 +3292,22 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         else:
             raise RuntimeError("Failed to get sim_state for observation")
         
-        # [DEBUG] Log ACTUAL obs shape and dimensions
-        import sys
-        actual_obs_dim = obs_numpy.shape[1]
-        print(f"[DEBUG _execute_plan_in_env] ACTUAL DIMENSIONS:", file=sys.stderr, flush=True)
-        print(f"  - qpos.shape: {qpos.shape}", file=sys.stderr, flush=True)
-        print(f"  - qvel.shape: {qvel.shape}", file=sys.stderr, flush=True)
-        print(f"  - obs_numpy.shape: {obs_numpy.shape} (batch=1, obs_dim={actual_obs_dim})", file=sys.stderr, flush=True)
-        print(f"  - state_dim for DQL agent will be: {actual_obs_dim} * 2 = {actual_obs_dim * 2}", file=sys.stderr, flush=True)
+        # [DEBUG] Log ACTUAL obs shape and dimensions using tracer
+        from utils.tracer import get_tracer
+        tracer = get_tracer()
+        if tracer is not None:
+            actual_obs_dim = obs_numpy.shape[1]
+            with tracer.scope("antmaze_state_dims", phase="validation"):
+                tracer.log(
+                    tag="state.dimensions.qpos_qvel",
+                    data={
+                        "qpos_shape": list(qpos.shape),
+                        "qvel_shape": list(qvel.shape),
+                        "obs_total_dim": actual_obs_dim,
+                        "dql_state_dim_input": actual_obs_dim * 2,
+                    },
+                    depth=0,
+                )
 
         batch_size = plan_frame_format.shape[1]
         reached = np.zeros(batch_size, dtype=bool)
