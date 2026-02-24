@@ -2,6 +2,7 @@ import subprocess
 import time
 import json
 import os
+import sys
 import shlex
 import datetime
 import yaml
@@ -248,6 +249,9 @@ try:
                         log_write(f"!! Job {exp_name} failed. Final log snippet: !!")
                         for line in final_logs.split("\n")[-10:]:
                             log_write(f"[{gpu}] {line.strip()}")
+                        # Exit immediately on error
+                        log_write(f"[ERROR] Exiting due to job failure: {exp_name}")
+                        sys.exit(1)
                 except:
                     pass
 

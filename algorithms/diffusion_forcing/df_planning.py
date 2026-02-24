@@ -136,12 +136,17 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # HILP value function guidance
         self.use_hilp_guidance = cfg.get("use_hilp_guidance", False)
-        self.hilp_checkpoint_path = cfg.get(
-            "hilp_checkpoint_path", "td_models/hilp_ckpt_latest.pt"
-        )
+        hilp_path = cfg.get("hilp_checkpoint_path", "td_models/hilp_ckpt_latest.pt")
+        # Resolve path relative to repo root if relative
+        import os
+        if not os.path.isabs(hilp_path):
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            hilp_path = os.path.join(repo_root, hilp_path)
+        self.hilp_checkpoint_path = hilp_path
         self.hilp_obs_dim = cfg.get("hilp_obs_dim", 29)
         self.hilp_skill_dim = cfg.get("hilp_skill_dim", 32)
-        self.hilp_value_fn = None  # Will be loaded lazily when needed
+        # HILP value function instance will be loaded lazily and stored in _hilp_value_fn_instance
+        # We don't initialize it here to prevent PyTorch from registering it as a submodule
         self.anchor_guidance_scale = cfg.get("anchor_guidance_scale", 40.0)
         self.rdf_guidance_scale = cfg.get("rdf_guidance_scale", 2.0)
         self.mcts_use_sim = cfg.get("mcts_use_sim", False)
@@ -169,7 +174,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
     def _get_hilp_value_fn(self):
         """Lazy loader for HILP value function model."""
-        if self.hilp_value_fn is None:
+        # Use a non-Module attribute name to prevent PyTorch from registering it as a submodule
+        if not hasattr(self, '_hilp_value_fn_instance') or self._hilp_value_fn_instance is None:
             import sys
             import os
 
@@ -180,23 +186,25 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             from cleandiffuser_ex.hilp import HILP
 
             # Load HILP model
-            self.hilp_value_fn = HILP(
+            hilp_model = HILP(
                 obs_dim=self.hilp_obs_dim,
                 skill_dim=self.hilp_skill_dim,
                 device=self.device,
                 value_hidden_dims=(512, 512, 512),
                 use_layer_norm=True,
             )
-            self.hilp_value_fn.load(self.hilp_checkpoint_path)
-            self.hilp_value_fn.eval()
+            hilp_model.load(self.hilp_checkpoint_path)
+            hilp_model.eval()
 
             # Freeze all parameters to prevent gradient updates
-            for param in self.hilp_value_fn.parameters():
+            for param in hilp_model.parameters():
                 param.requires_grad = False
 
+            # Store in a private attribute that won't be registered as a submodule
+            object.__setattr__(self, '_hilp_value_fn_instance', hilp_model)
             print(f"[HILP] Loaded HILP value function from {self.hilp_checkpoint_path}")
 
-        return self.hilp_value_fn
+        return object.__getattribute__(self, '_hilp_value_fn_instance')
 
     def _compute_hilp_values(
         self,
@@ -1079,6 +1087,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 torch.cuda.empty_cache()
 
             use_diffused_action = False
+            agent = None  # Initialize agent to None; will be set for antmaze
 
             # [ENV CACHING] Check if environment is cached and batch_size matches
             env_cache_key = f"{self.env_id}_{batch_size}"
@@ -1087,8 +1096,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 and hasattr(self, "_cached_env_key")
                 and self._cached_env_key == env_cache_key
             ):
-                # Reuse cached environment
+                # Reuse cached environment and agent
                 envs = self._cached_envs
+                agent = getattr(self, "_cached_agent", None)  # Retrieve cached agent if available
                 envs.reset()
                 if not (self.env_id in OGBENCH_ENVS):
                     envs.seed(self.interaction_seed)
@@ -1167,10 +1177,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 else:
                     envs = DummyVecEnv([lambda: gym.make(self.env_id)] * batch_size)
                     envs.seed(self.interaction_seed)
+                    agent = None
 
-                # Cache the environment
+                # Cache the environment and agent
                 self._cached_envs = envs
                 self._cached_env_key = env_cache_key
+                if agent is not None:
+                    self._cached_agent = agent  # Cache agent if it was created
 
                 # [MEMORY] Log after environment creation
                 log_memory_stats(tracer, "interact.envs_created", step=0)
@@ -3255,34 +3268,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         trajectory = []
 
 
-        # Step 1: Initialize environment state (done=False)
-        obs_reset = envs.reset()
-        # Handle both DummyVecEnv (returns (obs, info)) and single env (returns obs)
-        obs_numpy = obs_reset[0] if isinstance(obs_reset, tuple) else obs_reset
-
-        # Step 2: Override with parent's physical state (if provided)
-        # This will be reflected in obs since we just got fresh observation
         self._set_sim_state(envs, parent_sim_state)
 
-        # Conditional is for Path A (fresh start) vs Path B (MCTS continuation)
-        if parent_sim_state is not None:
-            # FIX: Retrieve observation without stepping (no dummy action)
-            try:
-                if hasattr(envs, '_get_obs'):
-                    obs_numpy = envs._get_obs()
-                elif hasattr(envs, 'get_obs'):
-                    obs_numpy = envs.get_obs()
-                if isinstance(obs_numpy, tuple):
-                    obs_numpy = obs_numpy[0]
-            except Exception as e:
-                if self.debug:
-                    print(f"[DEBUG] Failed to retrieve obs after parent_sim_state restore: {e}")
-
+        obs_numpy = parent_sim_state["qpos"][:2]
+        # obs_numpy is shape (2,), need to reshape to (1, 2) for consistency
         if obs_numpy.ndim == 1:
-            obs_numpy = obs_numpy[None, :]  # Add batch dimension: (obs_dim,) → (1, obs_dim)
+            obs_numpy = obs_numpy[np.newaxis, :]  # Shape: (1, 2)
+        assert obs_numpy.shape == (1, 2), f"obs_numpy shape is {obs_numpy.shape}, expected (1, 2)"
 
-        # Initialize reward tracking
-        batch_size = obs_numpy.shape[0]
+        batch_size = plan_frame_format.shape[1]
         reached = np.zeros(batch_size, dtype=bool)
         episode_reward = np.zeros(batch_size)
         episode_reward_if_stay = np.zeros(batch_size)
@@ -3452,6 +3446,42 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         if plan_slice.shape[0] == 0:
             return self._get_sim_state(envs)
 
+        # [LOGGING] 1) Verify that current sim state matches parent_sim_state after restoration
+        current_sim_state = self._get_sim_state(envs)
+        assert current_sim_state is not None, "Failed to get current sim state"
+        
+        parent_qpos = parent_sim_state["qpos"][:2]
+        current_qpos = current_sim_state["qpos"][:2]
+        
+        qpos_diff = np.linalg.norm(current_qpos - parent_qpos)
+        assert qpos_diff < 1e-5, (
+            f"After _set_sim_state, current qpos {current_qpos} does not match "
+            f"parent_sim_state qpos {parent_qpos}. Diff: {qpos_diff}"
+        )
+
+        # [LOGGING] 2) Log continuity between parent_sim_state and plan_slice[0]
+        from utils.tracer import get_tracer
+        tracer = get_tracer()
+        
+        # plan_slice is already unnormalized, so use it directly
+        plan_slice_first_qpos = plan_slice[0, 0, :2].detach().cpu().numpy()
+        
+        first_frame_diff = np.linalg.norm(plan_slice_first_qpos - current_qpos)
+        
+        if tracer:
+            tracer.log(
+                tag="rollout.plan_slice_continuity",
+                data={
+                    "parent_qpos": current_qpos.tolist(),
+                    "plan_slice_first_qpos": plan_slice_first_qpos.tolist(),
+                    "first_frame_diff": float(first_frame_diff),
+                    "plan_slice_shape": str(plan_slice.shape),
+                    "start_idx": new_denoised_start_idx,
+                    "end_idx": new_denoised_end_idx,
+                },
+                depth=1,
+            )
+
         # Execute plan with parent state injection for continuous state stitching
         # This restores parent's complete sim state before rolling out the new plan
         _, _ = self._execute_plan_in_env(
@@ -3462,8 +3492,26 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             parent_sim_state=parent_sim_state,  # Pass complete state for restoration
         )
 
-        # Capture reached physical state (contains qpos/qvel with position info)
+        # [LOGGING] 3) Capture reached physical state and log continuity with plan_slice[-1]
         final_sim_state = self._get_sim_state(envs)
+        
+        # plan_slice is already unnormalized, so use it directly
+        plan_slice_last_qpos = plan_slice[-1, 0, :2].detach().cpu().numpy()
+        final_qpos = final_sim_state["qpos"][:2]
+        
+        last_frame_diff = np.linalg.norm(final_qpos - plan_slice_last_qpos)
+        
+        if tracer:
+            tracer.log(
+                tag="rollout.final_state_continuity",
+                data={
+                    "plan_slice_last_qpos": plan_slice_last_qpos.tolist(),
+                    "final_sim_state_qpos": final_qpos.tolist(),
+                    "last_frame_diff": float(last_frame_diff),
+                    "plan_slice_shape": str(plan_slice.shape),
+                },
+                depth=1,
+            )
 
         return final_sim_state
 
@@ -3672,15 +3720,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     )
 
 
-        # [BIDIRECTIONAL FIX] In bidirectional mode, the combined plan is already correct:
-        # - Tree1 (forward): plan_A (tree1) + flip(plan_B from tree2)
-        # - Tree2 (backward): plan_A (tree2) + flip(plan_B from tree1)
-        # The plan sequence is from the current tree's perspective, so we should NOT flip based on is_tree1.
-        # The original code that flipped for tree2 was a bug that caused reversed execution trajectories.
-        #
-        # Removing the flip: both trees produce correct forward plans in their respective directions.
-        
-        # REMOVED: if not is_tree1: combined = torch.flip(combined, [0])
+        if not is_tree1:
+            combined = torch.flip(combined, [0])  # (A_len+B_len, c)
 
         output = combined.unsqueeze(1)  # (A_len+B_len, 1, c)
 
