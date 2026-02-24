@@ -1132,6 +1132,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         state_dim = envs.observation_space.shape[0]
                         action_dim = envs.action_space.shape[0]
                         max_action = float(envs.action_space.high[0])
+                        
+                        # [DEBUG] Print actual environment dimensions
+                        import sys
+                        print(f"[DEBUG] OGBench Environment Dimensions:", file=sys.stderr, flush=True)
+                        print(f"  - observation_space.shape: {envs.observation_space.shape}", file=sys.stderr, flush=True)
+                        print(f"  - state_dim (raw): {state_dim}", file=sys.stderr, flush=True)
+                        print(f"  - state_dim * 2 (passed to Agent): {state_dim * 2}", file=sys.stderr, flush=True)
+                        print(f"  - action_dim: {action_dim}", file=sys.stderr, flush=True)
+                        print(f"[DEBUG] DQL variant expects: state_dim=29 (from variant.json)", file=sys.stderr, flush=True)
+                        
                         agent = Agent(
                             state_dim=state_dim * 2,
                             action_dim=action_dim,
@@ -3270,11 +3280,24 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         self._set_sim_state(envs, parent_sim_state)
 
-        obs_numpy = parent_sim_state["qpos"][:2]
-        # obs_numpy is shape (2,), need to reshape to (1, 2) for consistency
-        if obs_numpy.ndim == 1:
-            obs_numpy = obs_numpy[np.newaxis, :]  # Shape: (1, 2)
-        assert obs_numpy.shape == (1, 2), f"obs_numpy shape is {obs_numpy.shape}, expected (1, 2)"
+        # Get the full observation from environment (qpos + qvel = 29 dims for antmaze)
+        # For DQL agent compatibility, we need the full obs [qpos, qvel], not just qpos[:2]
+        current_sim_state = self._get_sim_state(envs)
+        if current_sim_state is not None:
+            qpos = current_sim_state["qpos"]  # shape: (dof,)
+            qvel = current_sim_state["qvel"]  # shape: (dof,)
+            # Concatenate qpos and qvel to form full observation
+            obs_flat = np.concatenate([qpos, qvel], axis=0)  # shape: (2*dof,)
+            obs_numpy = obs_flat[np.newaxis, :]  # shape: (1, 2*dof)
+            
+            # Assert that we have the expected 29 dimensions for antmaze
+            assert obs_numpy.shape[1] == 29, f"Expected obs_dim=29 for antmaze, got {obs_numpy.shape[1]}. qpos.shape={qpos.shape}, qvel.shape={qvel.shape}"
+        else:
+            raise RuntimeError("Failed to get sim_state for observation")
+        
+        # [DEBUG] Log actual obs shape being used for DQL
+        import sys
+        print(f"[DEBUG _execute_plan_in_env] Full obs_numpy shape: {obs_numpy.shape}, qpos shape: {qpos.shape}, qvel shape: {qvel.shape}", file=sys.stderr, flush=True)
 
         batch_size = plan_frame_format.shape[1]
         reached = np.zeros(batch_size, dtype=bool)
@@ -3284,13 +3307,17 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # Initialize sub_goal for antmaze
         plan_slice_np = None
-        sub_goal = None
+        sub_goal_pos = None  # 2D position
+        sub_goal_sim_state = None  # Full 29D sim_state
         sub_goal_step = None
         if "antmaze" in self.env_id:
             plan_slice_np = plan_frame_format[:, 0, :].detach().cpu().numpy()  # (T*fs, c)
             sub_goal_idx = min(self.sub_goal_interval, plan_frame_format.shape[0] - 1)
-            sub_goal = plan_slice_np[sub_goal_idx, :2]
+            sub_goal_pos = plan_slice_np[sub_goal_idx, :2]
             sub_goal_step = sub_goal_idx
+            # Initialize sub_goal_sim_state as current state (will be updated during rollout)
+            sub_goal_sim_state = current_sim_state.copy() if current_sim_state is not None else None
+            sub_goal_sim_state["qpos"][:2] = sub_goal_pos
 
         # Execute plan: iterate over frame indices, but step every frame_stack
         plan_prev_frame = None
@@ -3301,12 +3328,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             # Update sub_goal for antmaze (with interval logic)
             if "antmaze" in self.env_id:
-                if np.linalg.norm(obs_numpy[0, :2] - sub_goal[0]) < 1.0:
+                if np.linalg.norm(obs_numpy[0, :2] - sub_goal_pos[0]) < 1.0:
                     if sub_goal_step < plan_frame_format.shape[0] - self.sub_goal_interval:
                         sub_goal_step += self.sub_goal_interval
-                        sub_goal = plan_slice_np[sub_goal_step, :2]
+                        sub_goal_pos = plan_slice_np[sub_goal_step, :2]
+                        # Update sub_goal_sim_state position
+                        sub_goal_sim_state["qpos"][:2] = sub_goal_pos
                     else:
-                        sub_goal = plan_slice_np[-1, :2]
+                        sub_goal_pos = plan_slice_np[-1, :2]
+                        sub_goal_sim_state["qpos"][:2] = sub_goal_pos
 
             # Compute action using unified function
             action = self._compute_action_from_plan(
@@ -3314,7 +3344,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 plan_frame=plan_frame,
                 plan_prev_frame=plan_prev_frame,
                 agent=agent,
-                sub_goal=sub_goal,
+                sub_goal_pos=sub_goal_pos,
+                sub_goal_sim_state=sub_goal_sim_state,
+                current_sim_state=current_sim_state,
                 use_diffused_action=use_diffused_action,
             )
 
@@ -3325,6 +3357,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             # Ensure obs_numpy is 2D: (batch_size, obs_dim)
             if obs_numpy.ndim == 1:
                 obs_numpy = obs_numpy[None, :]  # Add batch dimension
+
+            # Update current_sim_state after environment step (for next iteration)
+            current_sim_state = self._get_sim_state(envs)
 
             # Track rewards
             reached = np.logical_or(reached, reward >= 1.0)
@@ -3360,14 +3395,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         plan_frame: torch.Tensor,  # (1, c)
         plan_prev_frame: Optional[torch.Tensor],  # (1, c) or None
         agent: Optional[Any] = None,
-        sub_goal: Optional[np.ndarray] = None,  # (2,) for antmaze
+        sub_goal_pos: Optional[np.ndarray] = None,  # (2,) for antmaze - position only
+        sub_goal_sim_state: Optional[dict] = None,  # Full sim_state for sub_goal
+        current_sim_state: Optional[dict] = None,  # Full sim_state for current state
         use_diffused_action: bool = False,
     ) -> torch.Tensor:
         """
         Compute action for a single timestep given current observation and plan frame.
 
         Unified function supporting both antmaze and pointmaze:
-        - antmaze: Uses agent.sample_action with sub_goal
+        - antmaze: Uses agent.sample_action with concatenated current and goal sim_states (58D)
         - pointmaze: Uses PID-like controller
 
         Args:
@@ -3375,7 +3412,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             plan_frame: Plan frame at current timestep, shape (1, c)
             plan_prev_frame: Plan frame at previous timestep (for velocity calculation), shape (1, c) or None
             agent: RL agent for antmaze (None for pointmaze)
-            sub_goal: Goal position for antmaze, shape (2,)
+            sub_goal_pos: Goal position for antmaze, shape (2,) - only for reference
+            sub_goal_sim_state: Full sim_state dict for sub_goal (with qpos, qvel)
+            current_sim_state: Full sim_state dict for current state (with qpos, qvel)
             use_diffused_action: If True, use action directly from diffusion output
 
         Returns:
@@ -3387,10 +3426,34 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             return action
 
         if "antmaze" in self.env_id:
-            # AntMaze: agent-based action
+            # AntMaze: agent-based action with 58D state (current_sim_state + sub_goal_sim_state)
             assert agent is not None, "agent must be provided for antmaze"
-            assert sub_goal is not None, "sub_goal must be provided for antmaze"
-            action = agent.sample_action(obs_numpy, sub_goal)
+            assert sub_goal_pos is not None, "sub_goal_pos must be provided for antmaze"
+            assert sub_goal_sim_state is not None, "sub_goal_sim_state must be provided for antmaze"
+            assert current_sim_state is not None, "current_sim_state must be provided for antmaze"
+            
+            # Construct 58D input: concatenate [current_state (29D), goal_state (29D)]
+            current_qpos = current_sim_state["qpos"]  # (dof,)
+            current_qvel = current_sim_state["qvel"]  # (dof,)
+            goal_qpos = sub_goal_sim_state["qpos"]  # (dof,)
+            goal_qvel = sub_goal_sim_state["qvel"]  # (dof,)
+            
+            # Construct full 58D state vector
+            state_58d = np.concatenate([
+                current_qpos, current_qvel,  # current state (29D)
+                goal_qpos, goal_qvel  # goal state (29D)
+            ], axis=0)  # (58,)
+            state_input = state_58d[np.newaxis, :]  # (1, 58)
+            
+            # Assert correct dimensions
+            assert state_input.shape == (1, 58), f"Expected (1, 58) for antmaze DQL input, got {state_input.shape}"
+            
+            # [DEBUG] Check input dimensions to DQL agent
+            import sys
+            print(f"[DEBUG _compute_action_from_plan] state_input shape: {state_input.shape}, sub_goal_pos: {sub_goal_pos}", file=sys.stderr, flush=True)
+            
+            # Pass 58D state and 2D goal position to agent
+            action = agent.sample_action(state_input, sub_goal_pos)
             return torch.from_numpy(action).float().reshape(1, -1)
         else:
             # PointMaze: PID-like controller
