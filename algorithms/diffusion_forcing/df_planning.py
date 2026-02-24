@@ -3280,26 +3280,26 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         self._set_sim_state(envs, parent_sim_state)
 
-         # Get the full observation from environment (qpos + qvel concatenation for antmaze)
-         # For DQL agent compatibility, we need the full obs [qpos, qvel], not just qpos[:2]
-         current_sim_state = self._get_sim_state(envs)
-         if current_sim_state is not None:
-             qpos = current_sim_state["qpos"]  # shape: (dof,)
-             qvel = current_sim_state["qvel"]  # shape: (dof,)
-             # Concatenate qpos and qvel to form full observation
-             obs_flat = np.concatenate([qpos, qvel], axis=0)  # shape: (2*dof,)
-             obs_numpy = obs_flat[np.newaxis, :]  # shape: (1, 2*dof)
-         else:
-             raise RuntimeError("Failed to get sim_state for observation")
-         
-         # [DEBUG] Log ACTUAL obs shape and dimensions
-         import sys
-         actual_obs_dim = obs_numpy.shape[1]
-         print(f"[DEBUG _execute_plan_in_env] ACTUAL DIMENSIONS:", file=sys.stderr, flush=True)
-         print(f"  - qpos.shape: {qpos.shape}", file=sys.stderr, flush=True)
-         print(f"  - qvel.shape: {qvel.shape}", file=sys.stderr, flush=True)
-         print(f"  - obs_numpy.shape: {obs_numpy.shape} (batch=1, obs_dim={actual_obs_dim})", file=sys.stderr, flush=True)
-         print(f"  - state_dim for DQL agent will be: {actual_obs_dim} * 2 = {actual_obs_dim * 2}", file=sys.stderr, flush=True)
+        # Get the full observation from environment (qpos + qvel concatenation for antmaze)
+        # For DQL agent compatibility, we need the full obs [qpos, qvel], not just qpos[:2]
+        current_sim_state = self._get_sim_state(envs)
+        if current_sim_state is not None:
+            qpos = current_sim_state["qpos"]  # shape: (dof,)
+            qvel = current_sim_state["qvel"]  # shape: (dof,)
+            # Concatenate qpos and qvel to form full observation
+            obs_flat = np.concatenate([qpos, qvel], axis=0)  # shape: (2*dof,)
+            obs_numpy = obs_flat[np.newaxis, :]  # shape: (1, 2*dof)
+        else:
+            raise RuntimeError("Failed to get sim_state for observation")
+        
+        # [DEBUG] Log ACTUAL obs shape and dimensions
+        import sys
+        actual_obs_dim = obs_numpy.shape[1]
+        print(f"[DEBUG _execute_plan_in_env] ACTUAL DIMENSIONS:", file=sys.stderr, flush=True)
+        print(f"  - qpos.shape: {qpos.shape}", file=sys.stderr, flush=True)
+        print(f"  - qvel.shape: {qvel.shape}", file=sys.stderr, flush=True)
+        print(f"  - obs_numpy.shape: {obs_numpy.shape} (batch=1, obs_dim={actual_obs_dim})", file=sys.stderr, flush=True)
+        print(f"  - state_dim for DQL agent will be: {actual_obs_dim} * 2 = {actual_obs_dim * 2}", file=sys.stderr, flush=True)
 
         batch_size = plan_frame_format.shape[1]
         reached = np.zeros(batch_size, dtype=bool)
