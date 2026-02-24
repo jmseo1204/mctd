@@ -3436,46 +3436,39 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             return action
 
         if "antmaze" in self.env_id:
-            # AntMaze: agent-based action with 58D state (current_sim_state + sub_goal_sim_state)
+            # AntMaze: agent-based action
+            # Agent expects: state (29D = qpos+qvel) + goal (2D position)
+            # NOT the concatenation of [current, goal]
             assert agent is not None, "agent must be provided for antmaze"
             assert sub_goal_pos is not None, "sub_goal_pos must be provided for antmaze"
-            assert sub_goal_sim_state is not None, "sub_goal_sim_state must be provided for antmaze"
             assert current_sim_state is not None, "current_sim_state must be provided for antmaze"
             
-            # Construct 58D input: concatenate [current_state (29D), goal_state (29D)]
+            # Extract current state: qpos + qvel (29D total)
             current_qpos = current_sim_state["qpos"]  # (dof,)
             current_qvel = current_sim_state["qvel"]  # (dof,)
-            goal_qpos = sub_goal_sim_state["qpos"]  # (dof,)
-            goal_qvel = sub_goal_sim_state["qvel"]  # (dof,)
+            state_29d = np.concatenate([current_qpos, current_qvel], axis=0)  # (29,)
+            state_input = state_29d[np.newaxis, :]  # (1, 29)
             
-            # Construct full 58D state vector
-            state_58d = np.concatenate([
-                current_qpos, current_qvel,  # current state (29D)
-                goal_qpos, goal_qvel  # goal state (29D)
-            ], axis=0)  # (58,)
-            state_input = state_58d[np.newaxis, :]  # (1, 58)
-            
-            # Assert correct dimensions and log via tracer
+            # Log via tracer
             from utils.tracer import get_tracer
             tracer = get_tracer()
-            
-            assert state_input.shape == (1, 58), f"Expected (1, 58) for antmaze DQL input, got {state_input.shape}"
             
             if tracer is not None:
                 with tracer.scope("dql_agent_input", phase="validation"):
                     tracer.log(
-                        tag="agent.input_shape",
+                        tag="agent.input_dimensions",
                         data={
+                            "qpos_shape": list(current_qpos.shape),
+                            "qvel_shape": list(current_qvel.shape),
                             "state_input_shape": list(state_input.shape),
-                            "current_qpos_shape": list(current_qpos.shape),
-                            "current_qvel_shape": list(current_qvel.shape),
-                            "sub_goal_pos_shape": list(sub_goal_pos.shape) if sub_goal_pos is not None else None,
-                            "expected_state_dim": 58,
+                            "sub_goal_pos_shape": list(sub_goal_pos.shape),
+                            "expected_state_dim": 29,
+                            "expected_goal_dim": 2,
                         },
                         depth=0,
                     )
             
-            # Pass 58D state and 2D goal position to agent
+            # Pass 29D state and 2D goal position to agent
             action = agent.sample_action(state_input, sub_goal_pos)
             return torch.from_numpy(action).float().reshape(1, -1)
         else:
