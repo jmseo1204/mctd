@@ -1,114 +1,160 @@
 #!/usr/bin/env python3
-import argparse, json, math, re, sys
+"""
+scripts/analyze_logs.py
+Log analysis engine for AI research experiments.
+"""
+
+import argparse
+import json
+import math
+import re
+import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 SLP_REQUIRED = {"ts", "level", "tag"}
 ERROR_LEVELS = {"ERROR", "CRITICAL"}
-AI_ERROR_PATTERNS = [(r"nan", "NaN"), (r"memory", "Memory"), (r"shape mismatch", "Shape")]
+AI_ERROR_PATTERNS = [
+    (r"nan", "NaN Detected"),
+    (r"inf(?:inity)?", "Inf Detected"),
+    (r"out of memory|OOM|CUDA out", "OOM"),
+    (r"gradient.*explod", "Gradient Explosion"),
+    (r"cuda error", "CUDA Error"),
+]
 
 def parse_jsonl(log_path: Path) -> Tuple[List[Dict], bool]:
     records = []
     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
+        for i, line in enumerate(f):
             line = line.strip()
-            if not line: continue
+            if not line:
+                continue
             try:
                 obj = json.loads(line)
-                if isinstance(obj, dict): records.append(obj)
-            except: pass
-    is_slp = len([r for r in records if SLP_REQUIRED.issubset(r.keys())]) / max(len(records), 1) >= 0.5
+                if isinstance(obj, dict):
+                    records.append(obj)
+            except json.JSONDecodeError:
+                pass
+    is_slp = all(SLP_REQUIRED.issubset(r.keys()) for r in records) if records else False
     return records, is_slp
 
 def extract_run_meta(records: List[Dict]) -> Dict:
     for r in records:
-        if r.get("tag") == "run.start":
-            meta = r.get("data", {}).copy()
-            meta.update({"run_id": r.get("run_id", "unknown"), "purpose": r.get("purpose", ""), "start_ts": r.get("ts", 0.0)})
-            return meta
-    return {"run_id": records[0].get("run_id", "unknown") if records else "unknown", "purpose": "", "start_ts": records[0].get("ts", 0) if records else 0}
+        if "purpose" in r:
+            return r.copy()
+    return {"run_id": "unknown", "purpose": "general_monitoring"} if records else {}
 
 def extract_errors(records: List[Dict]) -> List[Dict]:
     errors = []
     for i, r in enumerate(records):
-        is_error = r.get("level") in ERROR_LEVELS
-        patterns = [label for pattern, label in AI_ERROR_PATTERNS if re.search(pattern, json.dumps(r, default=str).lower())]
-        if is_error or patterns:
-            error_record = r.copy()
-            error_record["_detected_patterns"] = patterns
-            errors.append(error_record)
+        if r.get("level") in ERROR_LEVELS:
+            errors.append(r)
     return errors
 
 def extract_numeric_series(records: List[Dict]) -> Dict[str, List[Dict]]:
-    series = defaultdict(list)
+    series: Dict[str, List] = defaultdict(list)
     for r in records:
+        tag = r.get("tag", "")
         data = r.get("data", {})
-        if not isinstance(data, dict): continue
+        if not isinstance(data, dict):
+            continue
         for k, v in data.items():
             if isinstance(v, (int, float)) and not isinstance(v, bool):
-                try:
-                    if not math.isnan(v) and not math.isinf(v):
-                        series_key = f"{r.get('tag', '')}.{k}" if k != "value" else r.get('tag', '')
-                        series[series_key].append({"step": r.get("step"), "ts": r.get("ts", 0.0), "value": v})
-                except: pass
+                if not (math.isnan(v) if isinstance(v, float) else False):
+                    series_key = f"{tag}.{k}" if k != "value" else tag
+                    series[series_key].append({
+                        "step": r.get("step"),
+                        "value": v,
+                    })
     return dict(series)
 
-def build_html_report(log_path, records, is_slp, run_meta, errors, series) -> str:
-    start_ts = run_meta.get("start_ts", 0)
-    end_ts = records[-1].get("ts", start_ts) if records else start_ts
-    duration_s = end_ts - start_ts
+def extract_tensor_stats(records: List[Dict]) -> List[Dict]:
+    tensor_records = []
+    for r in records:
+        data = r.get("data", {})
+        if isinstance(data, dict) and any(k in data for k in {"nan_count", "inf_count", "norm"}):
+            tensor_records.append({
+                "tag": r.get("tag", ""),
+                "step": r.get("step"),
+                "data": data,
+            })
+    return tensor_records
+
+def build_html_report(log_path, records, is_slp, run_meta, errors, series, tensor_stats):
+    sections = []
+    
+    # Summary
     error_count = len(errors)
-    series_count = len(series)
+    sections.append(f"""
+    <section>
+      <h2>Summary</h2>
+      <p>Records: {len(records)} | Errors: {error_count} | Format: {"SLP" if is_slp else "Heuristic"}</p>
+      <p>Run ID: {run_meta.get("run_id", "unknown")}</p>
+      <p>Purpose: {run_meta.get("purpose", "general_monitoring")}</p>
+    </section>
+    """)
     
-    memory_series = {k: v for k, v in series.items() if "memory" in k.lower()}
-    memory_html = ""
-    if memory_series:
-        memory_html = "<h3>Memory Metrics</h3><table class='data-table'><thead><tr><th>Tag</th><th>Count</th><th>Min</th><th>Max</th><th>Avg</th></tr></thead><tbody>"
-        for tag, points in memory_series.items():
-            vals = [p['value'] for p in points]
-            memory_html += f"<tr><td>{tag}</td><td>{len(points)}</td><td>{min(vals):.1f}</td><td>{max(vals):.1f}</td><td>{sum(vals)/len(vals):.1f}</td></tr>"
-        memory_html += "</tbody></table>"
-    
-    error_html = ""
+    # Errors
     if errors:
-        error_html = f"<h3>Errors Detected: {error_count}</h3><table class='data-table'><thead><tr><th>Tag</th><th>Level</th><th>Time</th></tr></thead><tbody>"
-        for e in errors[:20]:
-            ts_str = datetime.fromtimestamp(e.get("ts", 0)).strftime("%H:%M:%S")
-            error_html += f"<tr class='error-row'><td>{e.get('tag','')}</td><td>{e.get('level','')}</td><td>{ts_str}</td></tr>"
-        error_html += "</tbody></table>"
+        error_rows = ""
+        for e in errors[:50]:
+            error_rows += f"<tr><td>{e.get('tag')}</td><td>{e.get('step')}</td><td>{str(e.get('data'))[:100]}</td></tr>"
+        sections.append(f"""
+        <section>
+          <h2>Errors ({len(errors)})</h2>
+          <table border="1"><tr><th>Tag</th><th>Step</th><th>Data</th></tr>{error_rows}</table>
+        </section>
+        """)
     
-    html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Log Analysis: {log_path.stem}</title><style>
-    body {{ background: #0f1117; color: #e2e8f0; font-family: monospace; font-size: 13px; }}
-    table {{ width: 100%; border-collapse: collapse; margin: 10px 0; }}
-    th {{ background: #1a1d27; padding: 8px; border: 1px solid #2e3347; text-align: left; }}
-    td {{ padding: 6px 8px; border: 1px solid #2e3347; }}
-    .error-row {{ color: #f87171; }}
-    h3 {{ margin: 15px 0 10px; border-bottom: 1px solid #2e3347; padding-bottom: 5px; }}
-    .summary {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 20px 0; }}
-    .summary-item {{ background: #1a1d27; padding: 15px; border-radius: 4px; border: 1px solid #2e3347; }}
-    .summary-label {{ font-size: 11px; color: #94a3b8; text-transform: uppercase; }}
-    .summary-value {{ font-size: 18px; font-weight: bold; color: #6366f1; }}
-    </style></head><body>
-    <h1>Memory Efficiency Diagnosis Report</h1>
-    <div class="summary">
-        <div class="summary-item"><div class="summary-label">Records</div><div class="summary-value">{len(records)}</div></div>
-        <div class="summary-item"><div class="summary-label">Duration (s)</div><div class="summary-value">{duration_s:.1f}</div></div>
-        <div class="summary-item"><div class="summary-label">Errors</div><div class="summary-value">{error_count}</div></div>
-        <div class="summary-item"><div class="summary-label">Metrics</div><div class="summary-value">{series_count}</div></div>
-    </div>
-    {memory_html}
-    {error_html}
-    <h3>All Metrics Summary</h3>
-    <table class='data-table'><thead><tr><th>Tag</th><th>Points</th><th>Min</th><th>Max</th><th>Avg</th></tr></thead><tbody>"""
+    # Series Stats
+    if series:
+        series_info = ""
+        for tag, points in list(series.items())[:20]:
+            values = [p["value"] for p in points if isinstance(p["value"], (int, float))]
+            if values:
+                series_info += f"<tr><td>{tag}</td><td>{len(points)}</td><td>{min(values):.4f}</td><td>{max(values):.4f}</td><td>{sum(values)/len(values):.4f}</td></tr>"
+        sections.append(f"""
+        <section>
+          <h2>Numeric Series ({len(series)})</h2>
+          <table border="1"><tr><th>Tag</th><th>Points</th><th>Min</th><th>Max</th><th>Mean</th></tr>{series_info}</table>
+        </section>
+        """)
     
-    for tag, points in sorted(series.items())[:50]:
-        vals = [p['value'] for p in points]
-        if vals:
-            html += f"<tr><td>{tag}</td><td>{len(points)}</td><td>{min(vals):.6f}</td><td>{max(vals):.6f}</td><td>{sum(vals)/len(vals):.6f}</td></tr>"
+    # Tensor Stats
+    if tensor_stats:
+        tensor_rows = ""
+        for t in tensor_stats[:30]:
+            data = t.get("data", {})
+            tensor_rows += f"<tr><td>{t.get('tag')}</td><td>{t.get('step')}</td><td>{data.get('nan_count', 0)}</td><td>{data.get('inf_count', 0)}</td></tr>"
+        sections.append(f"""
+        <section>
+          <h2>Tensor Diagnostics ({len(tensor_stats)})</h2>
+          <table border="1"><tr><th>Tag</th><th>Step</th><th>NaN</th><th>Inf</th></tr>{tensor_rows}</table>
+        </section>
+        """)
     
-    html += f"""</tbody></table></body></html>"""
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <title>Log Analysis: {log_path.stem}</title>
+  <style>
+    body {{ font-family: monospace; background: #1a1a1a; color: #e0e0e0; padding: 20px; }}
+    section {{ background: #2a2a2a; border: 1px solid #444; padding: 15px; margin: 10px 0; border-radius: 5px; }}
+    h2 {{ color: #66bb6a; margin-top: 0; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th {{ background: #333; padding: 8px; text-align: left; }}
+    td {{ padding: 6px; border-bottom: 1px solid #333; }}
+    tr:hover td {{ background: #333; }}
+  </style>
+</head>
+<body>
+  <h1>Log Analysis Report</h1>
+  <p>File: {log_path.name} | Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+  {"".join(sections)}
+</body>
+</html>"""
     return html
 
 def main():
@@ -116,25 +162,26 @@ def main():
     parser.add_argument("--log-file", required=True)
     parser.add_argument("--output-dir", default="reports")
     args = parser.parse_args()
-    
+
     log_path = Path(args.log_file)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     print(f"[analyze_logs] Parsing: {log_path}")
     records, is_slp = parse_jsonl(log_path)
     print(f"[analyze_logs] Records: {len(records)}")
-    
+
     run_meta = extract_run_meta(records)
     errors = extract_errors(records)
     series = extract_numeric_series(records)
-    
+    tensor_stats = extract_tensor_stats(records)
+
     print(f"[analyze_logs] Errors: {len(errors)}, Series: {len(series)}")
+
+    html = build_html_report(log_path, records, is_slp, run_meta, errors, series, tensor_stats)
     
-    html = build_html_report(log_path, records, is_slp, run_meta, errors, series)
     output_path = output_dir / f"{log_path.stem}_analysis.html"
-    output_path.write_text(html)
-    
+    output_path.write_text(html, encoding="utf-8")
     print(f"[analyze_logs] Report saved: {output_path}")
     return 0
 

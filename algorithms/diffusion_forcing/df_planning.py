@@ -74,6 +74,9 @@ class MCTSTreeState:
 
 class DiffusionForcingPlanning(DiffusionForcingBase):
     def __init__(self, cfg: DictConfig):
+        # [INSTRUMENTATION] Initialize tracer (will be set later in interact() or on-demand in parallel_plan())
+        self.tracer = None
+        
         self.env_id = cfg.env_id
         self.dataset = cfg.dataset
         self.action_dim = len(cfg.action_mean)
@@ -105,7 +108,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.use_random_goals_for_interaction = cfg.use_random_goals_for_interaction
         self.task_id = cfg.task_id
         self.dql_model = cfg.dql_model
-        self.val_max_steps = cfg.val_max_steps
+        self.val_max_loops = cfg.val_max_loops
         self.mctd_guidance_scales = cfg.mctd_guidance_scales
         self.mctd_max_search_num = cfg.mctd_max_search_num
         self.mctd_num_denoising_steps = cfg.mctd_num_denoising_steps
@@ -587,16 +590,19 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self,
         levels: np.ndarray,
         batch_size: int,
-        stabilization: int,
-        pad_tokens: int,
+        stabilization: int = 0,
+        pad_tokens: int = 0,
+        include_final_token: bool = False,
+        include_init_token: bool = False,
     ) -> torch.Tensor:
-        """
-        Construct noise levels for middle tokens, optional init/final tokens, and padding.
+        """Build noise levels for diffusion inference. (batch, n_tokens) tensor
+
+        This function builds the full noise schedule for a single diffusion step.
 
         Args:
+            levels: Noise level schedule for plan tokens (b, plan_tokens) shape
             batch_size: Batch size
-            levels: Noise levels for plan tokens (batch_size, plan_tokens)
-            stabilization: Noise level for stabilized tokens (init and final)
+            stabilization: Noise level for parent obs token (typically 0-2)
             pad_tokens: Number of padding tokens
             include_final_token: Whether to include final_token (bidirectional mode)
             include_init_token: Whether to prepend init_token slot (pre-built format always False).
@@ -604,6 +610,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         Returns:
             Noise levels array (t, b)
         """
+        tracer = self.tracer if hasattr(self, 'tracer') else None
+
         components = []
         components.append(
             np.full((batch_size, 1), stabilization, dtype=np.int64)
@@ -628,57 +636,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         return result
 
-    # DEPRECATED: This function is no longer called inside parallel_plan.
-    """
-    def _construct_sequence(
-        self,
-        start: torch.Tensor,
-        goal: torch.Tensor,
-        plan: list,
-        plan_tokens: int,
-        reserve_final_token_space: bool,
-    ) -> tuple:
-        # Kept for reference only. New format pre-builds the full sequence in
-        # _build_plan_from_leaf and cats plans directly in parallel_plan.
-        # input plan.shape: b (t fs) 1 c
-
-        chunk = []
-        batch_size = len(plan) 
-        for i in range(batch_size):
-            if plan[i] == None:
-                c = torch.randn((plan_tokens, 1, *self.x_stacked_shape), device=self.device)
-                c = torch.clamp(c, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise)
-            else:
-                c = rearrange(plan[i], "(t fs) 1 c -> t 1 (fs c)", fs=self.frame_stack)
-            chunk.append(c)
-        chunk = torch.cat(chunk, 1) # (T,B, fs*c)
-        if len(chunk.shape) == 2:
-            chunk = chunk.unsqueeze(0)
-
-        init_token_raw = self.pad_init(start)  # (fs, b, c)
-        final_token_raw = self.pad_init(goal, is_start=False)  # (fs, b, c)
-        
-            # 1 for init_token, 1 for final_token
-            
-        processed_init_token = rearrange(init_token_raw, "fs b c -> 1 b (fs c)")
-        processed_final_token = rearrange(final_token_raw, "fs b c -> 1 b (fs c)")
-        # Normal order: [init(start), chunk, final(goal), pad]
-                
-        if reserve_final_token_space:
-            pad_tokens = max(0, self.n_tokens - plan_tokens - 2)
-            pad = torch.zeros((pad_tokens, batch_size, *self.x_stacked_shape), device=self.device)
-            plan_with_given_tokens = torch.cat([processed_init_token, chunk, processed_final_token, pad], 0)
-        else:
-            pad_tokens = max(0, self.n_tokens - plan_tokens - 1)
-            pad = torch.zeros((pad_tokens, batch_size, *self.x_stacked_shape), device=self.device)
-            plan_with_given_tokens = torch.cat([processed_init_token, chunk, pad], 0)
-
-
-
-
-        return plan_with_given_tokens # t b (fs c)
- 
-    """
 
     def _generate_bidirectional_schedule(
         self,
@@ -833,7 +790,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # Validate that each plan has shape (n_tokens, 1, fs*c)
         # These are pre-built from _build_plan_from_leaf with:
-        #   [prefix(prefix_len) | obs_parent(1) | noisy(plan_tokens-1-prefix_len) | padding]
+        #   [prefix(prefix_len) | obs_parent(1) | noisy(plan_tokens-prefix_len) | padding]
         for i, plan in enumerate(plans):
             assert plan is not None, f"plans[{i}] is None"
             assert plan.ndim == 3, f"plans[{i}].ndim={plan.ndim}, expected 3"
@@ -865,6 +822,26 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         )
 
         plan_tokens = horizon // self.frame_stack  # t (tokens per plan)
+
+        # [INSTRUMENTATION] Ensure tracer is initialized
+        if self.tracer is None:
+            from utils.tracer import Tracer, set_default_tracer
+            import datetime
+            _now = datetime.datetime.now()
+            run_id = _now.strftime("%Y-%m-%d_%H-%M-%S")
+            self.tracer = Tracer(
+                run_id=run_id,
+                purpose="first_token_denoising_diagnosis",
+                log_dir="logs_memory_debug",
+                extra_meta={
+                    "env_id": getattr(self, 'env_id', 'unknown'),
+                    "batch_size": batch_size,
+                    "frame_stack": self.frame_stack,
+                }
+            )
+            set_default_tracer(self.tracer)
+            # Note: tracer context manager should be started externally in interact()
+            # For now, we rely on DEBUG_MODE environment variable for logging control
 
         # Plans are always pre-built (n_tokens, 1, fs*c) format from _build_plan_from_leaf.
         # Each plan in the list has shape (n_tokens, 1, fs*c) where:
@@ -939,6 +916,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         stabilization = 0
 
+        tracer = self.tracer if hasattr(self, 'tracer') else None
+
         for m in range(noise_level.shape[1] - 1):
             # noise_level shape: (b, m, plan_tokens)
             # Iterating over m denoising steps
@@ -968,6 +947,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             update_mask = (from_noise_levels > to_noise_levels).unsqueeze(
                 -1
             )  # (n_tokens, b, 1) broadcast mask
+
             plan_with_given_tokens = torch.where(
                 update_mask, sample, plan_with_given_tokens
             )  # (n_tokens, b, fs*c)
@@ -979,25 +959,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     prefix_len_list,
                 ) # (plan_tokens, b, fs*c)
             )
-            
-            # [MEMORY DEBUG] Periodical memory logging during denoising
-            if self.profiler and (m + 1) % max(1, noise_level.shape[1] // 5) == 0:
-                self.profiler.snapshot(
-                    f"parallel_plan_denoise_step{m+1}",
-                    phase=f"denoise_step_{m+1}/{noise_level.shape[1]-1}"
-                )
 
         # Stack all denoising steps
         plan_hist = torch.stack(plan_hist)  # (m+1, plan_tokens, b, fs*c)
         
         # [MEMORY OPTIMIZATION] Keep only last N histories to save memory
         if self.max_plan_hist_keep > 0 and plan_hist.shape[0] > self.max_plan_hist_keep:
-            if self.debug_log_level >= 2:
-                import sys
-                old_size = plan_hist.shape[0]
-                new_size = self.max_plan_hist_keep
-                print(f"[DEBUG] Truncating plan_hist: {old_size} -> {new_size} steps", 
-                      file=sys.stderr, flush=True)
             plan_hist = plan_hist[-self.max_plan_hist_keep:]
         
         # Rearrange to expand tokens into frame stacks
@@ -1016,15 +983,61 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         assert plan_hist.shape[2] == batch_size, (
             f"plan_hist.shape[2]={plan_hist.shape[2]}, expected batch_size={batch_size}"
         )
-        
-        # [MEMORY DEBUG] Log final plan_hist
-        if self.profiler:
-            self.profiler.snapshot(
-                f"parallel_plan_end_batch{batch_size}",
-                phase="plan_hist_final"
-            )
 
         return plan_hist  # (m+1, plan_tokens*fs, b, c)
+
+    def _extract_node_trajectory(self, best_node: "TreeNode") -> np.ndarray:
+        """
+        Recursively extract trajectory from best_node to root via sim_state.
+        Returns array of shape (num_nodes, 2) with position at each node level.
+        """
+        trajectory = []
+        current_node = best_node
+        
+        # ── Logging extraction process ──
+        tracer = get_tracer()
+        node_trace_log = []
+
+        while current_node is not None:
+            # Extract position from sim_state if available
+            if current_node.sim_state is not None:
+                pos = current_node.sim_state["qpos"][:2]
+                trajectory.append(pos)
+            elif current_node.obs_pos is not None:
+                trajectory.append(current_node.obs_pos)
+            
+            # ── Log each node in the trace ──
+            if tracer:
+                node_trace_log.append({
+                    "node_id": id(current_node),
+                    "node_depth": current_node.depth,
+                    "has_sim_state": current_node.sim_state is not None,
+                    "sim_state_qpos": current_node.sim_state["qpos"][:2].tolist() if current_node.sim_state else None,
+                    "obs_pos": current_node.obs_pos.tolist() if hasattr(current_node.obs_pos, 'tolist') else None,
+                    "parent_id": id(current_node._parent_node) if current_node._parent_node else None,
+                })
+
+            # Move to parent
+            current_node = current_node._parent_node
+
+        # Reverse so root is first
+        if trajectory:
+            trajectory = np.array(trajectory[::-1])
+        else:
+            trajectory = np.array([])
+        
+        # ── Log final trajectory ──
+        if tracer:
+            tracer.log(
+                tag="bidir_mcts._extract_node_trajectory.details",
+                data={
+                    "trajectory_length": len(trajectory),
+                    "node_trace": node_trace_log,
+                },
+                depth=1,
+            )
+
+        return trajectory
 
     def interact(
         self,
@@ -1046,7 +1059,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # [TRACER SETUP] Initialize structured memory logger
         tracer = Tracer(
-            run_id=f"interact_{int(time.time())}",
             purpose="memory_efficiency_diagnosis",
             log_dir="logs_memory_debug",
             extra_meta={
@@ -1057,29 +1069,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             }
         )
         set_default_tracer(tracer)
+        self.tracer = tracer  # [INSTRUMENTATION] Make tracer accessible to other methods
 
         with tracer:
-            # [MEMORY DEBUG] Log interaction start
-            if self.profiler:
-                self.profiler.snapshot(
-                    "interact_start",
-                    phase="interact_init"
-                )
-                if self.debug_log_level >= 1:
-                    import sys
-                    print(f"[DEBUG] interact() starting with batch_size={batch_size}",
-                          file=sys.stderr, flush=True)
-
-            tracer.log(
-                "interact.start",
-                {"batch_size": batch_size, "env_id": self.env_id},
-                step=0,
-                depth=0
-            )
-
-            # [MEMORY] Log initial GPU state
-            log_memory_stats(tracer, "interact.init", step=0)
-
             # [MEMORY CLEANUP] Clear caches before interaction
             import gc
             gc.collect()
@@ -1100,13 +1092,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 envs.reset()
                 if not (self.env_id in OGBENCH_ENVS):
                     envs.seed(self.interaction_seed)
-                if self.debug_log_level >= 1:
-                    import sys
-                    print(
-                        f"[MEM] Reusing cached environment (batch_size={batch_size})",
-                        file=sys.stderr,
-                        flush=True,
-                    )
             else:
                 # Create new environment and cache it
                 if self.env_id in OGBENCH_ENVS:
@@ -1130,7 +1115,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                             ]
                             * batch_size
                         )
-                        # use_diffused_action = True
                         from dql.main_Antmaze import hyperparameters
                         from dql.agents.ql_diffusion import Diffusion_QL as Agent
 
@@ -1258,13 +1242,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             goal_normalized = ((goal - obs_mean[None]) / obs_std[None]).detach()
 
             steps = 0
+            loops = 0  # Loop counter for bidirectional MCTS planning
             episode_reward = np.zeros(batch_size)
             episode_reward_if_stay = np.zeros(batch_size)
             reached = np.zeros(batch_size, dtype=bool)
             first_reach = np.zeros(batch_size)
 
             trajectory = []  # actual trajectory
-            all_plan_hist = []  # a list of plan histories, each history is a collection of m diffusion steps
 
             # run mpc with diffused actions
             planning_time = []
@@ -1303,13 +1287,39 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 root_obs=_bidir_goal_np[0],
                 root_sim_state=goal_sim_state,
             )
+            
+            # ── Logging initialization ──
+            tracer = get_tracer()
+            if tracer:
+                tracer.log(
+                    tag="bidir_mcts.initialization",
+                    data={
+                        "tree1_root_obs": _bidir_start_np[0][:2].tolist(),
+                        "tree1_root_sim_state_qpos": initial_sim_state["qpos"][:2].tolist(),
+                        "tree2_root_obs": _bidir_goal_np[0][:2].tolist(),
+                        "tree2_root_sim_state_qpos": goal_sim_state["qpos"][:2].tolist(),
+                        "tree1_id": id(bidir_tree1.root_node),
+                        "tree2_id": id(bidir_tree2.root_node),
+                    },
+                    step=0,
+                    depth=0,
+                )
+            
             # Flag: 0 → expand tree1 next, 1 → expand tree2 next
             expanded_tree_idx: int = 0
             # Configurable meeting threshold (Euclidean distance in unnormalized obs space)
             _meeting_delta: float = getattr(self.cfg, "meeting_delta", 2.0)
 
-            while not terminate and steps < self.val_max_steps:
+            while not terminate and loops < self.val_max_loops:
+                loops += 1
                 planning_start_time = time.time()
+
+                # [EXPANSION CHECK] Early termination if both trees are fully explored
+                if not bidir_tree1.root_node.is_expandable_flag and \
+                   not bidir_tree2.root_node.is_expandable_flag:
+                    print("[INFO] Both trees fully explored (root nodes unexpandable). Terminating planning.")
+                    terminate = True
+                    break
 
                 # Generate plan (start → goal)
                 # _generate_plan_between_points has been inlined here.
@@ -1341,6 +1351,46 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 # (leaf node lists are passed directly to _run_mcts_search as opposite_leaf_nodes)
 
                 # Initialize infos dicts so {**infos1, **infos2} is safe even on the first step
+                
+                # ── Logging before tree expansion ──
+                tracer = get_tracer()
+                if tracer:
+                    tree_to_expand = "tree1" if expanded_tree_idx == 0 else "tree2"
+                    tracer.log(
+                        tag="bidir_mcts.before_expansion",
+                        data={
+                            "loop_count": loops,
+                            "expanded_tree": tree_to_expand,
+                            "expanded_tree_idx": expanded_tree_idx,
+                            "t1_leaf_count": len(t1_leaf_nodes),
+                            "t2_leaf_count": len(t2_leaf_nodes),
+                            "t1_root_id": id(bidir_tree1.root_node),
+                            "t2_root_id": id(bidir_tree2.root_node),
+                        },
+                        step=loops,
+                        depth=0,
+                    )
+                    
+                    # ── Verify tree instance before expansion ──
+                    active_tree = bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2
+                    tracer.log(
+                        tag="bidir_mcts.tree_instance_check",
+                        data={
+                            "loop_count": loops,
+                            "expanded_tree_idx": expanded_tree_idx,
+                            "active_tree_id": id(active_tree),
+                            "active_tree_root_id": id(active_tree.root_node),
+                            "active_tree_tag": active_tree.tag,
+                            "bidir_tree1_id": id(bidir_tree1),
+                            "bidir_tree1_root_id": id(bidir_tree1.root_node),
+                            "bidir_tree2_id": id(bidir_tree2),
+                            "bidir_tree2_root_id": id(bidir_tree2.root_node),
+                            "matches_tree1": active_tree is bidir_tree1,
+                            "matches_tree2": active_tree is bidir_tree2,
+                        },
+                        step=loops,
+                        depth=1,
+                    )
 
                 # Alternate expansion: one single_step per MPC iteration
                 active_tree, expanded_node_infos = self._run_mcts_search(
@@ -1350,12 +1400,21 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     _start_np,
                     _goal_np,
                     opposite_leaf_nodes=t2_leaf_nodes if expanded_tree_idx == 0 else t1_leaf_nodes,
-                    single_step=False,  # Allow multiple iterations to reach terminal_depth
+                    single_step=True,
                 )
-
-                if self.debug:
-                    print(
-                        f"[DEBUG] [Step {steps}] Bidir Turn: {'Tree1 (Forward)' if expanded_tree_idx == 0 else 'Tree2 (Backward)'}"
+                
+                # ── Logging after tree expansion ──
+                if tracer:
+                    tracer.log(
+                        tag="bidir_mcts.after_expansion",
+                        data={
+                            "loop_count": loops,
+                            "expanded_node_count": len(expanded_node_infos),
+                            "active_tree_id": id(active_tree.root_node),
+                            "active_tree_tag": active_tree.tag,
+                        },
+                        step=loops,
+                        depth=0,
                     )
 
                 # Per-leaf MPC rollout: update obs_pos and sim_state for newly expanded leaves
@@ -1376,6 +1435,26 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     new_denoised_start: int = parent_node.depth * seg_size * self.frame_stack
                     new_denoised_end: int = (parent_node.depth + 1) * seg_size * self.frame_stack
 
+                    # ── Pre-rollout logging ──
+                    tracer = get_tracer()
+                    if tracer:
+                        tracer.log(
+                            tag="bidir_mcts._rollout_leaf_plan.pre_rollout",
+                            data={
+                                "loop_count": loops,
+                                "child_node_id": id(_child),
+                                "child_depth": _child.depth,
+                                "parent_node_id": id(parent_node),
+                                "parent_depth": parent_node.depth,
+                                "parent_sim_state_qpos": parent_node.sim_state["qpos"][:2].tolist() if parent_node.sim_state else None,
+                                "new_denoised_start": new_denoised_start,
+                                "new_denoised_end": new_denoised_end,
+                                "active_tree_id": id(active_tree.root_node),
+                                "active_tree_tag": active_tree.tag,
+                            },
+                            depth=1,
+                        )
+
                     _new_sim_state = self._rollout_leaf_plan(
                         leaf_plan_unnormalized=plan_unnormalized,
                         new_denoised_start_idx=new_denoised_start,
@@ -1384,46 +1463,81 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         envs=envs,
                         parent_sim_state=parent_node.sim_state,
                     )
+                    assert _new_sim_state is not None, "_new_sim_state is None"
                     _child.sim_state = _new_sim_state
-                    # Update obs_pos from reached sim_state if possible
-                    _child.obs_pos = (
-                        _new_sim_state["qpos"][:2] if _new_sim_state is not None else None
-                    )
-
-                    if self.debug:
-                        print(
-                            f"  [DEBUG] Expanded Leaf '{_child.name}' updated with sim_state. Pos: {_child.obs_pos}"
+                    _child.obs_pos = _new_sim_state["qpos"][:2]
+                    
+                    # ── Post-rollout logging ──
+                    if tracer:
+                        tracer.log(
+                            tag="bidir_mcts._rollout_leaf_plan.post_rollout",
+                            data={
+                                "loop_count": loops,
+                                "child_node_id": id(_child),
+                                "child_obs_pos": _child.obs_pos.tolist() if hasattr(_child.obs_pos, 'tolist') else [float(x) for x in _child.obs_pos],
+                                "child_sim_state_qpos": _child.sim_state["qpos"][:2].tolist() if _child.sim_state else None,
+                                "parent_qpos": parent_node.sim_state["qpos"][:2].tolist() if parent_node.sim_state else None,
+                                "displacement": (
+                                    (float(_child.sim_state["qpos"][0] - parent_node.sim_state["qpos"][0]),
+                                     float(_child.sim_state["qpos"][1] - parent_node.sim_state["qpos"][1]))
+                                    if _child.sim_state and parent_node.sim_state else None
+                                ),
+                            },
+                            depth=1,
                         )
 
                 # Extract plan by selecting best leaf and combining plans
                 best_info: dict = self._select_best_leaf(expanded_node_infos)
 
-                # If no valid node was expanded (e.g., tree fully explored), skip this planning iteration
-                if best_info is None:
-                    if self.debug_log_level >= 1:
-                        import sys
-                        print(
-                            f"[WARN] No expandable nodes found at tree depth {active_tree.max_depth}. "
-                            f"Tree fully explored. Skipping plan extraction.",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                    # Use the previous plan if available, or continue without new plan
-                    continue
-
+                # [GUARANTEE] With is_expandable_flag and select() filtering:
+                # - Root unexpandable → terminate at loop start
+                # - Root expandable → at least 1 expandable child exists
+                # - select() only considers expandable children
+                # - Therefore expanded_node_infos is never empty
+                # - Therefore best_info is never None
+                assert best_info is not None, (
+                    "best_info should never be None: root is expandable, "
+                    "select() must have found an expandable child"
+                )
+                
                 best_node: "TreeNode" = best_info["node"]
+                
+                # ── Logging best_node selection ──
+                tracer = get_tracer()
+                if tracer:
+                    # Trace back to root to find which tree this belongs to
+                    curr = best_node
+                    depth_count = 0
+                    while curr._parent_node is not None:
+                        depth_count += 1
+                        curr = curr._parent_node
+                    belongs_to_tree1 = (curr is bidir_tree1.root_node)
+                    
+                    tracer.log(
+                        tag="bidir_mcts.best_node_selected",
+                        data={
+                            "loop_count": loops,
+                            "best_node_id": id(best_node),
+                            "best_node_depth": best_node.depth,
+                            "best_node_obs_pos": best_node.obs_pos.tolist() if hasattr(best_node.obs_pos, 'tolist') else [float(x) for x in best_node.obs_pos],
+                            "best_node_sim_state_qpos": best_node.sim_state["qpos"][:2].tolist() if best_node.sim_state else None,
+                            "belongs_to_tree1": belongs_to_tree1,
+                            "tree1_root_id": id(bidir_tree1.root_node),
+                            "tree2_root_id": id(bidir_tree2.root_node),
+                        },
+                        step=loops,
+                        depth=0,
+                    )
+
                 output_plan = self._extract_output_plan(
                     best_node,
                     plan_tokens=active_tree.plan_tokens,
                     is_tree1=(expanded_tree_idx == 0),
-                )
+                )  # (T_combined*fs, 1, c)
 
-                plan_hist = output_plan.unsqueeze(0)  # (1, T_combined, 1, c)
-                plan_hist = self._unnormalize_x(plan_hist)
-                plan = plan_hist[-1]  # (T_combined, 1, c)
+                plan_hist = output_plan.unsqueeze(0)  # (1, T_combined*fs, 1, c)
 
-                # [MEMORY] Log after plan extraction
-                log_memory_stats(tracer, f"interact.plan_extracted", step=steps)
+                plan_unnormalized = self._unnormalize_x(plan_hist)[-1]  # (T_combined*fs, 1, c)
 
                 # Flip for the next MPC step to alternate trees
                 expanded_tree_idx = (expanded_tree_idx + 1) % 2
@@ -1432,29 +1546,51 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 start_numpy = start.cpu().numpy()[:, :2]
                 goal_numpy = goal.cpu().numpy()[:, :2]
 
-                # Create forward trajectory image
+                # Extract best_node's tree trajectory (sim_state sequence from root to leaf)
+                node_trajectory = self._extract_node_trajectory(best_node)
+                
+                # ── Logging node_trajectory details ──
+                if tracer and node_trajectory is not None and len(node_trajectory) > 0:
+                    tracer.log(
+                        tag="bidir_mcts.node_trajectory_extracted",
+                        data={
+                            "loop_count": loops,
+                            "trajectory_length": len(node_trajectory),
+                            "trajectory_first_pos": node_trajectory[0].tolist(),
+                            "trajectory_last_pos": node_trajectory[-1].tolist(),
+                            "trajectory_all_positions": node_trajectory.tolist(),
+                            "start_goal_positions": {
+                                "start": start_numpy[0].tolist(),
+                                "goal": goal_numpy[0].tolist(),
+                            },
+                        },
+                        step=loops,
+                        depth=1,
+                    )
+
+                # Create forward trajectory image with both plan (red) and node trajectory (blue)
+                plan_positions = plan_unnormalized[:, :, :2].detach().cpu().numpy()
+
+                # Prepare trajectories dict for visualization
+                trajectories_dict = {
+                    'plan': plan_positions,  # Red
+                    'node_path': node_trajectory if node_trajectory is not None and len(node_trajectory) > 0 else None,  # Blue
+                }
+
                 forward_image = make_trajectory_images(
                     self.env_id,
-                    plan[:, :, :2].detach().cpu().numpy(),
+                    trajectories_dict,
                     1,
                     start_numpy,
                     goal_numpy,
                     self.plot_end_points,
                 )[0]
                 self.log_image(
-                    f"plan/plan_at_{steps}_from_start", Image.fromarray(forward_image)
+                    f"plan/plan_at_{steps}", Image.fromarray(forward_image)
                 )
 
                 # Create reverse trajectory image (swap start and goal for visualization)
-                """
-                reverse_image = make_trajectory_images(
-                    self.env_id, 
-                    reverse_plan[:, :, :2].detach().cpu().numpy(), 
-                    1, start_numpy, goal_numpy, 
-                    self.plot_end_points
-                )[0]
-                self.log_image(f"plan/plan_at_{steps}_from_goal", Image.fromarray(reverse_image))
-                """
+                
                 planning_end_time = time.time()
                 planning_time.append(planning_end_time - planning_start_time)
 
@@ -1463,53 +1599,33 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 # jumpy case (fill the gap)
                 if self.jump > 1:
                     _plan = []
-                    for t in range(plan.shape[0]):
+                    for t in range(plan_unnormalized.shape[0]):
                         for j in range(self.jump):
-                            _plan.append(plan[t, :, :2])
-                    plan = torch.stack(_plan)
+                            _plan.append(plan_unnormalized[t, :, :2])
+                    plan_unnormalized = torch.stack(_plan)
 
-                all_plan_hist.append(plan_hist.cpu())
 
-                # Convert plan from token format (T, 1, fs*c) to frame format (T*fs, 1, c) for unified execution
-                # This enables both interact and _rollout_leaf_plan to use the same execution logic
-                # Check if plan has the expected stacked dimension; if not, it's already in frame format
-                if plan.shape[-1] == self.x_stacked_shape[0]:
-                    # Plan is in token format (n_tokens, batch, obs_dim*frame_stack), convert to frame format
-                    plan_frame_format = rearrange(plan, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
-                else:
-                    # Plan is already in frame format or doesn't have stacking; use as-is
-                    # This can happen when the diffusion model outputs unstacked observations
-                    plan_frame_format = plan
-
-                # [MEMORY] Log before plan execution
-                log_memory_stats(tracer, f"interact.before_plan_exec", step=steps)
-
+                
                 # Prepare obs for environment execution
                 obs_numpy = obs.detach().cpu().numpy()
 
                 # Use unified plan execution function
                 trajectory_exec, reward_dict = self._execute_plan_in_env(
-                    plan_frame_format=plan_frame_format,
+                    plan_frame_format=plan_unnormalized,
                     envs=envs,
                     agent=agent if "antmaze" in self.env_id else None,
                     use_diffused_action=use_diffused_action,
-                    return_trajectory=True,
-                    return_rewards=True,
                 )
 
                 # Process returned rewards and trajectory
-                if reward_dict is not None:
-                    reached = np.logical_or(reached, reward_dict["reached"])
-                    episode_reward += reward_dict["episode_reward"]
-                    episode_reward_if_stay += reward_dict["episode_reward_if_stay"]
-                    first_reach += reward_dict["first_reach"]
+                reached = np.logical_or(reached, reward_dict["reached"])
+                episode_reward += reward_dict["episode_reward"]
+                episode_reward_if_stay += reward_dict["episode_reward_if_stay"]
+                first_reach += reward_dict["first_reach"]
 
-                    # Check if episode terminated
-                    if (reward_dict["reached"] >= 1.0).any():
-                        terminate = True
-
-                # [MEMORY] Log after plan execution
-                log_memory_stats(tracer, f"interact.after_plan_exec", step=steps)
+                # Check if episode terminated
+                if (reward_dict["reached"] >= 1.0).any():
+                    terminate = True
 
                 # [MEMORY CLEANUP] Clear caches after plan execution
                 gc.collect()
@@ -1553,44 +1669,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     Image.fromarray(img),
                 )
 
-            if self.debug:
-                samples = min(16, batch_size)
-                indicies = list(range(samples))
-
-                for i in indicies:
-                    filename = make_convergence_animation(
-                        self.env_id,
-                        all_plan_hist,
-                        trajectory,
-                        start,
-                        goal,
-                        self.open_loop_horizon,
-                        namespace=namespace,
-                        batch_idx=i,
-                    )
-                    self.logger.experiment.log(
-                        {
-                            f"convergence/{namespace}_{i}": wandb.Video(filename, fps=4),
-                            f"trainer/global_step": self.global_step,
-                        }
-                    )
-
-                    filename = make_mpc_animation(
-                        self.env_id,
-                        all_plan_hist,
-                        trajectory,
-                        start,
-                        goal,
-                        self.open_loop_horizon,
-                        namespace=namespace,
-                        batch_idx=i,
-                    )
-                    self.logger.experiment.log(
-                        {
-                            f"mpc/{namespace}_{i}": wandb.Video(filename, fps=24),
-                            f"trainer/global_step": self.global_step,
-                        }
-                    )
 
     def pad_init(self, x, is_start=True, batch_first=False):
         x = repeat(x, "b ... -> fs b ...", fs=self.frame_stack).clone()
@@ -1946,8 +2024,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         Args:
             tree: MCTSTreeState initialized by _init_mcts_tree
-            obs_normalized: Normalized start observation
-            goal_normalized: Normalized goal observation
             horizon: Planning horizon
             conditions: Planning conditions
             start: Raw (unnormalized) start observation, shape (1, obs_dim)
@@ -2460,12 +2536,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     parent_levels_list, axis=0
                 )  # (b, plan_tokens(=t))
 
-                # Zero-out obs_parent_token position (given token, not to be denoised)
-                for _b, _info in enumerate(expanded_node_candidates):
-                    _prefix_len_b = _info["parent_node"].depth * seg_size
-                    if _prefix_len_b < parent_levels.shape[1]:
-                        parent_levels[_b, _prefix_len_b] = 0
-
                 # Generate bidirectional denoising schedule
                 expanded_node_noise_levels = self._generate_bidirectional_schedule(
                     parent_levels, complete_denoising=False
@@ -2537,7 +2607,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     assert prefix_len_list is not None
                     batch_size = expanded_node_plan_hists.shape[2]
                     plans_tokens = rearrange(expanded_node_plan_hists, "m (t fs) b c -> m t fs b c", fs=self.frame_stack)
-                    num_tokens_to_check = seg_size + 1
+                    num_tokens_to_check = seg_size
                     t_rel_idx = torch.arange(num_tokens_to_check, device=self.device).view(-1, 1) # (T_check, 1)
                     prefixes = torch.tensor(prefix_len_list, device=self.device).view(1, -1) # (1, B)
                     token_indices = t_rel_idx + prefixes # (T_check, B)
@@ -2565,7 +2635,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                                 expanded_node_plan_hists[:, :, i]
                             )
 
-                else: # mcts_use_sim is True
+                else: # [DEPRECATED] mcts_use_sim is True
                     print("============ Simulation Start ============")
                     # Pad the noise levels - Sequential
                     simul_noiselevel_zero_padding_start = time.time()
@@ -2939,6 +3009,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         This output is ready to be passed directly to parallel_plan (pre-built format).
         """
+        # Structural guarantee: plan_history is ALWAYS a list (never None)
+        # This is guaranteed by TreeNode.__init__ and get_expandable_candidate
+        assert isinstance(parent_node.plan_history, list), \
+            f"plan_history must be list, got {type(parent_node.plan_history)}"
+
         if self.debug:
             print(
                 f"    [DEBUG] Building initial plan from leaf. Parent: {parent_node.name}, Depth: {parent_node.depth}, History Segments: {len(parent_node.plan_history)}"
@@ -2971,11 +3046,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         prefix_len = 0 # initial value
 
         # --- Build denoised prefix from parent's plan_history ---
+        # Structural guarantee: plan_history is ALWAYS a list (initialized to [] in TreeNode.__init__)
+        # - Root nodes: plan_history = [] (empty, evaluates to False)
+        # - Non-root nodes: plan_history has accumulated plan segments (non-empty, evaluates to True)
+        # This condition checks: "if parent is NOT a root node" to use accumulated prefix
         if parent_node.plan_history:
             # plan_history stores plans in canonical (forward) order via flip_plan_for_insert_hist.
-            latest_plan_canonical = parent_node.plan_history[-1][
-                -1
-            ]  # (plan_tokens*fs, c)
+            latest_plan_canonical = parent_node.plan_history[-1][-1]  # (plan_tokens*fs, c)
             prefix_len_frames = parent_node.depth * segment_size * self.frame_stack
             full_prefix_canonical = latest_plan_canonical[:prefix_len_frames].unsqueeze(
                 1
@@ -2992,10 +3069,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         else:
             denoised_prefix = None
             prefix_len = 0
-
-        # Layout within plan_tokens_with_parent_obs: [prefix(prefix_len) | obs_parent(1) | noisy(plan_tokens-1-prefix_len)]
-        # FIX: Account for obs_parent_token (1 token) when calculating noisy_total
-        noisy_total = plan_tokens - prefix_len - 1  # -1 for obs_parent_token
+        
+        # Layout within plan_tokens_with_parent_obs: [prefix(prefix_len) | obs_parent(1) | noisy(plan_tokens-prefix_len)] Totally, plan_tokens + 1.
+        noisy_total = plan_tokens - prefix_len
         assert noisy_total >= 0, f"Noisy total must be non-negative: {noisy_total}"
 
         # DEBUG
@@ -3021,19 +3097,69 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         if denoised_prefix is not None:
             plan_chunk_with_parent_obs = torch.cat(
                 [denoised_prefix, obs_parent_token, noisy_parts],
-                dim=0,  # (plan_tokens, 1, fs*c)
+                dim=0,  # (plan_tokens+1, 1, fs*c)
             )
         else:
             plan_chunk_with_parent_obs = torch.cat(
                 [obs_parent_token, noisy_parts], dim=0
-            )  # (plan_tokens, 1, fs*c)
+            )  # (plan_tokens+1, 1, fs*c)
 
-        assert plan_chunk_with_parent_obs.shape[0] == plan_tokens, (
-            f"Plan chunk length mismatch: {plan_chunk_with_parent_obs.shape[0]} != {plan_tokens}"
+        # [INSTRUMENTATION] Log plan assembly - HYPOTHESIS TESTING
+        tracer = self.tracer if hasattr(self, 'tracer') else None
+        if tracer:
+            with tracer.scope("plan_assembly", phase="inference", depth=0):
+                obs_parent_actual_pos = prefix_len if denoised_prefix is not None else 0
+
+                # H1: Check if obs_parent and first noisy token have different properties
+                first_token = plan_chunk_with_parent_obs[0:1]
+                obs_parent_token_in_chunk = plan_chunk_with_parent_obs[obs_parent_actual_pos:obs_parent_actual_pos+1]
+                first_noisy_token = plan_chunk_with_parent_obs[obs_parent_actual_pos+1:obs_parent_actual_pos+2] if obs_parent_actual_pos+1 < plan_chunk_with_parent_obs.shape[0] else None
+
+                tracer.log(
+                    tag="plan.assembly.structure",
+                    data={
+                        "prefix_len": prefix_len,
+                        "obs_parent_pos": obs_parent_actual_pos,
+                        "noisy_start_pos": obs_parent_actual_pos + 1,
+                        "total_plan_tokens": plan_tokens + 1,
+                        "plan_chunk_shape": list(plan_chunk_with_parent_obs.shape),
+                        "parent_depth": parent_node.depth,
+                        "segment_size": segment_size,
+                    },
+                    depth=0,
+                )
+
+                # H1 Testing: Log obs_parent properties
+                tracer.log_tensor_stats(
+                    tag="plan.segment_boundary.obs_parent",
+                    tensor=obs_parent_token_in_chunk,
+                    depth=1,
+                    label=f"obs_parent_at_pos_{obs_parent_actual_pos}_depth_{parent_node.depth}",
+                )
+
+                # H2 Testing: Log first noisy token
+                if first_noisy_token is not None:
+                    tracer.log_tensor_stats(
+                        tag="plan.segment_boundary.first_noisy",
+                        tensor=first_noisy_token,
+                        depth=1,
+                        label=f"first_noisy_at_pos_{obs_parent_actual_pos+1}_depth_{parent_node.depth}",
+                    )
+
+                # H3 Testing: Log first token overall (will become segment start)
+                tracer.log_tensor_stats(
+                    tag="plan.segment_boundary.first_token",
+                    tensor=first_token,
+                    depth=1,
+                    label=f"first_token_pos_0_depth_{parent_node.depth}",
+                )
+
+        assert plan_chunk_with_parent_obs.shape[0] == plan_tokens+1, (
+            f"Plan chunk length mismatch: {plan_chunk_with_parent_obs.shape[0]} != {plan_tokens+1}"
         )
 
         # Append zero-padding to reach n_tokens.
-        # FIX: padding formula should be: pad_tokens = n_tokens - plan_tokens (no extra +1)
+        # padding formula should be: pad_tokens = n_tokens - (plan_tokens+1)
         plan_chunk_len = plan_chunk_with_parent_obs.shape[0]
         pad_tokens = self.n_tokens - plan_chunk_len
 
@@ -3103,44 +3229,64 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         envs: Any,
         agent: Optional[Any] = None,
         use_diffused_action: bool = False,
-        return_trajectory: bool = False,
-        return_rewards: bool = False,
-    ) -> tuple[Optional[List[torch.Tensor]], Optional[dict]]:
+        parent_sim_state: Optional[dict] = None,
+    ) -> tuple[List[torch.Tensor], dict]:
         """
         Execute a plan segment in environment with unified action computation.
 
         Handles both antmaze and pointmaze with:
         - Sub-goal interval updates for antmaze
         - PID controller for pointmaze
-        - Optional trajectory and reward collection
+        - Trajectory and reward collection
+        - Optional parent state injection for state stitching
 
         Args:
             plan_frame_format: Plan in frame format, shape (T*fs, 1, c)
             envs: Vectorized environment
             agent: RL agent for antmaze (None for pointmaze)
             use_diffused_action: If True, use action directly from diffusion
-            return_trajectory: If True, collect trajectory bundles
-            return_rewards: If True, track reward statistics
+            parent_sim_state: Optional sim state (qpos, qvel) to restore before execution
 
         Returns:
-            (trajectory_list or None, reward_dict or None)
-            - trajectory_list: List of trajectory bundles, or None if return_trajectory=False
-            - reward_dict: Dict with keys 'reached', 'episode_reward', etc., or None if return_rewards=False
+            (trajectory_list, reward_dict)
+            - trajectory_list: List of trajectory bundles
+            - reward_dict: Dict with keys 'reached', 'episode_reward', etc.
         """
-        trajectory = [] if return_trajectory else None
+        trajectory = []
+
+
+        # Step 1: Initialize environment state (done=False)
         obs_reset = envs.reset()
         # Handle both DummyVecEnv (returns (obs, info)) and single env (returns obs)
         obs_numpy = obs_reset[0] if isinstance(obs_reset, tuple) else obs_reset
-        # Ensure obs_numpy is 2D: (batch_size, obs_dim)
+
+        # Step 2: Override with parent's physical state (if provided)
+        # This will be reflected in obs since we just got fresh observation
+        self._set_sim_state(envs, parent_sim_state)
+
+        # Conditional is for Path A (fresh start) vs Path B (MCTS continuation)
+        if parent_sim_state is not None:
+            # FIX: Retrieve observation without stepping (no dummy action)
+            try:
+                if hasattr(envs, '_get_obs'):
+                    obs_numpy = envs._get_obs()
+                elif hasattr(envs, 'get_obs'):
+                    obs_numpy = envs.get_obs()
+                if isinstance(obs_numpy, tuple):
+                    obs_numpy = obs_numpy[0]
+            except Exception as e:
+                if self.debug:
+                    print(f"[DEBUG] Failed to retrieve obs after parent_sim_state restore: {e}")
+
         if obs_numpy.ndim == 1:
             obs_numpy = obs_numpy[None, :]  # Add batch dimension: (obs_dim,) → (1, obs_dim)
 
         # Initialize reward tracking
         batch_size = obs_numpy.shape[0]
-        reached = np.zeros(batch_size, dtype=bool) if return_rewards else None
-        episode_reward = np.zeros(batch_size) if return_rewards else None
-        episode_reward_if_stay = np.zeros(batch_size) if return_rewards else None
-        first_reach = np.zeros(batch_size) if return_rewards else None
+        reached = np.zeros(batch_size, dtype=bool)
+        episode_reward = np.zeros(batch_size)
+        episode_reward_if_stay = np.zeros(batch_size)
+        first_reach = np.zeros(batch_size)
 
         # Initialize sub_goal for antmaze
         plan_slice_np = None
@@ -3186,18 +3332,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             if obs_numpy.ndim == 1:
                 obs_numpy = obs_numpy[None, :]  # Add batch dimension
 
-            # Track rewards if requested
-            if return_rewards:
-                reached = np.logical_or(reached, reward >= 1.0)
-                episode_reward += reward
-                episode_reward_if_stay += np.where(~reached, reward, 1)
-                first_reach += ~reached
+            # Track rewards
+            reached = np.logical_or(reached, reward >= 1.0)
+            episode_reward += reward
+            episode_reward_if_stay += np.where(~reached, reward, 1)
+            first_reach += ~reached
 
-            # Collect trajectory if requested
-            if return_trajectory:
-                obs_torch = torch.from_numpy(obs_numpy).float()
-                bundle = self.make_bundle(obs_torch, action, reward[..., None])
-                trajectory.append(bundle)
+            # Collect trajectory
+            obs_torch = torch.from_numpy(obs_numpy).float()
+            bundle = self.make_bundle(obs_torch, action, reward[..., None])
+            trajectory.append(bundle)
 
             # Update prev_frame for velocity calculation
             plan_prev_frame = plan_frame
@@ -3207,14 +3351,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 break
 
         # Return results
-        reward_dict = None
-        if return_rewards:
-            reward_dict = {
-                "reached": reached,
-                "episode_reward": episode_reward,
-                "episode_reward_if_stay": episode_reward_if_stay,
-                "first_reach": first_reach,
-            }
+        reward_dict = {
+            "reached": reached,
+            "episode_reward": episode_reward,
+            "episode_reward_if_stay": episode_reward_if_stay,
+            "first_reach": first_reach,
+        }
 
         return trajectory, reward_dict
 
@@ -3310,30 +3452,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         if plan_slice.shape[0] == 0:
             return self._get_sim_state(envs)
 
-        # Override envs.reset() temporarily to use the restored state
-        # Instead of resetting, we'll run the plan execution loop directly
-        # The observation is constructed from parent_sim_state
-        full_obs = np.concatenate([parent_sim_state["qpos"], parent_sim_state["qvel"]])
-        obs_numpy = full_obs[None, :]  # shape (1, full_obs_size)
-
-        # Prepare initial obs for _execute_plan_in_env by setting it properly
-        # We need to patch envs to return correct initial obs
-        original_reset = envs.reset
-        envs.reset = lambda: (obs_numpy, None)
-
-        try:
-            # Execute plan using unified function
-            _, _ = self._execute_plan_in_env(
-                plan_frame_format=plan_slice,
-                envs=envs,
-                agent=agent if "antmaze" in self.env_id else None,
-                use_diffused_action=False,
-                return_trajectory=False,
-                return_rewards=False,
-            )
-        finally:
-            # Restore original reset function
-            envs.reset = original_reset
+        # Execute plan with parent state injection for continuous state stitching
+        # This restores parent's complete sim state before rolling out the new plan
+        _, _ = self._execute_plan_in_env(
+            plan_frame_format=plan_slice,
+            envs=envs,
+            agent=agent if "antmaze" in self.env_id else None,
+            use_diffused_action=False,
+            parent_sim_state=parent_sim_state,  # Pass complete state for restoration
+        )
 
         # Capture reached physical state (contains qpos/qvel with position info)
         final_sim_state = self._get_sim_state(envs)
@@ -3361,12 +3488,66 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             # Return None to signal that no valid plan was found
             return None
 
-        return max(
+        # ── Detailed validation logging ──
+        tracer = get_tracer()
+        if tracer:
+            evaluation_log = []
+            for node_name, info in expanded_node_infos.items():
+                node = info.get("node")
+                parent_node = info.get("parent_node")
+                value = info.get("value")
+                plan_history = info.get("plan_history", [])
+                
+                if node and parent_node:
+                    evaluation_log.append({
+                        "node_name": node_name,
+                        "node_id": id(node),
+                        "node_depth": node.depth,
+                        "parent_id": id(parent_node),
+                        "parent_depth": parent_node.depth,
+                        "value": float(value) if value is not None else None,
+                        "obs_pos": node.obs_pos.tolist() if hasattr(node.obs_pos, 'tolist') else [float(x) for x in node.obs_pos],
+                        "sim_state_qpos": node.sim_state["qpos"][:2].tolist() if node.sim_state else None,
+                        "plan_history_length": len(plan_history),
+                    })
+            
+            tracer.log(
+                tag="bidir_mcts._select_best_leaf.evaluation",
+                data={
+                    "total_candidates": len(expanded_node_infos),
+                    "candidates": evaluation_log,
+                },
+                depth=1,
+            )
+
+        best_info = max(
             expanded_node_infos.values(),
             key=lambda info: info["value"]
             if info.get("value") is not None
             else float("-inf"),
         )
+        
+        # ── Log selected best ──
+        if tracer:
+            best_node = best_info.get("node")
+            best_value = best_info.get("value")
+            best_parent = best_info.get("parent_node")
+            
+            tracer.log(
+                tag="bidir_mcts._select_best_leaf.selected",
+                data={
+                    "best_node_id": id(best_node),
+                    "best_node_depth": best_node.depth,
+                    "best_node_obs_pos": best_node.obs_pos.tolist() if hasattr(best_node.obs_pos, 'tolist') else [float(x) for x in best_node.obs_pos],
+                    "best_node_sim_state_qpos": best_node.sim_state["qpos"][:2].tolist() if best_node.sim_state else None,
+                    "best_parent_id": id(best_parent),
+                    "best_parent_depth": best_parent.depth if best_parent else None,
+                    "best_value": float(best_value) if best_value is not None else None,
+                },
+                depth=1,
+            )
+        
+        return best_info
 
     def _extract_output_plan(
         self,
@@ -3390,32 +3571,54 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             plan_tokens: Total number of plan tokens for the tree (determines seg_size).
 
         Returns:
-            output_plan: Tensor of shape (T, 1, c), where T = combined path length.
+            output_plan: Tensor of shape (T_combined*fs, 1, c), where T = combined path length.
         """
         seg_size: int = plan_tokens // self.sequence_dividing_factor
 
         # --- Plan A: forward tree leaf ---
-        if len(best_node.plan_history) == 0 or len(best_node.plan_history[-1]) == 0:
-            # Fallback: use initial observation when no plan history exists (root node only)
-            import sys
-            print(f"[WARN _extract_output_plan] best_node has empty plan_history (root node?). Using initial obs.", file=sys.stderr, flush=True)
-            t1_segments = best_node.obs.unsqueeze(1)  # (frame_stack*obs_dim, 1) -> (frame_stack*obs_dim, 1)
-        else:
-            plan_a_full: torch.Tensor = best_node.plan_history[-1][-1]  # (T_total*fs, c)
-            a_len: int = best_node.depth * seg_size * self.frame_stack
-            t1_segments: torch.Tensor = plan_a_full[:a_len]  # (A_len, c)
+        # Structural guarantee: best_node is always an expanded node (from _select_best_leaf)
+        # Expanded nodes always have non-empty plan_history (set during expansion in _run_mcts_search)
+        # Root node can never be best_node because it is not expanded (see _select_best_leaf logic)
+        assert len(best_node.plan_history) > 0, \
+            f"best_node.plan_history must be non-empty for expanded nodes, but got {best_node.plan_history}"
+        assert len(best_node.plan_history[-1]) > 0, \
+            f"best_node.plan_history[-1] must be non-empty, but got {best_node.plan_history[-1]}"
 
-        if best_node.target_node is None or len(best_node.target_node.plan_history) == 0:
-            # --- Unidirectional: use plan_A only ---
+        plan_a_full: torch.Tensor = best_node.plan_history[-1][-1]  # (T_total*fs, c)
+        a_len: int = best_node.depth * seg_size * self.frame_stack
+        t1_segments: torch.Tensor = plan_a_full[:a_len]  # (A_len, c)
+
+        # [DIAGNOSTIC] Log plan slicing details
+        if self.debug_log_level >= 2:
             import sys
-            if best_node.target_node is not None and not best_node.target_node.plan_history:
-                print(f"[WARN Extract] target_node.plan_history is empty! Falling back to unidirectional", file=sys.stderr, flush=True)
+            print(f"\n[DEBUG _extract_output_plan] Plan A slicing:", file=sys.stderr, flush=True)
+            print(f"  best_node.depth: {best_node.depth}", file=sys.stderr, flush=True)
+            print(f"  seg_size: {seg_size} (plan_tokens={plan_tokens}, seq_div={self.sequence_dividing_factor})", file=sys.stderr, flush=True)
+            print(f"  frame_stack: {self.frame_stack}", file=sys.stderr, flush=True)
+            print(f"  a_len calculated: {a_len}", file=sys.stderr, flush=True)
+            print(f"  plan_a_full shape: {plan_a_full.shape}", file=sys.stderr, flush=True)
+            print(f"  t1_segments shape after slicing: {t1_segments.shape}", file=sys.stderr, flush=True)
+            print(f"  First few positions of plan_a_full: {plan_a_full[:5, :2]}", file=sys.stderr, flush=True)
+            print(f"  First few positions of t1_segments: {t1_segments[:5, :2]}", file=sys.stderr, flush=True)
+
+        # --- Bidirectional search: target_node handling ---
+        # Structural guarantee in bidirectional MCTS (always active in interact()):
+        # - best_node.target_node is ALWAYS set (opposite tree leaf selected at line 2341)
+        # - best_node.target_node is NEVER None (guarded by assertion at line 2338-2340)
+        #
+        # However, target_node.plan_history can be empty in early iterations:
+        # - Iteration 1: Tree1 active, Tree2 not expanded → Tree2.leaves may include root
+        # - If root node selected as target_node → plan_history=[] (root has empty plan_history)
+        # - Fallback to plan_A only (opposite tree hasn't contributed yet)
+        # - After iteration 2+: Tree2 is expanded → target_node.plan_history is non-empty
+        assert best_node.target_node is not None, \
+            "target_node must be set in bidirectional MCTS (opposite tree leaf must be available)"
+        if len(best_node.target_node.plan_history) == 0:
+            # --- Early iteration or missing opposite tree: use plan_A only ---
             combined = t1_segments
         else:
             # --- Bidirectional: flip plan_B and concat ---
-            plan_b_full: torch.Tensor = best_node.target_node.plan_history[-1][
-                -1
-            ]  # (T_total*fs, c)
+            plan_b_full: torch.Tensor = best_node.target_node.plan_history[-1][-1]  # (T_total*fs, c)
             b_len: int = best_node.target_node.depth * seg_size * self.frame_stack
             t2_flipped: torch.Tensor = torch.flip(
                 plan_b_full[:b_len], [0]
@@ -3428,9 +3631,56 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 )
 
             combined = torch.cat([t1_segments, t2_flipped], dim=0)  # (A_len+B_len, c)
+            # H5 Testing: Log segment boundary details for concatenation
+            tracer = self.tracer if hasattr(self, 'tracer') else None
+            if tracer:
+                with tracer.scope("plan_extraction", phase="inference", depth=0):
+                    tracer.log(
+                        tag="plan.extract.segment_concatenation",
+                        data={
+                            "t1_a_len": int(a_len),
+                            "t2_b_len": int(b_len),
+                            "combined_len": int(a_len + b_len),
+                            "plan_tokens": plan_tokens,
+                            "segment_size": int(plan_tokens // self.sequence_dividing_factor),
+                            "best_node_depth": best_node.depth,
+                            "target_node_depth": best_node.target_node.depth if best_node.target_node is not None else None,
+                        },
+                        depth=0,
+                    )
+                    
+                    # Log first few tokens of each segment at boundary
+                    tracer.log_tensor_stats(
+                        tag="plan.extract.t1_last_tokens",
+                        tensor=t1_segments[-3:] if t1_segments.shape[0] > 3 else t1_segments,
+                        depth=1,
+                        label=f"t1_last_3_tokens_len_{a_len}",
+                    )
+                    
+                    tracer.log_tensor_stats(
+                        tag="plan.extract.t2_first_tokens",
+                        tensor=t2_flipped[:3] if t2_flipped.shape[0] > 3 else t2_flipped,
+                        depth=1,
+                        label=f"t2_first_3_tokens_after_flip_len_{b_len}",
+                    )
+                    
+                    tracer.log_tensor_stats(
+                        tag="plan.extract.combined_boundary",
+                        tensor=combined[a_len-2:a_len+3] if combined.shape[0] > a_len+2 else combined[max(0, a_len-2):],
+                        depth=1,
+                        label=f"boundary_at_a_len_{a_len}_total_{a_len+b_len}",
+                    )
 
-        if not is_tree1:
-            combined = torch.flip(combined, [0])  # (A_len+B_len, c)
+
+        # [BIDIRECTIONAL FIX] In bidirectional mode, the combined plan is already correct:
+        # - Tree1 (forward): plan_A (tree1) + flip(plan_B from tree2)
+        # - Tree2 (backward): plan_A (tree2) + flip(plan_B from tree1)
+        # The plan sequence is from the current tree's perspective, so we should NOT flip based on is_tree1.
+        # The original code that flipped for tree2 was a bug that caused reversed execution trajectories.
+        #
+        # Removing the flip: both trees produce correct forward plans in their respective directions.
+        
+        # REMOVED: if not is_tree1: combined = torch.flip(combined, [0])
 
         output = combined.unsqueeze(1)  # (A_len+B_len, 1, c)
 
@@ -3440,136 +3690,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         return output
 
-    ############### DEPRECATED ###############
-    def p_mctd_plan(
-        self,
-        obs_normalized: torch.Tensor,
-        goal_normalized: torch.Tensor,
-        horizon: int,
-        conditions: Optional[Any],
-        start: np.ndarray,
-        goal: np.ndarray,
-        tag: str = "mcts_plan",
-    ) -> torch.Tensor:
-        """
-        Orchestrator for MCTS-based diffusion planning.
-
-        Initializes two trees: T1 (start-rooted, is_tree1=True) and T2 (goal-rooted, is_tree1=False).
-        Runs the full search on each tree independently (each up to max_search_num).
-        Selects the best expanded node across both trees for output.
-
-        Args:
-            obs_normalized: Normalized start observation, shape (1, obs_dim)
-            goal_normalized: Normalized goal observation, shape (1, obs_dim)
-            horizon: Planning horizon (must be divisible by frame_stack)
-            conditions: Planning conditions
-            start: Raw (unnormalized) start observation, shape (1, obs_dim)
-            goal: Raw (unnormalized) goal observation, shape (1, obs_dim)
-            tag: Tag string for logging
-
-        Returns:
-            output_plan: shape (1, t, 1, c)
-        """
-        assert start.shape[0] == 1, "the batch size must be 1"
-        assert (not self.leaf_parallelization) or (
-            self.parallel_search_num % len(self.mctd_guidance_scales) == 0
-        ), (
-            f"Parallel search num must be divisible by the number of guidance scales: {self.parallel_search_num} % {len(self.mctd_guidance_scales)} != 0"
-        )
-
-        assert horizon <= self.episode_len, (
-            f"Horizon must be less than or equal to episode length: {horizon} <= {self.episode_len}"
-        )
-        assert horizon % self.frame_stack == 0, (
-            f"Horizon must be divisible by frame stack: {horizon} % {self.frame_stack} != 0"
-        )
-
-        def _get_all_leaves(root: "TreeNode") -> List["TreeNode"]:
-            res = []
-            s = [root]
-            while s:
-                n = s.pop()
-                if all(c["node"] is None for c in n._children_nodes):
-                    res.append(n)
-                else:
-                    for c in n._children_nodes:
-                        if c["node"] is not None:
-                            s.append(c["node"])
-            return res
-
-        # --- Two trees searched independently: T1 (start-rooted), T2 (goal-rooted) ---
-        tree1 = self._init_mcts_tree(horizon, is_tree1=True, tag=tag + "_from_start")
-        tree2 = self._init_mcts_tree(horizon, is_tree1=False, tag=tag + "_from_goal")
-
-        tree1, infos1 = self._run_mcts_search(tree1, horizon, conditions, start, goal)
-        tree2, infos2 = self._run_mcts_search(tree2, horizon, conditions, start, goal)
-
-        _all_infos: dict[str, dict] = {}
-        _all_infos.update(infos1 if infos1 else {})
-        _all_infos.update(infos2 if infos2 else {})
-        if _all_infos:
-            _best_info = self._select_best_leaf(_all_infos)
-            output_plan = self._extract_output_plan(
-                _best_info["node"],
-                plan_tokens=tree1.plan_tokens,
-                is_tree1=_best_info["is_tree1"],
-            )
-        else:
-            # Fallback: no expansions occurred
-            output_plan = torch.zeros(
-                (horizon, 1, tree1.plan_tokens // horizon * self.frame_stack),
-                device=self.device,
-            )
-        output_plan = output_plan.unsqueeze(0)  # (1, T, 1, c)
-
-        # Logging: sum both trees' stats
-        self.log(f"validation/search_num", tree1.search_num + tree2.search_num)
-        self.log(f"validation/p_search_num", tree1.p_search_num + tree2.p_search_num)
-        self.log(f"validation/max_depth", max(tree1.max_depth, tree2.max_depth))
-
-        self.log(
-            f"validation_time/selection_time",
-            np.sum(tree1.selection_time) + np.sum(tree2.selection_time),
-        )
-        self.log(
-            f"validation_time/expansion_time",
-            np.sum(tree1.expansion_time) + np.sum(tree2.expansion_time),
-        )
-        self.log(
-            f"validation_time/simulation_time",
-            np.sum(tree1.simulation_time) + np.sum(tree2.simulation_time),
-        )
-        self.log(
-            f"validation_time/backprop_time",
-            np.sum(tree1.backprop_time) + np.sum(tree2.backprop_time),
-        )
-        self.log(
-            f"validation_time/early_termination_time",
-            np.sum(tree1.early_termination_time) + np.sum(tree2.early_termination_time),
-        )
-
-        self.log(
-            f"validation_time/simul_noiselevel_zero_padding_time",
-            np.sum(tree1.simul_noiselevel_zero_padding_time)
-            + np.sum(tree2.simul_noiselevel_zero_padding_time),
-        )
-        self.log(
-            f"validation_time/simul_value_estimation_time",
-            np.sum(tree1.simul_value_estimation_time)
-            + np.sum(tree2.simul_value_estimation_time),
-        )
-        self.log(
-            f"validation_time/simul_value_calculation_time",
-            np.sum(tree1.simul_value_calculation_time)
-            + np.sum(tree2.simul_value_calculation_time),
-        )
-        self.log(
-            f"validation_time/simul_node_allocation_time",
-            np.sum(tree1.simul_node_allocation_time)
-            + np.sum(tree2.simul_node_allocation_time),
-        )
-
-        return output_plan
     
     def _print_memory_report(self) -> None:
         """Print memory usage report if profiler is enabled."""

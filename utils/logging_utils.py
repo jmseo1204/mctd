@@ -255,7 +255,24 @@ def plot_start_goal(ax, start_goal: None):
 
 
 def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end_points=True):
+    """
+    Create trajectory visualization images.
+
+    Args:
+        trajectory: Can be either:
+            - numpy array of shape (T, batch_size, 2) for backward compatibility (red)
+            - dict with keys 'plan' (red) and 'node_path' (blue, optional)
+    """
     images = []
+
+    # Handle both dict and array inputs for backward compatibility
+    if isinstance(trajectory, dict):
+        plan_trajectory = trajectory.get('plan')
+        node_trajectory = trajectory.get('node_path')
+    else:
+        plan_trajectory = trajectory
+        node_trajectory = None
+
     for batch_idx in range(batch_size):
         fig, ax = plt.subplots()
         if is_grid_env(env_id):
@@ -263,16 +280,40 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
         else:
             maze_grid = None
         plot_maze_layout(ax, maze_grid)
-        if env_id in OGBENCH_ENVS: # OGBench envs
-            ax.scatter(trajectory[:, batch_idx, 0]/4+1, trajectory[:, batch_idx, 1]/4+1, c=np.arange(len(trajectory)), cmap="Reds", alpha=0.8),
-        else:
-            ax.scatter(trajectory[:, batch_idx, 0], trajectory[:, batch_idx, 1], c=np.arange(len(trajectory)), cmap="Reds", alpha=0.8),
+
+        # Plot plan trajectory (red)
+        if plan_trajectory is not None:
+            if env_id in OGBENCH_ENVS:  # OGBench envs
+                ax.scatter(plan_trajectory[:, batch_idx, 0]/4+1, plan_trajectory[:, batch_idx, 1]/4+1,
+                          c=np.arange(len(plan_trajectory)), cmap="Reds", alpha=0.8, label="Plan", s=50),
+            else:
+                ax.scatter(plan_trajectory[:, batch_idx, 0], plan_trajectory[:, batch_idx, 1],
+                          c=np.arange(len(plan_trajectory)), cmap="Reds", alpha=0.8, label="Plan", s=50),
+
+        # Plot node trajectory (blue) - tree path from root to leaf
+        if node_trajectory is not None and len(node_trajectory) > 0:
+            if env_id in OGBENCH_ENVS:  # OGBench envs
+                ax.plot(node_trajectory[:, 0]/4+1, node_trajectory[:, 1]/4+1,
+                       'b-', linewidth=2, alpha=0.6, label="Tree Path"),
+                ax.scatter(node_trajectory[:, 0]/4+1, node_trajectory[:, 1]/4+1,
+                          c='blue', marker='o', s=100, alpha=0.7, edgecolors='darkblue', linewidth=2, zorder=5),
+            else:
+                ax.plot(node_trajectory[:, 0], node_trajectory[:, 1],
+                       'b-', linewidth=2, alpha=0.6, label="Tree Path"),
+                ax.scatter(node_trajectory[:, 0], node_trajectory[:, 1],
+                          c='blue', marker='o', s=100, alpha=0.7, edgecolors='darkblue', linewidth=2, zorder=5),
+
         if plot_end_points:
-            if env_id in OGBENCH_ENVS: # OGBench envs
+            if env_id in OGBENCH_ENVS:  # OGBench envs
                 start_goal = (np.array(start[batch_idx])/4+1, np.array(goal[batch_idx])/4+1)
             else:
                 start_goal = (start[batch_idx], goal[batch_idx])
             plot_start_goal(ax, start_goal)
+
+        # Add legend if node_trajectory is present
+        if node_trajectory is not None and len(node_trajectory) > 0:
+            ax.legend(loc='upper right', fontsize=10)
+
         # plt.title(f"sample_{batch_idx}")
         fig.tight_layout()
         fig.canvas.draw()

@@ -44,6 +44,11 @@ class TreeNode():
         # Set by _select_dynamic_goal() in _run_mcts_search().
         self.target_node: Optional['TreeNode'] = target_node
 
+        # Expansion state flag: tracks whether this node can be expanded further.
+        # For leaf nodes: initialized based on is_expandable() evaluation.
+        # For non-leaf nodes: updated during backpropagation when all children become unexpandable.
+        self.is_expandable_flag: bool = self.is_expandable()
+
     def __lt__(self, other):
         return self.name < other.name
     
@@ -91,14 +96,35 @@ class TreeNode():
         for child_node in self._children_nodes:
             if child_node["node"] is None:
                 raise ValueError('Child node is None in select method')
-        total_visit_count = sum([child_node["node"].visit_count + child_node["node"].virtual_visit_count * self.virtual_visit_weight for child_node in self._children_nodes])
+
+        # Filter out unexpandable children - only consider expandable ones for selection
+        expandable_children_indices = [
+            i for i, child_node in enumerate(self._children_nodes)
+            if child_node["node"].is_expandable_flag
+        ]
+
+        if not expandable_children_indices:
+            raise ValueError('No expandable children available for selection')
+
+        # Calculate total visit count only for expandable children
+        total_visit_count = sum([
+            self._children_nodes[i]["node"].visit_count +
+            self._children_nodes[i]["node"].virtual_visit_count * self.virtual_visit_weight
+            for i in expandable_children_indices
+        ])
+
+        # Calculate UCT values only for expandable children
         uct_values = []
-        for child_node in self._children_nodes:
-            _node = child_node["node"]
+        for idx in expandable_children_indices:
+            _node = self._children_nodes[idx]["node"]
             _value = _node.value
             _visit_count = _node.visit_count + _node.virtual_visit_count * self.virtual_visit_weight
-            uct_values.append(_value + exp_weight * np.sqrt(np.log(1e-6 + total_visit_count) / (1e-6 + _visit_count))) # UCT calculation
-        selected_index = np.argmax(uct_values)
+            uct_values.append(_value + exp_weight * np.sqrt(np.log(1e-6 + total_visit_count) / (1e-6 + _visit_count)))
+
+        # Select the best among expandable children
+        best_idx_in_expandable = np.argmax(uct_values)
+        selected_index = expandable_children_indices[best_idx_in_expandable]
+
         if leaf_parallelization:
             self._children_nodes[selected_index]["node"].virtual_visit_count += len(self._children_nodes)
         else:
@@ -157,6 +183,20 @@ class TreeNode():
         self.visit_count += 1
         self.virtual_visit_count = 0 # reset the virtual visit count
         self.value = max([child_node["node"].value for child_node in self._children_nodes if child_node["node"] is not None])
+
+        # [EXPANSION STATE] Update is_expandable_flag during backpropagation
+        # For leaf nodes: evaluate using is_expandable() method
+        # For non-leaf nodes: mark unexpandable if all children are unexpandable
+        if not self._children_nodes or all(c["node"] is None for c in self._children_nodes):
+            # Leaf node: evaluate current expansion capability
+            self.is_expandable_flag = self.is_expandable()
+        else:
+            # Non-leaf node: check if all created children are unexpandable
+            created_children = [c["node"] for c in self._children_nodes if c["node"] is not None]
+            if created_children and all(not c.is_expandable_flag for c in created_children):
+                # All children are unexpandable → mark parent as unexpandable too
+                self.is_expandable_flag = False
+
         if self._parent_node is not None:
             self._parent_node.backpropagate()
 

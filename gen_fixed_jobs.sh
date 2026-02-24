@@ -17,6 +17,23 @@ echo "===================================================="
 echo "  MCTD Job Generator (Fixed: 3-10-3-1)"
 echo "===================================================="
 
+# Check if Docker is available
+echo "Checking Docker availability..."
+if ! command -v docker &> /dev/null; then
+    echo "❌ ERROR: Docker is not installed or not in PATH"
+    echo "   Please install Docker or add it to your PATH"
+    exit 1
+fi
+
+if ! docker ps > /dev/null 2>&1; then
+    echo "❌ ERROR: Docker daemon is not running"
+    echo "   Please start Docker daemon and try again"
+    echo "   Command: docker ps (should work without errors)"
+    exit 1
+fi
+echo "✓ Docker is available and running"
+echo ""
+
 # 0. Clean up all existing MCTD containers and jobs
 echo "Cleaning up existing MCTD containers..."
 docker rm -f $(docker ps -a 2>/dev/null | grep exp_gpu0 | awk '{print $1}') 2>/dev/null || true
