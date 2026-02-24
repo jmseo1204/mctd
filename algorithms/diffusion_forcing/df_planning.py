@@ -3455,12 +3455,25 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             ], axis=0)  # (58,)
             state_input = state_58d[np.newaxis, :]  # (1, 58)
             
-            # Assert correct dimensions
+            # Assert correct dimensions and log via tracer
+            from utils.tracer import get_tracer
+            tracer = get_tracer()
+            
             assert state_input.shape == (1, 58), f"Expected (1, 58) for antmaze DQL input, got {state_input.shape}"
             
-            # [DEBUG] Check input dimensions to DQL agent
-            import sys
-            print(f"[DEBUG _compute_action_from_plan] state_input shape: {state_input.shape}, sub_goal_pos: {sub_goal_pos}", file=sys.stderr, flush=True)
+            if tracer is not None:
+                with tracer.scope("dql_agent_input", phase="validation"):
+                    tracer.log(
+                        tag="agent.input_shape",
+                        data={
+                            "state_input_shape": list(state_input.shape),
+                            "current_qpos_shape": list(current_qpos.shape),
+                            "current_qvel_shape": list(current_qvel.shape),
+                            "sub_goal_pos_shape": list(sub_goal_pos.shape) if sub_goal_pos is not None else None,
+                            "expected_state_dim": 58,
+                        },
+                        depth=0,
+                    )
             
             # Pass 58D state and 2D goal position to agent
             action = agent.sample_action(state_input, sub_goal_pos)
