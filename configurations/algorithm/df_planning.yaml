@@ -32,19 +32,17 @@ use_random_goals_for_interaction: False
 task_id: 1
 dql_model: null
 mctd_skip_level_steps: 10
-mctd_denoising_steps_per_segment: 10
 time_limit: null
 virtual_visit_weight: 1.0
 warp_threshold: 1.0
 leaf_parallelization: False
 parallel_multiple_visits: False
-sub_goal_interval: 5
 
 pyramid: True
 mctd_num_denoising_steps: 100 # Must be <= sampling_timesteps in df_base.yaml
-parallel_search_num: 2
+parallel_search_num: 1
 mctd_max_search_num: 70
-mctd_guidance_scales: [0.6]
+mctd_guidance_scales: [1.0]
 padding_mode: "same" # "zero" or "same"
 viz_plans: True
 DEBUG: True
@@ -54,11 +52,12 @@ debug_memory_profile: True # Enable GPU/CPU memory profiling
 max_plan_hist_keep: 1 # Keep only last N plan histories (memory optimization)
 meeting_delta: 2.0
 episode_len: ${dataset.episode_len} # self.n_tokens = self.episode_len // self.frame_stack
-horizon_scale: 0.3 # horizon = self.episode_len * horizon_scale
+horizon_scale: 0.2 # horizon = self.episode_len * horizon_scale
 sequence_dividing_factor: 2
 num_tries_for_bad_plans: 3
-open_loop_horizon: 400 #fixme -> best: episode_len*horizon_scale
+open_loop_horizon: 200 #fixme -> best: episode_len*horizon_scale
 val_max_loops: 4 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
+sub_goal_interval: 5
 
 # HILP value function guidance
 use_hilp_guidance: true  # Set to true to use HILP value function instead of MSE distance

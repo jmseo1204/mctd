@@ -113,7 +113,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.mctd_max_search_num = cfg.mctd_max_search_num
         self.mctd_num_denoising_steps = cfg.mctd_num_denoising_steps
         self.mctd_skip_level_steps = cfg.mctd_skip_level_steps
-        self.mctd_denoising_steps_per_segment = cfg.mctd_denoising_steps_per_segment
         self.jump = cfg.jump
         self.time_limit = cfg.time_limit
         self.parallel_search_num = cfg.parallel_search_num
@@ -1617,7 +1616,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 planning_end_time = time.time()
                 planning_time.append(planning_end_time - planning_start_time)
 
-                # TODO: we don't have to do below process if the output plan is infeasible(unachieved) (break or continue)
+                
 
                 # jumpy case (fill the gap)
                 if self.jump > 1:
@@ -3283,31 +3282,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         # Get the full observation from environment (qpos + qvel concatenation for antmaze)
         # For DQL agent compatibility, we need the full obs [qpos, qvel], not just qpos[:2]
         current_sim_state = self._get_sim_state(envs)
-        if current_sim_state is not None:
-            qpos = current_sim_state["qpos"]  # shape: (dof,)
-            qvel = current_sim_state["qvel"]  # shape: (dof,)
-            # Concatenate qpos and qvel to form full observation
-            obs_flat = np.concatenate([qpos, qvel], axis=0)  # shape: (2*dof,)
-            obs_numpy = obs_flat[np.newaxis, :]  # shape: (1, 2*dof)
-        else:
-            raise RuntimeError("Failed to get sim_state for observation")
-        
-        # [DEBUG] Log ACTUAL obs shape and dimensions using tracer
-        from utils.tracer import get_tracer
-        tracer = get_tracer()
-        if tracer is not None:
-            actual_obs_dim = obs_numpy.shape[1]
-            with tracer.scope("antmaze_state_dims", phase="validation"):
-                tracer.log(
-                    tag="state.dimensions.qpos_qvel",
-                    data={
-                        "qpos_shape": list(qpos.shape),
-                        "qvel_shape": list(qvel.shape),
-                        "obs_total_dim": actual_obs_dim,
-                        "dql_state_dim_input": actual_obs_dim * 2,
-                    },
-                    depth=0,
-                )
+        qpos = current_sim_state["qpos"]  # shape: (15,)
+        qvel = current_sim_state["qvel"]  # shape: (14,)
+        # Concatenate qpos and qvel to form full observation
+        obs_flat = np.concatenate([qpos, qvel], axis=0)  # shape: (29,)
+        obs_numpy = obs_flat[np.newaxis, :]  # shape: (1, 29)
+    
+      
 
         batch_size = plan_frame_format.shape[1]
         reached = np.zeros(batch_size, dtype=bool)
@@ -3329,16 +3310,23 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             sub_goal_sim_state = current_sim_state.copy() if current_sim_state is not None else None
             sub_goal_sim_state["qpos"][:2] = sub_goal_pos
 
-        # Execute plan: iterate over frame indices, but step every frame_stack
+        # Execute plan: iterate, ensuring at least open_loop_horizon steps
+        # MODIFIED: Use current_sim_state to generate plan_frame instead of cycling through stored plan
         plan_prev_frame = None
-        for t_token_idx, t_frame in enumerate(range(0, plan_frame_format.shape[0], self.frame_stack)):
-            # Extract frame for action computation
-            plan_frame = plan_frame_format[t_frame : t_frame + 1, :, :]  # (1, 1, c)
-            plan_frame = plan_frame.squeeze(1)  # (1, c)
+        loop_cnt = 0
+        
+        
+        while loop_cnt < self.open_loop_horizon:
+            # Generate plan_frame from current_sim_state 
+            # Extract position from the actual executed state, not from pre-computed plan
+            
+            # current_sim_state = self._get_sim_state(envs)
+            # plan_frame = torch.from_numpy(current_sim_state["qpos"][:2]).float().unsqueeze(0)  # (1, 2)
+            plan_frame = torch.from_numpy(obs_numpy[:, :2]).float()  # (1, 2)
 
             # Update sub_goal for antmaze (with interval logic)
             if "antmaze" in self.env_id:
-                if np.linalg.norm(obs_numpy[0, :2] - sub_goal_pos[0]) < 1.0:
+                if np.linalg.norm(plan_frame - sub_goal_pos[0]) < 1.0:
                     if sub_goal_step < plan_frame_format.shape[0] - self.sub_goal_interval:
                         sub_goal_step += self.sub_goal_interval
                         sub_goal_pos = plan_slice_np[sub_goal_step, :2]
@@ -3362,14 +3350,43 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             # Execute action in environment
             action_np = action.detach().cpu().numpy()
+            
+            # ── Pre-step state logging ──
+            pre_step_sim_state = self._get_sim_state(envs)
+            pre_step_qpos = pre_step_sim_state["qpos"][:2].copy() if pre_step_sim_state else None
+            
             obs_numpy, reward, done, _ = envs.step(np.nan_to_num(action_np))
 
             # Ensure obs_numpy is 2D: (batch_size, obs_dim)
             if obs_numpy.ndim == 1:
                 obs_numpy = obs_numpy[None, :]  # Add batch dimension
-
-            # Update current_sim_state after environment step (for next iteration)
-            current_sim_state = self._get_sim_state(envs)
+            
+            # ── Post-step state logging ──
+            post_step_sim_state = self._get_sim_state(envs)
+            post_step_qpos = post_step_sim_state["qpos"][:2].copy() if post_step_sim_state else None
+            obs_qpos_from_step = obs_numpy[0, :2].copy()  # Extract qpos from step return
+            
+            # Log state difference
+            from utils.tracer import get_tracer
+            tracer = get_tracer()
+            if tracer:
+                pre_post_qpos_diff = np.linalg.norm(post_step_qpos - pre_step_qpos) if pre_step_qpos is not None and post_step_qpos is not None else None
+                obs_vs_get_attr_diff = np.linalg.norm(obs_qpos_from_step - post_step_qpos) if post_step_qpos is not None else None
+                
+                tracer.log(
+                    tag="bidir_mcts._execute_plan_in_env.step_state_comparison",
+                    data={
+                        "loop_cnt": loop_cnt,
+                        "pre_step_qpos": pre_step_qpos.tolist() if pre_step_qpos is not None else None,
+                        "post_step_qpos": post_step_qpos.tolist() if post_step_qpos is not None else None,
+                        "obs_qpos_from_step": obs_qpos_from_step.tolist(),
+                        "pre_post_qpos_diff": float(pre_post_qpos_diff) if pre_post_qpos_diff is not None else None,
+                        "obs_vs_get_attr_diff": float(obs_vs_get_attr_diff) if obs_vs_get_attr_diff is not None else None,
+                        "reward": float(reward[0]) if reward is not None else None,
+                        "done": bool(done[0]) if done is not None else None,
+                    },
+                    depth=1,
+                )
 
             # Track rewards
             reached = np.logical_or(reached, reward >= 1.0)
@@ -3384,6 +3401,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             # Update prev_frame for velocity calculation
             plan_prev_frame = plan_frame
+
+            # Increment counter
+            loop_cnt += 1
 
             # Check for episode termination
             if done.any():
@@ -3414,7 +3434,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         Compute action for a single timestep given current observation and plan frame.
 
         Unified function supporting both antmaze and pointmaze:
-        - antmaze: Uses agent.sample_action with concatenated current and goal sim_states (58D)
+        - antmaze: Uses agent.sample_action with current state (29D = qpos+qvel) + goal (2D position)
         - pointmaze: Uses PID-like controller
 
         Args:
@@ -3563,22 +3583,46 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # Execute plan with parent state injection for continuous state stitching
         # This restores parent's complete sim state before rolling out the new plan
-        _, _ = self._execute_plan_in_env(
+        trajectory, _ = self._execute_plan_in_env(
             plan_frame_format=plan_slice,
             envs=envs,
             agent=agent if "antmaze" in self.env_id else None,
             use_diffused_action=False,
             parent_sim_state=parent_sim_state,  # Pass complete state for restoration
         )
+        # Extract all obs from trajectory frames
+        # trajectory is a list of bundles, not a tensor
+        trajectory_bundle_list = []
+        for trajectory_bundle in trajectory:
+            obs_t, _, _ = self.split_bundle(trajectory_bundle)
+            trajectory_bundle_list.append(obs_t)
+        
+        # Stack all obs: (T, batch, obs_dim) -> (T, obs_dim) when batch=1 and cat along dim=0
+        trajectory_all_obs = torch.cat(trajectory_bundle_list, dim=0)  # (T, obs_dim)
+        # Extract x,y positions: if batch dimension exists, extract it
+        if trajectory_all_obs.dim() == 3:
+            # Shape is (T, batch, obs_dim)
+            trajectory_obs_positions = trajectory_all_obs[:, 0, :2].detach().cpu().numpy()  # (T, 2)
+        else:
+            # Shape is (T, obs_dim) - batch was singleton and got removed
+            trajectory_obs_positions = trajectory_all_obs[:, :2].detach().cpu().numpy()  # (T, 2)
+        
+        # Also get final obs for state update
+        obs, _, _ = self.split_bundle(trajectory[-1])
+
+        final_sim_state = self._get_sim_state(envs)  # dummy sim_state
+        final_sim_state["qpos"][:2] = obs[0, :2]
 
         # [LOGGING] 3) Capture reached physical state and log continuity with plan_slice[-1]
-        final_sim_state = self._get_sim_state(envs)
         
         # plan_slice is already unnormalized, so use it directly
         plan_slice_last_qpos = plan_slice[-1, 0, :2].detach().cpu().numpy()
         final_qpos = final_sim_state["qpos"][:2]
         
         last_frame_diff = np.linalg.norm(final_qpos - plan_slice_last_qpos)
+        
+        # Extract plan positions for logging
+        plan_positions_np = plan_slice[:, 0, :2].detach().cpu().numpy()
         
         if tracer:
             tracer.log(
@@ -3588,6 +3632,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     "final_sim_state_qpos": final_qpos.tolist(),
                     "last_frame_diff": float(last_frame_diff),
                     "plan_slice_shape": str(plan_slice.shape),
+                    "trajectory_length": len(trajectory),
+                    "trajectory_obs_positions_length": len(trajectory_obs_positions),
+                    "trajectory_obs_positions": trajectory_obs_positions.tolist(),
+                    "plan_positions": plan_positions_np.tolist(),
+                    "trajectory_obs_first": trajectory_obs_positions[0].tolist(),
+                    "trajectory_obs_last": trajectory_obs_positions[-1].tolist(),
                 },
                 depth=1,
             )

@@ -1,0 +1,77 @@
+====================================================================================================
+ROLLOUT TRAJECTORY ANALYSIS REPORT
+====================================================================================================
+
+Rollout #1
+----------------------------------------------------------------------------------------------------
+  Plan slice range: [0:150]
+  Plan shape: torch.Size([150, 1, 2])
+  Trajectory shape: unknown
+
+  State Continuity Analysis:
+    Parent state:          [52.0, 0.0]
+    Plan first position:   [51.12589645385742, 0.9194240570068359]
+    First frame diff:      1.2686
+
+  Execution Result Analysis:
+    Plan final position:   [38.94694519042969, 15.614957809448242]
+    Executed final state:  [51.934974670410156, 0.7640884518623352]
+    Final frame diff:      19.7291
+
+  Executed trajectory length: 0 frames
+
+Rollout #2
+----------------------------------------------------------------------------------------------------
+  Plan slice range: [0:150]
+  Plan shape: torch.Size([150, 1, 2])
+  Trajectory shape: unknown
+
+  State Continuity Analysis:
+    Parent state:          [0.0, 36.0]
+    Plan first position:   [1.0939998626708984, 35.15802001953125]
+    First frame diff:      1.3805
+
+  Execution Result Analysis:
+    Plan final position:   [20.24087142944336, 3.750491142272949]
+    Executed final state:  [52.0, 0.0]
+    Final frame diff:      31.9798
+
+  Executed trajectory length: 0 frames
+
+Rollout #3
+----------------------------------------------------------------------------------------------------
+  Plan slice range: [150:300]
+  Plan shape: torch.Size([150, 1, 2])
+  Trajectory shape: unknown
+
+  State Continuity Analysis:
+    Parent state:          [51.934974670410156, 0.7640884518623352]
+    Plan first position:   [49.54920196533203, 5.716279029846191]
+    First frame diff:      5.4969
+
+  Execution Result Analysis:
+    Plan final position:   [37.11439514160156, 6.698647499084473]
+    Executed final state:  [52.394371032714844, 1.037437081336975]
+    Final frame diff:      16.2950
+
+  Executed trajectory length: 0 frames
+
+Rollout #4
+----------------------------------------------------------------------------------------------------
+  Plan slice range: [150:300]
+  Plan shape: torch.Size([150, 1, 2])
+  Trajectory shape: unknown
+
+  State Continuity Analysis:
+    Parent state:          [52.0, 0.0]
+    Plan first position:   [23.8629207611084, 1.6600227355957031]
+    First frame diff:      28.1860
+
+  Execution Result Analysis:
+    Plan final position:   [24.55593490600586, 17.01120376586914]
+    Executed final state:  [52.48311233520508, 0.2387986183166504]
+    Final frame diff:      32.5767
+
+  Executed trajectory length: 0 frames
+
+====================================================================================================

@@ -1,0 +1,207 @@
+================================================================================
+양방향 MCTS Rollout 연속성 분석 - 요약 정보
+================================================================================
+
+[분석 대상]
+- 파일: /logs_memory_debug/run_20260225_030235.jsonl
+- 환경: antmaze-giant-v0
+- 루프 개수: 4개 (from_start depth 1~2, from_goal depth 1~2)
+
+[주요 결과]
+
+LOOP별 연속성 분석:
+┌─────┬──────────────┬──────────────┬──────────┬────────┬─────────┐
+│Loop │ Start Δ (3539) │ End Δ (3596) │ Traj Len │ Status │ 심각도  │
+├─────┼──────────────┼──────────────┼──────────┼────────┼─────────┤
+│  1  │    1.67 ✓    │   19.64 ✗    │   200    │  OK    │   중간  │
+│  2  │    1.21 ✓    │   43.54 ✗✗   │    1     │ 버그   │   높음  │
+│  3  │    3.93 ⚠    │   25.24 ✗✗   │   200    │  OK    │   높음  │
+│  4  │   31.98 ✗✗   │   32.73 ✗✗   │   200    │  OK    │   높음  │
+└─────┴──────────────┴──────────────┴──────────┴────────┴─────────┘
+
+✓ = PASS (< 2.0)
+⚠ = WARNING (2-5)
+✗ = ERROR (5-20)
+✗✗ = CRITICAL (> 20)
+
+================================================================================
+
+🔴 CRITICAL ISSUES (즉시 해결 필요)
+
+1. LOOP 2: Early Termination Bug
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   - Trajectory length = 1 (expected 200) ← **STRUCTURAL BUG**
+   - End discontinuity = 43.54 units ← **WORST**
+   - Stuck at fixed goal [52.0, 0.0]
+   
+   원인: _execute_plan_in_env 루프에서 done 플래그가 첫 스텝 후 True
+   위치: df_planning.py:3377-3378
+   ```python
+   if done.any():
+       break  # ← Loop 2에서만 작동!
+   ```
+   
+   영향: 
+   - 트리 확장이 불완전한 rollout에 기반함
+   - Node value 계산 오류
+
+2. LOOP 4: Critical Start Discontinuity
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   - Start Δ = 31.98 units ← **WORST START**
+   - End Δ = 32.73 units ← **PERSISTENT MISALIGNMENT**
+   - Frame-by-frame mean divergence = 30.23
+   
+   원인: Plan slice [100-200]이 parent state와 연속되지 않음
+   위치: df_planning.py:3534-3550
+   
+   증상:
+   - Plan은 [21.03, 7.96]에서 시작하도록 예측
+   - 실제 parent는 [52.0, 0.0]
+   - 시작부터 32 units 떨어짐
+   - 전체 rollout이 plan에서 30+ units 거리 유지
+
+3. LOOP 3: High Divergence
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   - End Δ = 25.24 units
+   - Start Δ = 3.93 units (warning level)
+   - 200 frames 모두 높은 divergence (mean=13.56, max=25.24)
+
+================================================================================
+
+📊 패턴 분석
+
+FROM_START vs FROM_GOAL:
+┌──────────────┬────────────────┬──────────────┬─────────────┐
+│    Tree Type │ Loop 1 (Depth 1) │ Loop 3 (Depth 2) │ 특징      │
+├──────────────┼────────────────┼──────────────┼─────────────┤
+│ FROM_START   │ End Δ: 19.64   │ End Δ: 25.24 │ 완료되지만 │
+│              │ Traj: 200      │ Traj: 200    │ 점진적     │
+│              │                │              │ divergence │
+├──────────────┼────────────────┼──────────────┼─────────────┤
+│ FROM_GOAL    │ End Δ: 43.54   │ End Δ: 32.73 │ 심각한     │
+│              │ Traj: 1 ⚠️     │ Traj: 200    │ misalignment│
+│              │ (EARLY TERM)   │              │            │
+└──────────────┴────────────────┴──────────────┴─────────────┘
+
+DEPTH 1 vs DEPTH 2:
+┌───────┬────────────────┬──────────────┬─────────────────┐
+│ Depth │ FROM_START     │ FROM_GOAL    │ 특징            │
+├───────┼────────────────┼──────────────┼─────────────────┤
+│   1   │ 19.64 (OK)    │ 43.54 (BUG)  │ Loop 2 조기종료 │
+├───────┼────────────────┼──────────────┼─────────────────┤
+│   2   │ 25.24 (WARN)  │ 32.73 (ERR)  │ Loop 4 심각    │
+└───────┴────────────────┴──────────────┴─────────────────┘
+
+================================================================================
+
+💡 근본 원인 3가지
+
+1️⃣  LOOP 2 EARLY TERMINATION
+   원인: from_goal + depth 1의 특정 조합에서
+         parent state 복원 후 첫 env.step()이 done=True 반환
+   
+   결과: trajectory_length = 1 (1 프레임만 수집)
+   
+   해결방법:
+   - from_goal rollout에서 초기 done 신호 무시
+   - parent state 복원 후 done flag 리셋
+
+2️⃣  LOOP 4 PLAN SLICE MISALIGNMENT
+   원인: Segment 경계에서 plan stitching 부재
+         Plan slice [100-200]과 parent state의 연속성 부재
+   
+   결과: Start discontinuity = 31.98 units
+        전체 rollout이 plan에서 30+ units 거리 유지
+   
+   해결방법:
+   - Plan slice 첫 프레임과 parent state 강제 정렬
+   - Segment 경계에서 offset 보정
+
+3️⃣  COMMON FRAME-BY-FRAME DIVERGENCE
+   원인: Denoising plan과 실제 action execution의 mismatch
+         Model prediction ≠ Environment dynamics
+   
+   결과: 평균 13-30 units의 frame-by-frame 차이
+   
+   해결방법:
+   - Action computation 재검토
+   - PID controller 게인 최적화
+   - Sub-goal interval 조정
+
+================================================================================
+
+🎯 권장 조치 (우선순위)
+
+HIGH PRIORITY (즉시):
+1. Loop 2 early termination 버그 수정
+   - df_planning.py:3377-3378 근처 from_goal 특수처리
+   
+2. Loop 4 plan stitching 개선
+   - Plan slice 첫 프레임 강제 정렬
+
+MEDIUM PRIORITY (일주일 내):
+3. Frame-by-frame divergence 감소
+   - Action computation 재검토
+
+LOW PRIORITY (중기):
+4. 전체 양방향 MCTS 아키텍처 평가
+
+================================================================================
+
+📈 각 루프별 상세 지표
+
+LOOP 1 (from_start, depth 1)
+├─ Start Discontinuity: 1.67 units ✓ (acceptable)
+├─ End Discontinuity: 19.64 units ✗ (error level)
+├─ Trajectory Length: 200 frames (normal)
+├─ Frame-by-Frame Divergence:
+│  ├─ Mean: 21.53
+│  ├─ Max: 34.49
+│  └─ Std: 9.68
+└─ 평가: 기준점, 실행은 완료되지만 높은 divergence
+
+LOOP 2 (from_goal, depth 1) ⚠️ CRITICAL
+├─ Start Discontinuity: 1.21 units ✓ (good)
+├─ End Discontinuity: 43.54 units ✗✗ (catastrophic)
+├─ Trajectory Length: 1 frame (ANOMALY) ← 버그!
+├─ Frame-by-Frame Divergence:
+│  ├─ Mean: 62.45 (1프레임뿐)
+│  ├─ Max: 62.45
+│  └─ Std: 0.0
+├─ Parent → Traj(1st): 63.25 units (엄청 큼!)
+└─ 평가: STRUCTURAL BUG - early termination
+
+LOOP 3 (from_start, depth 2)
+├─ Start Discontinuity: 3.93 units ⚠ (warning)
+├─ End Discontinuity: 25.24 units ✗✗ (critical)
+├─ Trajectory Length: 200 frames (normal)
+├─ Frame-by-Frame Divergence:
+│  ├─ Mean: 13.56
+│  ├─ Max: 25.24
+│  └─ Std: 8.28
+└─ 평가: Depth 증가로 부정확해짐
+
+LOOP 4 (from_goal, depth 2) 🚨 CRITICAL
+├─ Start Discontinuity: 31.98 units ✗✗ (worst start!)
+├─ End Discontinuity: 32.73 units ✗✗ (persistent)
+├─ Trajectory Length: 200 frames (normal)
+├─ Frame-by-Frame Divergence:
+│  ├─ Mean: 30.23 (거의 항상 30+ units 떨어짐)
+│  ├─ Max: 37.31
+│  └─ Std: 3.68 (일정함 = 지속적인 문제)
+└─ 평가: Plan과 reality 완전히 다름 - stitching 문제
+
+================================================================================
+
+📁 결과물
+
+1. /loop_comparison_analysis.py - 상세 분석 스크립트
+2. /ROLLOUT_CONTINUITY_REPORT.md - 종합 보고서
+3. /loop_analysis_summary.txt - 이 요약
+
+================================================================================
+
+버전: 1.0
+생성일: 2025-02-25
+분석 대상: run_20260225_030235.jsonl
+
