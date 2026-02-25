@@ -1312,9 +1312,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             bidir_tree2 = self._init_mcts_tree(
                 horizon,
                 tag="bidir_mcts_from_goal",
-                root_obs=_bidir_goal_np[0],
-                root_sim_state=goal_sim_state,
-            )
+                 root_obs=_bidir_goal_np[0],
+                 root_sim_state=goal_sim_state,
+             )
             
             # ── Logging initialization ──
             tracer = get_tracer()
@@ -1328,6 +1328,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         "tree2_root_sim_state_qpos": goal_sim_state["qpos"][:2].tolist(),
                         "tree1_id": id(bidir_tree1.root_node),
                         "tree2_id": id(bidir_tree2.root_node),
+                        "env_setup": {
+                            "tree1_env": "envs_forward (start->goal)",
+                            "tree2_env": "envs_backward (goal->start)",
+                            "done_logic": "tree1: normal, tree2: skip done-break to allow continuous planning",
+                        },
                     },
                     step=0,
                     depth=0,
@@ -3284,6 +3289,19 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         """
         trajectory = []
 
+        # [LOGGING] Log backward environment configuration
+        from utils.tracer import get_tracer
+        tracer = get_tracer()
+        if tracer and is_backward:
+            tracer.log(
+                tag="bidir_mcts._execute_plan_in_env.backward_init",
+                data={
+                    "is_backward": True,
+                    "note": "Backward environment will skip done-break logic to allow continuous planning",
+                    "plan_shape": str(plan_frame_format.shape),
+                },
+                depth=1,
+            )
 
         self._set_sim_state(envs, parent_sim_state)
 
@@ -3556,6 +3574,21 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         if plan_slice.shape[0] == 0:
             return self._get_sim_state(envs)
+
+        # [LOGGING] 0) Log bidirectional planning direction
+        from utils.tracer import get_tracer
+        tracer = get_tracer()
+        if tracer:
+            tracer.log(
+                tag="bidir_mcts._rollout_leaf_plan.direction",
+                data={
+                    "is_backward": is_backward,
+                    "plan_direction": "goal->start (backward)" if is_backward else "start->goal (forward)",
+                    "parent_qpos": parent_sim_state["qpos"][:2].tolist(),
+                    "plan_slice_length": plan_slice.shape[0],
+                },
+                depth=1,
+            )
 
         # [LOGGING] 1) Verify that current sim state matches parent_sim_state after restoration
         current_sim_state = self._get_sim_state(envs)
