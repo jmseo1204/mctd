@@ -1056,6 +1056,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             import gym
             import ogbench
             from stable_baselines3.common.vec_env import DummyVecEnv
+            from algorithms.diffusion_forcing.env_manager import EnvironmentManager
         except ImportError:
             print(
                 "d4rl import not successful, skipping environment interaction. Check d4rl installation."
@@ -1091,51 +1092,53 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             # [ENV CACHING] Check if environment is cached and batch_size matches
             env_cache_key = f"{self.env_id}_{batch_size}"
             if (
-                hasattr(self, "_cached_envs")
+                hasattr(self, "_cached_envs_forward")
                 and hasattr(self, "_cached_env_key")
                 and self._cached_env_key == env_cache_key
             ):
-                # Reuse cached environment and agent
-                envs = self._cached_envs
-                agent = getattr(self, "_cached_agent", None)  # Retrieve cached agent if available
-                envs.reset()
+                # Reuse cached bidirectional environments
+                envs_forward = self._cached_envs_forward
+                envs_backward = self._cached_envs_backward
+                agent = getattr(self, "_cached_agent", None)
+                envs_forward.reset()
+                envs_backward.reset()
                 if not (self.env_id in OGBENCH_ENVS):
-                    envs.seed(self.interaction_seed)
+                    envs_forward.seed(self.interaction_seed)
+                    envs_backward.seed(self.interaction_seed)
+                # For backward compatibility
+                envs = envs_forward
             else:
-                # Create new environment and cache it
+                # Create new bidirectional environments
                 if self.env_id in OGBENCH_ENVS:
                     if "pointmaze" in self.env_id:
-                        envs = DummyVecEnv(
-                            [
-                                lambda: ogbench.locomaze.maze.make_maze_env(
-                                    "point", "maze", maze_type=self.env_id.split("-")[1]
-                                )
-                            ]
-                            * batch_size
-                        )
-                        if self.action_dim == 2:
-                            use_diffused_action = True
+                        env_fns = [
+                            lambda: ogbench.locomaze.maze.make_maze_env(
+                                "point", "maze", maze_type=self.env_id.split("-")[1]
+                            )
+                        ] * batch_size
+                        use_diffused_action = True
                     elif "antmaze" in self.env_id:
-                        envs = DummyVecEnv(
-                            [
-                                lambda: ogbench.locomaze.maze.make_maze_env(
-                                    "ant", "maze", maze_type=self.env_id.split("-")[1]
-                                )
-                            ]
-                            * batch_size
-                        )
+                        env_fns = [
+                            lambda: ogbench.locomaze.maze.make_maze_env(
+                                "ant", "maze", maze_type=self.env_id.split("-")[1]
+                            )
+                        ] * batch_size
                         from dql.main_Antmaze import hyperparameters
                         from dql.agents.ql_diffusion import Diffusion_QL as Agent
 
                         params = hyperparameters[self.dataset]
-                        state_dim = envs.observation_space.shape[0]
-                        action_dim = envs.action_space.shape[0]
-                        max_action = float(envs.action_space.high[0])
+                        
+                        # Create temporary env to get dimensions
+                        _temp_env = DummyVecEnv(env_fns)
+                        state_dim = _temp_env.observation_space.shape[0]
+                        action_dim = _temp_env.action_space.shape[0]
+                        max_action = float(_temp_env.action_space.high[0])
+                        _temp_env.close()
                         
                         # [DEBUG] Print actual environment dimensions
                         import sys
                         print(f"[DEBUG] OGBench Environment Dimensions:", file=sys.stderr, flush=True)
-                        print(f"  - observation_space.shape: {envs.observation_space.shape}", file=sys.stderr, flush=True)
+                        print(f"  - observation_space.shape: ({state_dim},)", file=sys.stderr, flush=True)
                         print(f"  - state_dim (raw): {state_dim}", file=sys.stderr, flush=True)
                         print(f"  - state_dim * 2 (passed to Agent): {state_dim * 2}", file=sys.stderr, flush=True)
                         print(f"  - action_dim: {action_dim}", file=sys.stderr, flush=True)
@@ -1184,15 +1187,30 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                             os.path.join(os.getcwd(), "dql", "results", dql_folder), id=200
                         )
                 else:
-                    envs = DummyVecEnv([lambda: gym.make(self.env_id)] * batch_size)
-                    envs.seed(self.interaction_seed)
+                    env_fns = [lambda: gym.make(self.env_id)] * batch_size
                     agent = None
 
-                # Cache the environment and agent
-                self._cached_envs = envs
+                # Create bidirectional environments using EnvironmentManager
+                env_manager = EnvironmentManager(
+                    env_id=self.env_id,
+                    batch_size=batch_size,
+                    task_id=self.task_id,
+                    use_random_goals=self.use_random_goals_for_interaction,
+                    debug=self.debug_log_level >= 1,
+                )
+                envs_forward, envs_backward = env_manager.create_bidirectional_envs(env_fns)
+                
+                # Cache the environments and manager
+                self._cached_envs_forward = envs_forward
+                self._cached_envs_backward = envs_backward
+                self._cached_env_manager = env_manager
                 self._cached_env_key = env_cache_key
                 if agent is not None:
                     self._cached_agent = agent  # Cache agent if it was created
+                
+                # For backward compatibility, also cache single envs reference
+                envs = envs_forward  # Default to forward environment
+                self._cached_envs = envs
 
                 # [MEMORY] Log after environment creation
                 log_memory_stats(tracer, "interact.envs_created", step=0)
@@ -1200,42 +1218,17 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 if self.debug_log_level >= 1:
                     import sys
                     print(
-                        f"[MEM] Created and cached new environment (batch_size={batch_size})",
+                        f"[MEM] Created and cached new bidirectional environments (batch_size={batch_size})",
                         file=sys.stderr,
                         flush=True,
                     )
 
             # [ENV CACHING END] Environment setup complete (cached or new)
 
-            # Set task IDs for OGBench environments
-            if self.env_id in OGBENCH_ENVS:
-                for i, env in enumerate(envs.envs):
-                    # Convert 0-based task_id to 1-based indexing for ogbench
-                    actual_task_id = self.task_id + i + 1
-                    import sys
-                    print(
-                        f"[DEBUG Task] Setting task_id={actual_task_id} (base task_id={self.task_id}, i={i})",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    env.set_task(actual_task_id)
-                    # env.set_seed(self.interaction_seed)
-        
-            # [MEMORY DEBUG] Log environment initialization
-            if self.profiler:
-                self.profiler.snapshot(
-                    "interact_envs_created",
-                    phase=f"env_creation(batch={batch_size})"
-                )
-                if self.debug_log_level >= 1:
-                    import sys
-                    print(f"[DEBUG] Created {batch_size} environment instances", 
-                          file=sys.stderr, flush=True)
-
             terminate = False
             obs_mean = self.data_mean[: self.observation_dim]
             obs_std = self.data_std[: self.observation_dim]
-            obs = envs.reset()
+            obs = envs_forward.reset()
             # Randomize the goal for each environment
             if (
                 self.env_id in OGBENCH_ENVS
@@ -1243,7 +1236,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 pass
             else:
                 if self.use_random_goals_for_interaction:
-                    for env in envs.envs:
+                    for env in envs_forward.envs:
                         env.set_target()
 
             obs = torch.from_numpy(obs).float().to(self.device)
@@ -1254,14 +1247,27 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             if self.env_id in OGBENCH_ENVS:  # OGBench
                 goal = np.vstack(
-                    [envs.reset_infos[i]["goal"] for i in range(len(envs.reset_infos))]
+                    [envs_forward.reset_infos[i]["goal"] for i in range(len(envs_forward.reset_infos))]
                 )
             else:
-                goal = np.concatenate([[env.env._target] for env in envs.envs])
+                goal = np.concatenate([[env.env._target] for env in envs_forward.envs])
             goal = torch.Tensor(goal).float().to(self.device)
             goal = torch.cat([goal, torch.zeros_like(goal)], -1)
             goal = goal[:, : self.observation_dim]
             goal_normalized = ((goal - obs_mean[None]) / obs_std[None]).detach()
+            
+            # ────────────────────────────────────────────────────────────────
+            # Bidirectional Environment Setup
+            # ────────────────────────────────────────────────────────────────
+            # For tree2 (backward direction), set up environment to start from goal
+            # and plan towards start. We do this by:
+            # 1. Creating a goal_sim_state (heuristic goal state for tree2)
+            # 2. Will be set explicitly when tree2 needs to execute
+            goal_qpos = goal.cpu().numpy()[0, :2]  # (2,) - goal coordinates
+            
+            # Reset envs_backward to a known state
+            envs_backward.reset()
+            # envs_backward will be reused in rollouts with _set_sim_state as needed
 
             steps = 0
             loops = 0  # Loop counter for bidirectional MCTS planning
@@ -1284,7 +1290,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             _bidir_start_np = start.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
             _bidir_goal_np = goal.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
             # Capture initial physical state if available
-            initial_sim_state = self._get_sim_state(envs)
+            initial_sim_state = self._get_sim_state(envs_forward)
             assert initial_sim_state is not None, "Failed to capture initial sim state"
             assert np.allclose(initial_sim_state["qpos"][:2], _bidir_start_np[0][:2], atol=1e-5), \
                 f"Physical start position {initial_sim_state['qpos'][:2]} does not match observation start position {_bidir_start_np[0][:2]}"
@@ -1482,7 +1488,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         new_denoised_start_idx=new_denoised_start,
                         new_denoised_end_idx=new_denoised_end,
                         agent=agent,
-                        envs=envs,
+                        envs=envs_forward if active_tree is bidir_tree1 else envs_backward,
                         parent_sim_state=parent_node.sim_state,
                     )
                     assert _new_sim_state is not None, "_new_sim_state is None"
