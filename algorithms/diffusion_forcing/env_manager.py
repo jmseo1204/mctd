@@ -7,6 +7,23 @@ This module manages the creation and maintenance of dual environments:
 
 Both environments are created once and maintained across multiple planning iterations
 within the same task, utilizing _get_sim_state() and _set_sim_state() for state management.
+
+CRITICAL ISSUE WITH BACKWARD ENVIRONMENT:
+=========================================
+When tree2 (backward) tries to plan from goal state [0.0, 36.0], the OGBench environment
+immediately signals done=True because it checks if position == goal. This causes DummyVecEnv
+to auto-reset.
+
+SOLUTION IMPLEMENTED:
+- For backward planning, we need to swap the internal goal to be the start position.
+- Since OGBench doesn't allow goal modification after set_task(), we use a state tracking
+  approach: before executing plans in the backward environment, we save the intended final
+  position and skip the done-triggered auto-reset logic in the planning code.
+
+FUTURE IMPROVEMENT:
+- Modify OGBench to accept goal modification, or
+- Create a custom wrapper that overrides the done condition, or  
+- Use state injection more aggressively
 """
 
 from typing import Any, Optional, Dict, Tuple

@@ -1490,6 +1490,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         agent=agent,
                         envs=envs_forward if active_tree is bidir_tree1 else envs_backward,
                         parent_sim_state=parent_node.sim_state,
+                        is_backward=(active_tree is bidir_tree2),
                     )
                     assert _new_sim_state is not None, "_new_sim_state is None"
                     _child.sim_state = _new_sim_state
@@ -3258,6 +3259,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         agent: Optional[Any] = None,
         use_diffused_action: bool = False,
         parent_sim_state: Optional[dict] = None,
+        is_backward: bool = False,
     ) -> tuple[List[torch.Tensor], dict]:
         """
         Execute a plan segment in environment with unified action computation.
@@ -3412,7 +3414,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             loop_cnt += 1
 
             # Check for episode termination
-            if done.any():
+            # For backward planning, we skip the done condition because the environment
+            # signals done when reaching the goal, but in backward mode we're planning
+            # from the goal towards the start. So done=True initially and we should ignore it.
+            if not is_backward and done.any():
                 break
 
         # Return results
@@ -3521,6 +3526,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         agent: Any,
         envs: Any,
         parent_sim_state: Optional[dict] = None,
+        is_backward: bool = False,
     ) -> Optional[dict]:
         """
         Execute a freshly denoised plan segment in the actual environment.
@@ -3585,7 +3591,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     "end_idx": new_denoised_end_idx,
                 },
                 depth=1,
-            )
+             )
 
         # Execute plan with parent state injection for continuous state stitching
         # This restores parent's complete sim state before rolling out the new plan
@@ -3595,6 +3601,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             agent=agent if "antmaze" in self.env_id else None,
             use_diffused_action=False,
             parent_sim_state=parent_sim_state,  # Pass complete state for restoration
+            is_backward=is_backward,
         )
         # Extract all obs from trajectory frames
         # trajectory is a list of bundles, not a tensor
