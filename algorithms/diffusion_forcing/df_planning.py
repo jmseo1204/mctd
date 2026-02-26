@@ -618,8 +618,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         Returns:
             Noise levels array (t, b)
         """
-        tracer = self.tracer if hasattr(self, 'tracer') else None
-
         components = []
         components.append(
             np.full((batch_size, 1), stabilization, dtype=np.int64)
@@ -924,8 +922,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         stabilization = 0
 
-        tracer = self.tracer if hasattr(self, 'tracer') else None
-
         for m in range(noise_level.shape[1] - 1):
             # noise_level shape: (b, m, plan_tokens)
             # Iterating over m denoising steps
@@ -1001,10 +997,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         """
         trajectory = []
         current_node = best_node
-        
-        # ── Logging extraction process ──
-        tracer = get_tracer()
-        node_trace_log = []
 
         while current_node is not None:
             # Extract position from sim_state if available
@@ -1013,17 +1005,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 trajectory.append(pos)
             elif current_node.obs_pos is not None:
                 trajectory.append(current_node.obs_pos)
-            
-            # ── Log each node in the trace ──
-            if tracer:
-                node_trace_log.append({
-                    "node_id": id(current_node),
-                    "node_depth": current_node.depth,
-                    "has_sim_state": current_node.sim_state is not None,
-                    "sim_state_qpos": current_node.sim_state["qpos"][:2].tolist() if current_node.sim_state else None,
-                    "obs_pos": current_node.obs_pos.tolist() if hasattr(current_node.obs_pos, 'tolist') else None,
-                    "parent_id": id(current_node._parent_node) if current_node._parent_node else None,
-                })
 
             # Move to parent
             current_node = current_node._parent_node
@@ -1033,17 +1014,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             trajectory = np.array(trajectory[::-1])
         else:
             trajectory = np.array([])
-        
-        # ── Log final trajectory ──
-        if tracer:
-            tracer.log(
-                tag="bidir_mcts._extract_node_trajectory.details",
-                data={
-                    "trajectory_length": len(trajectory),
-                    "node_trace": node_trace_log,
-                },
-                depth=1,
-            )
 
         return trajectory
 
@@ -1321,28 +1291,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                  root_sim_state=goal_sim_state,
              )
             
-            # ── Logging initialization ──
-            tracer = get_tracer()
-            if tracer:
-                tracer.log(
-                    tag="bidir_mcts.initialization",
-                    data={
-                        "tree1_root_obs": _bidir_start_np[0][:2].tolist(),
-                        "tree1_root_sim_state_qpos": initial_sim_state["qpos"][:2].tolist() if initial_sim_state is not None else None,
-                        "tree2_root_obs": _bidir_goal_np[0][:2].tolist(),
-                        "tree2_root_sim_state_qpos": goal_sim_state["qpos"][:2].tolist() if goal_sim_state is not None else None,
-                        "tree1_id": id(bidir_tree1.root_node),
-                        "tree2_id": id(bidir_tree2.root_node),
-                        "env_setup": {
-                            "tree1_env": "envs_forward (start->goal)",
-                            "tree2_env": "envs_backward (goal->start)",
-                            "done_logic": "tree1: normal, tree2: skip done-break to allow continuous planning",
-                        },
-                    },
-                    step=0,
-                    depth=0,
-                )
-            
             # Flag: 0 → expand tree1 next, 1 → expand tree2 next
             expanded_tree_idx: int = 0
             # Configurable meeting threshold (Euclidean distance in unnormalized obs space)
@@ -1390,46 +1338,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
                 # Initialize infos dicts so {**infos1, **infos2} is safe even on the first step
                 
-                # ── Logging before tree expansion ──
-                tracer = get_tracer()
-                if tracer:
-                    tree_to_expand = "tree1" if expanded_tree_idx == 0 else "tree2"
-                    tracer.log(
-                        tag="bidir_mcts.before_expansion",
-                        data={
-                            "loop_count": loops,
-                            "expanded_tree": tree_to_expand,
-                            "expanded_tree_idx": expanded_tree_idx,
-                            "t1_leaf_count": len(t1_leaf_nodes),
-                            "t2_leaf_count": len(t2_leaf_nodes),
-                            "t1_root_id": id(bidir_tree1.root_node),
-                            "t2_root_id": id(bidir_tree2.root_node),
-                        },
-                        step=loops,
-                        depth=0,
-                    )
-                    
-                    # ── Verify tree instance before expansion ──
-                    active_tree = bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2
-                    tracer.log(
-                        tag="bidir_mcts.tree_instance_check",
-                        data={
-                            "loop_count": loops,
-                            "expanded_tree_idx": expanded_tree_idx,
-                            "active_tree_id": id(active_tree),
-                            "active_tree_root_id": id(active_tree.root_node),
-                            "active_tree_tag": active_tree.tag,
-                            "bidir_tree1_id": id(bidir_tree1),
-                            "bidir_tree1_root_id": id(bidir_tree1.root_node),
-                            "bidir_tree2_id": id(bidir_tree2),
-                            "bidir_tree2_root_id": id(bidir_tree2.root_node),
-                            "matches_tree1": active_tree is bidir_tree1,
-                            "matches_tree2": active_tree is bidir_tree2,
-                        },
-                        step=loops,
-                        depth=1,
-                    )
-
                 # Alternate expansion: one single_step per MPC iteration
                 active_tree, expanded_node_infos = self._run_mcts_search(
                     bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2,
@@ -1441,20 +1349,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     single_step=True,
                 )
                 
-                # ── Logging after tree expansion ──
-                if tracer:
-                    tracer.log(
-                        tag="bidir_mcts.after_expansion",
-                        data={
-                            "loop_count": loops,
-                            "expanded_node_count": len(expanded_node_infos),
-                            "active_tree_id": id(active_tree.root_node),
-                            "active_tree_tag": active_tree.tag,
-                        },
-                        step=loops,
-                        depth=0,
-                    )
-
                 # Per-leaf MPC rollout: update obs_pos and sim_state for newly expanded leaves
 
                 if self.use_rollout:
@@ -1474,26 +1368,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         new_denoised_start: int = parent_node.depth * seg_size * self.frame_stack
                         new_denoised_end: int = (parent_node.depth + 1) * seg_size * self.frame_stack
 
-                        # ── Pre-rollout logging ──
-                        tracer = get_tracer()
-                        if tracer:
-                            tracer.log(
-                                tag="bidir_mcts._rollout_leaf_plan.pre_rollout",
-                                data={
-                                    "loop_count": loops,
-                                    "child_node_id": id(_child),
-                                    "child_depth": _child.depth,
-                                    "parent_node_id": id(parent_node),
-                                    "parent_depth": parent_node.depth,
-                                    "parent_sim_state_qpos": parent_node.sim_state["qpos"][:2].tolist() if parent_node.sim_state else None,
-                                    "new_denoised_start": new_denoised_start,
-                                    "new_denoised_end": new_denoised_end,
-                                    "active_tree_id": id(active_tree.root_node),
-                                    "active_tree_tag": active_tree.tag,
-                                },
-                                depth=1,
-                            )
-
                         _new_sim_state = self._rollout_leaf_plan(
                             leaf_plan_unnormalized=plan_unnormalized,
                             new_denoised_start_idx=new_denoised_start,
@@ -1506,25 +1380,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         assert _new_sim_state is not None, "_new_sim_state is None"
                         _child.sim_state = _new_sim_state
                         _child.obs_pos = _new_sim_state["qpos"][:2]
-                        
-                        # ── Post-rollout logging ──
-                        if tracer:
-                            tracer.log(
-                                tag="bidir_mcts._rollout_leaf_plan.post_rollout",
-                                data={
-                                    "loop_count": loops,
-                                    "child_node_id": id(_child),
-                                    "child_obs_pos": _child.obs_pos.tolist() if hasattr(_child.obs_pos, 'tolist') else [float(x) for x in _child.obs_pos],
-                                    "child_sim_state_qpos": _child.sim_state["qpos"][:2].tolist() if _child.sim_state else None,
-                                    "parent_qpos": parent_node.sim_state["qpos"][:2].tolist() if parent_node.sim_state else None,
-                                    "displacement": (
-                                        (float(_child.sim_state["qpos"][0] - parent_node.sim_state["qpos"][0]),
-                                         float(_child.sim_state["qpos"][1] - parent_node.sim_state["qpos"][1]))
-                                        if _child.sim_state and parent_node.sim_state else None
-                                    ),
-                                },
-                                depth=1,
-                            )
+                
                 else:
                     # Derive obs_pos from plan_history without physical simulation
                     seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
@@ -1559,33 +1415,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 
                 best_node: "TreeNode" = best_info["node"]
                 
-                # ── Logging best_node selection ──
-                tracer = get_tracer()
-                if tracer:
-                    # Trace back to root to find which tree this belongs to
-                    curr = best_node
-                    depth_count = 0
-                    while curr._parent_node is not None:
-                        depth_count += 1
-                        curr = curr._parent_node
-                    belongs_to_tree1 = (curr is bidir_tree1.root_node)
-                    
-                    tracer.log(
-                        tag="bidir_mcts.best_node_selected",
-                        data={
-                            "loop_count": loops,
-                            "best_node_id": id(best_node),
-                            "best_node_depth": best_node.depth,
-                            "best_node_obs_pos": best_node.obs_pos.tolist() if hasattr(best_node.obs_pos, 'tolist') else [float(x) for x in best_node.obs_pos],
-                            "best_node_sim_state_qpos": best_node.sim_state["qpos"][:2].tolist() if best_node.sim_state else None,
-                            "belongs_to_tree1": belongs_to_tree1,
-                            "tree1_root_id": id(bidir_tree1.root_node),
-                            "tree2_root_id": id(bidir_tree2.root_node),
-                        },
-                        step=loops,
-                        depth=0,
-                    )
-
                 output_plan = self._extract_output_plan(
                     best_node,
                     plan_tokens=active_tree.plan_tokens,
@@ -1605,25 +1434,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
                 # Extract best_node's tree trajectory (sim_state sequence from root to leaf)
                 node_trajectory = self._extract_node_trajectory(best_node)
-                
-                # ── Logging node_trajectory details ──
-                if tracer and node_trajectory is not None and len(node_trajectory) > 0:
-                    tracer.log(
-                        tag="bidir_mcts.node_trajectory_extracted",
-                        data={
-                            "loop_count": loops,
-                            "trajectory_length": len(node_trajectory),
-                            "trajectory_first_pos": node_trajectory[0].tolist(),
-                            "trajectory_last_pos": node_trajectory[-1].tolist(),
-                            "trajectory_all_positions": node_trajectory.tolist(),
-                            "start_goal_positions": {
-                                "start": start_numpy[0].tolist(),
-                                "goal": goal_numpy[0].tolist(),
-                            },
-                        },
-                        step=loops,
-                        depth=1,
-                    )
 
                 # Create forward trajectory image with both plan (red) and node trajectory (blue)
                 plan_positions = plan_unnormalized[:, :, :2].detach().cpu().numpy()
@@ -2142,58 +1952,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 )
 
         while True:
-            # [FINE-GRAIN LOGGING] Log loop condition check
-            if tracer:
-                tracer.log(
-                    tag="tree.search.loop_check",
-                    data={
-                        "search_num": tree.search_num,
-                        "p_search_num": tree.p_search_num,
-                        "max_search_num": tree.max_search_num,
-                        "time_limit": self.time_limit,
-                    },
-                    step=tree.search_num,
-                    depth=1,
-                )
-
             if self.time_limit is not None:
                 if time.time() - self.start_time > self.time_limit:
-                    if tracer:
-                        tracer.log(
-                            tag="tree.search.loop_break",
-                            data={"reason": "time_limit_exceeded"},
-                            step=tree.search_num,
-                            depth=0,
-                        )
                     break
             else:
                 # if search_num >= max_search_num:
                 if tree.p_search_num >= tree.max_search_num:
-                    if tracer:
-                        tracer.log(
-                            tag="tree.search.loop_break",
-                            data={"reason": "max_search_num_reached", "p_search_num": tree.p_search_num, "max_search_num": tree.max_search_num},
-                            step=tree.search_num,
-                            depth=0,
-                        )
                     break
 
             ## For checking the virtual visit count
             # root_node.check_virtual_visit_count()
-
-            # [LOGGING] Log iteration stats
-            if tracer and (tree.search_num % 5 == 0):  # Log every 5 iterations
-                tracer.log(
-                    tag="tree.expansion.iteration",
-                    data={
-                        "search_num": tree.search_num,
-                        "max_depth": tree.max_depth,
-                        "p_search_num": tree.p_search_num,
-                    },
-                    step=tree.search_num,
-                    depth=1,
-                )
-
             # [MEMORY DEBUG] Periodic memory logging
             if self.profiler and (tree.search_num > 0) and (tree.search_num % self.debug_log_interval == 0):
                 self.profiler.snapshot(
@@ -2216,19 +1984,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 expandable_node_names = root_node.get_expandable_node_names()
                 # print(f"Expandable node names: {expandable_node_names}")
 
-            if tracer:
-                expandable_count = len(expandable_node_names) if not self.parallel_multiple_visits else "unknown"
-                tracer.log(
-                    tag="tree.node.expandability_check",
-                    data={
-                        "search_num": tree.search_num,
-                        "max_depth": tree.max_depth,
-                        "expandable_node_count": expandable_count,
-                    },
-                    step=tree.search_num,
-                    depth=1,
-                )
-
             selection_start_time = time.time()
             print("============ Selection Start ============")
             psn = self.parallel_search_num
@@ -2237,32 +1992,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 selected_node = root_node
 
                 # [FINE-GRAIN LOGGING] Log node traversal with child status details
-                if tracer:
-                    # Get child node status
-                    children_info = []
-                    for i, child_dict in enumerate(selected_node._children_nodes):
-                        children_info.append({
-                            "child_idx": i,
-                            "node_exists": child_dict["node"] is not None,
-                            "virtually_visited": child_dict.get("virtually_visited", False),
-                            "guidance_scale": child_dict.get("guidance_scale"),
-                        })
-
-                    tracer.log(
-                        tag="tree.node.traversal_start",
-                        data={
-                            "node_name": selected_node.name,
-                            "node_depth": selected_node.depth,
-                            "is_expandable": selected_node.is_expandable(consider_virtually_visited=(not self.parallel_multiple_visits)),
-                            "is_expandable_without_vv": selected_node.is_expandable(consider_virtually_visited=False),
-                            "is_terminal": selected_node.is_terminal(),
-                            "is_selectable": selected_node.is_selectable(),
-                            "visit_count": selected_node.visit_count,
-                            "children_status": children_info,
-                        },
-                        step=tree.search_num,
-                        depth=1,
-                    )
 
                 while (
                     (
@@ -2279,43 +2008,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         leaf_parallelization=self.leaf_parallelization
                     )
 
-                    # [FINE-GRAIN LOGGING] Log selected child node
-                    if tracer:
-                        tracer.log(
-                            tag="tree.node.selected_child",
-                            data={
-                                "parent_name": selected_node._parent_node.name if selected_node._parent_node else "root",
-                                "child_name": selected_node.name,
-                                "child_depth": selected_node.depth,
-                                "is_expandable": selected_node.is_expandable(consider_virtually_visited=(not self.parallel_multiple_visits)),
-                                "is_terminal": selected_node.is_terminal(),
-                                "is_selectable": selected_node.is_selectable(),
-                                "visit_count": selected_node.visit_count,
-                            },
-                            step=tree.search_num,
-                            depth=1,
-                        )
-
                 # [FINE-GRAIN LOGGING] Log final selected node before expansion check
                 is_term = selected_node.is_terminal()
                 is_exp = selected_node.is_expandable(consider_virtually_visited=(not self.parallel_multiple_visits))
                 is_sel = selected_node.is_selectable()
-
-                if tracer:
-                    tracer.log(
-                        tag="tree.node.final_selection_check",
-                        data={
-                            "node_name": selected_node.name,
-                            "node_depth": selected_node.depth,
-                            "is_terminal": is_term,
-                            "is_expandable": is_exp,
-                            "is_selectable": is_sel,
-                            "will_expand": is_exp,
-                            "will_skip": is_term or (not is_sel and not is_exp),
-                        },
-                        step=tree.search_num,
-                        depth=1,
-                    )
 
                 if is_term or (not is_sel and not is_exp):
                     psn -= (
@@ -2323,31 +2019,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         if not self.leaf_parallelization
                         else len(children_node_guidance_scales)
                     )
-                    if tracer:
-                        tracer.log(
-                            tag="tree.node.skip_reason",
-                            data={
-                                "node_name": selected_node.name,
-                                "is_terminal": is_term,
-                                "not_selectable_and_not_expandable": (not is_sel and not is_exp),
-                            },
-                            step=tree.search_num,
-                            depth=1,
-                        )
                     continue
                 if self.leaf_parallelization:
-                    # [FINE-GRAIN LOGGING] Log leaf parallelization expansion
-                    if tracer:
-                        tracer.log(
-                            tag="tree.expansion.leaf_parallelization_block",
-                            data={
-                                "node_name": selected_node.name,
-                                "num_guidance_scales": len(children_node_guidance_scales),
-                            },
-                            step=tree.search_num,
-                            depth=1,
-                        )
-
                     for i in range(len(children_node_guidance_scales)):
                         # when multiple visits is False, then we need to consider the virtually visited nodes to visit only once
                         expanded_node_candidate = (
@@ -2358,20 +2031,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                                 ),
                             )
                         )
-
-                        # [FINE-GRAIN LOGGING] Log candidate obtained
-                        if tracer and expanded_node_candidate is not None:
-                            tracer.log(
-                                tag="tree.expansion.candidate_obtained",
-                                data={
-                                    "candidate_name": expanded_node_candidate["name"],
-                                    "candidate_depth": expanded_node_candidate["depth"],
-                                    "parent_name": expanded_node_candidate["parent_node"].name,
-                                    "guidance_scale": expanded_node_candidate["guidance_scale"],
-                                },
-                                step=tree.search_num,
-                                depth=1,
-                            )
 
                         selected_nodes.append(selected_node)
                         expanded_node_candidates.append(expanded_node_candidate)
@@ -2389,37 +2048,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         # print(f"Expanded node candidate {expanded_node_candidate['name']} is selected")
                         psn -= 1
                 else:
-                    # [FINE-GRAIN LOGGING] Log sequential expansion
-                    if tracer:
-                        tracer.log(
-                            tag="tree.expansion.sequential_block",
-                            data={
-                                "node_name": selected_node.name,
-                                "node_depth": selected_node.depth,
-                            },
-                            step=tree.search_num,
-                            depth=1,
-                        )
-
                     # when multiple visits is False, then we need to consider the virtually visited nodes to visit only once
                     expanded_node_candidate = selected_node.get_expandable_candidate(
                         index=None,
                         consider_virtually_visited=(not self.parallel_multiple_visits),
                     )
-
-                    # [FINE-GRAIN LOGGING] Log candidate obtained
-                    if tracer and expanded_node_candidate is not None:
-                        tracer.log(
-                            tag="tree.expansion.candidate_obtained",
-                            data={
-                                "candidate_name": expanded_node_candidate["name"],
-                                "candidate_depth": expanded_node_candidate["depth"],
-                                "parent_name": expanded_node_candidate["parent_node"].name,
-                                "guidance_scale": expanded_node_candidate["guidance_scale"],
-                            },
-                            step=tree.search_num,
-                            depth=1,
-                        )
 
                     selected_nodes.append(selected_node)
                     expanded_node_candidates.append(expanded_node_candidate)
@@ -2437,19 +2070,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         break
             if len(selected_nodes) == 0:
                 print("No more selected nodes")
-                # [FINE-GRAIN LOGGING] Log why loop breaks
-                if tracer:
-                    tracer.log(
-                        tag="tree.search.termination_reason",
-                        data={
-                            "reason": "no_selected_nodes",
-                            "search_num": tree.search_num,
-                            "max_depth": tree.max_depth,
-                            "p_search_num": tree.p_search_num,
-                        },
-                        step=tree.search_num,
-                        depth=0,
-                    )
                 break
             print("============ Selection End ============")
             selection_end_time = time.time()
@@ -2985,42 +2605,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 early_termination_end_time - early_termination_start_time
             )
 
-            # [FINE-GRAIN LOGGING] Log iteration completion and tree state
-            if tracer:
-                tracer.log(
-                    tag="tree.iteration.complete",
-                    data={
-                        "search_num": tree.search_num,
-                        "p_search_num": tree.p_search_num,
-                        "max_depth": tree.max_depth,
-                        "is_early_termination": is_early_termination,
-                        "single_step": single_step,
-                    },
-                    step=tree.search_num,
-                    depth=0,
-                )
-
             if is_early_termination:
-                if tracer:
-                    tracer.log(
-                        tag="tree.search.loop_break",
-                        data={"reason": "early_termination"},
-                        step=tree.search_num,
-                        depth=0,
-                    )
                 break
 
             # ------------------------------------------------------------------
             # single_step mode: exit after 1 iteration (expanded_node_infos already set)
             # ------------------------------------------------------------------
             if single_step:
-                if tracer:
-                    tracer.log(
-                        tag="tree.search.loop_break",
-                        data={"reason": "single_step_mode"},
-                        step=tree.search_num,
-                        depth=0,
-                    )
                 break
 
         tree.pbar.close()
@@ -3160,56 +2751,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             plan_chunk_with_parent_obs = torch.cat(
                 [obs_parent_token, noisy_parts], dim=0
             )  # (plan_tokens+1, 1, fs*c)
-
-        # [INSTRUMENTATION] Log plan assembly - HYPOTHESIS TESTING
-        tracer = self.tracer if hasattr(self, 'tracer') else None
-        if tracer:
-            with tracer.scope("plan_assembly", phase="inference", depth=0):
-                obs_parent_actual_pos = prefix_len if denoised_prefix is not None else 0
-
-                # H1: Check if obs_parent and first noisy token have different properties
-                first_token = plan_chunk_with_parent_obs[0:1]
-                obs_parent_token_in_chunk = plan_chunk_with_parent_obs[obs_parent_actual_pos:obs_parent_actual_pos+1]
-                first_noisy_token = plan_chunk_with_parent_obs[obs_parent_actual_pos+1:obs_parent_actual_pos+2] if obs_parent_actual_pos+1 < plan_chunk_with_parent_obs.shape[0] else None
-
-                tracer.log(
-                    tag="plan.assembly.structure",
-                    data={
-                        "prefix_len": prefix_len,
-                        "obs_parent_pos": obs_parent_actual_pos,
-                        "noisy_start_pos": obs_parent_actual_pos + 1,
-                        "total_plan_tokens": plan_tokens + 1,
-                        "plan_chunk_shape": list(plan_chunk_with_parent_obs.shape),
-                        "parent_depth": parent_node.depth,
-                        "segment_size": segment_size,
-                    },
-                    depth=0,
-                )
-
-                # H1 Testing: Log obs_parent properties
-                tracer.log_tensor_stats(
-                    tag="plan.segment_boundary.obs_parent",
-                    tensor=obs_parent_token_in_chunk,
-                    depth=1,
-                    label=f"obs_parent_at_pos_{obs_parent_actual_pos}_depth_{parent_node.depth}",
-                )
-
-                # H2 Testing: Log first noisy token
-                if first_noisy_token is not None:
-                    tracer.log_tensor_stats(
-                        tag="plan.segment_boundary.first_noisy",
-                        tensor=first_noisy_token,
-                        depth=1,
-                        label=f"first_noisy_at_pos_{obs_parent_actual_pos+1}_depth_{parent_node.depth}",
-                    )
-
-                # H3 Testing: Log first token overall (will become segment start)
-                tracer.log_tensor_stats(
-                    tag="plan.segment_boundary.first_token",
-                    tensor=first_token,
-                    depth=1,
-                    label=f"first_token_pos_0_depth_{parent_node.depth}",
-                )
 
         assert plan_chunk_with_parent_obs.shape[0] == plan_tokens+1, (
             f"Plan chunk length mismatch: {plan_chunk_with_parent_obs.shape[0]} != {plan_tokens+1}"
@@ -3388,20 +2929,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         """
         trajectory = []
 
-        # [LOGGING] Log backward environment configuration
-        from utils.tracer import get_tracer
-        tracer = get_tracer()
-        if tracer and is_backward:
-            tracer.log(
-                tag="bidir_mcts._execute_plan_in_env.backward_init",
-                data={
-                    "is_backward": True,
-                    "note": "Backward environment will skip done-break logic to allow continuous planning",
-                    "plan_shape": str(plan_frame_format.shape),
-                },
-                depth=1,
-            )
-
         self._set_sim_state(envs, parent_sim_state)
 
         # Get the full observation from environment (qpos + qvel concatenation for antmaze)
@@ -3475,43 +3002,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             # Execute action in environment
             action_np = action.detach().cpu().numpy()
-            
-            # ── Pre-step state logging ──
-            pre_step_sim_state = self._get_sim_state(envs)
-            pre_step_qpos = pre_step_sim_state["qpos"][:2].copy() if pre_step_sim_state else None
-            
+
             obs_numpy, reward, done, _ = envs.step(np.nan_to_num(action_np))
 
             # Ensure obs_numpy is 2D: (batch_size, obs_dim)
             if obs_numpy.ndim == 1:
                 obs_numpy = obs_numpy[None, :]  # Add batch dimension
-            
-            # ── Post-step state logging ──
-            post_step_sim_state = self._get_sim_state(envs)
-            post_step_qpos = post_step_sim_state["qpos"][:2].copy() if post_step_sim_state else None
-            obs_qpos_from_step = obs_numpy[0, :2].copy()  # Extract qpos from step return
-            
-            # Log state difference
-            from utils.tracer import get_tracer
-            tracer = get_tracer()
-            if tracer:
-                pre_post_qpos_diff = np.linalg.norm(post_step_qpos - pre_step_qpos) if pre_step_qpos is not None and post_step_qpos is not None else None
-                obs_vs_get_attr_diff = np.linalg.norm(obs_qpos_from_step - post_step_qpos) if post_step_qpos is not None else None
-                
-                tracer.log(
-                    tag="bidir_mcts._execute_plan_in_env.step_state_comparison",
-                    data={
-                        "loop_cnt": loop_cnt,
-                        "pre_step_qpos": pre_step_qpos.tolist() if pre_step_qpos is not None else None,
-                        "post_step_qpos": post_step_qpos.tolist() if post_step_qpos is not None else None,
-                        "obs_qpos_from_step": obs_qpos_from_step.tolist(),
-                        "pre_post_qpos_diff": float(pre_post_qpos_diff) if pre_post_qpos_diff is not None else None,
-                        "obs_vs_get_attr_diff": float(obs_vs_get_attr_diff) if obs_vs_get_attr_diff is not None else None,
-                        "reward": float(reward[0]) if reward is not None else None,
-                        "done": bool(done[0]) if done is not None else None,
-                    },
-                    depth=1,
-                )
 
             # Track rewards
             reached = np.logical_or(reached, reward >= 1.0)
@@ -3597,25 +3093,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             state_29d = np.concatenate([current_qpos, current_qvel], axis=0)  # (29,)
             state_input = state_29d[np.newaxis, :]  # (1, 29)
             
-            # Log via tracer
-            from utils.tracer import get_tracer
-            tracer = get_tracer()
-            
-            if tracer is not None:
-                with tracer.scope("dql_agent_input", phase="validation"):
-                    tracer.log(
-                        tag="agent.input_dimensions",
-                        data={
-                            "qpos_shape": list(current_qpos.shape),
-                            "qvel_shape": list(current_qvel.shape),
-                            "state_input_shape": list(state_input.shape),
-                            "sub_goal_pos_shape": list(sub_goal_pos.shape),
-                            "expected_state_dim": 29,
-                            "expected_goal_dim": 2,
-                        },
-                        depth=0,
-                    )
-            
             # Pass 29D state and 2D goal position to agent
             action = agent.sample_action(state_input, sub_goal_pos)
             return torch.from_numpy(action).float().reshape(1, -1)
@@ -3674,22 +3151,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         if plan_slice.shape[0] == 0:
             return self._get_sim_state(envs)
 
-        # [LOGGING] 0) Log bidirectional planning direction
-        from utils.tracer import get_tracer
-        tracer = get_tracer()
-        if tracer:
-            tracer.log(
-                tag="bidir_mcts._rollout_leaf_plan.direction",
-                data={
-                    "is_backward": is_backward,
-                    "plan_direction": "goal->start (backward)" if is_backward else "start->goal (forward)",
-                    "parent_qpos": parent_sim_state["qpos"][:2].tolist(),
-                    "plan_slice_length": plan_slice.shape[0],
-                },
-                depth=1,
-            )
-
-        # [LOGGING] 1) Verify that current sim state matches parent_sim_state after restoration
+        # Verify that current sim state matches parent_sim_state after restoration
         current_sim_state = self._get_sim_state(envs)
         assert current_sim_state is not None, "Failed to get current sim state"
         
@@ -3701,29 +3163,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             f"After _set_sim_state, current qpos {current_qpos} does not match "
             f"parent_sim_state qpos {parent_qpos}. Diff: {qpos_diff}"
         )
-
-        # [LOGGING] 2) Log continuity between parent_sim_state and plan_slice[0]
-        from utils.tracer import get_tracer
-        tracer = get_tracer()
-        
-        # plan_slice is already unnormalized, so use it directly
-        plan_slice_first_qpos = plan_slice[0, 0, :2].detach().cpu().numpy()
-        
-        first_frame_diff = np.linalg.norm(plan_slice_first_qpos - current_qpos)
-        
-        if tracer:
-            tracer.log(
-                tag="rollout.plan_slice_continuity",
-                data={
-                    "parent_qpos": current_qpos.tolist(),
-                    "plan_slice_first_qpos": plan_slice_first_qpos.tolist(),
-                    "first_frame_diff": float(first_frame_diff),
-                    "plan_slice_shape": str(plan_slice.shape),
-                    "start_idx": new_denoised_start_idx,
-                    "end_idx": new_denoised_end_idx,
-                },
-                depth=1,
-             )
 
         # Execute plan with parent state injection for continuous state stitching
         # This restores parent's complete sim state before rolling out the new plan
@@ -3758,35 +3197,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         final_sim_state = self._get_sim_state(envs)  # dummy sim_state
         final_sim_state["qpos"][:2] = obs[0, :2]
 
-        # [LOGGING] 3) Capture reached physical state and log continuity with plan_slice[-1]
-        
-        # plan_slice is already unnormalized, so use it directly
-        plan_slice_last_qpos = plan_slice[-1, 0, :2].detach().cpu().numpy()
-        final_qpos = final_sim_state["qpos"][:2]
-        
-        last_frame_diff = np.linalg.norm(final_qpos - plan_slice_last_qpos)
-        
-        # Extract plan positions for logging
-        plan_positions_np = plan_slice[:, 0, :2].detach().cpu().numpy()
-        
-        if tracer:
-            tracer.log(
-                tag="rollout.final_state_continuity",
-                data={
-                    "plan_slice_last_qpos": plan_slice_last_qpos.tolist(),
-                    "final_sim_state_qpos": final_qpos.tolist(),
-                    "last_frame_diff": float(last_frame_diff),
-                    "plan_slice_shape": str(plan_slice.shape),
-                    "trajectory_length": len(trajectory),
-                    "trajectory_obs_positions_length": len(trajectory_obs_positions),
-                    "trajectory_obs_positions": trajectory_obs_positions.tolist(),
-                    "plan_positions": plan_positions_np.tolist(),
-                    "trajectory_obs_first": trajectory_obs_positions[0].tolist(),
-                    "trajectory_obs_last": trajectory_obs_positions[-1].tolist(),
-                },
-                depth=1,
-            )
-
         return final_sim_state
 
     def _select_best_leaf(
@@ -3810,64 +3220,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             # Return None to signal that no valid plan was found
             return None
 
-        # ── Detailed validation logging ──
-        tracer = get_tracer()
-        if tracer:
-            evaluation_log = []
-            for node_name, info in expanded_node_infos.items():
-                node = info.get("node")
-                parent_node = info.get("parent_node")
-                value = info.get("value")
-                plan_history = info.get("plan_history", [])
-                
-                if node and parent_node:
-                    evaluation_log.append({
-                        "node_name": node_name,
-                        "node_id": id(node),
-                        "node_depth": node.depth,
-                        "parent_id": id(parent_node),
-                        "parent_depth": parent_node.depth,
-                        "value": float(value) if value is not None else None,
-                        "obs_pos": node.obs_pos.tolist() if hasattr(node.obs_pos, 'tolist') else [float(x) for x in node.obs_pos],
-                        "sim_state_qpos": node.sim_state["qpos"][:2].tolist() if node.sim_state else None,
-                        "plan_history_length": len(plan_history),
-                    })
-            
-            tracer.log(
-                tag="bidir_mcts._select_best_leaf.evaluation",
-                data={
-                    "total_candidates": len(expanded_node_infos),
-                    "candidates": evaluation_log,
-                },
-                depth=1,
-            )
-
         best_info = max(
             expanded_node_infos.values(),
             key=lambda info: info["value"]
             if info.get("value") is not None
             else float("-inf"),
         )
-        
-        # ── Log selected best ──
-        if tracer:
-            best_node = best_info.get("node")
-            best_value = best_info.get("value")
-            best_parent = best_info.get("parent_node")
-            
-            tracer.log(
-                tag="bidir_mcts._select_best_leaf.selected",
-                data={
-                    "best_node_id": id(best_node),
-                    "best_node_depth": best_node.depth,
-                    "best_node_obs_pos": best_node.obs_pos.tolist() if hasattr(best_node.obs_pos, 'tolist') else [float(x) for x in best_node.obs_pos],
-                    "best_node_sim_state_qpos": best_node.sim_state["qpos"][:2].tolist() if best_node.sim_state else None,
-                    "best_parent_id": id(best_parent),
-                    "best_parent_depth": best_parent.depth if best_parent else None,
-                    "best_value": float(best_value) if best_value is not None else None,
-                },
-                depth=1,
-            )
         
         return best_info
 
@@ -3953,45 +3311,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 )
 
             combined = torch.cat([t1_segments, t2_flipped], dim=0)  # (A_len+B_len, c)
-            # H5 Testing: Log segment boundary details for concatenation
-            tracer = self.tracer if hasattr(self, 'tracer') else None
-            if tracer:
-                with tracer.scope("plan_extraction", phase="inference", depth=0):
-                    tracer.log(
-                        tag="plan.extract.segment_concatenation",
-                        data={
-                            "t1_a_len": int(a_len),
-                            "t2_b_len": int(b_len),
-                            "combined_len": int(a_len + b_len),
-                            "plan_tokens": plan_tokens,
-                            "segment_size": int(plan_tokens // self.sequence_dividing_factor),
-                            "best_node_depth": best_node.depth,
-                            "target_node_depth": best_node.target_node.depth if best_node.target_node is not None else None,
-                        },
-                        depth=0,
-                    )
-                    
-                    # Log first few tokens of each segment at boundary
-                    tracer.log_tensor_stats(
-                        tag="plan.extract.t1_last_tokens",
-                        tensor=t1_segments[-3:] if t1_segments.shape[0] > 3 else t1_segments,
-                        depth=1,
-                        label=f"t1_last_3_tokens_len_{a_len}",
-                    )
-                    
-                    tracer.log_tensor_stats(
-                        tag="plan.extract.t2_first_tokens",
-                        tensor=t2_flipped[:3] if t2_flipped.shape[0] > 3 else t2_flipped,
-                        depth=1,
-                        label=f"t2_first_3_tokens_after_flip_len_{b_len}",
-                    )
-                    
-                    tracer.log_tensor_stats(
-                        tag="plan.extract.combined_boundary",
-                        tensor=combined[a_len-2:a_len+3] if combined.shape[0] > a_len+2 else combined[max(0, a_len-2):],
-                        depth=1,
-                        label=f"boundary_at_a_len_{a_len}_total_{a_len+b_len}",
-                    )
 
 
         if not is_tree1:
