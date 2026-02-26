@@ -1936,16 +1936,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             import sys
             print(f"[DEBUG BiDir] Candidate {i}: parent_seq_len={parent_seq_len}, candid_seq_len={candid_seq_len}, max_seq_len={max_seq_len}, plan_a_sliced.shape={plan_a_sliced.shape}", file=sys.stderr, flush=True)
 
-
             # --- Delegate Warp/Achieved detection to calculate_values --- #
-            # start = parent_node's physical position, goal = target_node's physical position
+            # start = parent_node's physical position, goal = target_node's last valid frame from plan_hist
             start_np: np.ndarray = parent_node.obs_pos[
                 None, : self.observation_dim
             ]  # (1, obs_dim)
-            goal_np: np.ndarray = target_node.obs_pos[
+            target_pos_from_plan = self._get_target_pos_from_plan_hist(target_node)
+            goal_np: np.ndarray = target_pos_from_plan[
                 None, : self.observation_dim
             ]  # (1, obs_dim)
-            # Always evaluate as forward (plan_A is forward, plan_B already flipped)
+             # Always evaluate as forward (plan_A is forward, plan_B already flipped)
             _vals, _achieved_infos, _achieved_ts = self.calculate_values(
                 plan_a_sliced, start_np, goal_np
             )
@@ -2490,7 +2490,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 info["target_node"] = (
                     target_node  # Will be propagated to child TreeNode via expand()
                 )
-                target_pos = target_node.obs_pos
+                target_pos = self._get_target_pos_from_plan_hist(target_node)
 
                 eff_goal_np_list.append(target_pos[None, : self.observation_dim])
                 obs_mean_np = self.data_mean[: self.observation_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[: self.observation_dim])
@@ -3224,6 +3224,62 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         return result, prefix_len
 
+    def _get_target_pos_from_plan_hist(self, node: "TreeNode") -> np.ndarray:
+        """
+        Extract the last valid frame from node.plan_history at this node's depth level.
+        
+        Instead of using obs_pos (agent's actual executed position), we extract the target
+        position from the plan's denoised history. This ensures bidirectional planning targets
+        the actual planned frames, avoiding the Step 0 jump issue.
+        
+        For backward planning (tree2), the target should be the last frame of the forward tree's
+        plan at this node's depth level.
+        
+        Args:
+            node: TreeNode with plan_history list
+        
+        Returns:
+            target_pos: (obs_dim,) numpy array with the last valid frame from plan_hist
+        
+        Shape Reference:
+            node.plan_history: list of plan_hist tensors
+            plan_hist tensor shape: (m+1, plan_tokens*fs, b, c)
+                - m+1: number of denoising steps
+                - plan_tokens*fs: total frames in horizon
+                - b: batch size (1 for single instance)
+                - c: observation dimension
+        """
+        # Fallback to obs_pos if plan_history is empty
+        if not node.plan_history or len(node.plan_history) == 0:
+            if node.obs_pos is not None:
+                return node.obs_pos
+            else:
+                raise ValueError(f"Node {node.name} has no plan_history and no obs_pos")
+        
+        # Get the latest plan_hist from the list
+        plan_hist = node.plan_history[-1]  # shape: (m+1, plan_tokens*fs, b, c)
+        
+        # Calculate valid end index: frames denoised up to this node's depth
+        # node.depth indicates how many segments have been completed
+        # Valid frames: [0, node.depth * seg_size * frame_stack)
+        # Valid end index (inclusive): node.depth * seg_size * frame_stack - 1
+        seg_size = self.segment_size  # tokens per segment
+        valid_end_idx = node.depth * seg_size * self.frame_stack
+        
+        if valid_end_idx <= 0:
+            raise ValueError(
+                f"Node {node.name} has invalid depth {node.depth} "
+                f"(valid_end_idx={valid_end_idx}, seg_size={seg_size}, frame_stack={self.frame_stack})"
+            )
+        
+        # Extract the last valid frame from the latest denoising step
+        # plan_hist[-1, ...] → latest denoising step (m index)
+        # valid_end_idx - 1 → last valid frame index (T*fs dimension)
+        # [0, :] → batch 0, all coordinates
+        last_valid_frame = plan_hist[-1, valid_end_idx - 1, 0, :]
+        
+        return last_valid_frame.detach().cpu().numpy()
+
     def _select_dynamic_goal(
         self,
         current_leaf_obs: np.ndarray,
@@ -3243,7 +3299,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         Returns:
             best_node: The TreeNode from opposite_leaf_nodes with the highest HILP value.
         """
-        targets = np.stack([n.obs_pos for n in opposite_leaf_nodes])  # (N, D)
+        targets = np.stack([self._get_target_pos_from_plan_hist(n) for n in opposite_leaf_nodes])  # (N, D)
         obs_expanded = np.tile(current_leaf_obs, (targets.shape[0], 1))  # (N, D)
         values = self._compute_hilp_values(obs_expanded, targets, use_no_grad=True)
 
