@@ -3259,7 +3259,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         # Get the latest segment's latest denoising step
         # node.plan_history[-1] → latest segment (list of denoising steps)
         # node.plan_history[-1][-1] → latest denoising step, shape (plan_tokens*fs, c)
-        plan_full = node.plan_history[-1][-1]  # shape: (plan_tokens*fs, c)
+        try:
+            plan_full = node.plan_history[-1][-1]  # shape: (plan_tokens*fs, c)
+        except (IndexError, TypeError) as e:
+            # Debug info for shape issues
+            import sys
+            print(f"[DEBUG _get_target_pos_from_plan_hist] Error accessing plan_history", file=sys.stderr, flush=True)
+            print(f"  node.name: {node.name}", file=sys.stderr, flush=True)
+            print(f"  node.depth: {node.depth}", file=sys.stderr, flush=True)
+            print(f"  len(node.plan_history): {len(node.plan_history)}", file=sys.stderr, flush=True)
+            if len(node.plan_history) > 0:
+                print(f"  len(node.plan_history[-1]): {len(node.plan_history[-1]) if isinstance(node.plan_history[-1], list) else 'not a list'}", file=sys.stderr, flush=True)
+                if isinstance(node.plan_history[-1], list) and len(node.plan_history[-1]) > 0:
+                    print(f"  node.plan_history[-1][-1].shape: {node.plan_history[-1][-1].shape if hasattr(node.plan_history[-1][-1], 'shape') else 'no shape'}", file=sys.stderr, flush=True)
+            raise ValueError(f"Failed to access plan_history[-1][-1] for node {node.name}: {e}")
         
         # Calculate the number of valid frames up to this node's depth
         # node.depth indicates how many segments have been completed
@@ -3274,7 +3287,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         
         if valid_end_idx > plan_full.shape[0]:
             raise ValueError(
-                f"Node {node.name} valid_end_idx {valid_end_idx} exceeds plan length {plan_full.shape[0]}"
+                f"Node {node.name} valid_end_idx {valid_end_idx} exceeds plan length {plan_full.shape[0]} "
+                f"(depth={node.depth}, seg_size={seg_size}, frame_stack={self.frame_stack})"
             )
         
         # Extract the last valid frame from the sliced plan
