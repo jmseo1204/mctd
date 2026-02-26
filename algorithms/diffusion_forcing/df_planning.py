@@ -1941,7 +1941,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             start_np: np.ndarray = parent_node.obs_pos[
                 None, : self.observation_dim
             ]  # (1, obs_dim)
-            target_pos_from_plan = self._get_target_pos_from_plan_hist(target_node)
+            target_pos_from_plan = self._get_target_pos_from_plan_hist(target_node, seg_size)
             goal_np: np.ndarray = target_pos_from_plan[
                 None, : self.observation_dim
             ]  # (1, obs_dim)
@@ -2460,6 +2460,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     )
                 break  # Exit search loop
 
+            assert tree.plan_tokens % self.sequence_dividing_factor == 0, (
+                f"plan_tokens {tree.plan_tokens} is not divisible by sequence_dividing_factor {self.sequence_dividing_factor}"
+            )
+            seg_size = tree.plan_tokens // self.sequence_dividing_factor
+
             eff_obs_norm_list, eff_goal_norm_list = [], []
             eff_start_np_list, eff_goal_np_list = [], []
 
@@ -2486,11 +2491,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 target_node = self._select_dynamic_goal(
                     current_leaf_obs=parent_obs_pos,
                     opposite_leaf_nodes=opposite_leaf_nodes,
+                    seg_size=seg_size,
                 )
                 info["target_node"] = (
                     target_node  # Will be propagated to child TreeNode via expand()
                 )
-                target_pos = self._get_target_pos_from_plan_hist(target_node)
+                target_pos = self._get_target_pos_from_plan_hist(target_node, seg_size)
 
                 eff_goal_np_list.append(target_pos[None, : self.observation_dim])
                 obs_mean_np = self.data_mean[: self.observation_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[: self.observation_dim])
@@ -2514,12 +2520,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 valid_candidates
             )
 
-            assert tree.plan_tokens % self.sequence_dividing_factor == 0, (
-                f"plan_tokens {tree.plan_tokens} is not divisible by sequence_dividing_factor {self.sequence_dividing_factor}"
-            )
-
-            seg_size = tree.plan_tokens // self.sequence_dividing_factor
-            
             for _ in range(
                 self.num_tries_for_bad_plans
             ):  # Trick used in MCTD to resample when the generated plan is terrible (e.g., not moving plans)
@@ -3224,7 +3224,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         return result, prefix_len
 
-    def _get_target_pos_from_plan_hist(self, node: "TreeNode") -> np.ndarray:
+    def _get_target_pos_from_plan_hist(self, node: "TreeNode", seg_size: int) -> np.ndarray:
         """
         Extract the last valid frame from node.plan_history at this node's depth level.
         
@@ -3237,6 +3237,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         
         Args:
             node: TreeNode with plan_history list
+            seg_size: int - tokens per segment (calculated as tree.plan_tokens // sequence_dividing_factor)
         
         Returns:
             target_pos: (obs_dim,) numpy array with the last valid frame from plan_hist
@@ -3263,7 +3264,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         # node.depth indicates how many segments have been completed
         # Valid frames: [0, node.depth * seg_size * frame_stack)
         # Valid end index (inclusive): node.depth * seg_size * frame_stack - 1
-        seg_size = self.segment_size  # tokens per segment
         valid_end_idx = node.depth * seg_size * self.frame_stack
         
         if valid_end_idx <= 0:
@@ -3284,6 +3284,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self,
         current_leaf_obs: np.ndarray,
         opposite_leaf_nodes: List["TreeNode"],
+        seg_size: int,
     ) -> "TreeNode":
         """Select the best goal from the opposite tree's leaf nodes using HILP value.
 
@@ -3295,11 +3296,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             current_leaf_obs: Unnormalized observation of the leaf node being expanded,
                               shape (obs_dim,).
             opposite_leaf_nodes: List of TreeNode objects from the opposite tree's leaf nodes.
+            seg_size: int - tokens per segment (calculated as tree.plan_tokens // sequence_dividing_factor)
 
         Returns:
             best_node: The TreeNode from opposite_leaf_nodes with the highest HILP value.
         """
-        targets = np.stack([self._get_target_pos_from_plan_hist(n) for n in opposite_leaf_nodes])  # (N, D)
+        targets = np.stack([self._get_target_pos_from_plan_hist(n, seg_size) for n in opposite_leaf_nodes])  # (N, D)
         obs_expanded = np.tile(current_leaf_obs, (targets.shape[0], 1))  # (N, D)
         values = self._compute_hilp_values(obs_expanded, targets, use_no_grad=True)
 
