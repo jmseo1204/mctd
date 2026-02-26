@@ -3242,12 +3242,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         Returns:
             target_pos: (obs_dim,) numpy array with the last valid frame from plan_hist
         
-        Shape Reference:
-            node.plan_history: list of plan_hist tensors
-            plan_hist tensor shape: (m+1, plan_tokens*fs, b, c)
-                - m+1: number of denoising steps
-                - plan_tokens*fs: total frames in horizon
-                - b: batch size (1 for single instance)
+        Structure Reference:
+            node.plan_history: list of plan segments
+            node.plan_history[-1]: latest segment (list of denoising steps)
+            node.plan_history[-1][-1]: latest denoising step tensor, shape (plan_tokens*fs, c)
+                - plan_tokens*fs: total frames in full horizon
                 - c: observation dimension
         """
         # Fallback to obs_pos if plan_history is empty
@@ -3257,13 +3256,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             else:
                 raise ValueError(f"Node {node.name} has no plan_history and no obs_pos")
         
-        # Get the latest plan_hist from the list
-        plan_hist = node.plan_history[-1]  # shape: (m+1, plan_tokens*fs, b, c)
+        # Get the latest segment's latest denoising step
+        # node.plan_history[-1] → latest segment (list of denoising steps)
+        # node.plan_history[-1][-1] → latest denoising step, shape (plan_tokens*fs, c)
+        plan_full = node.plan_history[-1][-1]  # shape: (plan_tokens*fs, c)
         
-        # Calculate valid end index: frames denoised up to this node's depth
+        # Calculate the number of valid frames up to this node's depth
         # node.depth indicates how many segments have been completed
         # Valid frames: [0, node.depth * seg_size * frame_stack)
-        # Valid end index (inclusive): node.depth * seg_size * frame_stack - 1
         valid_end_idx = node.depth * seg_size * self.frame_stack
         
         if valid_end_idx <= 0:
@@ -3272,11 +3272,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 f"(valid_end_idx={valid_end_idx}, seg_size={seg_size}, frame_stack={self.frame_stack})"
             )
         
-        # Extract the last valid frame from the latest denoising step
-        # plan_hist[-1, ...] → latest denoising step (m index)
-        # valid_end_idx - 1 → last valid frame index (T*fs dimension)
-        # [0, :] → batch 0, all coordinates
-        last_valid_frame = plan_hist[-1, valid_end_idx - 1, 0, :]
+        if valid_end_idx > plan_full.shape[0]:
+            raise ValueError(
+                f"Node {node.name} valid_end_idx {valid_end_idx} exceeds plan length {plan_full.shape[0]}"
+            )
+        
+        # Extract the last valid frame from the sliced plan
+        # plan_full[:valid_end_idx] → frames [0, valid_end_idx)
+        # [valid_end_idx - 1, :] → last frame in this range
+        last_valid_frame = plan_full[valid_end_idx - 1, :]
         
         return last_valid_frame.detach().cpu().numpy()
 
