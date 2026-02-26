@@ -149,6 +149,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.anchor_guidance_scale = cfg.get("anchor_guidance_scale", 40.0)
         self.rdf_guidance_scale = cfg.get("rdf_guidance_scale", 2.0)
         self.mcts_use_sim = cfg.get("mcts_use_sim", False)
+        self.use_rollout: bool = cfg.get("use_rollout", False)
 
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal
@@ -1290,18 +1291,22 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             _bidir_start_np = start.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
             _bidir_goal_np = goal.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
             # Capture initial physical state if available
-            initial_sim_state = self._get_sim_state(envs_forward)
-            assert initial_sim_state is not None, "Failed to capture initial sim state"
-            assert np.allclose(initial_sim_state["qpos"][:2], _bidir_start_np[0][:2], atol=1e-5), \
-                f"Physical start position {initial_sim_state['qpos'][:2]} does not match observation start position {_bidir_start_np[0][:2]}"
+            if self.use_rollout:
+                initial_sim_state = self._get_sim_state(envs_forward)
+                assert initial_sim_state is not None, "Failed to capture initial sim state"
+                assert np.allclose(initial_sim_state["qpos"][:2], _bidir_start_np[0][:2], atol=1e-5), \
+                    f"Physical start position {initial_sim_state['qpos'][:2]} does not match observation start position {_bidir_start_np[0][:2]}"
 
-            # Derive heuristic goal simulation state from initial state
-            goal_sim_state = {
-                "qpos": initial_sim_state["qpos"].copy(),
-                "qvel": np.zeros_like(initial_sim_state["qvel"]),  # Goal is assumed static
-            }
-            # Replace x, y coordinates with goal coordinates
-            goal_sim_state["qpos"][:2] = _bidir_goal_np[0][:2]
+                # Derive heuristic goal simulation state from initial state
+                goal_sim_state = {
+                    "qpos": initial_sim_state["qpos"].copy(),
+                    "qvel": np.zeros_like(initial_sim_state["qvel"]),  # Goal is assumed static
+                }
+                # Replace x, y coordinates with goal coordinates
+                goal_sim_state["qpos"][:2] = _bidir_goal_np[0][:2]
+            else:
+                initial_sim_state = None
+                goal_sim_state = None
 
             bidir_tree1 = self._init_mcts_tree(
                 horizon,
@@ -1452,73 +1457,91 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
                 # Per-leaf MPC rollout: update obs_pos and sim_state for newly expanded leaves
 
-                for info in expanded_node_infos.values():
-                    parent_node: "TreeNode" = info["parent_node"]
-                    _child: Optional["TreeNode"] = info.get("node")  # set by expand()
-                    if _child is None:
-                        continue
+                if self.use_rollout:
+                    for info in expanded_node_infos.values():
+                        parent_node: "TreeNode" = info["parent_node"]
+                        _child: Optional["TreeNode"] = info.get("node")  # set by expand()
+                        if _child is None:
+                            continue
 
-                    # Recompute plan tensor and denoised index range from stored plan_history
-                    plan_hist_last: torch.Tensor = info["plan_history"][-1][-1]  # (t*fs, c)
-                    plan_unnormalized: torch.Tensor = self._unnormalize_x(
-                        plan_hist_last.unsqueeze(1)
-                    )  # (t*fs, 1, c)
+                        # Recompute plan tensor and denoised index range from stored plan_history
+                        plan_hist_last: torch.Tensor = info["plan_history"][-1][-1]  # (t*fs, c)
+                        plan_unnormalized: torch.Tensor = self._unnormalize_x(
+                            plan_hist_last.unsqueeze(1)
+                        )  # (t*fs, 1, c)
 
+                        seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
+                        new_denoised_start: int = parent_node.depth * seg_size * self.frame_stack
+                        new_denoised_end: int = (parent_node.depth + 1) * seg_size * self.frame_stack
+
+                        # ── Pre-rollout logging ──
+                        tracer = get_tracer()
+                        if tracer:
+                            tracer.log(
+                                tag="bidir_mcts._rollout_leaf_plan.pre_rollout",
+                                data={
+                                    "loop_count": loops,
+                                    "child_node_id": id(_child),
+                                    "child_depth": _child.depth,
+                                    "parent_node_id": id(parent_node),
+                                    "parent_depth": parent_node.depth,
+                                    "parent_sim_state_qpos": parent_node.sim_state["qpos"][:2].tolist() if parent_node.sim_state else None,
+                                    "new_denoised_start": new_denoised_start,
+                                    "new_denoised_end": new_denoised_end,
+                                    "active_tree_id": id(active_tree.root_node),
+                                    "active_tree_tag": active_tree.tag,
+                                },
+                                depth=1,
+                            )
+
+                        _new_sim_state = self._rollout_leaf_plan(
+                            leaf_plan_unnormalized=plan_unnormalized,
+                            new_denoised_start_idx=new_denoised_start,
+                            new_denoised_end_idx=new_denoised_end,
+                            agent=agent,
+                            envs=envs_forward if active_tree is bidir_tree1 else envs_backward,
+                            parent_sim_state=parent_node.sim_state,
+                            is_backward=(active_tree is bidir_tree2),
+                        )
+                        assert _new_sim_state is not None, "_new_sim_state is None"
+                        _child.sim_state = _new_sim_state
+                        _child.obs_pos = _new_sim_state["qpos"][:2]
+                        
+                        # ── Post-rollout logging ──
+                        if tracer:
+                            tracer.log(
+                                tag="bidir_mcts._rollout_leaf_plan.post_rollout",
+                                data={
+                                    "loop_count": loops,
+                                    "child_node_id": id(_child),
+                                    "child_obs_pos": _child.obs_pos.tolist() if hasattr(_child.obs_pos, 'tolist') else [float(x) for x in _child.obs_pos],
+                                    "child_sim_state_qpos": _child.sim_state["qpos"][:2].tolist() if _child.sim_state else None,
+                                    "parent_qpos": parent_node.sim_state["qpos"][:2].tolist() if parent_node.sim_state else None,
+                                    "displacement": (
+                                        (float(_child.sim_state["qpos"][0] - parent_node.sim_state["qpos"][0]),
+                                         float(_child.sim_state["qpos"][1] - parent_node.sim_state["qpos"][1]))
+                                        if _child.sim_state and parent_node.sim_state else None
+                                    ),
+                                },
+                                depth=1,
+                            )
+                else:
+                    # Derive obs_pos from plan_history without physical simulation
                     seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
-                    new_denoised_start: int = parent_node.depth * seg_size * self.frame_stack
-                    new_denoised_end: int = (parent_node.depth + 1) * seg_size * self.frame_stack
+                    for info in expanded_node_infos.values():
+                        parent_node: "TreeNode" = info["parent_node"]
+                        _child: Optional["TreeNode"] = info.get("node")
+                        if _child is None:
+                            continue
 
-                    # ── Pre-rollout logging ──
-                    tracer = get_tracer()
-                    if tracer:
-                        tracer.log(
-                            tag="bidir_mcts._rollout_leaf_plan.pre_rollout",
-                            data={
-                                "loop_count": loops,
-                                "child_node_id": id(_child),
-                                "child_depth": _child.depth,
-                                "parent_node_id": id(parent_node),
-                                "parent_depth": parent_node.depth,
-                                "parent_sim_state_qpos": parent_node.sim_state["qpos"][:2].tolist() if parent_node.sim_state else None,
-                                "new_denoised_start": new_denoised_start,
-                                "new_denoised_end": new_denoised_end,
-                                "active_tree_id": id(active_tree.root_node),
-                                "active_tree_tag": active_tree.tag,
-                            },
-                            depth=1,
-                        )
+                        plan_hist_last: torch.Tensor = info["plan_history"][-1][-1]  # (t*fs, c)
+                        plan_unnormalized: torch.Tensor = self._unnormalize_x(
+                            plan_hist_last.unsqueeze(1)
+                        )  # (t*fs, 1, c)
 
-                    _new_sim_state = self._rollout_leaf_plan(
-                        leaf_plan_unnormalized=plan_unnormalized,
-                        new_denoised_start_idx=new_denoised_start,
-                        new_denoised_end_idx=new_denoised_end,
-                        agent=agent,
-                        envs=envs_forward if active_tree is bidir_tree1 else envs_backward,
-                        parent_sim_state=parent_node.sim_state,
-                        is_backward=(active_tree is bidir_tree2),
-                    )
-                    assert _new_sim_state is not None, "_new_sim_state is None"
-                    _child.sim_state = _new_sim_state
-                    _child.obs_pos = _new_sim_state["qpos"][:2]
-                    
-                    # ── Post-rollout logging ──
-                    if tracer:
-                        tracer.log(
-                            tag="bidir_mcts._rollout_leaf_plan.post_rollout",
-                            data={
-                                "loop_count": loops,
-                                "child_node_id": id(_child),
-                                "child_obs_pos": _child.obs_pos.tolist() if hasattr(_child.obs_pos, 'tolist') else [float(x) for x in _child.obs_pos],
-                                "child_sim_state_qpos": _child.sim_state["qpos"][:2].tolist() if _child.sim_state else None,
-                                "parent_qpos": parent_node.sim_state["qpos"][:2].tolist() if parent_node.sim_state else None,
-                                "displacement": (
-                                    (float(_child.sim_state["qpos"][0] - parent_node.sim_state["qpos"][0]),
-                                     float(_child.sim_state["qpos"][1] - parent_node.sim_state["qpos"][1]))
-                                    if _child.sim_state and parent_node.sim_state else None
-                                ),
-                            },
-                            depth=1,
-                        )
+                        new_denoised_end: int = (parent_node.depth + 1) * seg_size * self.frame_stack
+                        _child.obs_pos = plan_unnormalized[new_denoised_end - 1, 0, :self.observation_dim].cpu().numpy()
+                        _child.sim_state = None  # no physical rollout
 
                 # Extract plan by selecting best leaf and combining plans
                 best_info: dict = self._select_best_leaf(expanded_node_infos)
