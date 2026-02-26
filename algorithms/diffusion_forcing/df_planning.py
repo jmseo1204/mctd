@@ -1328,9 +1328,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     tag="bidir_mcts.initialization",
                     data={
                         "tree1_root_obs": _bidir_start_np[0][:2].tolist(),
-                        "tree1_root_sim_state_qpos": initial_sim_state["qpos"][:2].tolist(),
+                        "tree1_root_sim_state_qpos": initial_sim_state["qpos"][:2].tolist() if initial_sim_state is not None else None,
                         "tree2_root_obs": _bidir_goal_np[0][:2].tolist(),
-                        "tree2_root_sim_state_qpos": goal_sim_state["qpos"][:2].tolist(),
+                        "tree2_root_sim_state_qpos": goal_sim_state["qpos"][:2].tolist() if goal_sim_state is not None else None,
                         "tree1_id": id(bidir_tree1.root_node),
                         "tree2_id": id(bidir_tree2.root_node),
                         "env_setup": {
