@@ -137,9 +137,9 @@ def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, gu
             -1
         ]
 
-        # print(f"[SCALE IMPACT] Dist per batch: {dist_per_batch.tolist()}")
-        # print(f"[SCALE IMPACT] Final token dist: {last_token_dist.tolist()}")
-        # print(f"[SCALE IMPACT] Scales: {guidance_scale.tolist()}")
+        print(f"Dist per batch: {dist_per_batch.tolist()}")
+        print(f"Final token dist: {last_token_dist.tolist()}")
+        print(f"Scales: {guidance_scale.tolist()}")
 
     else:
         raise NotImplementedError(
@@ -215,10 +215,8 @@ def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     k_idx = indices.view(1, -1)
 
     # Sliding window mask: k is between [j-7-segment_size, j-7]
-    ignore_latest = 5 * planner.frame_stack
-    pair_mask = (k_idx <= j_idx - ignore_latest) & (
-        k_idx >= j_idx - ignore_latest - segment_size
-    )
+    ignore_latest = 3* planner.frame_stack
+    pair_mask = (k_idx <= j_idx - ignore_latest) # & (k_idx >= j_idx - ignore_latest - segment_size)
 
     # Only apply to states within the planning horizon (after conditioning frames)
     planning_mask = (j_idx >= planner.frame_stack) & (
@@ -249,7 +247,7 @@ def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     if not j_has_candidates.any():
         return torch.tensor(0.0, device=x.device, requires_grad=True)
 
-    mean_loss = topk_rdf_mean_per_j[:, j_has_candidates].sum() / 1000
+    mean_loss = topk_rdf_mean_per_j[:, j_has_candidates].sum()
 
     # Return negative loss (gradient descent will minimize repulsion)
     return -mean_loss

@@ -131,7 +131,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.max_plan_hist_keep = cfg.get("max_plan_hist_keep", 1)  # Memory optimization: limit history
         self.sequence_dividing_factor = cfg.sequence_dividing_factor
         self.horizon_scale = cfg.horizon_scale
-        self.pyramid = cfg.get("pyramid", False)
+        self.scheduling_matrix = cfg.get("scheduling_matrix", "pyramid")
 
         # HILP value function guidance
         self.use_hilp_guidance = cfg.get("use_hilp_guidance", False)
@@ -417,123 +417,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             batch_size, conditions, namespace
         )  # interact if environment is installation
 
-    # DEPRECATED
-    """
-    def plan(self, start: torch.Tensor, goal: torch.Tensor, horizon: int, conditions: Optional[Any] = None,
-        guidance_scale: int = None, noise_level: Optional[torch.Tensor] = None, plan: Optional[torch.Tensor] = None):
-        horizon = int(horizon)
-        # start and goal are numpy arrays of shape (b, obs_dim)
-        # start and goal are assumed to be normalized
-        # returns plan history of (m, t, b, c), where the last dim of m is the fully diffused plan
-
-        batch_size = start.shape[0]
-
-        start = self.make_bundle(start)
-        goal = self.make_bundle(goal)
-
-        if guidance_scale is None:
-            guidance_scale = self.guidance_scale
-
-        def goal_guidance(x):
-            # x is a tensor of shape [t b (fs c)]
-            pred = rearrange(x, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
-            h_padded = pred.shape[0] - self.frame_stack  # include padding when horizon % frame_stack != 0
-
-            if not self.use_reward:
-                # sparse / no reward setting, guide with goal like diffuser
-                target = torch.stack([start] * self.frame_stack + [goal] * (h_padded))
-                dist = nn.functional.mse_loss(pred, target, reduction="none")  # (t fs) b c
-                # guidance weight for observation and action
-                weight = np.array(
-                    [20] * (self.frame_stack)  # conditoning (aka reconstruction guidance)
-
-                    + [1 for _ in range(horizon)]  # try to reach the goal at any horizon
-                    #+ [0 for _ in range(horizon-1)] + [1]  # Diffuer guidance
-                    + [0] * (h_padded - horizon)  # don't guide padded entries due to horizon % frame_stack != 0
-                )
-                # mathematically, one may also try multiplying weight by sqrt(alpha_cum)
-                # this means you put higher weight to less noisy terms
-                # which might be better but we haven't tried yet
-                weight = torch.from_numpy(weight).float().to(self.device)
-                
-                dist_o, dist_a, _ = self.split_bundle(dist)  # guidance observation and action with separate weights
-                dist_a = torch.sum(dist_a, -1, keepdim=True).sqrt()
-                dist_o = dist_o[:, :, : 2]
-                #dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=self.observation_dim // 2).sqrt()
-                dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=1).sqrt()
-                dist_o = torch.tanh(dist_o / 2)  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
-                #dist = torch.cat([dist_o, dist_a], -1)
-                dist = dist_o
-                weight = repeat(weight, "t -> t c", c=dist.shape[-1])
-                weight[self.frame_stack :, 1:] = 8
-                weight[: self.frame_stack, 1:] = 2
-                weight = torch.ones_like(dist) * weight[:, None]
-
-                episode_return = -(dist * weight).mean() * 1000 * dist.shape[1] / 16 # considering the batch size
-            else:
-                # dense reward seeting, guide with reward
-                raise NotImplementedError("reward guidance not officially supported yet, although implemented")
-                rewards = pred[:, :, -1]
-                weight = np.array([10] * self.frame_stack + [0.997**j for j in range(h)] + [0] * h_padded)
-                weight = torch.from_numpy(weight).float().to(self.device)
-                episode_return = rewards * weight[:, None]
-
-            #return self.guidance_scale * episode_return
-            return guidance_scale * episode_return
-
-        #guidance_fn = goal_guidance if self.guidance_scale else None
-        guidance_fn = goal_guidance if guidance_scale else None
-
-        plan_tokens = np.ceil(horizon / self.frame_stack).astype(int)
-        pad_tokens = 0 if self.causal else self.n_tokens - plan_tokens - 1
-        #pad_tokens = 0 # To be more efficient
-        if noise_level is None:
-            scheduling_matrix = self._generate_scheduling_matrix(plan_tokens)
-        else: # if noise_level is given, use it
-            scheduling_matrix = noise_level
-        if plan is None:
-            chunk = torch.randn((plan_tokens, batch_size, *self.x_stacked_shape), device=self.device)
-            chunk = torch.clamp(chunk, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise)
-        else: # if plan is given, use it
-            chunk = plan
-            chunk = rearrange(chunk, "(t fs) b c -> t b (fs c)", fs=self.frame_stack)
-        pad = torch.zeros((pad_tokens, batch_size, *self.x_stacked_shape), device=self.device)
-        init_token = rearrange(self.pad_init(start), "fs b c -> 1 b (fs c)")
-        plan = torch.cat([init_token, chunk, pad], 0)
-
-        plan_hist = [plan.detach().clone()[: self.n_tokens - pad_tokens]]
-        stabilization = 0
-        for m in range(scheduling_matrix.shape[0] - 1):
-            from_noise_levels = np.concatenate(
-                [
-                    np.array((stabilization,), dtype=np.int64),
-                    scheduling_matrix[m],
-                    np.array([self.sampling_timesteps] * pad_tokens, dtype=np.int64),
-                ]
-            )
-            to_noise_levels = np.concatenate(
-                [
-                    np.array((stabilization,), dtype=np.int64),
-                    scheduling_matrix[m + 1],
-                    np.array([self.sampling_timesteps] * pad_tokens, dtype=np.int64),
-                ]
-            )
-            from_noise_levels = torch.from_numpy(from_noise_levels).to(self.device)
-            to_noise_levels = torch.from_numpy(to_noise_levels).to(self.device)
-            from_noise_levels = repeat(from_noise_levels, "t -> t b", b=batch_size)
-            to_noise_levels = repeat(to_noise_levels, "t -> t b", b=batch_size)
-            plan[1 : self.n_tokens - pad_tokens] = self.diffusion_model.sample_step(
-                plan, conditions, from_noise_levels, to_noise_levels, guidance_fn=guidance_fn
-            )[1 : self.n_tokens - pad_tokens]
-            plan_hist.append(plan.detach().clone()[: self.n_tokens - pad_tokens])
-
-        plan_hist = torch.stack(plan_hist)
-        plan_hist = rearrange(plan_hist, "m t b (fs c) -> m (t fs) b c", fs=self.frame_stack)
-        plan_hist = plan_hist[:, self.frame_stack : self.frame_stack + horizon]
-
-        return plan_hist
-    """
-
+    
     def process_segment_noise_levels(
         self,
         level_array: np.ndarray,
@@ -558,7 +442,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         start_idx = non_zero_indices[0]
         end_idx = min(start_idx + segment_size, plan_tokens)
 
-        if self.pyramid:
+        if self.scheduling_matrix == 'causal':
             local_horizon = end_idx - start_idx
             uncertainty_scale = getattr(self, "uncertainty_scale", 1)
 
@@ -580,17 +464,59 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     work_array[start_idx:end_idx], target_levels
                 )
 
-                step_to_add = work_array.copy()
-                steps.append(step_to_add)
+                steps.append(work_array.copy())
+
+        elif self.scheduling_matrix == 'smooth' and start_idx > 0:
+            # Phase 1: bilateral ramp — grow the denoised prefix toward B (left ramp)
+            # while reducing the new segment head toward 0 (right ramp), so the
+            # boundary jump level[B]-level[B-1] drops from N to ≤1.
+            #
+            # Left-ramp tokens have *increasing* noise levels (0 → k).  ddim_sample_step
+            # would normally produce NaN for these via sqrt(negative) in the sigma term.
+            # This is now handled transparently inside ddim_sample_step via forward_step
+            # (q_sample), so sample_step is safe to call for all tokens.
+            B = start_idx
+            S = segment_size
+            N_val = int(work_array[B])
+            window_start = max(0, B - S)
+            window_end = min(plan_tokens, B + S)
+
+            for k in range(1, S + 1):
+                # Left ramp: prefix tail grows from 0 → k
+                left_start = max(window_start, B - k)
+                left_len = B - left_start
+                if left_len > 0:
+                    ramp_start_val = k - left_len + 1
+                    work_array[left_start:B] = np.arange(ramp_start_val, ramp_start_val + left_len)
+
+                # Right ramp: new-segment head drops from N → N-k
+                right_end = min(window_end, B + k)
+                right_len = right_end - B
+                if right_len > 0:
+                    work_array[B:right_end] = np.maximum(
+                        0, np.arange(N_val - k, N_val - k + right_len)
+                    )
+
+                steps.append(work_array.copy())
+
+                # Early stop when boundary is smooth
+                if work_array[B] - work_array[B - 1] <= 1:
+                    break
+
+            # Phase 2: uniform subtraction over extended window
+            while np.any(work_array[start_idx:end_idx] > 0):
+                work_array[window_start:window_end] = np.maximum(
+                    0, work_array[window_start:window_end] - reduction_amount
+                )
+                steps.append(work_array.copy())
 
         else:
+            # Normal uniform denoising (also handles 'smooth' at start_idx==0)
             while np.any(work_array[start_idx:end_idx] > 0):
                 work_array[start_idx:end_idx] = np.maximum(
                     0, work_array[start_idx:end_idx] - reduction_amount
                 )
-
-                step_to_add = work_array.copy()
-                steps.append(step_to_add)
+                steps.append(work_array.copy())
 
         return np.stack(steps, axis=0)  # (M, T)
 
@@ -861,8 +787,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             f"too long horizon (n_tokens={self.n_tokens} < plan_tokens+1={plan_tokens+1})"
         )
         pad_tokens = max(0, self.n_tokens - plan_tokens - 1)  # scalar: padding tokens
-        use_init_token_in_noise = False
-        use_final_token_in_noise = False
 
         # CRITICAL: Concatenate plans from list along batch dimension
         # Input: list of b plans, each shape (n_tokens, 1, fs*c)
@@ -1260,23 +1184,19 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             horizon: int = int(self.episode_len * self.horizon_scale)
             _bidir_start_np = start.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
             _bidir_goal_np = goal.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
-            # Capture initial physical state if available
-            if self.use_rollout:
-                initial_sim_state = self._get_sim_state(envs_forward)
-                assert initial_sim_state is not None, "Failed to capture initial sim state"
-                assert np.allclose(initial_sim_state["qpos"][:2], _bidir_start_np[0][:2], atol=1e-5), \
-                    f"Physical start position {initial_sim_state['qpos'][:2]} does not match observation start position {_bidir_start_np[0][:2]}"
+            # Capture initial physical state (always, regardless of use_rollout)
+            initial_sim_state = self._get_sim_state(envs_forward)
+            assert initial_sim_state is not None, "Failed to capture initial sim state"
+            assert np.allclose(initial_sim_state["qpos"][:2], _bidir_start_np[0][:2], atol=1e-5), \
+                f"Physical start position {initial_sim_state['qpos'][:2]} does not match observation start position {_bidir_start_np[0][:2]}"
 
-                # Derive heuristic goal simulation state from initial state
-                goal_sim_state = {
-                    "qpos": initial_sim_state["qpos"].copy(),
-                    "qvel": np.zeros_like(initial_sim_state["qvel"]),  # Goal is assumed static
-                }
-                # Replace x, y coordinates with goal coordinates
-                goal_sim_state["qpos"][:2] = _bidir_goal_np[0][:2]
-            else:
-                initial_sim_state = None
-                goal_sim_state = None
+            # Derive heuristic goal simulation state from initial state
+            goal_sim_state = {
+                "qpos": initial_sim_state["qpos"].copy(),
+                "qvel": np.zeros_like(initial_sim_state["qvel"]),  # Goal is assumed static
+            }
+            # Replace x, y coordinates with goal coordinates
+            goal_sim_state["qpos"][:2] = _bidir_goal_np[0][:2]
 
             bidir_tree1 = self._init_mcts_tree(
                 horizon,
@@ -1397,7 +1317,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
                         new_denoised_end: int = (parent_node.depth + 1) * seg_size * self.frame_stack
                         _child.obs_pos = plan_unnormalized[new_denoised_end - 1, 0, :self.observation_dim].cpu().numpy()
-                        _child.sim_state = None  # no physical rollout
+
+                        # Create new sim_state: copy parent's structure and update qpos[:2] with last valid position
+                        _child.sim_state = {}
+                        for k, v in parent_node.sim_state.items():
+                            if isinstance(v, np.ndarray):
+                                _child.sim_state[k] = v.copy()
+                            else:
+                                _child.sim_state[k] = v
+                        # Update qpos with last valid frame position (x, y only)
+                        _child.sim_state['qpos'][:2] = _child.obs_pos[:2]
 
                 # Extract plan by selecting best leaf and combining plans
                 best_info: dict = self._select_best_leaf(expanded_node_infos)
@@ -1438,10 +1367,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 # Create forward trajectory image with both plan (red) and node trajectory (blue)
                 plan_positions = plan_unnormalized[:, :, :2].detach().cpu().numpy()
 
+                # Extract best_node's target_node obs_pos (single green point)
+                best_node_target_pos = None
+                if best_node.target_node is not None and best_node.target_node.obs_pos is not None:
+                    best_node_target_pos = best_node.target_node.obs_pos  # shape: (2,)
+
                 # Prepare trajectories dict for visualization
                 trajectories_dict = {
                     'plan': plan_positions,  # Red
                     'node_path': node_trajectory if node_trajectory is not None and len(node_trajectory) > 0 else None,  # Blue
+                    'best_node_target': best_node_target_pos,  # Green point (target_node.obs_pos)
                 }
 
                 forward_image = make_trajectory_images(
@@ -1514,6 +1449,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         obs_normalized = (
                             (obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]
                         ).detach()
+                        
             self.log(f"{namespace}/planning_time", np.sum(planning_time))
             self.log(f"{namespace}/episode_reward", episode_reward.mean())
             self.log(f"{namespace}/episode_reward_if_stay", episode_reward_if_stay.mean())
@@ -1522,12 +1458,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             # Visualization
             # samples = min(16, batch_size)
-            samples = min(32, batch_size)
+            samples = 1 # min(32, batch_size)
             trajectory = torch.stack(trajectory)
             start = start[:, :2].cpu().numpy().tolist()
             goal = goal[:, :2].cpu().numpy().tolist()
             images = make_trajectory_images(
-                self.env_id, trajectory, samples, start, goal, self.plot_end_points
+                self.env_id, trajectory[:, -samples:], samples, start, goal, self.plot_end_points
             )
 
             for i, img in enumerate(images):
@@ -2139,7 +2075,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 info["target_node"] = (
                     target_node  # Will be propagated to child TreeNode via expand()
                 )
-                target_pos = self._get_target_pos_from_plan_hist(target_node, seg_size)
+                target_pos = target_node.obs_pos
 
                 eff_goal_np_list.append(target_pos[None, : self.observation_dim])
                 obs_mean_np = self.data_mean[: self.observation_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[: self.observation_dim])
@@ -2963,42 +2899,30 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             sub_goal_sim_state["qpos"][:2] = sub_goal_pos
 
         # Execute plan: iterate, ensuring at least open_loop_horizon steps
-        # MODIFIED: Use current_sim_state to generate plan_frame instead of cycling through stored plan
-        plan_prev_frame = None
+        prev_sim_state = None
         loop_cnt = 0
-        
-        
-        while loop_cnt < self.open_loop_horizon:
-            # Generate plan_frame from current_sim_state 
-            # Extract position from the actual executed state, not from pre-computed plan
-            
-            # current_sim_state = self._get_sim_state(envs)
-            # plan_frame = torch.from_numpy(current_sim_state["qpos"][:2]).float().unsqueeze(0)  # (1, 2)
-            plan_frame = torch.from_numpy(obs_numpy[:, :2]).float()  # (1, 2)
 
+        while loop_cnt < self.open_loop_horizon:
             # Update sub_goal for antmaze (with interval logic)
             if "antmaze" in self.env_id:
-                if np.linalg.norm(plan_frame - sub_goal_pos[0]) < 1.0:
+                if np.linalg.norm(current_sim_state["qpos"][:2] - sub_goal_sim_state["qpos"][:2]) < 1.0:
                     if sub_goal_step < plan_frame_format.shape[0] - self.sub_goal_interval:
                         sub_goal_step += self.sub_goal_interval
-                        sub_goal_pos = plan_slice_np[sub_goal_step, :2]
-                        # Update sub_goal_sim_state position
-                        sub_goal_sim_state["qpos"][:2] = sub_goal_pos
+                        sub_goal_sim_state["qpos"][:2] = plan_slice_np[sub_goal_step, :2]
                     else:
-                        sub_goal_pos = plan_slice_np[-1, :2]
-                        sub_goal_sim_state["qpos"][:2] = sub_goal_pos
+                        sub_goal_sim_state["qpos"][:2] = plan_slice_np[-1, :2]
 
-            # Compute action using unified function
-            action = self._compute_action_from_plan(
-                obs_numpy=obs_numpy,
-                plan_frame=plan_frame,
-                plan_prev_frame=plan_prev_frame,
-                agent=agent,
-                sub_goal_pos=sub_goal_pos,
-                sub_goal_sim_state=sub_goal_sim_state,
-                current_sim_state=current_sim_state,
-                use_diffused_action=use_diffused_action,
-            )
+            # Compute action
+            if use_diffused_action:
+                plan_frame = plan_frame_format[loop_cnt]
+                _, action, _ = self.split_bundle(plan_frame)
+            else:
+                action = self._compute_action_from_plan(
+                    agent=agent,
+                    sub_goal_sim_state=sub_goal_sim_state,
+                    current_sim_state=current_sim_state,
+                    prev_sim_state=prev_sim_state,
+                )
 
             # Execute action in environment
             action_np = action.detach().cpu().numpy()
@@ -3020,8 +2944,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             bundle = self.make_bundle(obs_torch, action, reward[..., None])
             trajectory.append(bundle)
 
-            # Update prev_frame for velocity calculation
-            plan_prev_frame = plan_frame
+            # Update sim states for next iteration
+            prev_sim_state = current_sim_state
+            current_sim_state = self._get_sim_state(envs)
 
             # Increment counter
             loop_cnt += 1
@@ -3045,71 +2970,50 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
     def _compute_action_from_plan(
         self,
-        obs_numpy: np.ndarray,  # (1, obs_size)
-        plan_frame: torch.Tensor,  # (1, c)
-        plan_prev_frame: Optional[torch.Tensor],  # (1, c) or None
         agent: Optional[Any] = None,
-        sub_goal_pos: Optional[np.ndarray] = None,  # (2,) for antmaze - position only
-        sub_goal_sim_state: Optional[dict] = None,  # Full sim_state for sub_goal
-        current_sim_state: Optional[dict] = None,  # Full sim_state for current state
-        use_diffused_action: bool = False,
+        sub_goal_sim_state: Optional[dict] = None,
+        current_sim_state: Optional[dict] = None,
+        prev_sim_state: Optional[dict] = None,
     ) -> torch.Tensor:
         """
-        Compute action for a single timestep given current observation and plan frame.
-
-        Unified function supporting both antmaze and pointmaze:
-        - antmaze: Uses agent.sample_action with current state (29D = qpos+qvel) + goal (2D position)
-        - pointmaze: Uses PID-like controller
+        Compute action for a single timestep from sim_states.
 
         Args:
-            obs_numpy: Current observation, shape (1, obs_size)
-            plan_frame: Plan frame at current timestep, shape (1, c)
-            plan_prev_frame: Plan frame at previous timestep (for velocity calculation), shape (1, c) or None
             agent: RL agent for antmaze (None for pointmaze)
-            sub_goal_pos: Goal position for antmaze, shape (2,) - only for reference
-            sub_goal_sim_state: Full sim_state dict for sub_goal (with qpos, qvel)
-            current_sim_state: Full sim_state dict for current state (with qpos, qvel)
-            use_diffused_action: If True, use action directly from diffusion output
+            sub_goal_sim_state: sim_state of the sub-goal (qpos[:2] used as target position)
+            current_sim_state: sim_state of the current agent state (qpos + qvel)
+            prev_sim_state: sim_state from previous step (qpos[:2] used for plan velocity in PID)
 
         Returns:
             action: (1, action_dim) - clipped to [-1, 1]
         """
-        if use_diffused_action:
-            # Direct action from diffusion model
-            _, action, _ = self.split_bundle(plan_frame)
-            return action
-
         if "antmaze" in self.env_id:
-            # AntMaze: agent-based action
-            # Agent expects: state (29D = qpos+qvel) + goal (2D position)
-            # NOT the concatenation of [current, goal]
             assert agent is not None, "agent must be provided for antmaze"
-            assert sub_goal_pos is not None, "sub_goal_pos must be provided for antmaze"
             assert current_sim_state is not None, "current_sim_state must be provided for antmaze"
-            
-            # Extract current state: qpos + qvel (29D total)
-            current_qpos = current_sim_state["qpos"]  # (dof,)
-            current_qvel = current_sim_state["qvel"]  # (dof,)
-            state_29d = np.concatenate([current_qpos, current_qvel], axis=0)  # (29,)
+            assert sub_goal_sim_state is not None, "sub_goal_sim_state must be provided for antmaze"
+
+            state_29d = np.concatenate([current_sim_state["qpos"], current_sim_state["qvel"]], axis=0)  # (29,)
             state_input = state_29d[np.newaxis, :]  # (1, 29)
-            
-            # Pass 29D state and 2D goal position to agent
+            sub_goal_pos = sub_goal_sim_state["qpos"][:2]  # (2,)
+
             action = agent.sample_action(state_input, sub_goal_pos)
             return torch.from_numpy(action).float().reshape(1, -1)
         else:
             # PointMaze: PID-like controller
-            obs_t = torch.from_numpy(obs_numpy).float()
+            assert current_sim_state is not None, "current_sim_state must be provided for pointmaze"
+            assert sub_goal_sim_state is not None, "sub_goal_sim_state must be provided for pointmaze"
 
-            if plan_prev_frame is None:
-                # First step: compute velocity from obs to plan
-                plan_vel = plan_frame[:, :2] - obs_t[:, :2]
+            current_pos = torch.tensor(current_sim_state["qpos"][:2], dtype=torch.float32).unsqueeze(0)  # (1, 2)
+            current_vel = torch.tensor(current_sim_state["qvel"][:2], dtype=torch.float32).unsqueeze(0)  # (1, 2)
+            target_pos = torch.tensor(sub_goal_sim_state["qpos"][:2], dtype=torch.float32).unsqueeze(0)  # (1, 2)
+
+            if prev_sim_state is None:
+                plan_vel = target_pos - current_pos
             else:
-                # Subsequent steps: compute velocity from previous plan frame
-                plan_vel = plan_frame[:, :2] - plan_prev_frame[:, :2]
+                prev_pos = torch.tensor(prev_sim_state["qpos"][:2], dtype=torch.float32).unsqueeze(0)  # (1, 2)
+                plan_vel = target_pos - prev_pos
 
-            action = 12.5 * (plan_frame[:, :2] - obs_t[:, :2]) + 1.2 * (
-                plan_vel - obs_t[:, 2:4]
-            )
+            action = 12.5 * (target_pos - current_pos) + 1.2 * (plan_vel - current_vel)
             return torch.clip(action, -1, 1)
 
     def _rollout_leaf_plan(

@@ -226,6 +226,25 @@ class Diffusion(nn.Module):
             + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
+    def forward_step(self, x_clean: torch.Tensor, to_real_level: torch.Tensor) -> torch.Tensor:
+        """Apply closed-form forward diffusion q(x_t | x_0) to re-noise tokens.
+
+        Used when the noise schedule requires noise levels to *increase* (e.g. the
+        left-ramp phase of smooth boundary scheduling).  The standard DDIM sigma
+        formula contains sqrt((1 - alpha/alpha_next) * ...) which is sqrt of a
+        negative when alpha > alpha_next (forward direction), producing NaN.
+        This method bypasses that entirely with the analytical forward kernel.
+
+        Args:
+            x_clean:       (n_tokens, b, *x_shape) — assumed at noise level ≈ 0.
+            to_real_level: (n_tokens, b)            — target real timestep (0..T-1).
+
+        Returns:
+            x_noisy: same shape as x_clean, noised to the target level.
+        """
+        noise = torch.randn_like(x_clean).clamp(-self.clip_noise, self.clip_noise)
+        return self.q_sample(x_clean, to_real_level.clamp(min=0), noise=noise)
+
     def p_mean_variance(self, x, t, external_cond=None):
         model_pred = self.model_predictions(x=x, t=t, external_cond=external_cond)
         x_start = model_pred.pred_x_start
@@ -511,5 +530,19 @@ class Diffusion(nn.Module):
             orig_x,
             x_pred,
         )
+
+        # Handle tokens going in the *forward* direction (noise increasing, curr < next).
+        # The DDIM sigma formula = sqrt((1-alpha/alpha_next)*...) is undefined here
+        # because alpha > alpha_next makes the argument negative → NaN → contaminates
+        # the final x_pred for these tokens.  Replace with the closed-form forward
+        # kernel q(x_t | x_0) using orig_x as x_0 (valid when curr_level ≈ 0).
+        forward_mask = (
+            (curr_noise_level >= 0)
+            & (next_noise_level >= 0)
+            & (curr_noise_level < next_noise_level)
+        )  # (n_tokens, b)
+        if forward_mask.any():
+            x_forward = self.forward_step(orig_x, next_noise_level)
+            x_pred = torch.where(self.add_shape_channels(forward_mask), x_forward, x_pred)
 
         return x_pred

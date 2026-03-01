@@ -269,9 +269,11 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
     if isinstance(trajectory, dict):
         plan_trajectory = trajectory.get('plan')
         node_trajectory = trajectory.get('node_path')
+        best_node_target = trajectory.get('best_node_target')  # single (2,) pos or None
     else:
         plan_trajectory = trajectory
         node_trajectory = None
+        best_node_target = None
 
     for batch_idx in range(batch_size):
         fig, ax = plt.subplots()
@@ -310,8 +312,18 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
                 start_goal = (start[batch_idx], goal[batch_idx])
             plot_start_goal(ax, start_goal)
 
-        # Add legend if node_trajectory is present
-        if node_trajectory is not None and len(node_trajectory) > 0:
+        # Plot best_node's target_node obs_pos (single green star)
+        if best_node_target is not None:
+            pos = np.asarray(best_node_target).flatten()
+            if env_id in OGBENCH_ENVS:
+                px, py = pos[0] / 4 + 1, pos[1] / 4 + 1
+            else:
+                px, py = pos[0], pos[1]
+            ax.scatter(px, py, c='green', marker='*', s=300, zorder=10,
+                       edgecolors='darkgreen', linewidth=1.5, label="Target")
+
+        # Add legend if node_trajectory or target is present
+        if (node_trajectory is not None and len(node_trajectory) > 0) or best_node_target is not None:
             ax.legend(loc='upper right', fontsize=10)
 
         # plt.title(f"sample_{batch_idx}")
