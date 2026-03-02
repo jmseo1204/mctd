@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 from einops import rearrange, repeat, reduce
-from utils.tracer import get_tracer
 
 def weighted_loss(
     planner,
@@ -59,17 +58,6 @@ def prepare_pred(planner, x: torch.Tensor) -> torch.Tensor:
     )  # (t*fs, b, c)
     return planner._unnormalize_x(pred)
 
-def _tstat(t):
-    """Return compact NaN/Inf/range stats for a tensor (detached)."""
-    d = t.detach().float()
-    return {
-        "nan": int(torch.isnan(d).sum()),
-        "inf": int(torch.isinf(d).sum()),
-        "min": float(d.min()) if d.numel() > 0 else None,
-        "max": float(d.max()) if d.numel() > 0 else None,
-        "norm": float(d.norm()) if d.numel() > 0 else None,
-    }
-
 def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, guidance_scale: torch.Tensor) -> torch.Tensor:
     """
     Target guidance to reach goal/start.
@@ -85,12 +73,10 @@ def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, gu
     Returns:
         loss: scalar negative guidance loss for gradient ascent
     """
-    _tracer = get_tracer()
     pred = prepare_pred(planner, x)
-    segment_size = horizon // planner.sequence_dividing_factor
-    # h_padded = (
-    #     pred.shape[0] - planner.frame_stack
-    # )  # include padding when horizon % frame_stack != 0
+    h_padded = (
+        pred.shape[0] - planner.frame_stack
+    )  # include padding when horizon % frame_stack != 0
 
     if not planner.use_reward:
         # Temporal consistency guidance via shifted predictions
@@ -103,85 +89,49 @@ def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, gu
 
         target_guidance = torch.stack([target] * pred.shape[0])  # (t*fs, b, c)
 
-        # Compute distance: either HILP value function or MSE
+        # Compute distance using HILP value function
         T, B = pred.shape[0], pred.shape[1]
+        obs_flat = pred[:, :, :2].reshape(T * B, 2)
+        goal_expanded = (
+            target[:, :2].unsqueeze(0).expand(T, -1, -1).reshape(T * B, 2)
+        )
 
-        # Only run HILP at positions where target_weight=1 to avoid
-        # gradient explosion from extreme unnormalized noise in padding region.
-        active_idx = torch.arange(
-            planner.frame_stack - 1,
-            planner.frame_stack + horizon,
-            segment_size,
-            device=pred.device,
-        )  # e.g. [9, 59, 109]
-        active_idx = active_idx[active_idx < T]
-
-        obs_active   = pred[active_idx, :, :2].reshape(-1, 2)           # (len*B, 2)
-        goal_active  = target[:, :2].unsqueeze(0).expand(
-            len(active_idx), -1, -1
-        ).reshape(-1, 2)                                                 # (len*B, 2)
-
-        if _tracer is not None:
-            with _tracer.scope("goal_guidance_nan_diagnosis", phase="guidance"):
-                _tracer.log("goal_guidance.inputs", {
-                    "pred":        _tstat(pred),
-                    "target":      _tstat(target),
-                    "obs_active":  _tstat(obs_active),
-                    "goal_active": _tstat(goal_active),
-                    "active_idx":  active_idx.tolist(),
-                }, depth=1)
-
-        v_active = planner._compute_hilp_values(
-            obs_active, goal_active, use_no_grad=False
-        ).reshape(len(active_idx), B)                                    # (len, B)
-
-        # Fill full (T, B) tensor — non-active positions get 0 (detached, no grad)
-        v = torch.zeros(T, B, device=pred.device, dtype=v_active.dtype)
-        v[active_idx] = v_active
+        v_flat = planner._compute_hilp_values(
+            obs_flat, goal_expanded, use_no_grad=False
+        )
+        v = v_flat.reshape(T, B)  # (T, B)
 
         # Convert value to distance: negate since v is negative distance
-        TD_values = -v  # (T, B)
-        TD_target_hilp = TD_values.unsqueeze(-1)  # (T, B, 1)
+        dist_values = -v  # (T, B)
+        dist_target_hilp = dist_values.unsqueeze(-1)  # (T, B, 1)
 
         # Replicate to match MSE output shape (T, B, C)
-        TD_target = TD_target_hilp.expand(-1, -1, pred.shape[-1])
+        dist_target = dist_target_hilp.expand(-1, -1, pred.shape[-1])
 
-        # # Use traditional RMSE distance (commented out: causes grad explosion when MSE≈0)
-        # RMSE_target = torch.sqrt(nn.functional.mse_loss(
-        #     pred, target_guidance, reduction="none"
-        # ) + 1e-8)
+        target_weight = np.array(
+            [0]
+            * (planner.frame_stack)  # conditoning (aka reconstruction guidance)
+            + [
+                1 for _ in range(horizon)
+            ]  # try to reach the goal at any horizon
+            + [0]
+            * (
+                h_padded - horizon
+            )  # don't guide padded entries due to horizon % frame_stack != 0
+        )
+        target_weight = torch.from_numpy(target_weight).float().to(planner.device)
+        weighted_dist_target = weighted_loss(planner, dist_target, target_weight)
 
-        dist_target = TD_target  # + RMSE_target
-
-        target_weight = torch.zeros_like(pred.detach().cpu()[:, 0, 0])
-        target_weight[
-            planner.frame_stack-1 : planner.frame_stack + horizon : segment_size
-        ] = 1
-        target_weight = target_weight.float().to(planner.device)
-
-        if _tracer is not None:
-            with _tracer.scope("goal_guidance_nan_diagnosis", phase="guidance"):
-                _tracer.log("goal_guidance.intermediates", {
-                    "v_active":  _tstat(v_active),
-                    "TD_values": _tstat(TD_values),
-                    "TD_target": _tstat(TD_target),
-                    # "RMSE_target": _tstat(RMSE_target),
-                    "dist_target": _tstat(dist_target),
-                }, depth=1)
-
-        # weighted mean over time (dim=0) and feature (dim=2) → (b,)
-        weighted_dist_target = weighted_loss(planner, dist_target, target_weight, dim=(0, 2))
         dist_per_batch = guidance_scale * weighted_dist_target
 
-        if _tracer is not None:
-            with _tracer.scope("goal_guidance_nan_diagnosis", phase="guidance"):
-                _tracer.log("goal_guidance.output", {
-                    "weighted_dist": _tstat(weighted_dist_target),
-                    "dist_per_batch": _tstat(dist_per_batch),
-                    "loss": float(-(dist_per_batch).mean().detach()),
-                }, depth=1)
+        # Specifically for dist_left, the last token is the most important
+        # dist is (t fs) b n
+        last_token_dist = weighted_loss(planner, dist_target, weight=None, dim=(-1,))[
+            -1
+        ]
 
         print(f"Dist per batch: {dist_per_batch.tolist()}")
+        print(f"Final token dist: {last_token_dist.tolist()}")
         print(f"Scales: {guidance_scale.tolist()}")
 
     else:
@@ -203,8 +153,6 @@ def anchor_dist_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     Returns:
         loss: scalar negative regularization loss
     """
-    tracer = get_tracer()
-
     # x is a tensor of shape [t b (fs c)]
     pred = prepare_pred(planner, x)
     h_padded = (
@@ -223,60 +171,13 @@ def anchor_dist_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     ] = head_of_each_segments
     dist_anchor = nn.functional.mse_loss(pred, anchor_plan, reduction="none")
 
-    tail_of_each_segments = pred_detached[
-        planner.frame_stack : planner.frame_stack + horizon : segment_size
-    ]
-    spread_plan = torch.zeros_like(pred_detached)
-    spread_plan[
-        planner.frame_stack + segment_size - 1 : planner.frame_stack + horizon : segment_size
-    ] = tail_of_each_segments
-    dist_spread = nn.functional.mse_loss(pred, spread_plan, reduction="none")
-
-
     anchor_weight = torch.zeros_like(pred_detached[:, 0, 0])
     anchor_weight[
         planner.frame_stack : planner.frame_stack + horizon : segment_size
     ] = 1
+    weighted_dist_anchor = weighted_loss(planner, dist_anchor, anchor_weight)
 
-    anchor_weight[
-        planner.frame_stack - 1 : planner.frame_stack + horizon - 1 : segment_size
-    ] = 1
-
-    anchor_spread = dist_anchor - dist_spread
-
-    weighted_dist_anchor = weighted_loss(planner, anchor_spread, anchor_weight)
-
-    loss = -(weighted_dist_anchor).mean()
-
-    if tracer is not None:
-        with tracer.scope("anchor_guidance_nan_check", phase="guidance"):
-            tracer.log_tensor_stats("anchor_guidance.pred",          pred.detach(),                depth=1)
-            tracer.log_tensor_stats("anchor_guidance.dist_anchor",   dist_anchor.detach(),         depth=1)
-            tracer.log_tensor_stats("anchor_guidance.dist_spread",   dist_spread.detach(),         depth=1)
-            tracer.log_tensor_stats("anchor_guidance.anchor_spread", anchor_spread.detach(),       depth=1)
-            tracer.log_tensor_stats("anchor_guidance.weighted_dist", weighted_dist_anchor.detach(),depth=1)
-            tracer.log_tensor_stats("anchor_guidance.loss",          loss.detach(),                depth=1)
-            tracer.log(
-                "anchor_guidance.nan_inf_summary",
-                {
-                    "pred_has_nan":          bool(torch.isnan(pred).any()),
-                    "pred_has_inf":          bool(torch.isinf(pred).any()),
-                    "dist_anchor_has_nan":   bool(torch.isnan(dist_anchor).any()),
-                    "dist_anchor_has_inf":   bool(torch.isinf(dist_anchor).any()),
-                    "dist_spread_has_nan":   bool(torch.isnan(dist_spread).any()),
-                    "dist_spread_has_inf":   bool(torch.isinf(dist_spread).any()),
-                    "anchor_spread_neg_frac": float((anchor_spread < 0).float().mean()),
-                    "weighted_dist_has_nan": bool(torch.isnan(weighted_dist_anchor).any()),
-                    "weighted_dist_has_inf": bool(torch.isinf(weighted_dist_anchor).any()),
-                    "loss_has_nan":          bool(torch.isnan(loss)),
-                    "loss_has_inf":          bool(torch.isinf(loss)),
-                    "loss_value":            float(loss.detach()),
-                    "anchor_guidance_scale": float(planner.anchor_guidance_scale),
-                },
-                depth=1,
-            )
-
-    return loss
+    return -(weighted_dist_anchor).mean()
 
 def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor:
     """
