@@ -197,14 +197,15 @@ def anchor_dist_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
 
     repel_plan = torch.zeros_like(pred_detached)
     repel_plan[tail_pos] = pred_detached[head_pos]  # place head frame at tail position
-    dist_repel = nn.functional.mse_loss(pred, repel_plan, reduction="none")
+    sq_diff = (pred - repel_plan) ** 2               # (T, B, C)
+    dist_repel = torch.exp(-sq_diff / 1.0)           # RDF similarity, h=1; range (0, 1]
 
     repel_weight = torch.zeros_like(pred_detached[:, 0, 0])
     repel_weight[tail_pos] = 1
     weighted_dist_repel = weighted_loss(planner, dist_repel, repel_weight)
 
-    # attraction: minimize dist_anchor (−), repulsion: maximize dist_repel (+)
-    return -(weighted_dist_anchor).mean() + (weighted_dist_repel).mean()
+    # attraction: minimize dist_anchor (−), repulsion: minimize RDF similarity (−)
+    return -(weighted_dist_anchor).mean() - (weighted_dist_repel).mean()
 
 def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor:
     """

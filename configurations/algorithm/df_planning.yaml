@@ -62,10 +62,11 @@ scheduling_matrix: smooth
 hilp_checkpoint_path: "td_models/hilp_ckpt_latest.pt"
 hilp_obs_dim: 29  # AntMaze observation dimension
 hilp_skill_dim: 32  # HILP phi representation dimension
-anchor_guidance_scale: 20.0 # 40.0
+anchor_guidance_scale: 10.0 # 40.0
 rdf_guidance_scale: 0.0 # 2.0
 mcts_use_sim: false
 use_rollout: false  # If false, skip _rollout_leaf_plan; derive obs_pos from plan_history instead of physical sim
+use_dynamic_obs_padding: false  # If true, use parent_node's obs_pos as padding; if false, always use root_node's obs_pos
 
 diffusion:
   clip_noise: 20.0

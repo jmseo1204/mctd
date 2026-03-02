@@ -151,6 +151,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.rdf_guidance_scale = cfg.get("rdf_guidance_scale", 2.0)
         self.mcts_use_sim = cfg.get("mcts_use_sim", False)
         self.use_rollout: bool = cfg.get("use_rollout", False)
+        self.use_dynamic_obs_padding: bool = cfg.get("use_dynamic_obs_padding", True)
 
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal
@@ -868,6 +869,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             plan_without_parent_obs = torch.zeros((plan_tokens, *plan_tensor.shape[1:]), device=plan_tensor.device)
             
             for i, prefix_len in enumerate(prefix_len_list):
+                if not self.use_dynamic_obs_padding:
+                    prefix_len = 0
                 plan_without_parent_obs[:, i] = torch.cat([plan_with_parent_obs[:prefix_len, i], plan_with_parent_obs[prefix_len+1:, i]], dim=0)
             
             return plan_without_parent_obs
@@ -2657,8 +2660,17 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 f"    [DEBUG] Building initial plan from leaf. Parent: {parent_node.name}, Depth: {parent_node.depth}, History Segments: {len(parent_node.plan_history)}"
             )
 
-        # Build obs_parent_token: the parent node's current observation, tokenised.
-        parent_obs_pos = parent_node.obs_pos  # Raw (unnormalized) world coordinate
+        # Build obs_parent_token: the observation used as padding anchor.
+        # use_dynamic_obs_padding=True : use parent_node's obs_pos (moves with tree depth)
+        # use_dynamic_obs_padding=False: always use root_node's obs_pos (fixed starting point)
+        if self.use_dynamic_obs_padding:
+            padding_node = parent_node
+        else:
+            padding_node = parent_node
+            while padding_node._parent_node is not None:
+                padding_node = padding_node._parent_node
+
+        parent_obs_pos = padding_node.obs_pos  # Raw (unnormalized) world coordinate
 
         # Normalize parent observation for diffusion model input
         obs_mean_np = self.data_mean[: self.observation_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[: self.observation_dim])
@@ -2688,7 +2700,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         # - Root nodes: plan_history = [] (empty, evaluates to False)
         # - Non-root nodes: plan_history has accumulated plan segments (non-empty, evaluates to True)
         # This condition checks: "if parent is NOT a root node" to use accumulated prefix
-        if parent_node.plan_history:
+        if parent_node.plan_history: # and self.use_dynamic_obs_padding:
             # plan_history stores plans in canonical (forward) order via flip_plan_for_insert_hist.
             latest_plan_canonical = parent_node.plan_history[-1][-1]  # (plan_tokens*fs, c)
             prefix_len_frames = parent_node.depth * segment_size * self.frame_stack
@@ -2707,7 +2719,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         else:
             denoised_prefix = None
             prefix_len = 0
-        
+
+
         # Layout within plan_tokens_with_parent_obs: [prefix(prefix_len) | obs_parent(1) | noisy(plan_tokens-prefix_len)] Totally, plan_tokens + 1.
         noisy_total = plan_tokens - prefix_len
         assert noisy_total >= 0, f"Noisy total must be non-negative: {noisy_total}"
@@ -2732,9 +2745,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             print(f"[DEBUG _build_plan_from_leaf] denoised_prefix.shape={denoised_prefix.shape}", file=sys.stderr, flush=True)
 
         # Assemble plan_tokens-length chunk: [prefix | obs_parent | noisy]
-        if denoised_prefix is not None:
+        # obs_parent token is inserted only when using dynamic padding (parent's obs_pos varies by depth)
+        if denoised_prefix is not None and self.use_dynamic_obs_padding:
             plan_chunk_with_parent_obs = torch.cat(
                 [denoised_prefix, obs_parent_token, noisy_parts],
+                dim=0,  # (plan_tokens+1, 1, fs*c)
+            )
+        elif denoised_prefix is not None and not self.use_dynamic_obs_padding:
+            plan_chunk_with_parent_obs = torch.cat(
+                [obs_parent_token, denoised_prefix, noisy_parts],
                 dim=0,  # (plan_tokens+1, 1, fs*c)
             )
         else:

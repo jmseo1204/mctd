@@ -13,8 +13,8 @@ dql/backup/
 dql/results/
 test_*.py
 ./*.log
-logs/*
-logs_memory_debug/*
+logs/
+logs_memory_debug/
 
 
 # agent_config
