@@ -2,6 +2,7 @@ from typing import Optional, Callable
 from collections import namedtuple
 from omegaconf import DictConfig
 import torch
+from utils.tracer import get_tracer
 from torch import nn
 from torch.nn import functional as F
 from einops import rearrange
@@ -460,6 +461,7 @@ class Diffusion(nn.Module):
                         # Multi-component guidance: compute individual grads for logging and analysis
                         grad = torch.zeros_like(x)
                         norms = {}
+                        _tracer = get_tracer()
                         # Use retain_graph=True for all but the last component to get individual grads
                         items = list(guidance_results.items())
                         for i, (name, loss) in enumerate(items):
@@ -467,7 +469,22 @@ class Diffusion(nn.Module):
                             g = torch.autograd.grad(loss.sum(), x, retain_graph=not is_last)[0]
                             grad = grad + g
                             norms[name] = g.norm().item()
-                        
+                            if _tracer is not None:
+                                with _tracer.scope("gradient_nan_diagnosis", phase="guidance"):
+                                    _tracer.log(
+                                        f"gradient.component.{name}",
+                                        {
+                                            "loss_value":    float(loss.detach().sum()),
+                                            "loss_has_nan":  bool(torch.isnan(loss).any()),
+                                            "loss_has_inf":  bool(torch.isinf(loss).any()),
+                                            "grad_norm":     float(g.detach().norm()),
+                                            "grad_has_nan":  bool(torch.isnan(g).any()),
+                                            "grad_has_inf":  bool(torch.isinf(g).any()),
+                                            "grad_max_abs":  float(g.detach().abs().max()),
+                                        },
+                                        depth=1,
+                                    )
+
                         # Log individual norm ratios for analysis
                         total_norm = sum(norms.values())
                         if total_norm > 1e-8:

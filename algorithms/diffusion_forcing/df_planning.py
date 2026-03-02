@@ -17,6 +17,8 @@ from utils.logging_utils import (
     get_random_start_goal,
     make_convergence_animation,
     make_mpc_animation,
+    get_maze_grid,
+    is_grid_env,
 )
 from utils.tracer import Tracer, set_default_tracer, get_tracer
 from .tree_node import TreeNode
@@ -134,7 +136,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.scheduling_matrix = cfg.get("scheduling_matrix", "pyramid")
 
         # HILP value function guidance
-        self.use_hilp_guidance = cfg.get("use_hilp_guidance", False)
         hilp_path = cfg.get("hilp_checkpoint_path", "td_models/hilp_ckpt_latest.pt")
         # Resolve path relative to repo root if relative
         import os
@@ -289,6 +290,52 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             res = torch.min(v1, v2)
 
         return res
+
+    def _compute_hilp_heatmap(self, goal_obs_np: np.ndarray, grid_res: int = 40) -> dict:
+        """
+        Compute a HILP value heatmap over the maze for visualization.
+
+        Args:
+            goal_obs_np: Full goal observation (1D, obs_dim) in world (unnormalized) coords.
+                         First 2 dims are x, y. Used as the fixed goal for V(s, goal).
+            grid_res: Grid resolution per axis (default 40 → 1600 total points).
+
+        Returns:
+            dict with 'X', 'Y' (world-coord meshgrids, shape grid_res×grid_res) and
+            'values' (HILP values, same shape).
+        """
+        # --- Determine world-coordinate extent from maze dimensions ---
+        if is_grid_env(self.env_id):
+            maze_grid = get_maze_grid(self.env_id)
+            H = len(maze_grid)       # rows  → x axis in plot_maze_layout
+            W = len(maze_grid[0])    # cols  → y axis in plot_maze_layout
+            # Plot coord p = world / 4 + 1  →  world = (p - 1) * 4
+            # Plot range: [0.5, H+0.5] for x, [0.5, W+0.5] for y
+            x_min, x_max = (0.5 - 1) * 4, (H + 0.5 - 1) * 4   # ≈ -2 to (H-0.5)*4
+            y_min, y_max = (0.5 - 1) * 4, (W + 0.5 - 1) * 4
+        else:
+            obs_mean_np = self.data_mean[:2].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[:2])
+            obs_std_np  = self.data_std[:2].cpu().numpy()  if isinstance(self.data_std,  torch.Tensor) else np.array(self.data_std[:2])
+            x_min, x_max = obs_mean_np[0] - 3 * obs_std_np[0], obs_mean_np[0] + 3 * obs_std_np[0]
+            y_min, y_max = obs_mean_np[1] - 3 * obs_std_np[1], obs_mean_np[1] + 3 * obs_std_np[1]
+
+        xs = np.linspace(x_min, x_max, grid_res)
+        ys = np.linspace(y_min, y_max, grid_res)
+        X, Y = np.meshgrid(xs, ys)             # both shape (grid_res, grid_res)
+        grid_xy = np.stack([X.ravel(), Y.ravel()], axis=-1)  # (N, 2)
+        N = grid_xy.shape[0]
+
+        # Build obs_batch: use goal_obs as template, swap in grid x,y
+        obs_batch  = np.tile(goal_obs_np, (N, 1)).astype(np.float32)
+        obs_batch[:, :2] = grid_xy
+
+        # goal_batch: same goal obs repeated for each grid point
+        goal_batch = np.tile(goal_obs_np, (N, 1)).astype(np.float32)
+
+        values = self._compute_hilp_values(obs_batch, goal_batch)   # (N,)
+        values = values.cpu().numpy().reshape(X.shape)               # (grid_res, grid_res)
+
+        return {'X': X, 'Y': Y, 'values': values}
 
     def _build_model(self):
         mean = list(self.observation_mean) + list(self.action_mean)
@@ -786,7 +833,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         assert self.n_tokens >= plan_tokens + 1, (
             f"too long horizon (n_tokens={self.n_tokens} < plan_tokens+1={plan_tokens+1})"
         )
-        pad_tokens = max(0, self.n_tokens - plan_tokens - 1)  # scalar: padding tokens
+        pad_tokens = self.n_tokens - plan_tokens - 1  # scalar: padding tokens (must match _build_plan_from_leaf)
 
         # CRITICAL: Concatenate plans from list along batch dimension
         # Input: list of b plans, each shape (n_tokens, 1, fs*c)
@@ -1372,11 +1419,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 if best_node.target_node is not None and best_node.target_node.obs_pos is not None:
                     best_node_target_pos = best_node.target_node.obs_pos  # shape: (2,)
 
+                # Compute HILP value heatmap if model is already loaded
+                hilp_heatmap = None
+                if hasattr(self, '_hilp_value_fn_instance') and self._hilp_value_fn_instance is not None:
+                    try:
+                        hilp_heatmap = self._compute_hilp_heatmap(best_node_target_pos)
+                    except Exception as _hm_err:
+                        print(f"[HILP heatmap] skipped: {_hm_err}", file=sys.stderr, flush=True)
+
                 # Prepare trajectories dict for visualization
                 trajectories_dict = {
                     'plan': plan_positions,  # Red
                     'node_path': node_trajectory if node_trajectory is not None and len(node_trajectory) > 0 else None,  # Blue
                     'best_node_target': best_node_target_pos,  # Green point (target_node.obs_pos)
+                    'hilp_heatmap': hilp_heatmap,  # HILP value heatmap (low-alpha overlay)
                 }
 
                 forward_image = make_trajectory_images(
@@ -1710,10 +1766,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             start_np: np.ndarray = parent_node.obs_pos[
                 None, : self.observation_dim
             ]  # (1, obs_dim)
-            target_pos_from_plan = self._get_target_pos_from_plan_hist(target_node, seg_size)
-            goal_np: np.ndarray = target_pos_from_plan[
+            goal_np: np.ndarray = target_node.obs_pos[
                 None, : self.observation_dim
-            ]  # (1, obs_dim)
+            ]  # (1, obs_dim) — unnormalized world coords, same space as calculate_values' obs
              # Always evaluate as forward (plan_A is forward, plan_B already flipped)
             _vals, _achieved_infos, _achieved_ts = self.calculate_values(
                 plan_a_sliced, start_np, goal_np
@@ -2070,7 +2125,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 target_node = self._select_dynamic_goal(
                     current_leaf_obs=parent_obs_pos,
                     opposite_leaf_nodes=opposite_leaf_nodes,
-                    seg_size=seg_size,
                 )
                 info["target_node"] = (
                     target_node  # Will be propagated to child TreeNode via expand()
@@ -2724,85 +2778,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         return result, prefix_len
 
-    def _get_target_pos_from_plan_hist(self, node: "TreeNode", seg_size: int) -> np.ndarray:
-        """
-        Extract the last valid frame from node.plan_history at this node's depth level.
-        
-        Instead of using obs_pos (agent's actual executed position), we extract the target
-        position from the plan's denoised history. This ensures bidirectional planning targets
-        the actual planned frames, avoiding the Step 0 jump issue.
-        
-        For backward planning (tree2), the target should be the last frame of the forward tree's
-        plan at this node's depth level.
-        
-        Args:
-            node: TreeNode with plan_history list
-            seg_size: int - tokens per segment (calculated as tree.plan_tokens // sequence_dividing_factor)
-        
-        Returns:
-            target_pos: (obs_dim,) numpy array with the last valid frame from plan_hist
-        
-        Structure Reference:
-            node.plan_history: list of plan segments
-            node.plan_history[-1]: latest segment (list of denoising steps)
-            node.plan_history[-1][-1]: latest denoising step tensor, shape (plan_tokens*fs, c)
-                - plan_tokens*fs: total frames in full horizon
-                - c: observation dimension
-        """
-        # Fallback to obs_pos if plan_history is empty
-        if not node.plan_history or len(node.plan_history) == 0:
-            if node.obs_pos is not None:
-                return node.obs_pos
-            else:
-                raise ValueError(f"Node {node.name} has no plan_history and no obs_pos")
-        
-        # Get the latest segment's latest denoising step
-        # node.plan_history[-1] → latest segment (list of denoising steps)
-        # node.plan_history[-1][-1] → latest denoising step, shape (plan_tokens*fs, c)
-        try:
-            plan_full = node.plan_history[-1][-1]  # shape: (plan_tokens*fs, c)
-        except (IndexError, TypeError) as e:
-            # Debug info for shape issues
-            import sys
-            print(f"[DEBUG _get_target_pos_from_plan_hist] Error accessing plan_history", file=sys.stderr, flush=True)
-            print(f"  node.name: {node.name}", file=sys.stderr, flush=True)
-            print(f"  node.depth: {node.depth}", file=sys.stderr, flush=True)
-            print(f"  len(node.plan_history): {len(node.plan_history)}", file=sys.stderr, flush=True)
-            if len(node.plan_history) > 0:
-                print(f"  len(node.plan_history[-1]): {len(node.plan_history[-1]) if isinstance(node.plan_history[-1], list) else 'not a list'}", file=sys.stderr, flush=True)
-                if isinstance(node.plan_history[-1], list) and len(node.plan_history[-1]) > 0:
-                    print(f"  node.plan_history[-1][-1].shape: {node.plan_history[-1][-1].shape if hasattr(node.plan_history[-1][-1], 'shape') else 'no shape'}", file=sys.stderr, flush=True)
-            raise ValueError(f"Failed to access plan_history[-1][-1] for node {node.name}: {e}")
-        
-        # Calculate the number of valid frames up to this node's depth
-        # node.depth indicates how many segments have been completed
-        # Valid frames: [0, node.depth * seg_size * frame_stack)
-        valid_end_idx = node.depth * seg_size * self.frame_stack
-        
-        if valid_end_idx <= 0:
-            raise ValueError(
-                f"Node {node.name} has invalid depth {node.depth} "
-                f"(valid_end_idx={valid_end_idx}, seg_size={seg_size}, frame_stack={self.frame_stack})"
-            )
-        
-        if valid_end_idx > plan_full.shape[0]:
-            raise ValueError(
-                f"Node {node.name} valid_end_idx {valid_end_idx} exceeds plan length {plan_full.shape[0]} "
-                f"(depth={node.depth}, seg_size={seg_size}, frame_stack={self.frame_stack})"
-            )
-        
-        # Extract the last valid frame from the sliced plan
-        # plan_full[:valid_end_idx] → frames [0, valid_end_idx)
-        # [valid_end_idx - 1, :] → last frame in this range
-        last_valid_frame = plan_full[valid_end_idx - 1, :]
-        
-        return last_valid_frame.detach().cpu().numpy()
-
     def _select_dynamic_goal(
         self,
         current_leaf_obs: np.ndarray,
         opposite_leaf_nodes: List["TreeNode"],
-        seg_size: int,
     ) -> "TreeNode":
         """Select the best goal from the opposite tree's leaf nodes using HILP value.
 
@@ -2814,12 +2793,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             current_leaf_obs: Unnormalized observation of the leaf node being expanded,
                               shape (obs_dim,).
             opposite_leaf_nodes: List of TreeNode objects from the opposite tree's leaf nodes.
-            seg_size: int - tokens per segment (calculated as tree.plan_tokens // sequence_dividing_factor)
 
         Returns:
             best_node: The TreeNode from opposite_leaf_nodes with the highest HILP value.
         """
-        targets = np.stack([self._get_target_pos_from_plan_hist(n, seg_size) for n in opposite_leaf_nodes])  # (N, D)
+        assert all(n.obs_pos is not None for n in opposite_leaf_nodes), \
+            "All opposite_leaf_nodes must have obs_pos set before goal selection"
+        targets = np.stack([n.obs_pos for n in opposite_leaf_nodes])  # (N, D) — unnormalized world coords
         obs_expanded = np.tile(current_leaf_obs, (targets.shape[0], 1))  # (N, D)
         values = self._compute_hilp_values(obs_expanded, targets, use_no_grad=True)
 

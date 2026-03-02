@@ -59,12 +59,11 @@ sub_goal_interval: 5
 scheduling_matrix: smooth
 
 # HILP value function guidance
-use_hilp_guidance: true  # Set to true to use HILP value function instead of MSE distance
 hilp_checkpoint_path: "td_models/hilp_ckpt_latest.pt"
 hilp_obs_dim: 29  # AntMaze observation dimension
 hilp_skill_dim: 32  # HILP phi representation dimension
-anchor_guidance_scale: 10.0 # 40.0
-rdf_guidance_scale: 0.1 # 2.0
+anchor_guidance_scale: 0.0 # 40.0
+rdf_guidance_scale: 0.0 # 2.0
 mcts_use_sim: false
 use_rollout: false  # If false, skip _rollout_leaf_plan; derive obs_pos from plan_history instead of physical sim
 

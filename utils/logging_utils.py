@@ -270,10 +270,12 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
         plan_trajectory = trajectory.get('plan')
         node_trajectory = trajectory.get('node_path')
         best_node_target = trajectory.get('best_node_target')  # single (2,) pos or None
+        hilp_heatmap    = trajectory.get('hilp_heatmap')       # dict {X, Y, values} or None
     else:
         plan_trajectory = trajectory
         node_trajectory = None
         best_node_target = None
+        hilp_heatmap = None
 
     for batch_idx in range(batch_size):
         fig, ax = plt.subplots()
@@ -282,6 +284,18 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
         else:
             maze_grid = None
         plot_maze_layout(ax, maze_grid)
+
+        # Plot HILP value heatmap as a low-alpha background layer
+        if hilp_heatmap is not None:
+            X_w = hilp_heatmap['X']
+            Y_w = hilp_heatmap['Y']
+            vals = hilp_heatmap['values']
+            if env_id in OGBENCH_ENVS:
+                X_p = X_w / 4 + 1
+                Y_p = Y_w / 4 + 1
+            else:
+                X_p, Y_p = X_w, Y_w
+            ax.pcolormesh(X_p, Y_p, vals, shading='auto', cmap='viridis', alpha=0.5, zorder=1)
 
         # Plot plan trajectory (red)
         if plan_trajectory is not None:
