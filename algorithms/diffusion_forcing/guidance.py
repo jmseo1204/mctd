@@ -74,9 +74,6 @@ def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, gu
         loss: scalar negative guidance loss for gradient ascent
     """
     pred = prepare_pred(planner, x)
-    h_padded = (
-        pred.shape[0] - planner.frame_stack
-    )  # include padding when horizon % frame_stack != 0
 
     if not planner.use_reward:
         # Temporal consistency guidance via shifted predictions
@@ -89,37 +86,45 @@ def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, gu
 
         target_guidance = torch.stack([target] * pred.shape[0])  # (t*fs, b, c)
 
-        # Compute distance using HILP value function
+        # Compute distance at tail positions of each segment only
         T, B = pred.shape[0], pred.shape[1]
-        obs_flat = pred[:, :, :2].reshape(T * B, 2)
-        goal_expanded = (
-            target[:, :2].unsqueeze(0).expand(T, -1, -1).reshape(T * B, 2)
+        segment_size = horizon // planner.sequence_dividing_factor
+
+        # Tail positions: last frame of each segment
+        tail_pos = torch.arange(
+            planner.frame_stack + segment_size - 1,
+            planner.frame_stack + horizon,
+            segment_size,
+            device=pred.device,
         )
+        tail_pos = tail_pos[tail_pos < T]
 
-        v_flat = planner._compute_hilp_values(
-            obs_flat, goal_expanded, use_no_grad=False
-        )
-        v = v_flat.reshape(T, B)  # (T, B)
+        # HILP distance at tail positions only
+        obs_tail = pred[tail_pos, :, :2].reshape(-1, 2)           # (len*B, 2)
+        goal_tail = target[:, :2].unsqueeze(0).expand(
+            len(tail_pos), -1, -1
+        ).reshape(-1, 2)                                            # (len*B, 2)
 
-        # Convert value to distance: negate since v is negative distance
-        dist_values = -v  # (T, B)
-        dist_target_hilp = dist_values.unsqueeze(-1)  # (T, B, 1)
+        v_tail = planner._compute_hilp_values(
+            obs_tail, goal_tail, use_no_grad=False
+        ).reshape(len(tail_pos), B)                                 # (len, B)
 
-        # Replicate to match MSE output shape (T, B, C)
-        dist_target = dist_target_hilp.expand(-1, -1, pred.shape[-1])
+        # Fill full (T, B) tensor — non-tail positions get 0 (no grad)
+        v = torch.zeros(T, B, device=pred.device, dtype=v_tail.dtype)
+        v[tail_pos] = v_tail
+        dist_hilp = (-v).unsqueeze(-1).expand(-1, -1, pred.shape[-1])  # (T, B, C)
 
-        target_weight = np.array(
-            [0]
-            * (planner.frame_stack)  # conditoning (aka reconstruction guidance)
-            + [
-                1 for _ in range(horizon)
-            ]  # try to reach the goal at any horizon
-            + [0]
-            * (
-                h_padded - horizon
-            )  # don't guide padded entries due to horizon % frame_stack != 0
-        )
-        target_weight = torch.from_numpy(target_weight).float().to(planner.device)
+        # Euclidean (MSE) distance from pred to target
+        dist_mse = nn.functional.mse_loss(
+            pred, target_guidance, reduction="none"
+        )  # (T, B, C)
+
+        # Combined distance: HILP + MSE, weighted at tail positions only
+        dist_target = dist_hilp + dist_mse
+
+        target_weight = torch.zeros(T, device=planner.device)
+        target_weight[tail_pos] = 1
+
         weighted_dist_target = weighted_loss(planner, dist_target, target_weight)
 
         dist_per_batch = guidance_scale * weighted_dist_target
@@ -155,10 +160,6 @@ def anchor_dist_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     """
     # x is a tensor of shape [t b (fs c)]
     pred = prepare_pred(planner, x)
-    h_padded = (
-        pred.shape[0] - planner.frame_stack
-    )  # include padding when horizon % frame_stack != 0
-
     pred_detached = pred.detach()
 
     segment_size = horizon // planner.sequence_dividing_factor
@@ -177,7 +178,33 @@ def anchor_dist_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     ] = 1
     weighted_dist_anchor = weighted_loss(planner, dist_anchor, anchor_weight)
 
-    return -(weighted_dist_anchor).mean()
+    # Repulsion: tail of segment N is repelled by head of the same segment N.
+    # head_pos: first frame of each segment  [fs, fs+seg, fs+2*seg, ...]
+    # tail_pos: last frame of each segment   [fs+seg-1, fs+2*seg-1, ...]
+    head_pos = torch.arange(
+        planner.frame_stack,
+        planner.frame_stack + horizon,
+        segment_size,
+        device=pred.device,
+    )
+    tail_pos = torch.arange(
+        planner.frame_stack + segment_size - 1,
+        planner.frame_stack + horizon,
+        segment_size,
+        device=pred.device,
+    )
+    assert len(head_pos) == len(tail_pos), "len(head_pos) should be len(tail_pos)"
+
+    repel_plan = torch.zeros_like(pred_detached)
+    repel_plan[tail_pos] = pred_detached[head_pos]  # place head frame at tail position
+    dist_repel = nn.functional.mse_loss(pred, repel_plan, reduction="none")
+
+    repel_weight = torch.zeros_like(pred_detached[:, 0, 0])
+    repel_weight[tail_pos] = 1
+    weighted_dist_repel = weighted_loss(planner, dist_repel, repel_weight)
+
+    # attraction: minimize dist_anchor (−), repulsion: maximize dist_repel (+)
+    return -(weighted_dist_anchor).mean() + (weighted_dist_repel).mean()
 
 def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor:
     """
@@ -198,9 +225,6 @@ def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
 
     # Extract observation part (first 2 dimensions for position)
     pred_obs = pred[:, :, :2]  # Shape: [T, B, 2]
-
-    # Calculate segment size for window width
-    segment_size = float("inf")
 
     # Create indices for pairwise comparison
     indices = torch.arange(total_T, device=x.device)
