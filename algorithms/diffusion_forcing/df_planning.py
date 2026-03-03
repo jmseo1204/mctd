@@ -471,6 +471,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         level_array: np.ndarray,
         sequence_dividing_factor: int,
         reduction_amount: Optional[int] = None,
+        is_replanning = False
     ) -> np.ndarray:
         plan_tokens = len(level_array)  # T
         assert plan_tokens % sequence_dividing_factor == 0, (
@@ -490,7 +491,23 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         start_idx = non_zero_indices[0]
         end_idx = min(start_idx + segment_size, plan_tokens)
 
-        if self.scheduling_matrix == 'causal':
+        if is_replanning:
+            # Replan the already-denoised prefix [:start_idx]:
+            # 1) increase noise uniformly from 0 → sampling_timesteps // 5
+            # 2) decrease noise uniformly back to 0
+            assert reduction_amount is not None, "reduction_amount must be set when is_replanning=True"
+            target_level = self.sampling_timesteps // 2
+            current_level = 0
+            while current_level < target_level:
+                current_level = min(current_level + reduction_amount, target_level)
+                work_array[:start_idx] = current_level
+                steps.append(work_array.copy())
+            while current_level > 0:
+                current_level = max(current_level - reduction_amount, 0)
+                work_array[:start_idx] = current_level
+                steps.append(work_array.copy())
+
+        elif self.scheduling_matrix == 'causal':
             local_horizon = end_idx - start_idx
             uncertainty_scale = getattr(self, "uncertainty_scale", 1)
 
@@ -620,11 +637,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
     def _generate_bidirectional_schedule(
         self,
         start_levels: np.ndarray,
+        is_replanning: bool = False,
         complete_denoising: bool = False,
     ) -> np.ndarray:
         """
         Generates the N-step denoising schedule for bidirectional search.
         Returns a tensor of shape (B, Steps, T) representing the sequence of noise levels.
+
+        If complete_denoising=True, continues denoising all remaining segments until all
+        tokens reach 0 (used for value estimation). Otherwise, denoises one segment only.
         """
         # start_levels shape: (B, plan_tokens)  # (b, t)
 
@@ -639,25 +660,18 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             self.sampling_timesteps // self.mctd_num_denoising_steps
         )
 
-        while True:
-            # Process each batch to denoise ONE segment
+        def _one_segment_pass(levels):
             to_levels_list = []
             for b in range(batch_size):
                 to_levels_b = self.process_segment_noise_levels(
-                    current_levels[b],
+                    levels[b],
                     self.sequence_dividing_factor,
                     reduction_amount=chunk_of_sampling_timesteps_for_one_denoising,
+                    is_replanning=is_replanning,
                 )  # (m, t)
-                to_levels_list.append(to_levels_b)  # (b, m, t)
+                to_levels_list.append(to_levels_b)
 
-            # Verify that all particles in the batch have the same number of steps (M)
-            # assert all(len(steps) == len(to_levels_list[0]) for steps in to_levels_list), \
-            #     f"Schedules in batch have inconsistent lengths: {[len(s) for s in to_levels_list]}"
-
-            # Determine the maximum number of steps (M) in this segment across the batch
             max_m = max(len(steps) for steps in to_levels_list)
-
-            # Pad schedules to max_m by repeating the last step
             for b in range(batch_size):
                 if len(to_levels_list[b]) < max_m:
                     padding = np.tile(
@@ -668,20 +682,28 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     )
 
             batch_steps = np.stack(to_levels_list, axis=1)  # (M, B, T)
+            return batch_steps
 
-            # Append subsequent steps (index 0 is current_levels which is already in schedule)
-            for m in range(1, batch_steps.shape[0]):
-                schedule.append(batch_steps[m].copy())
+        # First segment pass
+        batch_steps = _one_segment_pass(current_levels)
+        for m in range(1, batch_steps.shape[0]):
+            schedule.append(batch_steps[m].copy())
+        current_levels = batch_steps[-1]
 
-            current_levels = batch_steps[-1]
+        # If complete_denoising, keep processing segments until all tokens reach 0
+        if complete_denoising:
+            max_segments = self.sequence_dividing_factor  # at most N more passes
+            for _ in range(max_segments - 1):
+                if not np.any(current_levels > 0):
+                    break
+                batch_steps = _one_segment_pass(current_levels)
+                for m in range(1, batch_steps.shape[0]):
+                    schedule.append(batch_steps[m].copy())
+                current_levels = batch_steps[-1]
 
-            if np.all(
-                current_levels == 0
-            ):  # all particles(every sequence) are denoised
-                break
 
-            if not complete_denoising:  # for expansion escape (not simulation)
-                break
+
+
 
         return np.stack(schedule, axis=0).transpose(1, 0, 2)  # (B, TotalSteps, T)
 
@@ -793,9 +815,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             goal = torch.cat([goal] * batch_size, 0)  # (b, obs_dim)
 
         if guidance_scale is None:
-            guidance_scale = self.guidance_scale
-
-        guidance_fn = lambda x: guidance.combined_guidance(self, x, goal, horizon, guidance_scale)
+            guidance_fn = lambda x: 0
+        else:
+            guidance_fn = lambda x: guidance.combined_guidance(self, x, goal, horizon, guidance_scale)
 
         assert horizon % self.frame_stack == 0, (
             "horizon must be a multiple of frame_stack"
@@ -2220,7 +2242,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     goal=effective_goal_normalized,
                     horizon=horizon,
                     conditions=conditions,
-                    guidance_scale=expanded_node_guidance_scales,
+                    guidance_scale=torch.zeros_like(expanded_node_guidance_scales),
                     noise_level=expanded_node_noise_levels,
                     plans=expanded_node_plans,
                     prefix_len_list=prefix_len_list,
@@ -2305,7 +2327,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                                 expanded_node_plan_hists[:, :, i]
                             )
 
-                else: # [DEPRECATED] mcts_use_sim is True
+                else: 
                     print("============ Simulation Start ============")
                     # Pad the noise levels - Sequential
                     simul_noiselevel_zero_padding_start = time.time()
@@ -2324,12 +2346,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                             _plan_t_fs, "(t fs) b c -> t b (fs c)", fs=self.frame_stack
                         )  # (plan_tokens, 1, fs*c)
                         _sim_pad_tokens = self.n_tokens - _plan_tokens_val - 1
+                        _obs_parent = torch.zeros(
+                            (1, 1, _plan_rearranged.shape[-1]),
+                            device=self.device,
+                        )
                         _sim_pad = torch.zeros(
                             (_sim_pad_tokens, 1, _plan_rearranged.shape[-1]),
                             device=self.device,
                         )
                         value_estimation_plans.append(
-                            torch.cat([_plan_rearranged, _sim_pad], dim=0)
+                            torch.cat([_obs_parent, _plan_rearranged, _sim_pad], dim=0)
                         )  # (n_tokens, 1, fs*c)
 
                     simul_noiselevel_zero_padding_end = time.time()

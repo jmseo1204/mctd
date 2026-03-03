@@ -120,7 +120,7 @@ def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, gu
         )  # (T, B, C)
 
         # Combined distance: HILP + MSE, weighted at tail positions only
-        dist_target = dist_hilp + dist_mse
+        dist_target =  dist_mse + dist_hilp
 
         target_weight = torch.zeros(T, device=planner.device)
         target_weight[tail_pos] = 1
@@ -233,7 +233,7 @@ def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     k_idx = indices.view(1, -1)
 
     # Sliding window mask: k is between [j-7-segment_size, j-7]
-    ignore_latest = 3* planner.frame_stack
+    ignore_latest = 6* planner.frame_stack
     pair_mask = (k_idx <= j_idx - ignore_latest) # & (k_idx >= j_idx - ignore_latest - segment_size)
 
     # Only apply to states within the planning horizon (after conditioning frames)

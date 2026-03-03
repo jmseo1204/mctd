@@ -94,7 +94,7 @@ if [ -z "$SELECTED_MODEL_ID" ]; then
 fi
 
 # 3. Fixed Parameters
-NUM_TASKS=1
+NUM_TASKS=3
 NUM_SEEDS=1
 NUM_REPEATS=1
 
