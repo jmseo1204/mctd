@@ -26,7 +26,7 @@ def weighted_loss(
         dist
     )  # guidance observation and action with separate weights
     # dist_a = torch.sum(dist_a, -1, keepdim=True).sqrt()
-    dist_o = dist_o[:, :, :2]
+    dist_o = dist_o[:, :, :planner.pos_dim]
     dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=1)
     dist_o = (dist_o + 1e-6).sqrt()
     # dist_o = torch.tanh(dist_o / 2)  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
@@ -99,11 +99,12 @@ def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, gu
         )
         tail_pos = tail_pos[tail_pos < T]
 
-        # HILP distance at tail positions only
-        obs_tail = pred[tail_pos, :, :2].reshape(-1, 2)           # (len*B, 2)
-        goal_tail = target[:, :2].unsqueeze(0).expand(
+        # HILP distance at tail positions only — use full observation_dim (pos+vel) for HILP
+        obs_dim = planner.observation_dim
+        obs_tail = pred[tail_pos, :, :obs_dim].reshape(-1, obs_dim)           # (len*B, observation_dim)
+        goal_tail = target[:, :obs_dim].unsqueeze(0).expand(
             len(tail_pos), -1, -1
-        ).reshape(-1, 2)                                            # (len*B, 2)
+        ).reshape(-1, obs_dim)                                            # (len*B, observation_dim)
 
         v_tail = planner._compute_hilp_values(
             obs_tail, goal_tail, use_no_grad=False
@@ -120,7 +121,7 @@ def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, gu
         )  # (T, B, C)
 
         # Combined distance: HILP + MSE, weighted at tail positions only
-        dist_target =  dist_mse + dist_hilp
+        dist_target =  dist_mse # + dist_hilp
 
         target_weight = torch.zeros(T, device=planner.device)
         target_weight[tail_pos] = 1
@@ -224,8 +225,8 @@ def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     pred = prepare_pred(planner, x)
     total_T = pred.shape[0]
 
-    # Extract observation part (first 2 dimensions for position)
-    pred_obs = pred[:, :, :2]  # Shape: [T, B, 2]
+    # Extract observation part (first pos_dim dimensions for position)
+    pred_obs = pred[:, :, :planner.pos_dim]  # Shape: [T, B, pos_dim]
 
     # Create indices for pairwise comparison
     indices = torch.arange(total_T, device=x.device)

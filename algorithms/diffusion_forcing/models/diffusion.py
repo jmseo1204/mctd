@@ -466,7 +466,9 @@ class Diffusion(nn.Module):
                         items = list(guidance_results.items())
                         for i, (name, loss) in enumerate(items):
                             is_last = (i == len(items) - 1)
-                            g = torch.autograd.grad(loss.sum(), x, retain_graph=not is_last)[0]
+                            g = torch.autograd.grad(loss.sum(), x, retain_graph=not is_last, allow_unused=True)[0]
+                            if g is None:
+                                g = torch.zeros_like(x)
                             grad = grad + g
                             norms[name] = g.norm().item()
                             if _tracer is not None:
@@ -492,7 +494,8 @@ class Diffusion(nn.Module):
                             print(f"[GUIDANCE RATIO] " + " | ".join(ratio_parts))
                     else:
                         guidance_loss = guidance_results
-                        grad = torch.autograd.grad(guidance_loss.sum(), x)[0]
+                        g = torch.autograd.grad(guidance_loss.sum(), x, allow_unused=True)[0]
+                        grad = g if g is not None else torch.zeros_like(x)
                 
                 # Guidance application: pred_noise = prior_noise - grad
                 # grad = d(-dist)/dx points towards the goal. Subtracting it from noise adds it to x.

@@ -1,0 +1,123 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║            CHECKPOINT MANAGEMENT - CLEANUP & ANALYSIS COMPLETE             ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+COMPLETION DATE: 2026-03-07 13:00 UTC
+PROJECT: Diffusion Forcing Trajectory Planning (MCTD)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. TASKS COMPLETED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✓ Collected 15D Training Checkpoint
+  └─ Location: /mnt/c/Users/USER/Desktop/test_ogbench/mctd_repo/outputs/2026-03-07/06-20-42/checkpoints/
+  └─ File: epoch=137-step=68000.ckpt (20 MB)
+  └─ Loss: 0.01455 (convergence: 0.5622 → 0.01455, 96% improvement)
+  └─ Training: 68,449 steps, 137 epochs
+
+✓ Registered 15D Model in outputs/downloaded
+  └─ Model ID: local_20260307062042_15d
+  └─ Symlink Target: /home/jmseo1204/mctd_outputs/2026-03-07/06-20-42/checkpoints/epoch=137-step=68000.ckpt
+
+✓ Analyzed Local Models (local_* folders)
+  └─ Identified 13 duplicate symlink pairs
+  └─ Each pair points to the SAME underlying checkpoint
+  └─ Suffix variants (_d2, _d15, _d29) created during different evaluations
+  └─ Models represent SEPARATE training runs, not sequential iterations
+
+✓ Cleaned Up Duplicate Symlinks
+  └─ Removed: local_*_d2, local_*_d15, local_*_d29 (13 folders)
+  └─ Result: 28 → 15 folders (46% reduction)
+  └─ Preserved: All unique checkpoints under base model names
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. MODEL INVENTORY (AFTER CLEANUP)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Category: 2D State Dimension Models (4 models)
+  • local_20260212125143 → 2026-02-12/12-51-43 (epoch=4799, step=24000)
+  • local_20260212143507 → 2026-02-12/14-35-07 (epoch=27, step=20000)
+  • local_20260212152455 → 2026-02-12/15-24-55 (epoch=29, step=22000)
+  • local_20260212152901 → 2026-02-12/15-29-01 (epoch=40, step=30000)
+
+Category: 29D State Dimension Models (5 models)
+  • local_20260303181343 → 2026-03-03/18-13-43 (epoch=5, step=5000)
+  • local_20260305050924 → 2026-03-05/05-09-24 (epoch=48, step=24000)
+  • local_20260305144616 → 2026-03-05/14-46-16 (epoch=12, step=6000)
+  • local_20260305144641 → 2026-03-05/14-46-41 (epoch=12, step=6000)
+  • local_20260306044559 → 2026-03-06/04-45-59 (epoch=68, step=34000)
+
+Category: Recent 2D/Early Stage Models (4 models)
+  • local_20260306175105 → 2026-03-06/17-51-05 (epoch=4, step=2000)
+  • local_20260306175519 → 2026-03-06/17-55-19 (epoch=4, step=2000)
+  • local_20260306200800 → 2026-03-06/20-08-00 (epoch=36, step=18000)
+  • local_20260306233910 → 2026-03-06/23-39-10 (epoch=8, step=4000)
+
+Category: Completed 15D Training Models (2 models)
+  • local_20260306220240 → 2026-03-06/22-02-40 (epoch=32, step=16000) [EARLY STOP]
+  • local_20260307062042_15d → 2026-03-07/06-20-42 (epoch=137, step=68000) [LATEST ✓]
+
+Category: Special
+  • train_29d_local_20260305 [Manual training session marker]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. KEY FINDINGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Question 1: Are local_* models separate, or continuations?
+  ANSWER: Separate independent training runs
+  EVIDENCE:
+    • Created across different dates (Feb 12, Mar 03, Mar 05, Mar 06, Mar 07)
+    • Each points to different training directories
+    • Different training lengths and convergence states
+    • No evidence of resume/checkpoint loading between them
+
+Question 2: Which are duplicates, and which are latest?
+  ANSWER: 13 pairs of duplicates identified; latest is local_20260307062042_15d
+  EVIDENCE:
+    • Removed suffix variants (_d2, _d15, _d29) - these were evaluation artifacts
+    • Each suffix pair pointed to the same underlying checkpoint
+    • Latest 15D: epoch=137, step=68000, loss=0.01455 ✓
+    • Latest 2D: local_20260306200800 (epoch=36, step=18000)
+    • Latest 29D: local_20260306044559 (epoch=68, step=34000)
+
+Question 3: Why duplicate symlinks with dimension suffixes?
+  ANSWER: Created by gen_fixed_jobs.sh during automated evaluation
+  EVIDENCE:
+    • Script auto-registers training checkpoints with timestamp-based IDs
+    • Each evaluation run creates new symlink with _dX suffix indicating state dim
+    • Suffix format: local_YYYYMMDD_HHMMSS_dX (where X = 2/15/29)
+    • Base name preserved for latest evaluation
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. NEXT STEPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For Immediate Use:
+  1. Evaluate latest 15D model (local_20260307062042_15d):
+     $ python generate_jobs_generalized.py --model_id local_20260307062042_15d
+     $ python run_jobs.py
+
+  2. (Optional) Compare 15D vs 29D vs 2D performance:
+     - 15D: local_20260307062042_15d (best loss: 0.01455)
+     - 29D: local_20260306044559 (epoch=68)
+     - 2D: local_20260306200800 (epoch=36)
+
+For Long-term Management:
+  1. Document model purpose (which experiment, what settings, results)
+  2. Archive or delete early experimental models if storage is concern
+  3. Keep only models needed for comparison/baseline evaluation
+
+Cleanup Status:
+  ✓ Directory organized
+  ✓ Duplicates removed
+  ✓ New 15D model registered
+  Ready for next evaluation phase
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. DOCUMENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+See CHECKPOINT_ANALYSIS.md for detailed model groups, timestamps, and metrics.
+
+═══════════════════════════════════════════════════════════════════════════════

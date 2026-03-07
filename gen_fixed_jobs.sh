@@ -1,40 +1,34 @@
 #!/bin/bash
 
 # ====================================================
-# MCTD Generalized Evaluation Launcher (Fixed Inputs)
+# MCTD Evaluation Launcher
 # ====================================================
-# Fixed inputs: 3-10-3-1
-# - Dataset index: 3 (og_antmaze_giant_navigate)
-# - Model index: 10
-# - Num tasks: 1
-# - Num seeds: 1
+# Prompts for state dim (2 or 29), then auto-selects
+# the matching dataset config and checkpoint.
 
 PROJECT_DIR=$(pwd)
 CONFIG_DATASET_DIR="configurations/dataset"
 OUTPUT_DOWNLOADED_DIR="outputs/downloaded/jmseo1204-seoul-national-university/mctd_eval"
+LOCAL_TRAIN_DIR="/home/jmseo1204/mctd_outputs"
 
 echo "===================================================="
-echo "  MCTD Job Generator (Fixed: 3-10-3-1)"
+echo "  MCTD Job Generator"
 echo "===================================================="
 
 # Check if Docker is available
 echo "Checking Docker availability..."
 if ! command -v docker &> /dev/null; then
     echo "❌ ERROR: Docker is not installed or not in PATH"
-    echo "   Please install Docker or add it to your PATH"
     exit 1
 fi
-
 if ! docker ps > /dev/null 2>&1; then
     echo "❌ ERROR: Docker daemon is not running"
-    echo "   Please start Docker daemon and try again"
-    echo "   Command: docker ps (should work without errors)"
     exit 1
 fi
 echo "✓ Docker is available and running"
 echo ""
 
-# 0. Clean up all existing MCTD containers and jobs
+# 0. Clean up existing containers and job files
 echo "Cleaning up existing MCTD containers..."
 docker rm -f $(docker ps -a 2>/dev/null | grep exp_gpu0 | awk '{print $1}') 2>/dev/null || true
 echo "✓ Container cleanup complete"
@@ -44,67 +38,168 @@ rm -f jobs/*.json
 echo "✓ Job files cleanup complete"
 echo ""
 
-# 1. Dataset Selection (Fixed: index 3)
-echo "Searching for datasets in: ${CONFIG_DATASET_DIR}"
-datasets=( $(ls ${CONFIG_DATASET_DIR}/*.yaml | xargs -n 1 basename | sed 's/\.yaml//' | grep -v "base") )
-
-if [ ${#datasets[@]} -eq 0 ]; then
-    echo "No datasets found in ${CONFIG_DATASET_DIR}"
-    exit 1
+# ─────────────────────────────────────────────────────
+# 1. Auto-register local training checkpoints
+# ─────────────────────────────────────────────────────
+if [ -d "$LOCAL_TRAIN_DIR" ]; then
+    echo "Scanning for local training checkpoints..."
+    while IFS= read -r ckpt; do
+        # Resolve symlink to actual .ckpt file
+        real_ckpt=$(readlink -f "$ckpt")
+        # Extract YYYY-MM-DD/HH-MM-SS from path → local_YYYYMMDD_HHMMSS
+        date_time=$(echo "$real_ckpt" | grep -oP '\d{4}-\d{2}-\d{2}/\d{2}-\d{2}-\d{2}')
+        if [ -z "$date_time" ]; then continue; fi
+        model_id="local_$(echo "$date_time" | tr '/-' '_' | tr -d '_' | sed 's/\(....\)\(..\)\(..\)_\(..\)\(..\)\(..\)/\1\2\3_\4\5\6/')"
+        dest="${OUTPUT_DOWNLOADED_DIR}/${model_id}/model.ckpt"
+        if [ ! -f "$dest" ]; then
+            mkdir -p "$(dirname "$dest")"
+            ln -sf "$real_ckpt" "$dest"
+            echo "✓ Auto-registered local checkpoint: $model_id"
+        fi
+    done < <(find "$LOCAL_TRAIN_DIR" -maxdepth 4 -name "last.ckpt" 2>/dev/null)
 fi
-
-ds_idx=3
-SELECTED_DATASET="${datasets[$ds_idx]}"
-echo "✓ Selected dataset (index $ds_idx): $SELECTED_DATASET"
-
-if [ -z "$SELECTED_DATASET" ]; then
-    echo "Invalid dataset selection."
-    exit 1
-fi
-
-# 2. Model Selection (Fixed: index 10)
 echo ""
-echo "Searching for downloaded models in: ${OUTPUT_DOWNLOADED_DIR}"
-if [ ! -d "$OUTPUT_DOWNLOADED_DIR" ]; then
-    echo "Directory ${OUTPUT_DOWNLOADED_DIR} not found. Trying to list all model.ckpt files in outputs..."
-    ckpt_files=( $(find outputs/downloaded -name "model.ckpt") )
-else
-    ckpt_files=( $(find "$OUTPUT_DOWNLOADED_DIR" -name "model.ckpt") )
-fi
 
-if [ ${#ckpt_files[@]} -eq 0 ]; then
-    echo "No model.ckpt files found."
+# ─────────────────────────────────────────────────────
+# 2. Scan for available state dimensions
+# ─────────────────────────────────────────────────────
+echo "Scanning all checkpoints to identify available state dimensions..."
+
+SCANNER_SCRIPT=$(mktemp /tmp/mctd_full_scan_XXXXXX.py)
+cat > "$SCANNER_SCRIPT" <<'PYEOF'
+import sys, os, torch
+from pathlib import Path
+
+base_dir = Path(sys.argv[1])
+if not base_dir.exists():
+    sys.exit(0)
+for model_dir in sorted(base_dir.iterdir()):
+    ckpt = model_dir / "model.ckpt"
+    if not ckpt.exists():
+        continue
+    try:
+        sd = torch.load(str(ckpt), map_location="cpu", weights_only=False).get("state_dict", {})
+        dm = sd.get("data_mean")
+        if dm is not None:
+             print(f"{model_dir.name}:{int(dm.shape[0])}")
+    except:
+        pass
+PYEOF
+
+SCAN_RESULTS=($(conda run -n diff_force_env python3 "$SCANNER_SCRIPT" "$OUTPUT_DOWNLOADED_DIR" 2>/dev/null))
+rm -f "$SCANNER_SCRIPT"
+
+if [ ${#SCAN_RESULTS[@]} -eq 0 ]; then
+    echo "❌ ERROR: No valid checkpoints found in ${OUTPUT_DOWNLOADED_DIR}"
     exit 1
 fi
 
-# Get model IDs
-model_ids=()
-for ckpt in "${ckpt_files[@]}"; do
-    model_id=$(basename $(dirname "$ckpt"))
-    model_ids+=("$model_id")
+# Extract unique dims
+UNIQUE_DIMS=($(printf "%s\n" "${SCAN_RESULTS[@]}" | cut -d: -f2 | sort -un))
+
+echo "Select observation state dimension:"
+for i in "${!UNIQUE_DIMS[@]}"; do
+    D="${UNIQUE_DIMS[$i]}"
+    case "$D" in
+        2)  DESC="2D  (x,y position only)   [og_antmaze_giant_navigate]" ;;
+        15) DESC="15D (qpos only)            [og_antmaze_giant_navigate_15d]" ;;
+        29) DESC="29D (full qpos+qvel)       [og_antmaze_giant_navigate_fullstate]" ;;
+        *)  DESC="${D}D (Custom)" ;;
+    esac
+    echo "  $((i+1))) $DESC"
 done
 
-mod_idx=10
-SELECTED_MODEL_ID="${model_ids[$mod_idx]}"
-echo "✓ Selected model (index $mod_idx): $SELECTED_MODEL_ID"
+read -rp "Enter state dimension index [1-${#UNIQUE_DIMS[@]}]: " DIM_INDEX
 
-if [ -z "$SELECTED_MODEL_ID" ]; then
-    echo "Invalid model selection."
+if ! [[ "$DIM_INDEX" =~ ^[0-9]+$ ]] || \
+   [ "$DIM_INDEX" -lt 1 ] || [ "$DIM_INDEX" -gt "${#UNIQUE_DIMS[@]}" ]; then
+    echo "❌ ERROR: Invalid selection '$DIM_INDEX'"
     exit 1
 fi
 
-# 3. Fixed Parameters
-NUM_TASKS=3
+STATE_DIM="${UNIQUE_DIMS[$((DIM_INDEX-1))]}"
+echo "✓ Selected state dim: $STATE_DIM"
+
+case "$STATE_DIM" in
+    2)  SELECTED_DATASET="og_antmaze_giant_navigate" ;;
+    15) SELECTED_DATASET="og_antmaze_giant_navigate_15d" ;;
+    29) SELECTED_DATASET="og_antmaze_giant_navigate_fullstate" ;;
+    *)
+        echo "⚠️ No mapping found for ${STATE_DIM}D. Defaulting to giant_navigate."
+        SELECTED_DATASET="og_antmaze_giant_navigate"
+        ;;
+esac
+
+DATASET_YAML="${CONFIG_DATASET_DIR}/${SELECTED_DATASET}.yaml"
+if [ ! -f "$DATASET_YAML" ]; then
+    echo "❌ ERROR: Dataset config not found: ${DATASET_YAML}"
+    exit 1
+fi
+echo "✓ Selected dataset: $SELECTED_DATASET"
+echo ""
+
+# ─────────────────────────────────────────────────────
+# 3. Filter checkpoints by selected obs_dim
+# ─────────────────────────────────────────────────────
+MATCHING_MODELS=()
+for res in "${SCAN_RESULTS[@]}"; do
+    ID=$(echo "$res" | cut -d: -f1)
+    DIM=$(echo "$res" | cut -d: -f2)
+    if [ "$DIM" -eq "$STATE_DIM" ]; then
+        MATCHING_MODELS+=("$ID")
+    fi
+done
+
+if [ ${#MATCHING_MODELS[@]} -eq 0 ]; then
+    echo "❌ ERROR: No checkpoints found with obs_dim=${STATE_DIM} in ${OUTPUT_DOWNLOADED_DIR}"
+    exit 1
+fi
+
+# ─────────────────────────────────────────────────────
+# 4. Let user pick model (or auto-select if only one)
+# ─────────────────────────────────────────────────────
+if [ ${#MATCHING_MODELS[@]} -eq 1 ]; then
+    SELECTED_MODEL_ID="${MATCHING_MODELS[0]}"
+    echo "✓ Auto-selected model: $SELECTED_MODEL_ID (only match)"
+else
+    echo "Found ${#MATCHING_MODELS[@]} checkpoints with obs_dim=${STATE_DIM}:"
+    for i in "${!MATCHING_MODELS[@]}"; do
+        echo "  $((i+1))) ${MATCHING_MODELS[$i]}"
+    done
+    read -rp "Select model [1-${#MATCHING_MODELS[@]}]: " MODEL_CHOICE
+    if ! [[ "$MODEL_CHOICE" =~ ^[0-9]+$ ]] || \
+       [ "$MODEL_CHOICE" -lt 1 ] || [ "$MODEL_CHOICE" -gt "${#MATCHING_MODELS[@]}" ]; then
+        echo "❌ ERROR: Invalid selection '$MODEL_CHOICE'"
+        exit 1
+    fi
+    SELECTED_MODEL_ID="${MATCHING_MODELS[$((MODEL_CHOICE-1))]}"
+    echo "✓ Selected model: $SELECTED_MODEL_ID"
+fi
+
+CKPT_PATH="${OUTPUT_DOWNLOADED_DIR}/${SELECTED_MODEL_ID}/model.ckpt"
+if [ ! -f "$CKPT_PATH" ]; then
+    echo "❌ ERROR: Checkpoint not found at ${CKPT_PATH}"
+    exit 1
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────
+# 5. Fixed parameters
+# ─────────────────────────────────────────────────────
+NUM_TASKS=1
 NUM_SEEDS=1
 NUM_REPEATS=1
 
-echo "✓ Num tasks: $NUM_TASKS"
-echo "✓ Num seeds: $NUM_SEEDS"
-echo "✓ Num repeats: $NUM_REPEATS"
-
-# 4. Execute Job Generator
+echo "Configuration summary:"
+echo "  Dataset    : $SELECTED_DATASET (obs_dim=${STATE_DIM})"
+echo "  Model      : $SELECTED_MODEL_ID"
+echo "  Tasks      : $NUM_TASKS  Seeds: $NUM_SEEDS  Repeats: $NUM_REPEATS"
 echo ""
-echo "Running: python3 generate_jobs_generalized.py --dataset $SELECTED_DATASET --model_id $SELECTED_MODEL_ID --num_tasks $NUM_TASKS --num_seeds $NUM_SEEDS --num_repeats $NUM_REPEATS"
+
+# ─────────────────────────────────────────────────────
+# 6. Execute Job Generator
+# ─────────────────────────────────────────────────────
+echo "Running: python3 generate_jobs_generalized.py --dataset $SELECTED_DATASET --model_id $SELECTED_MODEL_ID ..."
 python3 generate_jobs_generalized.py \
     --dataset "$SELECTED_DATASET" \
     --model_id "$SELECTED_MODEL_ID" \

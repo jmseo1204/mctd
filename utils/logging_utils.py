@@ -242,13 +242,13 @@ def plot_start_goal(ax, start_goal: None):
         star = plt.Polygon(np.array(points).reshape(-1, 2), color=color)
         ax.add_patch(star)
 
-    start_x, start_y = start_goal[0]
+    start_x, start_y = start_goal[0][:2]
     start_outer_circle = plt.Circle((start_x, start_y), 0.16, facecolor="white", edgecolor="black")
     ax.add_patch(start_outer_circle)
     start_inner_circle = plt.Circle((start_x, start_y), 0.08, color="black")
     ax.add_patch(start_inner_circle)
 
-    goal_x, goal_y = start_goal[1]
+    goal_x, goal_y = start_goal[1][:2]
     goal_outer_circle = plt.Circle((goal_x, goal_y), 0.16, facecolor="white", edgecolor="black")
     ax.add_patch(goal_outer_circle)
     draw_star((goal_x, goal_y), radius=0.08)

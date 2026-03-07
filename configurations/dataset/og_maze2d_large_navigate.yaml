@@ -2,7 +2,7 @@ defaults:
   - base_dataset
 env_id: "pointmaze-large-v0"
 dataset: "pointmaze-large-navigate-v0"
-save_dir: ~/.ogbench/data
+save_dir: ~/ogbench_data
 gamma: 1.0
 episode_len: 500
 observation_shape: [2]

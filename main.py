@@ -79,7 +79,18 @@ def run_local(cfg: DictConfig):
     checkpoint_path = None
     load_id = None
     if load and not is_run_id(load):
-        checkpoint_path = load
+        # Check if it's a local model_id in outputs/downloaded (non-WandB checkpoint)
+        local_downloaded = (
+            Path("outputs/downloaded")
+            / cfg.wandb.entity
+            / cfg.wandb.project
+            / load
+            / "model.ckpt"
+        )
+        if local_downloaded.exists():
+            checkpoint_path = local_downloaded
+        else:
+            checkpoint_path = load
     if resume:
         load_id = resume
     elif load and is_run_id(load):

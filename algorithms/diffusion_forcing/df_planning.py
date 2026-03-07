@@ -83,6 +83,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.dataset = cfg.dataset
         self.action_dim = len(cfg.action_mean)
         self.observation_dim = len(cfg.observation_mean)
+        self.pos_dim = cfg.get("pos_dim", 2)  # Spatial dims for MCTS/guidance (x, y)
         self.use_reward = cfg.use_reward
         self.unstacked_dim = (
             self.observation_dim + self.action_dim + int(self.use_reward)
@@ -315,8 +316,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             x_min, x_max = (0.5 - 1) * 4, (H + 0.5 - 1) * 4   # ≈ -2 to (H-0.5)*4
             y_min, y_max = (0.5 - 1) * 4, (W + 0.5 - 1) * 4
         else:
-            obs_mean_np = self.data_mean[:2].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[:2])
-            obs_std_np  = self.data_std[:2].cpu().numpy()  if isinstance(self.data_std,  torch.Tensor) else np.array(self.data_std[:2])
+            obs_mean_np = self.data_mean[:self.pos_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[:self.pos_dim])
+            obs_std_np  = self.data_std[:self.pos_dim].cpu().numpy()  if isinstance(self.data_std,  torch.Tensor) else np.array(self.data_std[:self.pos_dim])
             x_min, x_max = obs_mean_np[0] - 3 * obs_std_np[0], obs_mean_np[0] + 3 * obs_std_np[0]
             y_min, y_max = obs_mean_np[1] - 3 * obs_std_np[1], obs_mean_np[1] + 3 * obs_std_np[1]
 
@@ -328,7 +329,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # Build obs_batch: use goal_obs as template, swap in grid x,y
         obs_batch  = np.tile(goal_obs_np, (N, 1)).astype(np.float32)
-        obs_batch[:, :2] = grid_xy
+        obs_batch[:, :self.pos_dim] = grid_xy
 
         # goal_batch: same goal obs repeated for each grid point
         goal_batch = np.tile(goal_obs_np, (N, 1)).astype(np.float32)
@@ -422,8 +423,38 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             xs, conditions, noise_levels=self._generate_noise_levels(xs, masks=masks)
         )
 
+        # Per-dimension loss logging (before reduction)
+        # loss shape: (n_tokens+1, B, fs*C), C = obs_dim + action_dim
+        with torch.no_grad():
+            _loss_4d = rearrange(loss.detach(), "t b (fs c) -> t b fs c", fs=self.frame_stack)
+            _w = rearrange(weights.float(), "(t fs) b -> t b fs 1", fs=self.frame_stack)
+            _w_sum = _w.sum(dim=(0, 1, 2)).clamp(min=1e-8)
+            _loss_per_dim = (_loss_4d * _w).sum(dim=(0, 1, 2)) / _w_sum  # (C,)
+
+            _important_dims = {
+                0: "obs/pos_x", 1: "obs/pos_y",
+                3: "obs/quat_w", 4: "obs/quat_x", 5: "obs/quat_y", 6: "obs/quat_z",
+            }
+            for _dim_idx, _dim_name in _important_dims.items():
+                if _dim_idx < _loss_per_dim.shape[0]:
+                    self.log(f"training/loss_dim/{_dim_name}", _loss_per_dim[_dim_idx],
+                             on_step=True, on_epoch=False, sync_dist=True)
+
+            _per_dim_for_jsonl = _loss_per_dim.cpu().tolist()
+
         loss = self.reweight_loss(loss, weights)
 
+        # Write all-dim losses to local JSONL (wandb-independent)
+        _step = self.trainer.global_step if self.trainer else 0
+        _epoch = self.trainer.current_epoch if self.trainer else 0
+        self._dim_loss_logger.log(
+            step=_step,
+            epoch=_epoch,
+            total_loss=float(loss.item()),
+            per_dim_loss=_per_dim_for_jsonl,
+        )
+
+        self.log("training/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
         self.log(
             "training/loss_epoch", loss, on_step=False, on_epoch=True, sync_dist=True
         )
@@ -997,7 +1028,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         while current_node is not None:
             # Extract position from sim_state if available
             if current_node.sim_state is not None:
-                pos = current_node.sim_state["qpos"][:2]
+                pos = current_node.sim_state["qpos"][:self.pos_dim]
                 trajectory.append(pos)
             elif current_node.obs_pos is not None:
                 trajectory.append(current_node.obs_pos)
@@ -1230,7 +1261,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             # and plan towards start. We do this by:
             # 1. Creating a goal_sim_state (heuristic goal state for tree2)
             # 2. Will be set explicitly when tree2 needs to execute
-            goal_qpos = goal.cpu().numpy()[0, :2]  # (2,) - goal coordinates
+            goal_qpos = goal.cpu().numpy()[0, :self.pos_dim]  # (pos_dim,) - goal coordinates
             
             # Reset envs_backward to a known state
             envs_backward.reset()
@@ -1259,8 +1290,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             # Capture initial physical state (always, regardless of use_rollout)
             initial_sim_state = self._get_sim_state(envs_forward)
             assert initial_sim_state is not None, "Failed to capture initial sim state"
-            assert np.allclose(initial_sim_state["qpos"][:2], _bidir_start_np[0][:2], atol=1e-5), \
-                f"Physical start position {initial_sim_state['qpos'][:2]} does not match observation start position {_bidir_start_np[0][:2]}"
+            assert np.allclose(initial_sim_state["qpos"][:self.pos_dim], _bidir_start_np[0][:self.pos_dim], atol=1e-5), \
+                f"Physical start position {initial_sim_state['qpos'][:self.pos_dim]} does not match observation start position {_bidir_start_np[0][:self.pos_dim]}"
 
             # Derive heuristic goal simulation state from initial state
             goal_sim_state = {
@@ -1268,7 +1299,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 "qvel": np.zeros_like(initial_sim_state["qvel"]),  # Goal is assumed static
             }
             # Replace x, y coordinates with goal coordinates
-            goal_sim_state["qpos"][:2] = _bidir_goal_np[0][:2]
+            goal_sim_state["qpos"][:self.pos_dim] = _bidir_goal_np[0][:self.pos_dim]
 
             bidir_tree1 = self._init_mcts_tree(
                 horizon,
@@ -1371,7 +1402,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         )
                         assert _new_sim_state is not None, "_new_sim_state is None"
                         _child.sim_state = _new_sim_state
-                        _child.obs_pos = _new_sim_state["qpos"][:2]
+                        _child.obs_pos = np.concatenate([_new_sim_state["qpos"], _new_sim_state["qvel"]])[:self.observation_dim]
                 
                 else:
                     # Derive obs_pos from plan_history without physical simulation
@@ -1390,15 +1421,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         new_denoised_end: int = (parent_node.depth + 1) * seg_size * self.frame_stack
                         _child.obs_pos = plan_unnormalized[new_denoised_end - 1, 0, :self.observation_dim].cpu().numpy()
 
-                        # Create new sim_state: copy parent's structure and update qpos[:2] with last valid position
+                        # Create new sim_state: copy parent's structure and update qpos[:pos_dim] with last valid position
                         _child.sim_state = {}
                         for k, v in parent_node.sim_state.items():
                             if isinstance(v, np.ndarray):
                                 _child.sim_state[k] = v.copy()
                             else:
                                 _child.sim_state[k] = v
-                        # Update qpos with last valid frame position (x, y only)
-                        _child.sim_state['qpos'][:2] = _child.obs_pos[:2]
+                        # Update qpos with last valid frame position (pos_dim only)
+                        _child.sim_state['qpos'][:self.pos_dim] = _child.obs_pos[:self.pos_dim]
 
                 # Extract plan by selecting best leaf and combining plans
                 best_info: dict = self._select_best_leaf(expanded_node_infos)
@@ -1430,14 +1461,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 expanded_tree_idx = (expanded_tree_idx + 1) % 2
 
                 # Visualization with both forward and reverse trajectories
-                start_numpy = start.cpu().numpy()[:, :2]
-                goal_numpy = goal.cpu().numpy()[:, :2]
+                start_numpy = start.cpu().numpy()[:, :self.pos_dim]
+                goal_numpy = goal.cpu().numpy()[:, :self.pos_dim]
 
                 # Extract best_node's tree trajectory (sim_state sequence from root to leaf)
                 node_trajectory = self._extract_node_trajectory(best_node)
 
                 # Create forward trajectory image with both plan (red) and node trajectory (blue)
-                plan_positions = plan_unnormalized[:, :, :2].detach().cpu().numpy()
+                plan_positions = plan_unnormalized[:, :, :self.pos_dim].detach().cpu().numpy()
 
                 # Extract best_node's target_node obs_pos (single green point)
                 best_node_target_pos = None
@@ -1484,7 +1515,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     _plan = []
                     for t in range(plan_unnormalized.shape[0]):
                         for j in range(self.jump):
-                            _plan.append(plan_unnormalized[t, :, :2])
+                            _plan.append(plan_unnormalized[t, :, :self.pos_dim])
                     plan_unnormalized = torch.stack(_plan)
 
 
@@ -1541,8 +1572,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             # samples = min(16, batch_size)
             samples = 1 # min(32, batch_size)
             trajectory = torch.stack(trajectory)
-            start = start[:, :2].cpu().numpy().tolist()
-            goal = goal[:, :2].cpu().numpy().tolist()
+            start = start[:, :self.pos_dim].cpu().numpy().tolist()
+            goal = goal[:, :self.pos_dim].cpu().numpy().tolist()
             images = make_trajectory_images(
                 self.env_id, trajectory[:, -samples:], samples, start, goal, self.plot_end_points
             )
@@ -2893,13 +2924,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self._set_sim_state(envs, parent_sim_state)
 
         # Get the full observation from environment (qpos + qvel concatenation for antmaze)
-        # For DQL agent compatibility, we need the full obs [qpos, qvel], not just qpos[:2]
+        # For DQL agent compatibility, we need the full obs [qpos, qvel], not just qpos[:pos_dim]
         current_sim_state = self._get_sim_state(envs)
         qpos = current_sim_state["qpos"]  # shape: (15,)
         qvel = current_sim_state["qvel"]  # shape: (14,)
-        # Concatenate qpos and qvel to form full observation
-        obs_flat = np.concatenate([qpos, qvel], axis=0)  # shape: (29,)
-        obs_numpy = obs_flat[np.newaxis, :]  # shape: (1, 29)
+        # Concatenate qpos and qvel, then slice to observation_dim (supports both 15D and 29D modes)
+        obs_flat = np.concatenate([qpos, qvel], axis=0)[:self.observation_dim]
+        obs_numpy = obs_flat[np.newaxis, :]
     
       
 
@@ -2917,11 +2948,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         if "antmaze" in self.env_id:
             plan_slice_np = plan_frame_format[:, 0, :].detach().cpu().numpy()  # (T*fs, c)
             sub_goal_idx = min(self.sub_goal_interval, plan_frame_format.shape[0] - 1)
-            sub_goal_pos = plan_slice_np[sub_goal_idx, :2]
+            sub_goal_pos = plan_slice_np[sub_goal_idx, :self.pos_dim]
             sub_goal_step = sub_goal_idx
             # Initialize sub_goal_sim_state as current state (will be updated during rollout)
             sub_goal_sim_state = current_sim_state.copy() if current_sim_state is not None else None
-            sub_goal_sim_state["qpos"][:2] = sub_goal_pos
+            sub_goal_sim_state["qpos"][:self.pos_dim] = sub_goal_pos
 
         # Execute plan: iterate, ensuring at least open_loop_horizon steps
         prev_sim_state = None
@@ -2930,12 +2961,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         while loop_cnt < self.open_loop_horizon:
             # Update sub_goal for antmaze (with interval logic)
             if "antmaze" in self.env_id:
-                if np.linalg.norm(current_sim_state["qpos"][:2] - sub_goal_sim_state["qpos"][:2]) < 1.0:
+                if np.linalg.norm(current_sim_state["qpos"][:self.pos_dim] - sub_goal_sim_state["qpos"][:self.pos_dim]) < 1.0:
                     if sub_goal_step < plan_frame_format.shape[0] - self.sub_goal_interval:
                         sub_goal_step += self.sub_goal_interval
-                        sub_goal_sim_state["qpos"][:2] = plan_slice_np[sub_goal_step, :2]
+                        sub_goal_sim_state["qpos"][:self.pos_dim] = plan_slice_np[sub_goal_step, :self.pos_dim]
                     else:
-                        sub_goal_sim_state["qpos"][:2] = plan_slice_np[-1, :2]
+                        sub_goal_sim_state["qpos"][:self.pos_dim] = plan_slice_np[-1, :self.pos_dim]
 
             # Compute action
             if use_diffused_action:
@@ -2965,7 +2996,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             first_reach += ~reached
 
             # Collect trajectory
-            obs_torch = torch.from_numpy(obs_numpy).float()
+            obs_torch = torch.from_numpy(obs_numpy[:, :self.observation_dim]).float()
             bundle = self.make_bundle(obs_torch, action, reward[..., None])
             trajectory.append(bundle)
 
@@ -3005,9 +3036,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         Args:
             agent: RL agent for antmaze (None for pointmaze)
-            sub_goal_sim_state: sim_state of the sub-goal (qpos[:2] used as target position)
+            sub_goal_sim_state: sim_state of the sub-goal (qpos[:pos_dim] used as target position)
             current_sim_state: sim_state of the current agent state (qpos + qvel)
-            prev_sim_state: sim_state from previous step (qpos[:2] used for plan velocity in PID)
+            prev_sim_state: sim_state from previous step (qpos[:pos_dim] used for plan velocity in PID)
 
         Returns:
             action: (1, action_dim) - clipped to [-1, 1]
@@ -3019,7 +3050,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             state_29d = np.concatenate([current_sim_state["qpos"], current_sim_state["qvel"]], axis=0)  # (29,)
             state_input = state_29d[np.newaxis, :]  # (1, 29)
-            sub_goal_pos = sub_goal_sim_state["qpos"][:2]  # (2,)
+            sub_goal_pos = sub_goal_sim_state["qpos"][:self.pos_dim]  # (pos_dim,)
 
             action = agent.sample_action(state_input, sub_goal_pos)
             return torch.from_numpy(action).float().reshape(1, -1)
@@ -3028,14 +3059,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             assert current_sim_state is not None, "current_sim_state must be provided for pointmaze"
             assert sub_goal_sim_state is not None, "sub_goal_sim_state must be provided for pointmaze"
 
-            current_pos = torch.tensor(current_sim_state["qpos"][:2], dtype=torch.float32).unsqueeze(0)  # (1, 2)
-            current_vel = torch.tensor(current_sim_state["qvel"][:2], dtype=torch.float32).unsqueeze(0)  # (1, 2)
-            target_pos = torch.tensor(sub_goal_sim_state["qpos"][:2], dtype=torch.float32).unsqueeze(0)  # (1, 2)
+            current_pos = torch.tensor(current_sim_state["qpos"][:self.pos_dim], dtype=torch.float32).unsqueeze(0)  # (1, pos_dim)
+            current_vel = torch.tensor(current_sim_state["qvel"][:self.pos_dim], dtype=torch.float32).unsqueeze(0)  # (1, pos_dim)
+            target_pos = torch.tensor(sub_goal_sim_state["qpos"][:self.pos_dim], dtype=torch.float32).unsqueeze(0)  # (1, pos_dim)
 
             if prev_sim_state is None:
                 plan_vel = target_pos - current_pos
             else:
-                prev_pos = torch.tensor(prev_sim_state["qpos"][:2], dtype=torch.float32).unsqueeze(0)  # (1, 2)
+                prev_pos = torch.tensor(prev_sim_state["qpos"][:self.pos_dim], dtype=torch.float32).unsqueeze(0)  # (1, pos_dim)
                 plan_vel = target_pos - prev_pos
 
             action = 12.5 * (target_pos - current_pos) + 1.2 * (plan_vel - current_vel)
@@ -3084,8 +3115,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         current_sim_state = self._get_sim_state(envs)
         assert current_sim_state is not None, "Failed to get current sim state"
         
-        parent_qpos = parent_sim_state["qpos"][:2]
-        current_qpos = current_sim_state["qpos"][:2]
+        parent_qpos = parent_sim_state["qpos"][:self.pos_dim]
+        current_qpos = current_sim_state["qpos"][:self.pos_dim]
         
         qpos_diff = np.linalg.norm(current_qpos - parent_qpos)
         assert qpos_diff < 1e-5, (
@@ -3115,16 +3146,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         # Extract x,y positions: if batch dimension exists, extract it
         if trajectory_all_obs.dim() == 3:
             # Shape is (T, batch, obs_dim)
-            trajectory_obs_positions = trajectory_all_obs[:, 0, :2].detach().cpu().numpy()  # (T, 2)
+            trajectory_obs_positions = trajectory_all_obs[:, 0, :self.pos_dim].detach().cpu().numpy()  # (T, pos_dim)
         else:
             # Shape is (T, obs_dim) - batch was singleton and got removed
-            trajectory_obs_positions = trajectory_all_obs[:, :2].detach().cpu().numpy()  # (T, 2)
+            trajectory_obs_positions = trajectory_all_obs[:, :self.pos_dim].detach().cpu().numpy()  # (T, pos_dim)
         
         # Also get final obs for state update
         obs, _, _ = self.split_bundle(trajectory[-1])
 
         final_sim_state = self._get_sim_state(envs)  # dummy sim_state
-        final_sim_state["qpos"][:2] = obs[0, :2]
+        final_sim_state["qpos"][:self.pos_dim] = obs[0, :self.pos_dim]
 
         return final_sim_state
 
@@ -3207,8 +3238,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             print(f"  a_len calculated: {a_len}", file=sys.stderr, flush=True)
             print(f"  plan_a_full shape: {plan_a_full.shape}", file=sys.stderr, flush=True)
             print(f"  t1_segments shape after slicing: {t1_segments.shape}", file=sys.stderr, flush=True)
-            print(f"  First few positions of plan_a_full: {plan_a_full[:5, :2]}", file=sys.stderr, flush=True)
-            print(f"  First few positions of t1_segments: {t1_segments[:5, :2]}", file=sys.stderr, flush=True)
+            print(f"  First few positions of plan_a_full: {plan_a_full[:5, :self.pos_dim]}", file=sys.stderr, flush=True)
+            print(f"  First few positions of t1_segments: {t1_segments[:5, :self.pos_dim]}", file=sys.stderr, flush=True)
 
         # --- Bidirectional search: target_node handling ---
         # Structural guarantee in bidirectional MCTS (always active in interact()):

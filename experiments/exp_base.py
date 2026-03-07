@@ -174,7 +174,10 @@ class BaseLightningExperiment(BaseExperiment):
         
         effective_max_steps = self.cfg.training.max_steps
         if effective_max_steps > 0:
-            total_epochs = (effective_max_steps + num_batches - 1) // num_batches
+            # effective_max_steps counts optimizer steps; num_batches counts micro-batches.
+            # Multiply by accumulate_grad_batches so total_epochs reflects the true budget.
+            accum = self.cfg.training.optim.accumulate_grad_batches
+            total_epochs = (effective_max_steps * accum + num_batches - 1) // num_batches
         else:
             total_epochs = self.cfg.training.max_epochs
 
@@ -189,7 +192,103 @@ class BaseLightningExperiment(BaseExperiment):
                     **self.cfg.training.checkpointing,
                 )
             )
-        
+            # Keep only the latest step-based checkpoint to save disk space
+            _ckpt_dir = pathlib.Path(hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"]) / "checkpoints"
+
+            class _KeepLatestCheckpoint(pl.callbacks.Callback):
+                """
+                - Keeps the 2 most recent step/epoch checkpoints (current + previous).
+                - After each checkpoint save, monitors training loss for WINDOW_BATCHES
+                  micro-batches. If the post-save average loss exceeds the pre-save average
+                  by more than SURGE_FACTOR, the latest checkpoint is discarded (the
+                  previous one is kept as a safe restore point) and training is stopped.
+                """
+                SURGE_FACTOR   = 5.0   # post/pre loss ratio threshold
+                WINDOW_BATCHES = 200   # micro-batches to average before/after each save
+
+                def __init__(self):
+                    self._recent_losses   = []   # rolling window of raw micro-batch losses
+                    self._pre_ckpt_loss   = None # avg loss just before last checkpoint save
+                    self._post_losses     = []   # losses collected after last save
+                    self._collecting_post = False
+                    self._seen_steps      = set()  # global_steps already processed
+
+                def _step_ckpts(self):
+                    if not _ckpt_dir.exists():
+                        return []
+                    return sorted(
+                        [f for f in _ckpt_dir.glob("epoch=*.ckpt") if not f.is_symlink()],
+                        key=lambda f: f.stat().st_mtime,
+                    )
+
+                def _cleanup(self):
+                    for old in self._step_ckpts()[:-2]:  # keep 2 most recent
+                        old.unlink(missing_ok=True)
+
+                def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+                    step = trainer.global_step
+
+                    # --- accumulate per-micro-batch loss ---
+                    loss = None
+                    if isinstance(outputs, dict) and "loss" in outputs:
+                        try:
+                            loss = float(outputs["loss"])
+                        except Exception:
+                            pass
+                    if loss is None:
+                        v = trainer.callback_metrics.get("training/loss") or \
+                            trainer.callback_metrics.get("loss")
+                        if v is not None:
+                            loss = float(v)
+
+                    if loss is not None:
+                        self._recent_losses.append(loss)
+                        if len(self._recent_losses) > self.WINDOW_BATCHES * 2:
+                            self._recent_losses = self._recent_losses[-self.WINDOW_BATCHES * 2:]
+                        if self._collecting_post:
+                            self._post_losses.append(loss)
+
+                    # --- trigger once per global_step at every 2000 steps ---
+                    if step > 0 and step % 2000 == 0 and step not in self._seen_steps:
+                        self._seen_steps.add(step)
+                        # Record pre-checkpoint average loss
+                        recent_window = self._recent_losses[-self.WINDOW_BATCHES:]
+                        if recent_window:
+                            self._pre_ckpt_loss = sum(recent_window) / len(recent_window)
+                        self._post_losses = []
+                        self._collecting_post = True
+                        self._cleanup()
+
+                    # --- surge detection: after collecting WINDOW_BATCHES post-save losses ---
+                    if self._collecting_post and len(self._post_losses) >= self.WINDOW_BATCHES:
+                        self._collecting_post = False
+                        if self._pre_ckpt_loss is not None and self._pre_ckpt_loss > 0:
+                            post_avg = sum(self._post_losses) / len(self._post_losses)
+                            ratio = post_avg / self._pre_ckpt_loss
+                            if ratio > self.SURGE_FACTOR:
+                                ckpts = self._step_ckpts()
+                                if ckpts:
+                                    victim = ckpts[-1]
+                                    victim.unlink(missing_ok=True)
+                                    kept = ckpts[-2].name if len(ckpts) >= 2 else "none"
+                                    print(
+                                        f"\n[SURGE DETECTED] step={step}: "
+                                        f"post_loss={post_avg:.4f} vs pre_loss={self._pre_ckpt_loss:.4f} "
+                                        f"(ratio={ratio:.1f}×). "
+                                        f"Deleted '{victim.name}', kept '{kept}'. "
+                                        f"Stopping training.",
+                                        flush=True,
+                                    )
+                                else:
+                                    print(
+                                        f"\n[SURGE DETECTED] step={step}: ratio={ratio:.1f}×. "
+                                        f"No checkpoint to delete. Stopping training.",
+                                        flush=True,
+                                    )
+                                trainer.should_stop = True
+
+            callbacks.append(_KeepLatestCheckpoint())
+
         # Custom Callback for Overall Epoch Progress Bar
         class OverallEpochProgressBar(pl.callbacks.Callback):
             def __init__(self, total_epochs):
@@ -200,9 +299,11 @@ class BaseLightningExperiment(BaseExperiment):
                 if trainer.is_global_zero:
                     # Define X-axis for WandB plots
                     if trainer.logger and hasattr(trainer.logger.experiment, "define_metric"):
-                        trainer.logger.experiment.define_metric("training/loss", step_metric="epoch")
+                        trainer.logger.experiment.define_metric("training/loss", step_metric="trainer/global_step")
                         trainer.logger.experiment.define_metric("training/loss_epoch", step_metric="epoch")
                         trainer.logger.experiment.define_metric("trainer/global_step", step_metric="epoch")
+                        for _dm in ["obs/pos_x", "obs/pos_y", "obs/quat_w", "obs/quat_x", "obs/quat_y", "obs/quat_z"]:
+                            trainer.logger.experiment.define_metric(f"training/loss_dim/{_dm}", step_metric="trainer/global_step")
 
                     print(f"\n[Info] Starting Training. Total Epochs: {self.total_epochs}")
                     sys.stdout.flush()

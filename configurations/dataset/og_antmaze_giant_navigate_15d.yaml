@@ -1,0 +1,19 @@
+defaults:
+  - base_dataset
+env_id:  "antmaze-giant-v0"
+dataset: "antmaze-giant-navigate-v0"
+save_dir: ~/.ogbench/data
+gamma: 1.0
+episode_len: 1000
+# 15D qpos only: x, y, z, quat[4], joints[8]
+observation_shape: [15]
+pos_dim: 2   # Spatial dims for MCTS/guidance (x, y only)
+action_dim: 8
+goal_dim: 2
+# First 15 dims of fullstate stats (qpos only)
+observation_mean: [24.522118,17.191145,0.49445,0.657354,-0.034556687,-0.026426382,-0.3766177,0.059313383,0.7865311,-0.007378878,-0.8093582,0.01785866,-0.7250221,-0.055180363,0.7404036]
+observation_std:  [14.897491,11.685106,0.1419347,0.3489618,0.34048274,0.3085743,0.302092,0.45351005,0.30407962,0.44501382,0.28951034,0.45038906,0.28442472,0.43618518,0.28720334]
+action_mean: []
+action_std:  []
+reward_mean: 0.081254
+reward_std: 0.27322477

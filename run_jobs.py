@@ -39,6 +39,10 @@ ogbench_data_dir = os.path.abspath(os.path.join(project_dir, "..", "ogbench_data
 output_mount_dir = "/home/jmseo1204/mctd_outputs"
 os.makedirs(output_mount_dir, exist_ok=True)
 os.system(f"chmod 777 {output_mount_dir}")
+# Ensure today's date dir is writable by Docker (uid 1020) if already created by host user
+today_dir = os.path.join(output_mount_dir, datetime.datetime.now().strftime("%Y-%m-%d"))
+os.makedirs(today_dir, exist_ok=True)
+os.system(f"chmod 777 {today_dir}")
 
 # Dictionary to keep track of running experiments.
 running_experiments = {gpu: None for gpu in available_gpus}
@@ -242,12 +246,12 @@ try:
                         final_logs = (log_res.stdout + log_res.stderr).strip()
                         subprocess.run(["ssh", server, "docker", "rm", exp_name], capture_output=True)
                     
-                    # If it wasn't a clean exit or we want to see final status, print it
-                    # Check if 'Finished' or similar success markers are in final_logs if needed
-                    # For now, just print if there's an error/traceback
-                    if "Traceback" in final_logs or "AssertionError" in final_logs or "Error" in final_logs:
+                    # Detect real failures: Traceback present but exclude Hydra's normal
+                    # "Error executing job with overrides" summary line (not a crash).
+                    has_traceback = "Traceback (most recent call last)" in final_logs
+                    if has_traceback:
                         log_write(f"!! Job {exp_name} failed. Final log snippet: !!")
-                        for line in final_logs.split("\n")[-10:]:
+                        for line in final_logs.split("\n")[-15:]:
                             log_write(f"[{gpu}] {line.strip()}")
                         # Exit immediately on error
                         log_write(f"[ERROR] Exiting due to job failure: {exp_name}")

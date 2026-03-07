@@ -50,7 +50,7 @@ debug_memory_profile: True # Enable GPU/CPU memory profiling
 max_plan_hist_keep: 1 # Keep only last N plan histories (memory optimization)
 meeting_delta: 2.0
 episode_len: ${dataset.episode_len} # self.n_tokens = self.episode_len // self.frame_stack
-horizon_scale: 0.15 # horizon = self.episode_len * horizon_scale
+horizon_scale: 0.3 # horizon = self.episode_len * horizon_scale
 sequence_dividing_factor: 3
 num_tries_for_bad_plans: 3
 open_loop_horizon: 300 #fixme -> best: episode_len*horizon_scale
@@ -77,7 +77,7 @@ diffusion:
   snr_clip: 5.0
   ddim_sampling_eta: 0.1
   architecture:
-    network_size: 128
+    network_size: 256
     num_layers: 12
-    attn_heads: 4
-    dim_feedforward: 512
+    attn_heads: 8
+    dim_feedforward: 1024

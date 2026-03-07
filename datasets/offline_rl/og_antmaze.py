@@ -18,6 +18,7 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
         self.save_dir = cfg.save_dir # Using default save_dir, "~/.ogbench/data"
         self.env_id = cfg.env_id
         self.dataset_name = cfg.dataset
+        self.pos_dim = cfg.get("pos_dim", 2)  # Spatial dims for MCTS (x, y)
         self.n_frames = cfg.episode_len + 1
         self.gamma = cfg.gamma
         self.split = split
@@ -27,8 +28,8 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
             self.jump = cfg.jump
         Path(self.save_dir).mkdir(parents=True, exist_ok=True)
         self.dataset = self.get_dataset()
-        # Use [position, velocity] as observation
-        self.dataset["observations"] = np.concatenate([self.dataset["qpos"], self.dataset["qvel"]], axis=-1)
+        # Dataset already provides 29D observations (qpos+qvel) via compact_dataset=True
+        # No concatenation needed; observations key is present directly
         if "navigate" in self.dataset_name:
             if "giant" in self.dataset_name:
                 sample_length = 2001
@@ -59,37 +60,21 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
         print(f"action_mean: [{','.join(np.array(act_mean,dtype=str))}]")
         print(f"action_std:  [{','.join(np.array(act_std,dtype=str))}]")
 
-        # Dataset Reshaping
-        raw_observations = np.reshape(self.dataset["observations"], (-1, sample_length, self.dataset["observations"].shape[-1]))
-        raw_actions = np.reshape(self.dataset["actions"], (-1, sample_length, self.dataset["actions"].shape[-1]))
-        raw_terminals = np.zeros((raw_observations.shape[0], sample_length)) # This will not be used in training and validation
+        # Dataset Reshaping — keep raw episodes in memory, slice lazily in __getitem__
+        self._raw_obs = np.reshape(self.dataset["observations"], (-1, sample_length, self.dataset["observations"].shape[-1]))
+        self._raw_actions = np.reshape(self.dataset["actions"], (-1, sample_length, self.dataset["actions"].shape[-1]))
+        raw_terminals = np.zeros((self._raw_obs.shape[0], sample_length))
         raw_terminals[:, -1] = 1
-        raw_rewards = np.copy(raw_terminals)
-        raw_values = self.compute_value(raw_rewards) * (1 - self.gamma) * 4 - 1
+        raw_rewards = raw_terminals
+        self._raw_rewards = raw_rewards
+        self._raw_values = self.compute_value(raw_rewards) * (1 - self.gamma) * 4 - 1
 
-        # Dataset Preprocessing (Collecting episode_len trajectories in sliding window manner)
-        self.observations, self.actions, self.rewards, self.values = [], [], [], []
-        for i in range(raw_observations.shape[0]):
-            for j in range(sample_length - self.n_frames + 1):
-                self.observations.append(raw_observations[i, j:j+self.n_frames:self.jump])
-                self.actions.append(raw_actions[i, j:j+self.n_frames:self.jump])
-                self.rewards.append(raw_rewards[i, j:j+self.n_frames:self.jump])
-                self.values.append(raw_values[i, j:j+self.n_frames:self.jump])
-        self.observations = np.array(self.observations)
-        self.actions = np.array(self.actions)
-        self.rewards = np.array(self.rewards)
-        self.values = np.array(self.values)
-        
-        # Preprocessed Dataset Statistics
-        print(f"Preprocessed Dataset Statistics")
-        print(f"Observation shape: {self.observations.shape}")
-        print(f"Action shape: {self.actions.shape}")
-        print(f"Reward shape: {self.rewards.shape}")
-        print(f"Value shape: {self.values.shape}")
-
-        self.total_samples = len(self.observations)
-        print(f"Total samples loaded for {self.dataset_name}: {self.total_samples}")
-        print(f"Observation shape: {self.observations.shape}")
+        self._n_episodes = self._raw_obs.shape[0]
+        self._n_windows = sample_length - self.n_frames + 1
+        self.total_samples = self._n_episodes * self._n_windows
+        self.sample_length = sample_length
+        print(f"Lazy dataset: {self._n_episodes} episodes × {self._n_windows} windows = {self.total_samples} samples")
+        print(f"Raw obs shape: {self._raw_obs.shape}, Raw actions shape: {self._raw_actions.shape}")
 
     def compute_value(self, reward):
         # numerical stable way to compute value
@@ -102,10 +87,11 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
         return self.total_samples
 
     def __getitem__(self, idx):
-        observation = torch.from_numpy(self.observations[idx]).float() # (episode_len, obs_dim)
-        action = torch.from_numpy(self.actions[idx]).float() # (episode_len, act_dim)
-        reward = torch.from_numpy(self.rewards[idx]).float() # (episode_len,)
-        value = torch.from_numpy(self.values[idx]).float() # (episode_len,)
+        ep = idx // self._n_windows
+        w  = idx %  self._n_windows
+        observation = torch.from_numpy(self._raw_obs[ep, w:w+self.n_frames:self.jump].copy()).float()
+        action      = torch.from_numpy(self._raw_actions[ep, w:w+self.n_frames:self.jump].copy()).float()
+        reward      = torch.from_numpy(self._raw_rewards[ep, w:w+self.n_frames:self.jump].copy()).float()
         done = np.zeros(len(observation), dtype=bool)
         done[-1] = True
         nonterminal = torch.from_numpy(~done)

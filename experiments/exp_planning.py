@@ -10,6 +10,8 @@ class PlanningExperiment(BaseLightningExperiment):
 
     compatible_algorithms = dict(
         df_planning=DiffusionForcingPlanning,
+        df_planning_2d=DiffusionForcingPlanning,
+        df_planning_15d=DiffusionForcingPlanning,
     )
 
     compatible_datasets = dict(
@@ -25,6 +27,8 @@ class PlanningExperiment(BaseLightningExperiment):
         og_antmaze_medium_navigate=OGAntMazeOfflineRLDataset,
         og_antmaze_large_navigate=OGAntMazeOfflineRLDataset,
         og_antmaze_giant_navigate=OGAntMazeOfflineRLDataset,
+        og_antmaze_giant_navigate_fullstate=OGAntMazeOfflineRLDataset,
+        og_antmaze_giant_navigate_15d=OGAntMazeOfflineRLDataset,
         og_antmaze_teleport_navigate=OGAntMazeOfflineRLDataset,
         
         og_antmaze_giant_stitch=OGAntMazeOfflineRLDataset,

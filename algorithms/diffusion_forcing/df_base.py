@@ -8,6 +8,9 @@ and the `LICENSE` file to credit the author.
 from typing import Optional
 from tqdm import tqdm
 from omegaconf import DictConfig
+import json
+import math
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -18,6 +21,28 @@ from lightning.pytorch.utilities.types import STEP_OUTPUT
 
 from algorithms.common.base_pytorch_algo import BasePytorchAlgo
 from .models.diffusion import Diffusion
+
+
+class _DimLossJsonlLogger:
+    """Logs per-dimension MSE loss to a local JSONL file, independent of wandb."""
+
+    def __init__(self, log_path: str, log_every: int = 100):
+        self.log_path = log_path
+        self.log_every = log_every
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        self._buf = []
+
+    def log(self, step: int, epoch: int, total_loss: float, per_dim_loss):
+        if step % self.log_every != 0:
+            return
+        record = {
+            "step": step,
+            "epoch": epoch,
+            "loss": round(float(total_loss), 6),
+            "per_dim_loss": [round(float(v), 6) for v in per_dim_loss],
+        }
+        with open(self.log_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
 
 class DiffusionForcingBase(BasePytorchAlgo):
@@ -41,6 +66,10 @@ class DiffusionForcingBase(BasePytorchAlgo):
         self.cfg.diffusion.cum_snr_decay = self.cfg.diffusion.cum_snr_decay ** (self.frame_stack * cfg.frame_skip)
 
         self.validation_step_outputs = []
+        self._dim_loss_logger = _DimLossJsonlLogger(
+            log_path="logs/dim_loss.jsonl",
+            log_every=100,
+        )
         super().__init__(cfg)
 
     def _build_model(self):
@@ -63,17 +92,35 @@ class DiffusionForcingBase(BasePytorchAlgo):
         # update params
         optimizer.step(closure=optimizer_closure)
 
-        # manually warm up lr without a scheduler
-        if self.trainer.global_step < self.cfg.warmup_steps:
-            lr_scale = min(1.0, float(self.trainer.global_step + 1) / self.cfg.warmup_steps)
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr_scale * self.cfg.lr
+        # Warmup + cosine decay LR schedule (no external scheduler needed)
+        step = self.trainer.global_step
+        warmup = self.cfg.warmup_steps
+        total_steps = max(self.trainer.max_steps, 1)
+        lr_min_ratio = getattr(self.cfg, "lr_min_ratio", 0.1)
+
+        if step < warmup:
+            lr_scale = min(1.0, float(step + 1) / warmup)
+        else:
+            # cosine decay from 1.0 at step=warmup down to lr_min_ratio at step=total_steps
+            progress = min(1.0, (step - warmup) / max(1, total_steps - warmup))
+            lr_scale = lr_min_ratio + 0.5 * (1.0 - lr_min_ratio) * (1.0 + math.cos(math.pi * progress))
+
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr_scale * self.cfg.lr
 
     def training_step(self, batch, batch_idx) -> STEP_OUTPUT:
         xs, conditions, masks = self._preprocess_batch(batch)
 
-        xs_pred, loss = self.diffusion_model(xs, conditions, noise_levels=self._generate_noise_levels(xs))
-        loss = self.reweight_loss(loss, masks)
+        xs_pred, loss_raw = self.diffusion_model(xs, conditions, noise_levels=self._generate_noise_levels(xs))
+
+        # Log per-dimension loss to local JSONL (independent of wandb)
+        # loss_raw: (T, B, fs*C) unreduced
+        step = self.trainer.global_step if self.trainer else 0
+        epoch = self.trainer.current_epoch if self.trainer else 0
+        with torch.no_grad():
+            per_dim = loss_raw.mean(dim=(0, 1)).detach().cpu().tolist()  # shape: (fs*C,)
+        loss = self.reweight_loss(loss_raw, masks)
+        self._dim_loss_logger.log(step, epoch, loss.item(), per_dim)
 
         # log the loss
         if batch_idx % 20 == 0:
