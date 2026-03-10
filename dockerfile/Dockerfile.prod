@@ -68,8 +68,8 @@ RUN pip3 install /tmp/ogbench-1.0.1-py3-none-any.whl
 RUN pip3 install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 RUN pip3 install moviepy==1.0.3 imageio-ffmpeg
 
-# Create user (matching your environment: jsyoon)
-ARG UNAME=jsyoon
+# Create user (matching your environment: jmseo1204)
+ARG UNAME=jmseo1204
 ARG UID=1020
 ARG GID=1020
 RUN groupadd -g $GID -o $UNAME

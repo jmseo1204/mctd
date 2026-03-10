@@ -5,9 +5,13 @@ from typing import Dict, Mapping, Any
 import torch
 import torch.nn as nn
 
-import jax
-import jax.numpy as jnp # Often needed by pickle for JAX arrays if not pre-converted
-import flax.serialization # Needed to load the JAX state dict properly
+try:
+    import jax
+    import jax.numpy as jnp  # Often needed by pickle for JAX arrays if not pre-converted
+    import flax.serialization  # Needed to load the JAX state dict properly
+    _JAX_AVAILABLE = True
+except ImportError:
+    _JAX_AVAILABLE = False
 
 
 def convert_flax_dense_to_torch_linear(flax_params: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
@@ -104,11 +108,13 @@ def convert_jax_mlp_to_torch_mlp(jax_mlp_params: Dict, torch_mlp_layers: nn.Modu
     print(f"  [convert_jax_mlp_to_torch_mlp] Finished conversion. Returning dict with {len(torch_state_dict)} parameter tensors.")
     return torch_state_dict
 
-def load_hilp_jax_checkpoint_to_pytorch(
+def load_hilp_jax_checkpoint_to_pytorch(  # noqa: C901
     jax_checkpoint_path: str,
     pytorch_agent: nn.Module, # Expecting HILP_torch which is an nn.Module
 ):
     """Loads parameters from a JAX HILP checkpoint into a PyTorch HILP agent."""
+    if not _JAX_AVAILABLE:
+        raise ImportError("jax and flax are required to load HILP JAX checkpoints. Install them with: pip install jax flax")
 
     print(f"\nLoading HILP JAX checkpoint from: {jax_checkpoint_path}")
     with open(jax_checkpoint_path, 'rb') as f:

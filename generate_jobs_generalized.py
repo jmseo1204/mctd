@@ -86,6 +86,19 @@ def detect_network_size_from_ckpt(model_id, downloaded_dir="outputs/downloaded/j
         return None
 
     def _parse_from_sd(sd):
+        # Count number of transformer layers
+        layer_indices = set()
+        for k in sd.keys():
+            if "diffusion_model.model.transformer.layers." in k:
+                try:
+                    idx = int(k.split("diffusion_model.model.transformer.layers.")[1].split(".")[0])
+                    layer_indices.add(idx)
+                except (IndexError, ValueError):
+                    pass
+        num_layers = max(layer_indices) + 1 if layer_indices else None
+        if num_layers is not None:
+            print(f"  [ckpt detect] found transformer layers {sorted(layer_indices)} → num_layers={num_layers}")
+
         # Try to find any attention layer to get hidden dimension
         # Key path: diffusion_model.model.transformer.layers.0.self_attn.in_proj_weight
         attn_key = "diffusion_model.model.transformer.layers.0.self_attn.in_proj_weight"
@@ -101,9 +114,9 @@ def detect_network_size_from_ckpt(model_id, downloaded_dir="outputs/downloaded/j
             if linear1_w is not None:
                 dim_ff = linear1_w.shape[0]
                 print(f"  [ckpt detect] transformer layer 0 linear1.weight shape {list(linear1_w.shape)} → dim_feedforward={dim_ff}")
-                return {"network_size": hidden, "dim_feedforward": dim_ff}
+                return {"network_size": hidden, "dim_feedforward": dim_ff, "num_layers": num_layers}
 
-            return {"network_size": hidden, "dim_feedforward": None}
+            return {"network_size": hidden, "dim_feedforward": None, "num_layers": num_layers}
 
         # Fallback: try linear1 from first transformer layer feedforward
         linear1_key = "diffusion_model.model.transformer.layers.0.linear1.weight"
@@ -112,7 +125,7 @@ def detect_network_size_from_ckpt(model_id, downloaded_dir="outputs/downloaded/j
             hidden = linear1_w.shape[1]
             dim_ff = linear1_w.shape[0]
             print(f"  [ckpt detect] transformer layer 0 linear1.weight shape {list(linear1_w.shape)} → network_size={hidden}, dim_feedforward={dim_ff}")
-            return {"network_size": hidden, "dim_feedforward": dim_ff}
+            return {"network_size": hidden, "dim_feedforward": dim_ff, "num_layers": num_layers}
 
         return None
 
@@ -146,18 +159,33 @@ def detect_network_size_from_ckpt(model_id, downloaded_dir="outputs/downloaded/j
             attn_shape = info.get("attn")
             linear1_shape = info.get("linear1")
 
+            # Count num_layers via subprocess
+            nl_script = (
+                f"import torch, json; "
+                f"sd = torch.load('{ckpt_path}', map_location='cpu', weights_only=False).get('state_dict', {{}}); "
+                f"idxs = set(int(k.split('transformer.layers.')[1].split('.')[0]) for k in sd if 'transformer.layers.' in k) if any('transformer.layers.' in k for k in sd) else set(); "
+                f"print(max(idxs)+1 if idxs else 0)"
+            )
+            nl_result = subprocess.run(
+                ["conda", "run", "-n", "diff_force_env", "python", "-c", nl_script],
+                capture_output=True, text=True, timeout=60
+            )
+            num_layers = int(nl_result.stdout.strip()) if nl_result.returncode == 0 and nl_result.stdout.strip().isdigit() else None
+            if num_layers:
+                print(f"  [ckpt detect via conda] num_layers={num_layers}")
+
             if attn_shape and len(attn_shape) >= 2:
                 hidden = attn_shape[1]
                 dim_ff = linear1_shape[0] if linear1_shape and len(linear1_shape) >= 2 else None
                 print(f"  [ckpt detect via conda] transformer layer 0 in_proj_weight shape {attn_shape} → network_size={hidden}")
                 if dim_ff is not None:
                     print(f"  [ckpt detect via conda] transformer layer 0 linear1.weight shape {linear1_shape} → dim_feedforward={dim_ff}")
-                return {"network_size": hidden, "dim_feedforward": dim_ff}
+                return {"network_size": hidden, "dim_feedforward": dim_ff, "num_layers": num_layers}
             elif linear1_shape and len(linear1_shape) >= 2:
                 hidden = linear1_shape[1]
                 dim_ff = linear1_shape[0]
                 print(f"  [ckpt detect via conda] transformer layer 0 linear1.weight shape {linear1_shape} → network_size={hidden}, dim_feedforward={dim_ff}")
-                return {"network_size": hidden, "dim_feedforward": dim_ff}
+                return {"network_size": hidden, "dim_feedforward": dim_ff, "num_layers": num_layers}
     except Exception as e:
         print(f"  [ckpt detect] conda fallback failed: {e}")
 
@@ -312,14 +340,17 @@ def main():
     detected_frame_stack = detect_frame_stack_from_ckpt(args.model_id, obs_dim, act_dim)
     actual_frame_stack = model_metadata.get('frame_stack') or detected_frame_stack or full_cfg['algorithm'].get('frame_stack', 10)
 
-    # Detect network_size and dim_feedforward from checkpoint weights
+    # Detect network_size, dim_feedforward, and num_layers from checkpoint weights
     detected_arch = detect_network_size_from_ckpt(args.model_id)
+    arch_cfg = full_cfg['algorithm'].get('diffusion', {}).get('architecture', {})
     if isinstance(detected_arch, dict):
-        actual_network_size = detected_arch.get("network_size") or full_cfg['algorithm'].get('diffusion', {}).get('architecture', {}).get('network_size', 256)
-        actual_dim_feedforward = detected_arch.get("dim_feedforward") or full_cfg['algorithm'].get('diffusion', {}).get('architecture', {}).get('dim_feedforward', 1024)
+        actual_network_size = detected_arch.get("network_size") or arch_cfg.get('network_size', 256)
+        actual_dim_feedforward = detected_arch.get("dim_feedforward") or arch_cfg.get('dim_feedforward', 1024)
+        actual_num_layers = detected_arch.get("num_layers") or arch_cfg.get('num_layers', 6)
     else:
-        actual_network_size = full_cfg['algorithm'].get('diffusion', {}).get('architecture', {}).get('network_size', 256)
-        actual_dim_feedforward = full_cfg['algorithm'].get('diffusion', {}).get('architecture', {}).get('dim_feedforward', 1024)
+        actual_network_size = arch_cfg.get('network_size', 256)
+        actual_dim_feedforward = arch_cfg.get('dim_feedforward', 1024)
+        actual_num_layers = arch_cfg.get('num_layers', 6)
 
     actual_horizon_scale = args.horizon_scale if args.horizon_scale is not None else get_default_horizon_scale()
     actual_seq_div = full_cfg['algorithm'].get('sequence_dividing_factor', 3)
@@ -355,6 +386,7 @@ def main():
         "algorithm.frame_stack": actual_frame_stack,
         "algorithm.diffusion.architecture.network_size": actual_network_size,
         "algorithm.diffusion.architecture.dim_feedforward": actual_dim_feedforward,
+        "algorithm.diffusion.architecture.num_layers": actual_num_layers,
         "dataset.jump": actual_jump,
         "algorithm.horizon_scale": actual_horizon_scale,
         "experiment.tasks": ["validation"],

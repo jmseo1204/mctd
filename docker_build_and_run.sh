@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 DOCKER_IMAGE_NAME="mctd"
 DOCKER_IMAGE_TAG="latest"
-DOCKER_USER="jsyoon"
+DOCKER_USER="jmseo1204"
 CONTAINER_NAME="mctd_container"
 
 # Data paths (adjust as needed)

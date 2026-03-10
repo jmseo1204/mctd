@@ -9,7 +9,7 @@ available_gpus = ["localhost:0"]
 
 jobs_folder = "dql_jobs"
 docker_image = "fmctd:0.1"
-docker_user = "jsyoon"
+docker_user = "jmseo1204"
 home_dir = os.path.expanduser("~")
 project_dir = os.getcwd()
 

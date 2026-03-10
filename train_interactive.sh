@@ -14,7 +14,7 @@ PROJECT_DIR=$(pwd)
 OUTPUT_MOUNT_DIR="/home/jmseo1204/mctd_outputs"
 HOME_DIR=$HOME
 DOCKER_IMAGE="fmctd:0.1"
-DOCKER_USER="jsyoon"
+DOCKER_USER="jmseo1204"
 ENTITY="jmseo1204-seoul-national-university"
 PROJECT="mctd_eval"
 
@@ -114,7 +114,7 @@ docker run --rm -it --gpus all --name train_interactive --shm-size=50g \
         algorithm=df_planning \
         dataset=${DATASET_CONFIG} \
         dataset.dataset=${SELECTED_DATASET} \
-        dataset.save_dir=/home/jsyoon/.ogbench/data \
+        dataset.save_dir=/home/jmseo/.ogbench/data \
         +name=Interactive_${SELECTED_DATASET} \
         wandb.mode=online \
         experiment.training.batch_size=1024 \

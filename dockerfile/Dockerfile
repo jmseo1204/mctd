@@ -1,4 +1,4 @@
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=Korea/Seoul
 ENV PYTHONUNBUFFERED 1
@@ -70,7 +70,7 @@ RUN pip3 install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url 
 RUN pip3 install moviepy==1.0.3 imageio-ffmpeg
 
 # New User (Optional)
-ARG UNAME=jsyoon
+ARG UNAME=jmseo1204
 ARG UID=1020
 ARG GID=1020
 RUN groupadd -g $GID -o $UNAME

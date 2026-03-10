@@ -2,7 +2,7 @@ defaults:
   - base_dataset
 env_id:  "antmaze-giant-v0"
 dataset: "antmaze-giant-stitch-v0"
-save_dir: /home/jsyoon/.ogbench/data
+save_dir: /home/jmseo1204/.ogbench/data
 gamma: 1.0
 episode_len: 50
 observation_shape: [2]

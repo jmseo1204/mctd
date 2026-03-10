@@ -32,7 +32,7 @@ available_gpus = ["localhost:0"]
 
 jobs_folder = "jobs"
 docker_image = "fmctd:0.1"
-docker_user = "jsyoon"
+docker_user = "jmseo1204"
 home_dir = os.path.expanduser("~")
 project_dir = os.getcwd()
 ogbench_data_dir = os.path.abspath(os.path.join(project_dir, "..", "ogbench_data"))
@@ -76,28 +76,34 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
 
     if server == "localhost":
         command = f"""
-        docker run -d --gpus '"device={gpu_id}"' --name {exp_name} --shm-size=50g \
+        docker run -d --gpus all --name {exp_name} --shm-size=50g \
         -e MUJOCO_GL=osmesa \
+        -e HYDRA_FULL_ERROR=1 \
+        -e CUDA_VISIBLE_DEVICES=0 \
+        -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/jmseo1204/.mujoco/mujoco210/bin \
+        -v /usr/lib/wsl:/usr/lib/wsl \
         -v {project_dir}:/home/{docker_user}/mctd \
         -v {output_mount_dir}:/home/{docker_user}/mctd/outputs \
         -v {home_dir}/.netrc:/home/{docker_user}/.netrc \
         -v {home_dir}/.d4rl:/home/{docker_user}/.d4rl \
         -v {ogbench_data_dir}:/home/{docker_user}/.ogbench/data \
         {docker_image} /bin/bash \
-        -c "git config --global --add safe.directory /home/{docker_user}/mctd && cd mctd && python3 main.py hostname={server} gpu_id={gpu_id} {command_args}"
+        -c "git config --global --add safe.directory /home/{docker_user}/mctd && cd /home/{docker_user}/mctd && python3 main.py hostname={server} gpu_id={gpu_id} {command_args}"
         """
     else:
         # Multi-server setup example (ssh)
         command = f"""
-        ssh {server} "docker run -d --gpus '\"device={gpu_id}\"' --name {exp_name} --shm-size=50g \
+        ssh {server} "docker run -d --gpus all --name {exp_name} --shm-size=50g \
         -e MUJOCO_GL=osmesa \
+        -e HYDRA_FULL_ERROR=1 \
+        -e CUDA_VISIBLE_DEVICES=0 \
         -v {project_dir}:/home/{docker_user}/mctd \
         -v {output_mount_dir}:/home/{docker_user}/mctd/outputs \
         -v {home_dir}/.netrc:/home/{docker_user}/.netrc \
         -v {home_dir}/.d4rl:/home/{docker_user}/.d4rl \
         -v {ogbench_data_dir}:/home/{docker_user}/.ogbench/data \
         {docker_image} /bin/bash \
-        -c 'git config --global --add safe.directory /home/{docker_user}/mctd && cd mctd && python3 main.py hostname={server} gpu_id={gpu_id} {command_args}'"
+        -c 'git config --global --add safe.directory /home/{docker_user}/mctd && python3 main.py hostname={server} gpu_id={gpu_id} {command_args}'"
         """
         
     result = subprocess.run(command, shell=True, capture_output=True, text=True)

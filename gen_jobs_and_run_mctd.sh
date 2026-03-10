@@ -207,6 +207,32 @@ python3 generate_jobs_generalized.py \
     --num_seeds "$NUM_SEEDS" \
     --num_repeats "$NUM_REPEATS"
 
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "❌ ERROR: Job generation failed!"
+    exit 1
+fi
+
 echo ""
 echo "Generation Complete."
-echo "You can now run the jobs using: python3 run_jobs.py"
+echo ""
+echo "====================================================="
+echo "  Starting Job Execution via run_jobs.py"
+echo "====================================================="
+echo ""
+
+python3 run_jobs.py | tee /tmp/mctd_run_jobs.log
+
+JOB_EXIT_CODE=$?
+
+echo ""
+if [ $JOB_EXIT_CODE -eq 0 ]; then
+    echo "====================================================="
+    echo "  ✅ All Jobs Complete Successfully!"
+    echo "====================================================="
+else
+    echo "====================================================="
+    echo "  ❌ Jobs Failed with exit code: $JOB_EXIT_CODE"
+    echo "====================================================="
+    exit $JOB_EXIT_CODE
+fi
