@@ -117,12 +117,15 @@ class BaseLightningExperiment(BaseExperiment):
             False if isinstance(train_dataset, torch.utils.data.IterableDataset) else self.cfg.training.data.shuffle
         )
         if train_dataset:
+            use_gpu_cache = getattr(train_dataset, "use_gpu_cache", False)
+            num_workers = 0 if use_gpu_cache else min(os.cpu_count(), self.cfg.training.data.num_workers)
             return torch.utils.data.DataLoader(
                 train_dataset,
                 batch_size=self.cfg.training.batch_size,
-                num_workers=min(os.cpu_count(), self.cfg.training.data.num_workers),
+                num_workers=num_workers,
                 shuffle=shuffle,
-                persistent_workers=True,
+                pin_memory=(not use_gpu_cache),
+                persistent_workers=(num_workers > 0),
             )
         else:
             return None
@@ -135,12 +138,15 @@ class BaseLightningExperiment(BaseExperiment):
             else self.cfg.validation.data.shuffle
         )
         if validation_dataset:
+            use_gpu_cache = getattr(validation_dataset, "use_gpu_cache", False)
+            num_workers = 0 if use_gpu_cache else min(os.cpu_count(), self.cfg.validation.data.num_workers)
             return torch.utils.data.DataLoader(
                 validation_dataset,
                 batch_size=self.cfg.validation.batch_size,
-                num_workers=min(os.cpu_count(), self.cfg.validation.data.num_workers),
+                num_workers=num_workers,
                 shuffle=shuffle,
-                persistent_workers=True,
+                pin_memory=(not use_gpu_cache),
+                persistent_workers=(num_workers > 0),
             )
         else:
             return None
@@ -149,12 +155,15 @@ class BaseLightningExperiment(BaseExperiment):
         test_dataset = self._build_dataset("test")
         shuffle = False if isinstance(test_dataset, torch.utils.data.IterableDataset) else self.cfg.test.data.shuffle
         if test_dataset:
+            use_gpu_cache = getattr(test_dataset, "use_gpu_cache", False)
+            num_workers = 0 if use_gpu_cache else min(os.cpu_count(), self.cfg.test.data.num_workers)
             return torch.utils.data.DataLoader(
                 test_dataset,
                 batch_size=self.cfg.test.batch_size,
-                num_workers=min(os.cpu_count(), self.cfg.test.data.num_workers),
+                num_workers=num_workers,
                 shuffle=shuffle,
-                persistent_workers=True,
+                pin_memory=(not use_gpu_cache),
+                persistent_workers=(num_workers > 0),
             )
         else:
             return None
@@ -332,6 +341,57 @@ class BaseLightningExperiment(BaseExperiment):
 
         callbacks.append(OverallEpochProgressBar(total_epochs))
 
+        # Epoch loss logger + live plot updater
+        class EpochLossPlotter(pl.callbacks.Callback):
+            def __init__(self, log_dir):
+                import json as _json
+                self._json = _json
+                os.makedirs(log_dir, exist_ok=True)
+                self.jsonl_path = os.path.join(log_dir, "epoch_loss.jsonl")
+                self.plot_path = os.path.join(log_dir, "loss_plot.png")
+                self.epochs = []
+                self.losses = []
+                # Resume existing data
+                if os.path.exists(self.jsonl_path):
+                    with open(self.jsonl_path) as f:
+                        for line in f:
+                            try:
+                                d = _json.loads(line)
+                                self.epochs.append(d["epoch"])
+                                self.losses.append(d["loss"])
+                            except Exception:
+                                pass
+
+            def on_train_epoch_end(self, trainer, pl_module):
+                if not trainer.is_global_zero:
+                    return
+                metrics = trainer.callback_metrics
+                loss = metrics.get("training/loss") or metrics.get("loss")
+                if loss is None:
+                    return
+                loss_val = float(loss)
+                epoch = trainer.current_epoch
+                step = trainer.global_step
+                self.epochs.append(epoch)
+                self.losses.append(loss_val)
+                with open(self.jsonl_path, "a") as f:
+                    f.write(self._json.dumps({"epoch": epoch, "step": step, "loss": loss_val}) + "\n")
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                fig, ax = plt.subplots(figsize=(10, 4))
+                ax.plot(self.epochs, self.losses, linewidth=1)
+                ax.set_xlabel("Epoch")
+                ax.set_ylabel("Loss")
+                ax.set_title(f"Training Loss  (step={step}, epoch={epoch})")
+                ax.grid(True, alpha=0.3)
+                fig.tight_layout()
+                fig.savefig(self.plot_path, dpi=100)
+                plt.close(fig)
+
+        _hydra_output_dir = str(pathlib.Path(hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"]))
+        callbacks.append(EpochLossPlotter(os.path.join(_hydra_output_dir, "logs")))
+
         trainer = pl.Trainer(
             accelerator="auto",
             logger=self.logger if self.logger else False,
@@ -464,7 +524,15 @@ class BaseLightningExperiment(BaseExperiment):
                 fs = self.root_cfg.algorithm.frame_stack
                 # Use the original episode_len from the algorithm config
                 orig_ep_len = self.root_cfg.algorithm.episode_len
-                dataset_cfg.episode_len = orig_ep_len - fs
+                jump = getattr(dataset_cfg, 'jump', 1)
+                if jump <= 1:
+                    # jump=1: need (episode_len) divisible by frame_stack
+                    dataset_cfg.episode_len = orig_ep_len - fs
+                else:
+                    # jump>1: need (episode_len // jump) divisible by frame_stack
+                    # i.e., episode_len must be a multiple of (jump * frame_stack)
+                    unit = jump * fs
+                    dataset_cfg.episode_len = (orig_ep_len // unit) * unit
                 
             return self.compatible_datasets[dataset_cfg._name](dataset_cfg, split=split)
         else:

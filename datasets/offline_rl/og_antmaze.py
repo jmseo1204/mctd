@@ -76,6 +76,79 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
         print(f"Lazy dataset: {self._n_episodes} episodes × {self._n_windows} windows = {self.total_samples} samples")
         print(f"Raw obs shape: {self._raw_obs.shape}, Raw actions shape: {self._raw_actions.shape}")
 
+        # Try to cache entire dataset to GPU VRAM for zero-copy training
+        self.use_gpu_cache = False
+        self._try_gpu_cache()
+
+    def _try_gpu_cache(self):
+        """Try to cache raw dataset arrays to GPU VRAM for zero-copy __getitem__.
+
+        If the dataset fits within 70% of currently free VRAM, all arrays are
+        moved to CUDA tensors and self.use_gpu_cache is set to True.
+        The DataLoader must then use num_workers=0 (CUDA tensors cannot be
+        shared across multiprocessing workers).
+
+        Falls back to CPU loading if:
+          - CUDA is unavailable
+          - Dataset is too large (> 70% of free VRAM)
+          - CUDA OOM occurs despite the size check (e.g. fragmentation)
+        """
+        if not torch.cuda.is_available():
+            print("[GPU Cache] CUDA not available. Using CPU loading.")
+            return
+
+        obs_bytes = self._raw_obs.nbytes
+        act_bytes = self._raw_actions.nbytes
+        rew_bytes = self._raw_rewards.nbytes
+        total_bytes = obs_bytes + act_bytes + rew_bytes
+        total_mb = total_bytes / (1024 ** 2)
+
+        free_vram, total_vram = torch.cuda.mem_get_info()
+        free_mb = free_vram / (1024 ** 2)
+        threshold_bytes = free_vram * 0.70
+
+        print(f"[GPU Cache] Dataset: {total_mb:.1f} MB | Free VRAM: {free_mb:.1f} MB "
+              f"(threshold: {threshold_bytes / (1024**2):.1f} MB = 70% of free)")
+
+        if total_bytes > threshold_bytes:
+            print(
+                f"[GPU Cache] WARNING: Dataset ({total_mb:.1f} MB) exceeds 70% of free VRAM "
+                f"({threshold_bytes / (1024**2):.1f} MB). Falling back to CPU DataLoader. "
+                f"To enable GPU caching, reduce dataset size (fewer episodes / shorter episode_len) "
+                f"or use a GPU with more VRAM (need ~{total_mb / 0.70:.0f} MB free)."
+            )
+            return
+
+        print("[GPU Cache] Caching dataset to GPU VRAM ...")
+        try:
+            self._raw_obs_cuda     = torch.from_numpy(self._raw_obs).float().cuda()
+            self._raw_actions_cuda = torch.from_numpy(self._raw_actions).float().cuda()
+            self._raw_rewards_cuda = torch.from_numpy(self._raw_rewards).float().cuda()
+
+            # Precompute nonterminal template — shape is fixed for all __getitem__ calls
+            n_frames_out = len(range(0, self.n_frames, self.jump))
+            done_tmpl = torch.zeros(n_frames_out, dtype=torch.bool, device="cuda")
+            done_tmpl[-1] = True
+            self._nonterminal_template = ~done_tmpl
+
+            self.use_gpu_cache = True
+            used_mb = (self._raw_obs_cuda.element_size() * self._raw_obs_cuda.nelement()
+                       + self._raw_actions_cuda.element_size() * self._raw_actions_cuda.nelement()
+                       + self._raw_rewards_cuda.element_size() * self._raw_rewards_cuda.nelement()) / (1024 ** 2)
+            print(f"[GPU Cache] Dataset cached to GPU ({used_mb:.1f} MB). "
+                  f"DataLoader will run with num_workers=0.")
+
+        except torch.cuda.OutOfMemoryError:
+            # Clean up partial allocations before falling back
+            for attr in ("_raw_obs_cuda", "_raw_actions_cuda", "_raw_rewards_cuda", "_nonterminal_template"):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+            torch.cuda.empty_cache()
+            print(
+                f"[GPU Cache] WARNING: CUDA OOM while caching ({total_mb:.1f} MB). "
+                f"This can happen due to VRAM fragmentation. Falling back to CPU loading."
+            )
+
     def compute_value(self, reward):
         # numerical stable way to compute value
         value = np.copy(reward)
@@ -89,12 +162,19 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         ep = idx // self._n_windows
         w  = idx %  self._n_windows
-        observation = torch.from_numpy(self._raw_obs[ep, w:w+self.n_frames:self.jump].copy()).float()
-        action      = torch.from_numpy(self._raw_actions[ep, w:w+self.n_frames:self.jump].copy()).float()
-        reward      = torch.from_numpy(self._raw_rewards[ep, w:w+self.n_frames:self.jump].copy()).float()
-        done = np.zeros(len(observation), dtype=bool)
-        done[-1] = True
-        nonterminal = torch.from_numpy(~done)
+        if self.use_gpu_cache:
+            # All data already lives on GPU — slice and make contiguous (fast GPU memcpy)
+            observation = self._raw_obs_cuda[ep, w:w+self.n_frames:self.jump].contiguous()
+            action      = self._raw_actions_cuda[ep, w:w+self.n_frames:self.jump].contiguous()
+            reward      = self._raw_rewards_cuda[ep, w:w+self.n_frames:self.jump].contiguous()
+            nonterminal = self._nonterminal_template  # precomputed, same shape every call
+        else:
+            observation = torch.from_numpy(self._raw_obs[ep, w:w+self.n_frames:self.jump].copy()).float()
+            action      = torch.from_numpy(self._raw_actions[ep, w:w+self.n_frames:self.jump].copy()).float()
+            reward      = torch.from_numpy(self._raw_rewards[ep, w:w+self.n_frames:self.jump].copy()).float()
+            done = np.zeros(len(observation), dtype=bool)
+            done[-1] = True
+            nonterminal = torch.from_numpy(~done)
         return observation, action, reward, nonterminal
 
     def get_dataset(self):

@@ -8,7 +8,7 @@ available_gpus = ["localhost:0"]
 # available_gpus += [f"levine:{i}" for i in [0,1,2,3,4,5,6,7]]
 
 jobs_folder = "dql_jobs"
-docker_image = "fmctd:0.1"
+docker_image = "mctd:0.1"
 docker_user = "jmseo1204"
 home_dir = os.path.expanduser("~")
 project_dir = os.getcwd()

@@ -4,9 +4,9 @@ defaults:
 training:
   lr: 2e-4
   precision: 16-mixed
-  batch_size: 128 # 21% VRAM on 8GB GPU — sweet spot for this model/seq_len
+  batch_size: 2048 # increased 16x; VRAM ~6.8GB free → fits easily; ~245 batches/epoch vs 978
   optim:
-    accumulate_grad_batches: 8 # effective batch = 128 x 8 = 1024
+    accumulate_grad_batches: 1 # effective batch = 2048 (same order as before, fewer steps)
   max_steps: 200005 # 200k steps for full training
   max_epochs: -1 # train until max_steps
 
