@@ -78,5 +78,5 @@ docker build -f dockerfile/Dockerfile -t "$DOCKER_IMAGE" .
 echo ""
 echo "===================================================="
 echo "  ✓ Build complete: $DOCKER_IMAGE"
-echo "  Verify with: docker images | grep fmctd"
+echo "  Verify with: docker images | grep mctd"
 echo "===================================================="

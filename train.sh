@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# train_2d.sh
-# Trains the 2D AntMaze model (obs_dim=2: x,y position only)
-# - wandb.mode=offline: never blocks on network
-# - Auto-restarts on crash, up to MAX_RETRIES
-# - Filters checkpoints by obs_dim=2 via Docker python scan
-# - Checkpoint named: train_2d_{epoch}ep_{YYYYMMDDHHMMSS}[_{postfix}]
+# train.sh
+# Unified training script for 2D / 15D / 29D AntMaze models
+# - Prompts user to select state dimension at startup
+# - Filters checkpoints by obs_dim via Docker Python scan
+# - Checkpoint named: train_{dim}d_{epoch}ep_{YYYYMMDDHHMMSS}[_{postfix}]
 # - Uses Docker (mctd:0.1) — no conda dependency
+# - Auto-restarts on crash, up to MAX_RETRIES
 
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="$PROJECT_DIR/logs/train_2d.log"
 MAX_RETRIES=20
 RETRY_DELAY=30
 
@@ -23,14 +22,81 @@ OUTPUT_MOUNT_DIR="/home/jmseo1204/mctd_outputs"
 OGBENCH_DATA_DIR="/mnt/c/Users/USER/Desktop/test_ogbench/ogbench_data"
 HOME_DIR="$HOME"
 
-EVAL_BASE="$OUTPUT_MOUNT_DIR/downloaded/jmseo1204-seoul-national-university/mctd_eval"
-MODEL_ID_FILE="$PROJECT_DIR/logs/current_2d_model_id.txt"
-CKPT_MAP_FILE="$PROJECT_DIR/logs/2d_ckpt_model_map.txt"
-
-TARGET_OBS_DIM=2
+EVAL_BASE="$PROJECT_DIR/outputs/downloaded/jmseo1204-seoul-national-university/mctd_eval"
 
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$OUTPUT_MOUNT_DIR"
+
+# ────────────────────────────────────────────────────────
+# Step 1: Select state dimension
+# ────────────────────────────────────────────────────────
+echo "===================================================="
+echo "  MCTD Training Launcher"
+echo "===================================================="
+echo "Select observation state dimension:"
+echo "  1) 2D  (x,y position only)   [og_antmaze_giant_navigate]"
+echo "  2) 15D (qpos only)            [og_antmaze_giant_navigate_15d]"
+echo "  3) 29D (full qpos+qvel)       [og_antmaze_giant_navigate_fullstate]"
+echo ""
+read -p "Enter [1-3]: " DIM_SEL
+
+case "$DIM_SEL" in
+    1)
+        TARGET_OBS_DIM=2
+        ALGORITHM_CONFIG="df_planning_2d"
+        DATASET_CONFIG="og_antmaze_giant_navigate"
+        DEFAULT_JUMP=5
+        RUN_NAME="Train_2D_antmaze"
+        MODEL_ID_PREFIX="train_2d"
+        LOG_FILE="$PROJECT_DIR/logs/train_2d.log"
+        CKPT_MAP_FILE="$PROJECT_DIR/logs/2d_ckpt_model_map.txt"
+        MODEL_ID_FILE="$PROJECT_DIR/logs/current_2d_model_id.txt"
+        ;;
+    2)
+        TARGET_OBS_DIM=15
+        ALGORITHM_CONFIG="df_planning_15d"
+        DATASET_CONFIG="og_antmaze_giant_navigate_15d"
+        DEFAULT_JUMP=1
+        RUN_NAME="Train_15D_antmaze"
+        MODEL_ID_PREFIX="train_15d"
+        LOG_FILE="$PROJECT_DIR/logs/train_15d.log"
+        CKPT_MAP_FILE="$PROJECT_DIR/logs/15d_ckpt_model_map.txt"
+        MODEL_ID_FILE="$PROJECT_DIR/logs/current_15d_model_id.txt"
+        ;;
+    3)
+        TARGET_OBS_DIM=29
+        ALGORITHM_CONFIG="df_planning"
+        DATASET_CONFIG="og_antmaze_giant_navigate_fullstate"
+        DEFAULT_JUMP=1
+        RUN_NAME="Train_29D_big"
+        MODEL_ID_PREFIX="train_29d"
+        LOG_FILE="$PROJECT_DIR/logs/train_29d.log"
+        CKPT_MAP_FILE="$PROJECT_DIR/logs/29d_ckpt_model_map.txt"
+        MODEL_ID_FILE="$PROJECT_DIR/logs/current_29d_model_id.txt"
+        ;;
+    *)
+        echo "Invalid selection '$DIM_SEL'. Exiting."
+        exit 1
+        ;;
+esac
+
+# ────────────────────────────────────────────────────────
+# Step 2: Select jump value
+# ────────────────────────────────────────────────────────
+echo "Selected: ${TARGET_OBS_DIM}D  algorithm=$ALGORITHM_CONFIG  dataset=$DATASET_CONFIG"
+echo ""
+echo "dataset.jump: frame stride for training data (1 = use every frame)"
+read -p "Enter jump value [default: $DEFAULT_JUMP]: " JUMP_INPUT
+if [ -z "$JUMP_INPUT" ]; then
+    JUMP_VALUE=$DEFAULT_JUMP
+elif [[ "$JUMP_INPUT" =~ ^[0-9]+$ ]] && [ "$JUMP_INPUT" -ge 1 ]; then
+    JUMP_VALUE=$JUMP_INPUT
+else
+    echo "Invalid jump value '$JUMP_INPUT'. Exiting."
+    exit 1
+fi
+echo "Using jump=$JUMP_VALUE"
+echo ""
 
 # ────────────────────────────────────────────────────────
 # Trap: log any unexpected exit/error/signal
@@ -41,7 +107,7 @@ _trap_handler() {
     if [ "$signal" = "EXIT" ] && [ "$exit_code" -eq 0 ]; then
         return
     fi
-    echo "[$(date)] [FATAL] train_2d.sh terminated. signal=$signal exit_code=$exit_code line=$BASH_LINENO" | tee -a "$LOG_FILE"
+    echo "[$(date)] [FATAL] train.sh terminated. signal=$signal exit_code=$exit_code line=$BASH_LINENO" | tee -a "$LOG_FILE"
     local frame=0
     while caller $frame >> "$LOG_FILE" 2>/dev/null; do
         frame=$((frame + 1))
@@ -112,113 +178,84 @@ update_eval_symlink() {
 echo "========================================"
 echo "[$(date)] Checking for existing training processes..."
 
-EXISTING_PIDS=$(ps aux | grep -E "docker.*train_2d_training|python.*main.py.*Train_2D_antmaze" | grep -v grep | awk '{print $2}' | grep -v $$ || true)
+EXISTING_PIDS=$(ps aux | grep -E "docker.*mctd_training|python.*main.py.*$RUN_NAME" | grep -v grep | awk '{print $2}' | grep -v $$ || true)
 
 if [ -n "$EXISTING_PIDS" ]; then
     echo "Found existing training processes: $EXISTING_PIDS"
     echo "Killing existing processes..."
     echo "$EXISTING_PIDS" | xargs -r kill -9 2>/dev/null || true
-    docker rm -f train_2d_training 2>/dev/null || true
+    docker rm -f mctd_training 2>/dev/null || true
     sleep 2
     echo "Existing processes killed."
 else
     echo "No existing training processes found."
-    docker rm -f train_2d_training 2>/dev/null || true
+    docker rm -f mctd_training 2>/dev/null || true
 fi
 
 # ────────────────────────────────────────────────────────
-# Collect candidate checkpoint paths
+# Scan checkpoints via Docker (directory scan, no stdin pipe)
 # ────────────────────────────────────────────────────────
 echo "========================================"
-echo "[$(date)] Searching for 2D checkpoints (obs_dim=$TARGET_OBS_DIM)..."
-
-RAW_CKPTS=()
-
-# Regular training outputs (non-downloaded) in OUTPUT_MOUNT_DIR
-while IFS= read -r ckpt; do
-    run_dir=$(dirname "$(dirname "$(dirname "$ckpt")")")
-    run_name=$(basename "$run_dir")
-    RAW_CKPTS+=("$run_name|$ckpt")
-done < <(find "$OUTPUT_MOUNT_DIR" -name "last.ckpt" 2>/dev/null)
-
-# Eval symlinks in EVAL_BASE (local_* and other registered checkpoints)
-if [ -d "$EVAL_BASE" ]; then
-    while IFS= read -r ckpt; do
-        model_id=$(basename "$(dirname "$ckpt")")
-        real_ckpt=$(realpath "$ckpt" 2>/dev/null || echo "$ckpt")
-        # Avoid duplicates with the above (same real path)
-        RAW_CKPTS+=("$model_id|$real_ckpt")
-    done < <(find "$EVAL_BASE" -name "model.ckpt" 2>/dev/null)
-fi
+echo "[$(date)] Searching for ${TARGET_OBS_DIM}D checkpoints (obs_dim=$TARGET_OBS_DIM)..."
 
 CKPT_DIRS=()
 
-if [ ${#RAW_CKPTS[@]} -gt 0 ]; then
-    echo "[$(date)] Scanning ${#RAW_CKPTS[@]} checkpoint(s) via Docker..."
-
-    # Write scanner script to a temp file (mounted into Docker at same path)
-    SCANNER_SCRIPT=$(mktemp /tmp/train2d_scan_XXXXXX.py)
-    cat > "$SCANNER_SCRIPT" <<'PYEOF'
+SCANNER_SCRIPT=$(mktemp /tmp/mctd_scan_XXXXXX.py)
+chmod 644 "$SCANNER_SCRIPT"
+cat > "$SCANNER_SCRIPT" <<'PYEOF'
 import sys, torch
 from pathlib import Path
 
-output_mount_dir = sys.argv[1]
-docker_outputs   = sys.argv[2]
-project_dir      = sys.argv[3]
-docker_project   = sys.argv[4]
-target_dim       = int(sys.argv[5])
+docker_outputs   = sys.argv[1]  # /home/jmseo1204/mctd/outputs  (inside Docker)
+output_mount_dir = sys.argv[2]  # /home/jmseo1204/mctd_outputs   (on host)
+target_dim       = int(sys.argv[3])
 
-def host_to_docker(p):
-    if p.startswith(output_mount_dir):
-        return docker_outputs + p[len(output_mount_dir):]
-    if p.startswith(project_dir):
-        return docker_project + p[len(project_dir):]
-    return p
+base = Path(docker_outputs)
+if not base.exists():
+    print(f"ERROR: {docker_outputs} not found inside container", file=sys.stderr)
+    sys.exit(0)
 
-seen = set()
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    name, host_path = line.split("|", 1)
-    docker_path = host_to_docker(host_path)
-    if docker_path in seen:
-        continue
-    seen.add(docker_path)
-    p = Path(docker_path)
-    if not p.exists():
+for ckpt_path in sorted(base.rglob("last.ckpt")):
+    # Skip downloaded/ — those are symlinks, not real checkpoints
+    if "downloaded" in ckpt_path.parts:
         continue
     try:
-        ckpt = torch.load(str(p), map_location="cpu", weights_only=False)
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
         sd   = ckpt.get("state_dict", {})
         dm   = sd.get("data_mean")
         if dm is None or int(dm.shape[0]) != target_dim:
             continue
         epoch = ckpt.get("epoch", 0)
-        mtime = int(p.stat().st_mtime)
+        mtime = int(ckpt_path.stat().st_mtime)
+        # Convert docker path → host path for shell-side use
+        host_path = output_mount_dir + str(ckpt_path)[len(docker_outputs):]
+        # Derive human-readable name from date/time path components
+        parts = ckpt_path.parts
+        try:
+            idx = parts.index("outputs") + 1
+            name = "/".join(parts[idx:idx+2])
+        except (ValueError, IndexError):
+            name = str(ckpt_path.parent)
         print(f"{name}|{host_path}|{mtime}|{epoch}")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"SCAN_ERR {ckpt_path}: {e}", file=sys.stderr)
 PYEOF
 
-    mapfile -t FILTERED < <(
-        printf '%s\n' "${RAW_CKPTS[@]}" | docker run --rm -i \
-            -v "$PROJECT_DIR":"$DOCKER_PROJECT" \
-            -v "$OUTPUT_MOUNT_DIR":"$DOCKER_OUTPUTS" \
-            -v "$SCANNER_SCRIPT":"$SCANNER_SCRIPT":ro \
-            "$DOCKER_IMAGE" \
-            python3 "$SCANNER_SCRIPT" \
-                "$OUTPUT_MOUNT_DIR" "$DOCKER_OUTPUTS" \
-                "$PROJECT_DIR" "$DOCKER_PROJECT" \
-                "$TARGET_OBS_DIM" \
-            2>/dev/null
-    )
-    rm -f "$SCANNER_SCRIPT"
+echo "[$(date)] Scanning checkpoints via Docker (filtering obs_dim=$TARGET_OBS_DIM)..."
+mapfile -t FILTERED < <(
+    docker run --rm \
+        --entrypoint python3 \
+        -v "$OUTPUT_MOUNT_DIR":"$DOCKER_OUTPUTS" \
+        -v "$SCANNER_SCRIPT":"$SCANNER_SCRIPT":ro \
+        "$DOCKER_IMAGE" \
+        "$SCANNER_SCRIPT" "$DOCKER_OUTPUTS" "$OUTPUT_MOUNT_DIR" "$TARGET_OBS_DIM" \
+        2>/dev/null | grep -E '^[^|]+\|[^|]+\|[0-9]+\|[0-9]+$'
+)
+rm -f "$SCANNER_SCRIPT"
 
-    for entry in "${FILTERED[@]:-}"; do
-        [ -n "$entry" ] && CKPT_DIRS+=("$entry")
-    done
-fi
+for entry in "${FILTERED[@]:-}"; do
+    [ -n "$entry" ] && CKPT_DIRS+=("$entry")
+done
 
 # ────────────────────────────────────────────────────────
 # Present checkpoint menu and let user select
@@ -233,15 +270,16 @@ if [ ${#CKPT_DIRS[@]} -gt 0 ]; then
     echo "Found ${#CKPT_DIRS[@]} checkpoint(s) with obs_dim=${TARGET_OBS_DIM}:"
     echo "========================================"
 
-    # Sort by mtime descending (3rd field)
     mapfile -t sorted < <(printf '%s\n' "${CKPT_DIRS[@]}" | sort -t'|' -k3 -rn)
 
     echo "  [0] Start from scratch (fresh training)"
     for i in "${!sorted[@]}"; do
-        IFS='|' read -ra parts <<< "${sorted[$i]}"
-        ckpt_name="${parts[0]}"
-        ckpt_path="${parts[1]}"
-        epoch_num="${parts[3]:-0}"
+        entry="${sorted[$i]}"
+        ckpt_name=$(echo "$entry" | cut -d'|' -f1)
+        ckpt_path=$(echo "$entry" | cut -d'|' -f2)
+        epoch_num=$(echo "$entry" | cut -d'|' -f4)
+        epoch_num="${epoch_num:-0}"
+        [ -z "$ckpt_path" ] && continue
         ckpt_dir=$(dirname "$(realpath "$ckpt_path" 2>/dev/null || echo "$ckpt_path")")
         mapped_id=""
         if [ -f "$CKPT_MAP_FILE" ]; then
@@ -262,18 +300,19 @@ if [ ${#CKPT_DIRS[@]} -gt 0 ]; then
     else
         idx=$((SELECTION - 1))
         if [ "$idx" -ge 0 ] && [ "$idx" -lt "${#sorted[@]}" ]; then
-            IFS='|' read -ra parts <<< "${sorted[$idx]}"
-            SELECTED_CKPT="${parts[1]}"
-            SELECTED_EPOCH="${parts[3]:-0}"
+            entry="${sorted[$idx]}"
+            SELECTED_CKPT=$(echo "$entry" | cut -d'|' -f2)
+            SELECTED_EPOCH=$(echo "$entry" | cut -d'|' -f4)
+            SELECTED_EPOCH="${SELECTED_EPOCH:-0}"
+            ckpt_name_sel=$(echo "$entry" | cut -d'|' -f1)
             echo "Resuming from: $SELECTED_CKPT  (epoch $SELECTED_EPOCH)"
 
-            # Resolve model_id from map or checkpoint name
             ckpt_dir=$(dirname "$(realpath "$SELECTED_CKPT" 2>/dev/null || echo "$SELECTED_CKPT")")
             if [ -f "$CKPT_MAP_FILE" ]; then
                 MODEL_ID=$(grep "^$ckpt_dir|" "$CKPT_MAP_FILE" | cut -d'|' -f2 | tail -1 || true)
             fi
-            if [ -z "$MODEL_ID" ] && [[ "${parts[0]}" == train_* ]]; then
-                MODEL_ID="${parts[0]}"
+            if [ -z "$MODEL_ID" ] && [[ "$ckpt_name_sel" == train_* ]]; then
+                MODEL_ID="$ckpt_name_sel"
                 echo "[model_id] Using checkpoint name as model_id: $MODEL_ID"
             fi
         else
@@ -283,7 +322,7 @@ if [ ${#CKPT_DIRS[@]} -gt 0 ]; then
         fi
     fi
 else
-    echo "No existing 2D checkpoints found. Starting fresh training."
+    echo "No existing ${TARGET_OBS_DIM}D checkpoints found. Starting fresh training."
 fi
 
 # ────────────────────────────────────────────────────────
@@ -291,14 +330,14 @@ fi
 # ────────────────────────────────────────────────────────
 echo ""
 read -p "Optional name postfix (leave blank for none): " USER_POSTFIX
-USER_POSTFIX="${USER_POSTFIX// /_}"  # replace spaces with underscores
+USER_POSTFIX="${USER_POSTFIX// /_}"
 
 # ────────────────────────────────────────────────────────
 # Build MODEL_ID: train_{dim}d_{epoch}ep_{YYYYMMDDHHMMSS}[_{postfix}]
 # ────────────────────────────────────────────────────────
 if [ -z "$MODEL_ID" ]; then
     TIMESTAMP="$(date +%Y%m%d%H%M%S)"
-    MODEL_ID="train_${TARGET_OBS_DIM}d_${SELECTED_EPOCH}ep_${TIMESTAMP}"
+    MODEL_ID="${MODEL_ID_PREFIX}_j${JUMP_VALUE}_${SELECTED_EPOCH}ep_${TIMESTAMP}"
     if [ -n "$USER_POSTFIX" ]; then
         MODEL_ID="${MODEL_ID}_${USER_POSTFIX}"
     fi
@@ -311,10 +350,12 @@ echo "[model_id] Using: $MODEL_ID" | tee -a "$LOG_FILE"
 # Training loop (Docker-based)
 # ────────────────────────────────────────────────────────
 echo "========================================" | tee -a "$LOG_FILE"
-echo "[$(date)] Starting 2D AntMaze training (obs_dim=$TARGET_OBS_DIM)" | tee -a "$LOG_FILE"
+echo "[$(date)] Starting ${TARGET_OBS_DIM}D AntMaze training" | tee -a "$LOG_FILE"
 echo "Project dir : $PROJECT_DIR" | tee -a "$LOG_FILE"
 echo "Output dir  : $OUTPUT_MOUNT_DIR" | tee -a "$LOG_FILE"
 echo "Docker image: $DOCKER_IMAGE" | tee -a "$LOG_FILE"
+echo "Algorithm   : $ALGORITHM_CONFIG" | tee -a "$LOG_FILE"
+echo "Dataset     : $DATASET_CONFIG  (jump=$JUMP_VALUE)" | tee -a "$LOG_FILE"
 echo "Model ID    : $MODEL_ID" | tee -a "$LOG_FILE"
 echo "========================================" | tee -a "$LOG_FILE"
 
@@ -346,10 +387,10 @@ while [ $attempt -lt $MAX_RETRIES ]; do
     BASE_CMD="python3 main.py \
         experiment.tasks=[training] \
         experiment=exp_planning \
-        algorithm=df_planning_2d \
-        dataset=og_antmaze_giant_navigate \
-        dataset.jump=5 \
-        +name=Train_2D_antmaze \
+        algorithm=$ALGORITHM_CONFIG \
+        dataset=$DATASET_CONFIG \
+        dataset.jump=$JUMP_VALUE \
+        +name=$RUN_NAME \
         wandb.mode=offline \
         experiment.validation.limit_batch=0"
 
@@ -361,7 +402,7 @@ while [ $attempt -lt $MAX_RETRIES ]; do
         INNER_CMD="$BASE_CMD"
     fi
 
-    FULL_CMD="docker run --rm --gpus all --name train_2d_training --shm-size=50g \
+    FULL_CMD="docker run --rm --gpus all --name mctd_training --shm-size=50g \
         -e MUJOCO_GL=osmesa \
         -e HYDRA_FULL_ERROR=1 \
         -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/$DOCKER_USER/.mujoco/mujoco210/bin \
@@ -381,7 +422,6 @@ while [ $attempt -lt $MAX_RETRIES ]; do
     EXIT_CODE=${PIPESTATUS[0]}
     set -e
 
-    # Update eval symlink after each attempt
     update_eval_symlink "$MODEL_ID"
 
     if [ $EXIT_CODE -eq 0 ]; then
