@@ -46,7 +46,7 @@ if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 0 ] && [ "$idx" -lt "${#RECENT_LOGS[
     echo ""
     echo "Analyzing: $(basename "$SELECTED_LOG")"
     echo "=========================================="
-    python3 analyze_guidance_results.py "$SELECTED_LOG"
+    python3 scripts/guidance_analysis.py "$SELECTED_LOG"
 else
     echo "Invalid selection."
     exit 1

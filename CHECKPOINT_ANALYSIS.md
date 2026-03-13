@@ -153,7 +153,7 @@ mv local_*_{d2,d15,d29} evaluated_versions/
 
 1. **Use Latest 15D Model** for evaluation:
    ```bash
-   python generate_jobs_generalized.py --model_id local_20260307062042_15d
+   python scripts/generate_jobs_generalized.py --model_id local_20260307062042_15d
    ```
 
 2. **Clean up duplicates** (optional but recommended):

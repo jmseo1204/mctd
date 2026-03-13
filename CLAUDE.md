@@ -58,9 +58,9 @@ All configs are YAML files in `configurations/`:
 
 **Interactive training (Docker-based):**
 ```bash
-bash train_interactive.sh
+bash train.sh
 ```
-Launches an interactive menu to select dataset, configure episode length, and resume from checkpoints.
+Launches an interactive menu to select state dimension (2D/15D/29D), configure jump value, and resume from checkpoints.
 
 **Direct execution (local):**
 ```bash
@@ -77,29 +77,34 @@ python main.py resume=<wandb_run_id> experiment.tasks=[training]
 python main.py load=<wandb_run_id> experiment.tasks=[validation]
 ```
 
+**Full evaluation pipeline (checkpoint selection → job generation → execution):**
+```bash
+bash eval.sh
+```
+Interactive workflow: selects state dim (2D/15D/29D) → checkpoint → generates eval jobs → runs them via Docker.
+
 ### Debugging & Analysis
 
 **Generate job specifications:**
 ```bash
-python generate_jobs_generalized.py
+python scripts/generate_jobs_generalized.py
 ```
 
-**Analyze logs:**
+**Analyze debug logs (JSONL → HTML report):**
 ```bash
-bash scripts/analyze_logs.sh
+bash debug_log_report.sh <path/to/logfile.jsonl>
 ```
 
-**Run with monitoring:**
+**Analyze guidance scale results:**
 ```bash
-bash scripts/run_with_monitoring.sh
+bash guidance_analysis.sh
 ```
 
 ### Key Python Scripts
 
 - `main.py`: Hydra entry point - runs experiments with config overrides
-- `run_experiment.py`: Wrapper for batch experiment execution
-- `run_jobs.py`: Executes job specifications from job database
-- `generate_*.py`: Generate experiment job specifications
+- `scripts/run_jobs.py`: Executes job specifications from job database
+- `scripts/generate_jobs_generalized.py`: Generate evaluation job JSON files
 
 ## File Organization & Conventions
 
@@ -205,7 +210,7 @@ Use the `log-instrumentation` skill to add coarse-to-fine structured logging to 
 **Create validation jobs:**
 ```bash
 python insert_antmaze_validation_jobs.py  # or other environments
-python run_jobs.py  # executes jobs
+python scripts/run_jobs.py  # executes jobs
 ```
 
 **Analyze results:**
@@ -223,7 +228,7 @@ python run_jobs.py  # executes jobs
 | `tree_node.py` | MCTS node structure |
 | `exp_planning.py` | Training/validation experiment tasks |
 | `config.yaml` | Root Hydra config |
-| `train_interactive.sh` | Interactive training launcher |
+| `train.sh` | Interactive training launcher (2D/15D/29D) |
 
 ## Development Workflow
 

@@ -1,0 +1,2 @@
+- 호스트 환경은 아주 기본적인 패키지 밖에 없다. 특정 패키지가 필요하면 Docker image mctd:0.1 를 우선적으로 확인. 본 프로젝트에 필요한 모든 환경은 해당 docker image에서 구축된다.
+- Diffusion Forcing(planner) model training은 train.sh이, model evaluation은 eval.sh이 실행한다. 

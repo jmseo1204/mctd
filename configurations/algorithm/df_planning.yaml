@@ -40,8 +40,8 @@ parallel_multiple_visits: False
 mctd_num_denoising_steps: 100 # Must be <= sampling_timesteps in df_base.yaml
 parallel_search_num: 1
 mctd_max_search_num: 70
-mctd_guidance_scales: [10.0]
-padding_mode: "same" # "zero" or "same"
+mctd_guidance_scales: [0.0]
+padding_mode: "zero" # "zero" or "same"
 viz_plans: True
 DEBUG: True
 debug_log_level: 2 # 0=off, 1=basic (allocations), 2=detailed (memory tracking), 3=verbose (every step)
@@ -56,13 +56,13 @@ num_tries_for_bad_plans: 3
 open_loop_horizon: 300 #fixme -> best: episode_len*horizon_scale
 val_max_loops: 8 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
 sub_goal_interval: 5
-scheduling_matrix: smooth
+scheduling_matrix: "causal"
 
 # HILP value function guidance
 hilp_checkpoint_path: "td_models/hilp_ckpt_latest.pt"
 hilp_obs_dim: 29  # AntMaze observation dimension
 hilp_skill_dim: 32  # HILP phi representation dimension
-anchor_guidance_scale: 0.0 # 40.0
+anchor_guidance_scale: 0.4 # 40.0
 rdf_guidance_scale: 0.0 # 2.0
 mcts_use_sim: false
 use_rollout: false  # If false, skip _rollout_leaf_plan; derive obs_pos from plan_history instead of physical sim

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-scripts/analyze_logs.py
+scripts/debug_log_report.py
 Log analysis engine for AI research experiments.
 """
 
@@ -167,22 +167,22 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[analyze_logs] Parsing: {log_path}")
+    print(f"[debug_log_report] Parsing: {log_path}")
     records, is_slp = parse_jsonl(log_path)
-    print(f"[analyze_logs] Records: {len(records)}")
+    print(f"[debug_log_report] Records: {len(records)}")
 
     run_meta = extract_run_meta(records)
     errors = extract_errors(records)
     series = extract_numeric_series(records)
     tensor_stats = extract_tensor_stats(records)
 
-    print(f"[analyze_logs] Errors: {len(errors)}, Series: {len(series)}")
+    print(f"[debug_log_report] Errors: {len(errors)}, Series: {len(series)}")
 
     html = build_html_report(log_path, records, is_slp, run_meta, errors, series, tensor_stats)
     
     output_path = output_dir / f"{log_path.stem}_analysis.html"
     output_path.write_text(html, encoding="utf-8")
-    print(f"[analyze_logs] Report saved: {output_path}")
+    print(f"[debug_log_report] Report saved: {output_path}")
     return 0
 
 if __name__ == "__main__":

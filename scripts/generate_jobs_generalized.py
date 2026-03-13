@@ -46,19 +46,23 @@ def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir="out
         print(f"  [ckpt detect] direct torch failed: {e}")
         return None
 
-    # Fallback: run via conda env subprocess
+    # Fallback: run via Docker (mctd:0.1 has torch; host may not)
     try:
         import subprocess, json as _json
+        real_path = str(ckpt_path.resolve())
+        mount_dir = str(ckpt_path.resolve().parent)
         script = (
             f"import torch, json; "
-            f"sd = torch.load('{ckpt_path}', map_location='cpu', weights_only=False).get('state_dict', {{}}); "
+            f"sd = torch.load('{real_path}', map_location='cpu', weights_only=False).get('state_dict', {{}}); "
             f"w = sd.get('diffusion_model.model.out.weight'); "
             f"dm = sd.get('data_mean'); "
             f"print(json.dumps({{'out': list(w.shape) if w is not None else None, 'dm': list(dm.shape) if dm is not None else None}}))"
         )
         result = subprocess.run(
-            ["conda", "run", "-n", "diff_force_env", "python", "-c", script],
-            capture_output=True, text=True, timeout=60
+            ["docker", "run", "--rm", "--entrypoint", "python3",
+             "-v", f"{mount_dir}:{mount_dir}:ro",
+             "mctd:0.1", "-c", script],
+            capture_output=True, text=True, timeout=120
         )
         if result.returncode == 0:
             info = _json.loads(result.stdout.strip())
@@ -69,10 +73,10 @@ def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir="out
                 unstacked_dim = dm_shape[0] if dm_shape else (obs_dim + act_dim)
                 if unstacked_dim > 0 and x_dim % unstacked_dim == 0:
                     fs = x_dim // unstacked_dim
-                    print(f"  [ckpt detect via conda] x_dim={x_dim}, unstacked_dim={unstacked_dim} → frame_stack={fs}")
+                    print(f"  [ckpt detect via docker] x_dim={x_dim}, unstacked_dim={unstacked_dim} → frame_stack={fs}")
                     return fs
     except Exception as e:
-        print(f"  [ckpt detect] conda fallback failed: {e}")
+        print(f"  [ckpt detect] docker fallback failed: {e}")
     return None
 
 
@@ -140,54 +144,49 @@ def detect_network_size_from_ckpt(model_id, downloaded_dir="outputs/downloaded/j
         print(f"  [ckpt detect] direct torch failed: {e}")
         return None
 
-    # Fallback: run via conda env subprocess
+    # Fallback: run via Docker (mctd:0.1 has torch; host may not)
+    # Combines arch weights + num_layers into a single Docker call.
     try:
         import subprocess, json as _json
+        real_path = str(ckpt_path.resolve())
+        mount_dir = str(ckpt_path.resolve().parent)
         script = (
             f"import torch, json; "
-            f"sd = torch.load('{ckpt_path}', map_location='cpu', weights_only=False).get('state_dict', {{}}); "
+            f"sd = torch.load('{real_path}', map_location='cpu', weights_only=False).get('state_dict', {{}}); "
             f"attn_w = sd.get('diffusion_model.model.transformer.layers.0.self_attn.in_proj_weight'); "
             f"linear1_w = sd.get('diffusion_model.model.transformer.layers.0.linear1.weight'); "
-            f"print(json.dumps({{'attn': list(attn_w.shape) if attn_w is not None else None, 'linear1': list(linear1_w.shape) if linear1_w is not None else None}}))"
+            f"idxs = set(int(k.split('transformer.layers.')[1].split('.')[0]) for k in sd if 'transformer.layers.' in k) if any('transformer.layers.' in k for k in sd) else set(); "
+            f"num_layers = max(idxs)+1 if idxs else 0; "
+            f"print(json.dumps({{'attn': list(attn_w.shape) if attn_w is not None else None, 'linear1': list(linear1_w.shape) if linear1_w is not None else None, 'num_layers': num_layers}}))"
         )
         result = subprocess.run(
-            ["conda", "run", "-n", "diff_force_env", "python", "-c", script],
-            capture_output=True, text=True, timeout=60
+            ["docker", "run", "--rm", "--entrypoint", "python3",
+             "-v", f"{mount_dir}:{mount_dir}:ro",
+             "mctd:0.1", "-c", script],
+            capture_output=True, text=True, timeout=120
         )
         if result.returncode == 0:
             info = _json.loads(result.stdout.strip())
             attn_shape = info.get("attn")
             linear1_shape = info.get("linear1")
-
-            # Count num_layers via subprocess
-            nl_script = (
-                f"import torch, json; "
-                f"sd = torch.load('{ckpt_path}', map_location='cpu', weights_only=False).get('state_dict', {{}}); "
-                f"idxs = set(int(k.split('transformer.layers.')[1].split('.')[0]) for k in sd if 'transformer.layers.' in k) if any('transformer.layers.' in k for k in sd) else set(); "
-                f"print(max(idxs)+1 if idxs else 0)"
-            )
-            nl_result = subprocess.run(
-                ["conda", "run", "-n", "diff_force_env", "python", "-c", nl_script],
-                capture_output=True, text=True, timeout=60
-            )
-            num_layers = int(nl_result.stdout.strip()) if nl_result.returncode == 0 and nl_result.stdout.strip().isdigit() else None
+            num_layers = info.get("num_layers") or None
             if num_layers:
-                print(f"  [ckpt detect via conda] num_layers={num_layers}")
+                print(f"  [ckpt detect via docker] num_layers={num_layers}")
 
             if attn_shape and len(attn_shape) >= 2:
                 hidden = attn_shape[1]
                 dim_ff = linear1_shape[0] if linear1_shape and len(linear1_shape) >= 2 else None
-                print(f"  [ckpt detect via conda] transformer layer 0 in_proj_weight shape {attn_shape} → network_size={hidden}")
+                print(f"  [ckpt detect via docker] transformer layer 0 in_proj_weight shape {attn_shape} → network_size={hidden}")
                 if dim_ff is not None:
-                    print(f"  [ckpt detect via conda] transformer layer 0 linear1.weight shape {linear1_shape} → dim_feedforward={dim_ff}")
+                    print(f"  [ckpt detect via docker] transformer layer 0 linear1.weight shape {linear1_shape} → dim_feedforward={dim_ff}")
                 return {"network_size": hidden, "dim_feedforward": dim_ff, "num_layers": num_layers}
             elif linear1_shape and len(linear1_shape) >= 2:
                 hidden = linear1_shape[1]
                 dim_ff = linear1_shape[0]
-                print(f"  [ckpt detect via conda] transformer layer 0 linear1.weight shape {linear1_shape} → network_size={hidden}, dim_feedforward={dim_ff}")
+                print(f"  [ckpt detect via docker] transformer layer 0 linear1.weight shape {linear1_shape} → network_size={hidden}, dim_feedforward={dim_ff}")
                 return {"network_size": hidden, "dim_feedforward": dim_ff, "num_layers": num_layers}
     except Exception as e:
-        print(f"  [ckpt detect] conda fallback failed: {e}")
+        print(f"  [ckpt detect] docker fallback failed: {e}")
 
     return None
 
@@ -307,9 +306,10 @@ def main():
     parser = argparse.ArgumentParser(description="Generate evaluation jobs JSON files.")
     parser.add_argument("--dataset", required=True, help="Dataset config name (e.g., og_antmaze_giant_stitch)")
     parser.add_argument("--model_id", required=True, help="WandB model ID (e.g., en1ddvu7)")
-    parser.add_argument("--num_tasks", type=int, default=5, help="Number of tasks (1 to N)")
+    parser.add_argument("--num_tasks", type=int, default=5, help="Number of tasks to generate")
     parser.add_argument("--num_seeds", type=int, default=3, help="Number of seeds per task")
-    parser.add_argument("--num_repeats", type=int, default=1, help="Number of repeats per seed/task (robustness)")
+    parser.add_argument("--start_task_id", type=int, default=1, help="Starting task index (1-based)")
+    parser.add_argument("--total_tasks_num", type=int, default=None, help="Total number of tasks in the environment (for modulo wrapping)")
     parser.add_argument("--horizon_scale", type=float, default=None, help="Override Multiplier")
     parser.add_argument("--episode_len", type=int, default=None, help="Override episode_len (useful for offline/local runs without config.yaml)")
     parser.add_argument("--outputs_root", default="/home/jmseo1204/mctd_outputs", help="Root directory of outputs/wandb logs")
@@ -398,19 +398,25 @@ def main():
     if not os.path.exists(jobs_folder):
         os.makedirs(jobs_folder)
         
+    total_tasks_num = args.total_tasks_num
+    start_task_id = args.start_task_id
+
     count = 0
-    for task_id in range(1, args.num_tasks + 1):
+    for i in range(args.num_tasks):
+        if total_tasks_num:
+            task_id = ((start_task_id - 1 + i) % total_tasks_num) + 1
+        else:
+            task_id = start_task_id + i
         for seed in range(args.num_seeds):
-            for r in range(args.num_repeats):
-                job_cfg = copy.deepcopy(basic_job_config)
-                job_cfg["experiment.validation.seed"] = seed
-                job_cfg["algorithm.task_id"] = task_id
-                job_cfg["+name"] = f"EVAL_{args.model_id}_T{task_id}_S{seed}_R{r}"
-                
-                filename = f"{jobs_folder}/{datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')}.json"
-                with open(filename, "w") as f:
-                    json.dump(job_cfg, f, indent=4)
-                count += 1
+            job_cfg = copy.deepcopy(basic_job_config)
+            job_cfg["experiment.validation.seed"] = seed
+            job_cfg["algorithm.task_id"] = task_id
+            job_cfg["+name"] = f"EVAL_{args.model_id}_T{task_id}_S{seed}"
+
+            filename = f"{jobs_folder}/{datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')}.json"
+            with open(filename, "w") as f:
+                json.dump(job_cfg, f, indent=4)
+            count += 1
                 
     print(f"Successfully generated {count} jobs in '{jobs_folder}/' folder.")
 

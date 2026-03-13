@@ -178,7 +178,7 @@ def run(cfg: DictConfig):
         )
 
     if cfg.wandb.project is None:
-        cfg.wandb.project = str(Path(__file__).parent.name)
+        cfg.wandb.project = str(Path(__file__).parent.parent.name)
 
     # If resuming or loading a wandb ckpt and not on a compute node, download the checkpoint.
     resume = cfg.get("resume", None)

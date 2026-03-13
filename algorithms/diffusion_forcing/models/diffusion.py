@@ -454,8 +454,14 @@ class Diffusion(nn.Module):
                 )
                 
                 # Direct Reconstruction Guidance with Normalization
+                # For frozen tokens (curr == next noise level, e.g. obs_parent at level 0),
+                # replace model's (potentially contaminated) pred_x_start with the ground
+                # truth orig_x.  This ensures anchor_target = actual obs_parent_token and
+                # keeps grad[frozen] = 0, consistent with the x update mask at line ~547.
                 with torch.enable_grad():
-                    guidance_results = guidance_fn(model_pred.pred_x_start)
+                    frozen_mask = self.add_shape_channels(curr_noise_level == next_noise_level)
+                    masked_pred_x_start = torch.where(frozen_mask, orig_x, model_pred.pred_x_start)
+                    guidance_results = guidance_fn(masked_pred_x_start)
                     
                     if isinstance(guidance_results, dict):
                         # Multi-component guidance: compute individual grads for logging and analysis

@@ -399,6 +399,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         return bundles, conditions, masks
 
     def training_step(self, batch, batch_idx):
+        _step = self.trainer.global_step if self.trainer else 0
+
+        # Memory snapshot: record steps 0-5, dump at step 5
+        if _step == 0 and torch.cuda.is_available():
+            torch.cuda.memory._record_memory_history(max_entries=100000)
+        elif _step == 5 and torch.cuda.is_available():
+            import os
+            _snap_dir = os.path.join(os.path.dirname(__file__), "../../logs")
+            os.makedirs(_snap_dir, exist_ok=True)
+            _snap_path = os.path.join(_snap_dir, "memory_snapshot.pickle")
+            torch.cuda.memory._dump_snapshot(_snap_path)
+            torch.cuda.memory._record_memory_history(enabled=None)
+            print(f"[mosaic] Memory snapshot saved to {os.path.abspath(_snap_path)}")
+
         xs, conditions, masks = self._preprocess_batch(batch)
 
         n_tokens, batch_size = xs.shape[:2]
@@ -930,12 +944,34 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         plan_hist = [
             extract_plan_chunk(
-                plan_with_given_tokens, 
+                plan_with_given_tokens,
                 plan_tokens,
                 prefix_len_list,
             )
         ] # (plan_tokens, b, fs*c)
-        
+
+        # [DIAG] H2: denoising 전 plan_hist[0][0] 첫 frame (= noise) unnormalized x,y
+        if self.tracer is not None:
+            # plan_hist[0]: (plan_tokens, b, fs*c) → rearrange → unnormalize
+            _init_chunk_frames = rearrange(
+                plan_hist[0][:1].detach(), "t b (fs c) -> (t fs) b c", fs=self.frame_stack
+            )  # (fs, b, c)
+            _init_frame0_unnorm = self._unnormalize_x(_init_chunk_frames)  # (fs, b, c)
+            # obs_parent: plan_with_given_tokens[0] (1, b, fs*c)
+            _obs_par_frames = rearrange(
+                plan_with_given_tokens[:1].detach(), "t b (fs c) -> (t fs) b c", fs=self.frame_stack
+            )  # (fs, b, c)
+            _obs_par_unnorm = self._unnormalize_x(_obs_par_frames)  # (fs, b, c)
+            self.tracer.log(
+                "plan_start.before_denoising_xy",
+                {
+                    "plan_token0_frame0_xy_b0": _init_frame0_unnorm[0, 0, :self.pos_dim].cpu().tolist(),
+                    "obs_parent_lastframe_xy_b0": _obs_par_unnorm[-1, 0, :self.pos_dim].cpu().tolist(),
+                },
+                depth=1,
+                source="df_planning.py:parallel_plan:before_denoising",
+            )
+
         # [MEMORY DEBUG] Log initial plan_hist allocation
         if self.profiler:
             self.profiler.snapshot(
@@ -1004,6 +1040,32 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             "m t b (fs c) -> m (t fs) b c",
             fs=self.frame_stack,
         )  # (m+1, plan_tokens*fs, b, c)
+
+        # [DIAG] H2: denoising 완료 후 plan_hist[-1][0] 첫 frame unnormalized x,y
+        # plan_hist shape after rearrange: (m+1, plan_tokens*fs, b, c)
+        # H2 검증: obs_parent 대비 첫 planning frame이 실제로 수렴했는지
+        if self.tracer is not None:
+            # plan_hist[-1, 0]: (b, c) - first frame after full denoising
+            _final_xy = self._unnormalize_x(
+                plan_hist[-1, 0:1].detach()  # (1, b, c)
+            )[0, 0, :self.pos_dim].cpu().tolist()
+            # obs_parent last frame: plan_with_given_tokens[0] → rearrange → last frame
+            _obs_par_frames = rearrange(
+                plan_with_given_tokens[:1].detach(), "t b (fs c) -> (t fs) b c", fs=self.frame_stack
+            )
+            _obs_parent_xy = self._unnormalize_x(_obs_par_frames)[-1, 0, :self.pos_dim].cpu().tolist()
+            import math as _math
+            _dist = _math.sqrt(sum((a - b) ** 2 for a, b in zip(_final_xy, _obs_parent_xy)))
+            self.tracer.log(
+                "plan_start.after_denoising_xy",
+                {
+                    "plan_frame0_final_xy_b0": _final_xy,
+                    "obs_parent_lastframe_xy_b0": _obs_parent_xy,
+                    "dist_frame0_to_obsparent": _dist,
+                },
+                depth=1,
+                source="df_planning.py:parallel_plan:after_denoising",
+            )
 
         # Validate plan_hist shape before returning
         # m+1: number of denoising steps (length of noise_level schedule)
@@ -1469,6 +1531,32 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
                 # Create forward trajectory image with both plan (red) and node trajectory (blue)
                 plan_positions = plan_unnormalized[:, :, :self.pos_dim].detach().cpu().numpy()
+
+                # [DIAG] H4 (핵심): plan_positions[0] vs start — 시각화되는 첫 frame이 start와 얼마나 떨어져있나
+                if self.tracer is not None:
+                    import math as _math
+                    _p0 = plan_positions[0, 0].tolist()          # first frame x,y
+                    _s0 = start_numpy[0].tolist()                 # start x,y
+                    _dist_p0_start = _math.sqrt(sum((a - b)**2 for a, b in zip(_p0, _s0)))
+                    _a_len = best_node.depth * (active_tree.plan_tokens // self.sequence_dividing_factor) * self.frame_stack
+                    _b_len = plan_positions.shape[0] - _a_len
+                    self.tracer.log(
+                        "plan_start.plan0_vs_start",
+                        {
+                            "mcts_step": steps,
+                            "best_node_depth": best_node.depth,
+                            "plan_len_total": plan_positions.shape[0],
+                            "a_len": _a_len,
+                            "b_len": _b_len,
+                            "plan_positions_0_xy": _p0,
+                            "start_xy": _s0,
+                            "dist_plan0_to_start": _dist_p0_start,
+                            "goal_xy": goal_numpy[0].tolist(),
+                            "plan_last_xy": plan_positions[-1, 0].tolist(),
+                        },
+                        depth=0,
+                        source="df_planning.py:interact",
+                    )
 
                 # Extract best_node's target_node obs_pos (single green point)
                 best_node_target_pos = None
@@ -2273,7 +2361,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     goal=effective_goal_normalized,
                     horizon=horizon,
                     conditions=conditions,
-                    guidance_scale=torch.zeros_like(expanded_node_guidance_scales),
+                    guidance_scale=expanded_node_guidance_scales, # torch.zeros_like(expanded_node_guidance_scales),
                     noise_level=expanded_node_noise_levels,
                     plans=expanded_node_plans,
                     prefix_len_list=prefix_len_list,
@@ -2744,11 +2832,23 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             obs_parent_token_raw, "fs b c -> 1 b (fs c)"
         )  # (1, 1, fs*c) - normalized
 
-        # DEBUG: Check shapes
-        import sys
-        print(f"[DEBUG _build_plan_from_leaf] obs_parent_token_raw.shape={obs_parent_token_raw.shape}, obs_parent_token.shape={obs_parent_token.shape}", file=sys.stderr, flush=True)
-        print(f"[DEBUG _build_plan_from_leaf] self.x_stacked_shape={self.x_stacked_shape}, self.frame_stack={self.frame_stack}", file=sys.stderr, flush=True)
-        print(f"[DEBUG _build_plan_from_leaf] Expected obs_parent_token.shape=(1, 1, {self.frame_stack * self.x_stacked_shape[-1]})", file=sys.stderr, flush=True)
+        # [DIAG] H3: obs_parent_token이 실제 start x,y 를 담고 있는가?
+        if self.tracer is not None:
+            _obs_tok_unnorm = self._unnormalize_x(
+                obs_parent_token_raw[:1]  # (1, 1, obs_dim), detach copy only
+            ).detach()
+            self.tracer.log(
+                "plan_start.obs_parent_xy",
+                {
+                    "parent_node_name": parent_node.name,
+                    "parent_node_depth": parent_node.depth,
+                    "obs_parent_pos_raw_xy": parent_obs_pos[:2].tolist(),
+                    "obs_parent_token_unnorm_xy": _obs_tok_unnorm[0, 0, :self.pos_dim].cpu().tolist(),
+                    "use_dynamic_obs_padding": self.use_dynamic_obs_padding,
+                },
+                depth=1,
+                source="df_planning.py:_build_plan_from_leaf",
+            )
 
         prefix_len = 0 # initial value
 

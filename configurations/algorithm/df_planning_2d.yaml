@@ -1,23 +1,10 @@
 defaults:
   - df_planning
 
-# Smaller network for 2D pointmaze (observation_dim=2, unstacked_dim=2)
+# 2D antmaze: plan uses only (x,y); action via DQL+HILP with zero-padding to 29D
 diffusion:
-  clip_noise: 20.0
-  stabilization_level: 10
-  beta_schedule: linear
-  objective: pred_x0
-  use_snr_weighting: True
-  snr_clip: 5.0
-  ddim_sampling_eta: 0.1
   architecture:
     network_size: 64
     num_layers: 6
     attn_heads: 4
     dim_feedforward: 256
-
-# 2D-specific: no HILP/DQL needed
-dql_model: null
-anchor_guidance_scale: 0.0
-rdf_guidance_scale: 0.0
-hilp_obs_dim: 2

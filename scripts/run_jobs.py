@@ -103,7 +103,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -v {home_dir}/.d4rl:/home/{docker_user}/.d4rl \
         -v {ogbench_data_dir}:/home/{docker_user}/.ogbench/data \
         {docker_image} /bin/bash \
-        -c 'git config --global --add safe.directory /home/{docker_user}/mctd && python3 main.py hostname={server} gpu_id={gpu_id} {command_args}'"
+        -c 'git config --global --add safe.directory /home/{docker_user}/mctd && cd /home/{docker_user}/mctd && python3 main.py hostname={server} gpu_id={gpu_id} {command_args}'"
         """
         
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
@@ -125,12 +125,14 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         try:
             # Try to get logs from the dead container
             if server == "localhost":
-                logs = subprocess.run(["docker", "logs", exp_name], capture_output=True, text=True).stdout
+                log_res = subprocess.run(["docker", "logs", exp_name], capture_output=True, text=True)
+                logs = log_res.stdout + log_res.stderr
             else:
-                logs = subprocess.run(["ssh", server, "docker", "logs", exp_name], capture_output=True, text=True).stdout
+                log_res = subprocess.run(["ssh", server, "docker", "logs", exp_name], capture_output=True, text=True)
+                logs = log_res.stdout + log_res.stderr
             
             if logs:
-                log_write("--- Container Logs ---")
+                log_write("--- Container Logs (stdout+stderr) ---")
                 log_write(logs.strip())
         except:
             log_write("Could not retrieve logs from dead container.")
@@ -196,6 +198,8 @@ else:
     queue_is_empty = True
 
 completed_jobs = 0
+MAX_JOB_RETRIES = 3  # skip a job after this many consecutive immediate failures
+job_fail_counts = {}  # config_file -> consecutive failure count
 
 try:
     while not (queue_is_empty and all(v is None for v in running_experiments.values())):
@@ -273,7 +277,11 @@ try:
             # 3. Start new if available
             if running_experiments[gpu] is None and not queue_is_empty:
                 memory_used, memory_total = check_gpu_memory_usage(server, gpu_id)
-                if memory_used < 2000: # If the memory usage is less than 2GB, start a new experiment.
+                # Bypass memory check if retrying a recently failed job (crashed container
+                # may leave GPU memory temporarily elevated even though GPU is free)
+                current_fail_count = job_fail_counts.get(config_file, 0)
+                memory_ok = memory_used < 2000 or current_fail_count > 0
+                if memory_ok: # If GPU memory is free (or retrying a failed job), start a new experiment.
                     current_time_job = time.strftime("%Y%m%d-%H%M%S")
                     exp_name = f"exp_gpu{gpu_id}_{current_time_job}-{jobs_folder}"
                     
@@ -312,7 +320,8 @@ try:
                     if start_experiment(server, gpu_id, config, exp_name, current_time_job, pbar):
                         running_experiments[gpu] = exp_name
                         last_log_line_count[exp_name] = 0
-                        
+                        job_fail_counts.pop(config_file, None)  # reset on success
+
                         try:
                             os.remove(f"{jobs_folder}/{config_file}")
                         except FileNotFoundError:
@@ -320,9 +329,19 @@ try:
 
                         time.sleep(1)
                     else:
-                        # If failed to start, the error is already printed. 
-                        # We don't remove the job, just try again next loop or wait.
-                        pass
+                        # Container died immediately. Track failures and skip after MAX_JOB_RETRIES.
+                        fail_count = job_fail_counts.get(config_file, 0) + 1
+                        job_fail_counts[config_file] = fail_count
+                        if fail_count >= MAX_JOB_RETRIES:
+                            log_write(f"!! Job {config_file} failed {fail_count} times. Skipping. !!")
+                            try:
+                                os.remove(f"{jobs_folder}/{config_file}")
+                            except FileNotFoundError:
+                                pass
+                            job_fail_counts.pop(config_file, None)
+                        else:
+                            log_write(f"[WARN] Job start failed ({fail_count}/{MAX_JOB_RETRIES}). Will retry next loop.")
+                            time.sleep(5)  # brief cooldown to let Docker/GPU settle
                     config_files = sorted(os.listdir(f"{jobs_folder}/"))
                     if config_files:
                         config_file = config_files[0]

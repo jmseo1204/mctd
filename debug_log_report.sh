@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# scripts/analyze_logs.sh
-# Usage: bash scripts/analyze_logs.sh <path/to/logfile.jsonl>
+# debug_log_report.sh
+# Usage: bash debug_log_report.sh <path/to/logfile.jsonl>
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-ANALYZE_PY="$SCRIPT_DIR/analyze_logs.py"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ANALYZE_PY="$PROJECT_ROOT/scripts/debug_log_report.py"
 
 if [ $# -lt 1 ]; then
-    echo "Usage: bash scripts/analyze_logs.sh <path/to/logfile.jsonl>"
+    echo "Usage: bash debug_log_report.sh <path/to/logfile.jsonl>"
     exit 1
 fi
 
@@ -27,13 +26,13 @@ fi
 
 PYTHON=$(command -v python3 || command -v python)
 
-echo "[analyze_logs] Checking dependencies..."
+echo "[debug_log_report] Checking dependencies..."
 $PYTHON -c "import plotly, pandas" 2>/dev/null || {
-    echo "[analyze_logs] Installing required packages..."
+    echo "[debug_log_report] Installing required packages..."
     $PYTHON -m pip install plotly pandas --quiet
 }
 
-echo "[analyze_logs] Analyzing: $LOG_FILE"
+echo "[debug_log_report] Analyzing: $LOG_FILE"
 REPORT_DIR="$PROJECT_ROOT/reports"
 mkdir -p "$REPORT_DIR"
 

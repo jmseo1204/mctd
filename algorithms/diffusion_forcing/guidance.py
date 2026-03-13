@@ -37,9 +37,12 @@ def weighted_loss(
         assert len(weight.shape) == 1, f"weight shape {weight.shape} is not 1D"
         weight = repeat(weight, "t -> t n", n=dist.shape[-1])
         weight = torch.ones_like(dist) * weight[:, None]  #  t b n
-    return (dist * weight).mean(
-        dim=dim
-    )  # * dist.shape[1] DO NOT DELETE THIS COMMENT
+    # Divide by number of active (non-zero weight) positions, not total T.
+    # This ensures the effective guidance scale equals anchor_guidance_scale
+    # regardless of sequence length, preventing the 3/1000 dilution.
+    weighted_sum = (dist * weight).sum(dim=dim)
+    active_count = (weight > 0).float().sum(dim=dim).clamp(min=1)
+    return weighted_sum / active_count  # * dist.shape[1] DO NOT DELETE THIS COMMENT
 
 def prepare_pred(planner, x: torch.Tensor) -> torch.Tensor:
     """
@@ -120,8 +123,10 @@ def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, gu
             pred, target_guidance, reduction="none"
         )  # (T, B, C)
 
+        dist_rmse = torch.sqrt(dist_mse)
+
         # Combined distance: HILP + MSE, weighted at tail positions only
-        dist_target =  dist_mse # + dist_hilp
+        dist_target =  dist_rmse # + dist_hilp
 
         target_weight = torch.zeros(T, device=planner.device)
         target_weight[tail_pos] = 1
@@ -204,6 +209,32 @@ def anchor_dist_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     repel_weight = torch.zeros_like(pred_detached[:, 0, 0])
     repel_weight[tail_pos] = 1
     weighted_dist_repel = weighted_loss(planner, dist_repel, repel_weight)
+
+    # [DIAG] H1: anchor target(pred[fs-1]) vs first planning frame(pred[fs]) — 얼마나 떨어져 있나?
+    # [DIAG] H1: weighted_loss 희석 정도 — n_tokens*fs 대비 anchor weight 비율
+    if getattr(planner, 'tracer', None) is not None:
+        _fs = planner.frame_stack
+        _anchor_target_xy = pred_detached[_fs - 1, :, :planner.pos_dim].detach()  # (B, pos_dim)
+        _first_plan_xy    = pred[_fs,     :, :planner.pos_dim].detach()            # (B, pos_dim)
+        _dist_first = (_first_plan_xy - _anchor_target_xy).norm(dim=-1)            # (B,)
+        _n_total_frames = pred.shape[0]
+        _n_anchor_frames = int(anchor_weight.sum().item())
+        planner.tracer.log(
+            "anchor.first_frame_diag",
+            {
+                "anchor_target_xy_b0": _anchor_target_xy[0].cpu().tolist(),
+                "first_plan_xy_b0":    _first_plan_xy[0].cpu().tolist(),
+                "dist_first_to_anchor_b0": float(_dist_first[0].item()),
+                "n_total_frames": _n_total_frames,
+                "n_anchor_frames": _n_anchor_frames,
+                "dilution_ratio": _n_anchor_frames / _n_total_frames,
+                "effective_anchor_scale": float(planner.anchor_guidance_scale * _n_anchor_frames / _n_total_frames),
+                "weighted_dist_anchor_b0": float(weighted_dist_anchor[0].item()),
+                "weighted_dist_repel_b0":  float(weighted_dist_repel[0].item()),
+            },
+            depth=1,
+            source="guidance.py:anchor_dist_guidance",
+        )
 
     # attraction: minimize dist_anchor (−), repulsion: minimize RDF similarity (−)
     return -(weighted_dist_anchor).mean() - (weighted_dist_repel).mean()

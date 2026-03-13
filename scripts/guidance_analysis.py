@@ -135,7 +135,7 @@ def generate_summary_table(avg_dist_by_scale: Dict[float, List[float]],
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 analyze_guidance_results.py <log_file_path>")
+        print("Usage: python3 scripts/guidance_analysis.py <log_file_path>")
         return
 
     log_path = sys.argv[1]

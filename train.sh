@@ -14,15 +14,22 @@ MAX_RETRIES=20
 RETRY_DELAY=30
 
 # Docker configuration (matches run_jobs.py / train_interactive.sh)
-DOCKER_IMAGE="mctd:0.1"
 DOCKER_USER="jmseo1204"
 DOCKER_PROJECT="/home/$DOCKER_USER/mctd"
-DOCKER_OUTPUTS="/home/$DOCKER_USER/mctd/outputs"
-OUTPUT_MOUNT_DIR="/home/jmseo1204/mctd_outputs"
 OGBENCH_DATA_DIR="/mnt/c/Users/USER/Desktop/test_ogbench/ogbench_data"
 HOME_DIR="$HOME"
 
-EVAL_BASE="$PROJECT_DIR/outputs/downloaded/jmseo1204-seoul-national-university/mctd_eval"
+# Source shared checkpoint utilities (sets MCTD_DOCKER_IMAGE, MCTD_DOCKER_OUTPUTS,
+# MCTD_OUTPUT_MOUNT_DIR, MCTD_EVAL_BASE, and all mctd_* functions)
+MCTD_PROJECT_DIR="$PROJECT_DIR"
+# shellcheck source=scripts/mctd_ckpt_lib.sh
+source "$PROJECT_DIR/scripts/mctd_ckpt_lib.sh"
+
+# Aliases for backward-compat with the rest of this script
+DOCKER_IMAGE="$MCTD_DOCKER_IMAGE"
+DOCKER_OUTPUTS="$MCTD_DOCKER_OUTPUTS"
+OUTPUT_MOUNT_DIR="$MCTD_OUTPUT_MOUNT_DIR"
+EVAL_BASE="$MCTD_EVAL_BASE"
 
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$OUTPUT_MOUNT_DIR"
@@ -33,18 +40,17 @@ mkdir -p "$OUTPUT_MOUNT_DIR"
 echo "===================================================="
 echo "  MCTD Training Launcher"
 echo "===================================================="
-echo "Select observation state dimension:"
-echo "  1) 2D  (x,y position only)   [og_antmaze_giant_navigate]"
-echo "  2) 15D (qpos only)            [og_antmaze_giant_navigate_15d]"
-echo "  3) 29D (full qpos+qvel)       [og_antmaze_giant_navigate_fullstate]"
-echo ""
-read -p "Enter [1-3]: " DIM_SEL
 
-case "$DIM_SEL" in
-    1)
-        TARGET_OBS_DIM=2
+# Step 1: Select state dimension (shared menu → MCTD_TARGET_OBS_DIM, MCTD_DATASET_CONFIG)
+mctd_dim_menu
+
+TARGET_OBS_DIM="$MCTD_TARGET_OBS_DIM"
+DATASET_CONFIG="$MCTD_DATASET_CONFIG"
+
+# Training-specific per-dim settings
+case "$TARGET_OBS_DIM" in
+    2)
         ALGORITHM_CONFIG="df_planning_2d"
-        DATASET_CONFIG="og_antmaze_giant_navigate"
         DEFAULT_JUMP=5
         RUN_NAME="Train_2D_antmaze"
         MODEL_ID_PREFIX="train_2d"
@@ -52,10 +58,8 @@ case "$DIM_SEL" in
         CKPT_MAP_FILE="$PROJECT_DIR/logs/2d_ckpt_model_map.txt"
         MODEL_ID_FILE="$PROJECT_DIR/logs/current_2d_model_id.txt"
         ;;
-    2)
-        TARGET_OBS_DIM=15
+    15)
         ALGORITHM_CONFIG="df_planning_15d"
-        DATASET_CONFIG="og_antmaze_giant_navigate_15d"
         DEFAULT_JUMP=1
         RUN_NAME="Train_15D_antmaze"
         MODEL_ID_PREFIX="train_15d"
@@ -63,20 +67,14 @@ case "$DIM_SEL" in
         CKPT_MAP_FILE="$PROJECT_DIR/logs/15d_ckpt_model_map.txt"
         MODEL_ID_FILE="$PROJECT_DIR/logs/current_15d_model_id.txt"
         ;;
-    3)
-        TARGET_OBS_DIM=29
+    29)
         ALGORITHM_CONFIG="df_planning"
-        DATASET_CONFIG="og_antmaze_giant_navigate_fullstate"
         DEFAULT_JUMP=1
         RUN_NAME="Train_29D_big"
         MODEL_ID_PREFIX="train_29d"
         LOG_FILE="$PROJECT_DIR/logs/train_29d.log"
         CKPT_MAP_FILE="$PROJECT_DIR/logs/29d_ckpt_model_map.txt"
         MODEL_ID_FILE="$PROJECT_DIR/logs/current_29d_model_id.txt"
-        ;;
-    *)
-        echo "Invalid selection '$DIM_SEL'. Exiting."
-        exit 1
         ;;
 esac
 
@@ -133,16 +131,14 @@ host_to_docker_path() {
 }
 
 # ────────────────────────────────────────────────────────
-# update_eval_symlink: find latest last.ckpt in OUTPUT_MOUNT_DIR
-#   and symlink it into EVAL_BASE/$model_id/model.ckpt
+# update_eval_symlink: find latest model.ckpt (training output) in OUTPUT_MOUNT_DIR
+#   and symlink it into EVAL_BASE/$model_id/model.ckpt using a relative path.
 # ────────────────────────────────────────────────────────
 update_eval_symlink() {
     local model_id="$1"
-    local eval_dir="$EVAL_BASE/$model_id"
-    mkdir -p "$eval_dir"
 
-    local latest_ckpt=""
-    local latest_time=0
+    # Find latest model.ckpt in OUTPUT_MOUNT_DIR, excluding mctd_eval symlinks
+    local latest_ckpt="" latest_time=0
     while IFS= read -r f; do
         local ftime
         ftime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
@@ -150,17 +146,54 @@ update_eval_symlink() {
             latest_time=$ftime
             latest_ckpt=$f
         fi
-    done < <(find "$OUTPUT_MOUNT_DIR" -name "last.ckpt" 2>/dev/null)
+    done < <(find "$OUTPUT_MOUNT_DIR" -name "model.ckpt" -not -path "*/mctd_eval/*" 2>/dev/null)
 
     if [ -z "$latest_ckpt" ]; then
-        echo "[symlink] No last.ckpt found in $OUTPUT_MOUNT_DIR, skipping." | tee -a "$LOG_FILE"
+        echo "[symlink] No model.ckpt found in $OUTPUT_MOUNT_DIR, skipping." | tee -a "$LOG_FILE"
         return
     fi
 
     local real_ckpt
     real_ckpt=$(realpath "$latest_ckpt")
-    ln -sf "$real_ckpt" "$eval_dir/model.ckpt"
-    echo "[symlink] $model_id/model.ckpt -> $real_ckpt" | tee -a "$LOG_FILE"
+
+    # Read actual epoch from checkpoint via Docker
+    local docker_ckpt_path
+    docker_ckpt_path=$(host_to_docker_path "$real_ckpt")
+    local actual_epoch
+    actual_epoch=$(docker run --rm --entrypoint python3 \
+        -v "$OUTPUT_MOUNT_DIR":"$DOCKER_OUTPUTS" \
+        "$DOCKER_IMAGE" \
+        -c "import torch,sys; ck=torch.load(sys.argv[1], map_location='cpu', weights_only=False); print(ck.get('epoch', 0))" \
+        "$docker_ckpt_path" 2>/dev/null | grep -E '^[0-9]+$' | head -1 || true)
+    actual_epoch="${actual_epoch:-0}"
+
+    # Update epoch in model_id: replace _Xep_ with _${actual_epoch}ep_
+    local new_model_id
+    new_model_id=$(echo "$model_id" | sed -E "s/_[0-9]+ep_/_${actual_epoch}ep_/")
+
+    # If model_id changed, rename eval dir and update globals
+    if [ "$new_model_id" != "$model_id" ]; then
+        local old_eval_dir="$EVAL_BASE/$model_id"
+        local new_eval_dir="$EVAL_BASE/$new_model_id"
+        if [ -d "$old_eval_dir" ]; then
+            mv "$old_eval_dir" "$new_eval_dir" 2>/dev/null || mkdir -p "$new_eval_dir"
+        else
+            mkdir -p "$new_eval_dir"
+        fi
+        echo "[symlink] Renamed model_id: $model_id → $new_model_id  (epoch=$actual_epoch)" | tee -a "$LOG_FILE"
+        MODEL_ID="$new_model_id"
+        echo "$MODEL_ID" > "$MODEL_ID_FILE"
+        model_id="$new_model_id"
+    else
+        mkdir -p "$EVAL_BASE/$model_id"
+    fi
+
+    local eval_dir="$EVAL_BASE/$model_id"
+    # Use a relative symlink so it resolves correctly both on host and inside Docker
+    local rel_path
+    rel_path=$(realpath --relative-to="$eval_dir" "$real_ckpt")
+    ln -sf "$rel_path" "$eval_dir/model.ckpt"
+    echo "[symlink] $model_id/model.ckpt -> $rel_path  (epoch=$actual_epoch)" | tee -a "$LOG_FILE"
 
     # Update ckpt_dir → model_id map
     local ckpt_dir
@@ -193,137 +226,23 @@ else
 fi
 
 # ────────────────────────────────────────────────────────
-# Scan checkpoints via Docker (directory scan, no stdin pipe)
+# Scan checkpoints via Docker
 # ────────────────────────────────────────────────────────
 echo "========================================"
 echo "[$(date)] Searching for ${TARGET_OBS_DIM}D checkpoints (obs_dim=$TARGET_OBS_DIM)..."
-
-CKPT_DIRS=()
-
-SCANNER_SCRIPT=$(mktemp /tmp/mctd_scan_XXXXXX.py)
-chmod 644 "$SCANNER_SCRIPT"
-cat > "$SCANNER_SCRIPT" <<'PYEOF'
-import sys, torch
-from pathlib import Path
-
-docker_outputs   = sys.argv[1]  # /home/jmseo1204/mctd/outputs  (inside Docker)
-output_mount_dir = sys.argv[2]  # /home/jmseo1204/mctd_outputs   (on host)
-target_dim       = int(sys.argv[3])
-
-base = Path(docker_outputs)
-if not base.exists():
-    print(f"ERROR: {docker_outputs} not found inside container", file=sys.stderr)
-    sys.exit(0)
-
-for ckpt_path in sorted(base.rglob("last.ckpt")):
-    # Skip downloaded/ — those are symlinks, not real checkpoints
-    if "downloaded" in ckpt_path.parts:
-        continue
-    try:
-        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-        sd   = ckpt.get("state_dict", {})
-        dm   = sd.get("data_mean")
-        if dm is None or int(dm.shape[0]) != target_dim:
-            continue
-        epoch = ckpt.get("epoch", 0)
-        mtime = int(ckpt_path.stat().st_mtime)
-        # Convert docker path → host path for shell-side use
-        host_path = output_mount_dir + str(ckpt_path)[len(docker_outputs):]
-        # Derive human-readable name from date/time path components
-        parts = ckpt_path.parts
-        try:
-            idx = parts.index("outputs") + 1
-            name = "/".join(parts[idx:idx+2])
-        except (ValueError, IndexError):
-            name = str(ckpt_path.parent)
-        print(f"{name}|{host_path}|{mtime}|{epoch}")
-    except Exception as e:
-        print(f"SCAN_ERR {ckpt_path}: {e}", file=sys.stderr)
-PYEOF
-
 echo "[$(date)] Scanning checkpoints via Docker (filtering obs_dim=$TARGET_OBS_DIM)..."
-mapfile -t FILTERED < <(
-    docker run --rm \
-        --entrypoint python3 \
-        -v "$OUTPUT_MOUNT_DIR":"$DOCKER_OUTPUTS" \
-        -v "$SCANNER_SCRIPT":"$SCANNER_SCRIPT":ro \
-        "$DOCKER_IMAGE" \
-        "$SCANNER_SCRIPT" "$DOCKER_OUTPUTS" "$OUTPUT_MOUNT_DIR" "$TARGET_OBS_DIM" \
-        2>/dev/null | grep -E '^[^|]+\|[^|]+\|[0-9]+\|[0-9]+$'
-)
-rm -f "$SCANNER_SCRIPT"
 
-for entry in "${FILTERED[@]:-}"; do
-    [ -n "$entry" ] && CKPT_DIRS+=("$entry")
-done
+mctd_scan_ckpts "$TARGET_OBS_DIM"
+CKPT_DIRS=("${MCTD_CKPT_DIRS[@]:-}")
 
 # ────────────────────────────────────────────────────────
 # Present checkpoint menu and let user select
 # ────────────────────────────────────────────────────────
-SELECTED_CKPT=""
-SELECTED_EPOCH=0
-MODEL_ID=""
+mctd_ckpt_menu "$TARGET_OBS_DIM"
 
-if [ ${#CKPT_DIRS[@]} -gt 0 ]; then
-    echo ""
-    echo "========================================"
-    echo "Found ${#CKPT_DIRS[@]} checkpoint(s) with obs_dim=${TARGET_OBS_DIM}:"
-    echo "========================================"
-
-    mapfile -t sorted < <(printf '%s\n' "${CKPT_DIRS[@]}" | sort -t'|' -k3 -rn)
-
-    echo "  [0] Start from scratch (fresh training)"
-    for i in "${!sorted[@]}"; do
-        entry="${sorted[$i]}"
-        ckpt_name=$(echo "$entry" | cut -d'|' -f1)
-        ckpt_path=$(echo "$entry" | cut -d'|' -f2)
-        epoch_num=$(echo "$entry" | cut -d'|' -f4)
-        epoch_num="${epoch_num:-0}"
-        [ -z "$ckpt_path" ] && continue
-        ckpt_dir=$(dirname "$(realpath "$ckpt_path" 2>/dev/null || echo "$ckpt_path")")
-        mapped_id=""
-        if [ -f "$CKPT_MAP_FILE" ]; then
-            mapped_id=$(grep "^$ckpt_dir|" "$CKPT_MAP_FILE" | cut -d'|' -f2 | tail -1 || true)
-        fi
-        id_hint=""
-        [ -n "$mapped_id" ] && id_hint=" [eval: $mapped_id]"
-        printf "  [%d] %s  (epoch %s)%s\n" "$((i+1))" "$ckpt_name" "$epoch_num" "$id_hint"
-    done
-    echo ""
-
-    read -p "Select checkpoint to resume [0-${#sorted[@]}]: " SELECTION
-
-    if [ "$SELECTION" = "0" ] || [ -z "$SELECTION" ]; then
-        SELECTED_CKPT=""
-        SELECTED_EPOCH=0
-        echo "Starting fresh training."
-    else
-        idx=$((SELECTION - 1))
-        if [ "$idx" -ge 0 ] && [ "$idx" -lt "${#sorted[@]}" ]; then
-            entry="${sorted[$idx]}"
-            SELECTED_CKPT=$(echo "$entry" | cut -d'|' -f2)
-            SELECTED_EPOCH=$(echo "$entry" | cut -d'|' -f4)
-            SELECTED_EPOCH="${SELECTED_EPOCH:-0}"
-            ckpt_name_sel=$(echo "$entry" | cut -d'|' -f1)
-            echo "Resuming from: $SELECTED_CKPT  (epoch $SELECTED_EPOCH)"
-
-            ckpt_dir=$(dirname "$(realpath "$SELECTED_CKPT" 2>/dev/null || echo "$SELECTED_CKPT")")
-            if [ -f "$CKPT_MAP_FILE" ]; then
-                MODEL_ID=$(grep "^$ckpt_dir|" "$CKPT_MAP_FILE" | cut -d'|' -f2 | tail -1 || true)
-            fi
-            if [ -z "$MODEL_ID" ] && [[ "$ckpt_name_sel" == train_* ]]; then
-                MODEL_ID="$ckpt_name_sel"
-                echo "[model_id] Using checkpoint name as model_id: $MODEL_ID"
-            fi
-        else
-            echo "Invalid selection. Starting fresh training."
-            SELECTED_CKPT=""
-            SELECTED_EPOCH=0
-        fi
-    fi
-else
-    echo "No existing ${TARGET_OBS_DIM}D checkpoints found. Starting fresh training."
-fi
+SELECTED_CKPT="${MCTD_SELECTED_CKPT:-}"
+SELECTED_EPOCH="${MCTD_SELECTED_EPOCH:-0}"
+MODEL_ID="${MCTD_SELECTED_MODEL_ID:-}"
 
 # ────────────────────────────────────────────────────────
 # Ask user for optional name postfix
@@ -378,7 +297,7 @@ while [ $attempt -lt $MAX_RETRIES ]; do
                 LATEST_TIME=$ftime
                 LATEST_HOST=$f
             fi
-        done < <(find "$OUTPUT_MOUNT_DIR" -name "last.ckpt" 2>/dev/null)
+        done < <(find "$OUTPUT_MOUNT_DIR" -name "model.ckpt" -not -path "*/mctd_eval/*" 2>/dev/null)
         if [ -n "$LATEST_HOST" ]; then
             LOAD_CKPT="$(host_to_docker_path "$LATEST_HOST")"
         fi

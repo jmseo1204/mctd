@@ -298,6 +298,25 @@ class BaseLightningExperiment(BaseExperiment):
 
             callbacks.append(_KeepLatestCheckpoint())
 
+            class _RenameLastCheckpoint(pl.callbacks.Callback):
+                """Rename last.ckpt → model.ckpt after each save (atomic, no copy)."""
+                def _rename(self):
+                    last = _ckpt_dir / "last.ckpt"
+                    model = _ckpt_dir / "model.ckpt"
+                    if last.exists():
+                        last.replace(model)
+
+                def on_train_start(self, trainer, pl_module):
+                    self._rename()  # handle any pre-existing last.ckpt on resume
+
+                def on_train_epoch_end(self, trainer, pl_module):
+                    self._rename()
+
+                def on_train_end(self, trainer, pl_module):
+                    self._rename()
+
+            callbacks.append(_RenameLastCheckpoint())
+
         # Custom Callback for Overall Epoch Progress Bar
         class OverallEpochProgressBar(pl.callbacks.Callback):
             def __init__(self, total_epochs):
