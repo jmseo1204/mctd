@@ -8,6 +8,7 @@ episode_len: 50
 observation_shape: [2]
 action_dim: 8
 goal_dim: 2
+pos_dim: 2   # Spatial dims for MCTS/guidance (x, y only)
 observation_mean: [25.435719, 17.564924]
 observation_std:  [16.76764, 11.864943]
 action_mean: []

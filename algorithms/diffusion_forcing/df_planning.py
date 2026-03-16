@@ -406,7 +406,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 obs_np[:, 1] = grid_y_flat
 
                 target_np = np.zeros(self.observation_dim, dtype=np.float32)
-                target_np[:2] = target_pos[:2]
+                target_np[:self.pos_dim] = target_pos[:self.pos_dim]
 
                 # Must use torch.enable_grad() because validation_step is wrapped
                 # in @torch.no_grad(), which prevents gradient computation even for
@@ -419,7 +419,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     values.sum().backward()
 
                 if obs_batch.grad is not None:
-                    hilp_grads = obs_batch.grad[:, :2].detach().cpu().numpy().reshape(*X.shape, 2)
+                    hilp_grads = obs_batch.grad[:, :self.pos_dim].detach().cpu().numpy().reshape(*X.shape, self.pos_dim)
                     hilp_norms = np.linalg.norm(hilp_grads, axis=-1)
                 else:
                     import sys as _sys
@@ -495,6 +495,24 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         conditions = None
         # bundles = bundles[::self.jump]
         return bundles, conditions, masks
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """Override observation_dim from checkpoint if it conflicts with config."""
+        parent = super()
+        if hasattr(parent, "on_load_checkpoint"):
+            parent.on_load_checkpoint(checkpoint)
+        sd = checkpoint.get("state_dict", {})
+        dm = sd.get("data_mean")
+        if dm is not None:
+            ckpt_obs_dim = int(dm.shape[0]) - self.action_dim - int(self.use_reward)
+            if ckpt_obs_dim != self.observation_dim:
+                import warnings
+                warnings.warn(
+                    f"[DFPlanning] Config observation_dim={self.observation_dim} does not match "
+                    f"checkpoint ({ckpt_obs_dim}). Overriding with checkpoint value.",
+                    stacklevel=2,
+                )
+                self.observation_dim = ckpt_obs_dim
 
     def training_step(self, batch, batch_idx):
         _step = self.trainer.global_step if self.trainer else 0
@@ -2984,7 +3002,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 {
                     "parent_node_name": parent_node.name,
                     "parent_node_depth": parent_node.depth,
-                    "obs_parent_pos_raw_xy": parent_obs_pos[:2].tolist(),
+                    "obs_parent_pos_raw_xy": parent_obs_pos[:self.pos_dim].tolist(),
                     "obs_parent_token_unnorm_xy": _obs_tok_unnorm[0, 0, :self.pos_dim].cpu().tolist(),
                     "use_dynamic_obs_padding": self.use_dynamic_obs_padding,
                 },
