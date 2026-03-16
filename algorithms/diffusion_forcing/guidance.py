@@ -61,7 +61,7 @@ def prepare_pred(planner, x: torch.Tensor) -> torch.Tensor:
     )  # (t*fs, b, c)
     return planner._unnormalize_x(pred)
 
-def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, guidance_scale: torch.Tensor) -> torch.Tensor:
+def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, guidance_scale=None) -> torch.Tensor:
     """
     Target guidance to reach goal/start.
 
@@ -126,14 +126,13 @@ def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, gu
         dist_rmse = torch.sqrt(dist_mse)
 
         # Combined distance: HILP + MSE, weighted at tail positions only
-        dist_target =  dist_rmse # + dist_hilp
+        dist_target =  dist_rmse + dist_hilp
 
         target_weight = torch.zeros(T, device=planner.device)
         target_weight[tail_pos] = 1
 
-        weighted_dist_target = weighted_loss(planner, dist_target, target_weight)
+        dist_per_batch = weighted_loss(planner, dist_target, target_weight)
 
-        dist_per_batch = guidance_scale * weighted_dist_target
 
         # Specifically for dist_left, the last token is the most important
         # dist is (t fs) b n
@@ -141,9 +140,16 @@ def goal_guidance(planner, x: torch.Tensor, goal: torch.Tensor, horizon: int, gu
             -1
         ]
 
+        if guidance_scale is not None:
+            if hasattr(guidance_scale, 'tolist'):
+                scales = guidance_scale.tolist()
+            elif hasattr(guidance_scale, '__iter__'):
+                scales = [float(s) for s in guidance_scale]
+            else:
+                scales = [float(guidance_scale)]
+            print(f"Scales: {scales}")
         print(f"Dist per batch: {dist_per_batch.tolist()}")
         print(f"Final token dist: {last_token_dist.tolist()}")
-        print(f"Scales: {guidance_scale.tolist()}")
 
     else:
         raise NotImplementedError(
@@ -341,8 +347,19 @@ def combined_guidance(planner, x_start, goal, horizon, guidance_scale):
     Returns:
         guidance_dict: dict of guidance losses
     """
+    anchor_loss = anchor_dist_guidance(planner, x_start, horizon) * planner.anchor_guidance_scale
+    # NOTE: goal_guidance() no longer takes guidance_scale; scaling is done here only.
+    # [DIAG] Log effective scale ratio (anchor vs goal) to verify balance hypothesis.
+    _goal_inner = goal_guidance(planner, x_start, goal, horizon)
+    goal_loss = guidance_scale * _goal_inner
+    print(f"[GUIDANCE SCALE DIAG] anchor_loss={float(anchor_loss):.4f} (scale={planner.anchor_guidance_scale}) | "
+          f"goal_inner={float(_goal_inner):.4f} | goal_loss={float(goal_loss):.4f} "
+          f"(eff_goal_scale={float(guidance_scale.mean()):.1f}) | "
+          f"goal/anchor_ratio={abs(float(goal_loss)) / (abs(float(anchor_loss)) + 1e-8):.2f}x")
+    print(f"Scales: {guidance_scale.tolist()}")  # guidance_analysis.py 파싱용
+    rdf_loss = segment_rdf_guidance(planner, x_start, horizon) * planner.rdf_guidance_scale
     return {
-        "anchor": anchor_dist_guidance(planner, x_start, horizon) * planner.anchor_guidance_scale,
-        "goal": guidance_scale * goal_guidance(planner, x_start, goal, horizon, guidance_scale),
-        "rdf": segment_rdf_guidance(planner, x_start, horizon) * planner.rdf_guidance_scale,
+        "anchor": anchor_loss,
+        "goal": goal_loss,
+        "rdf": rdf_loss,
     }

@@ -351,6 +351,124 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
     return images
 
 
+def make_combined_grad_field_image(
+    env_id: str,
+    grad_field: dict,
+    target_pos,
+    start,
+    goal,
+) -> np.ndarray:
+    """
+    Draw RMSE and HILP gradient fields on a single figure.
+
+    - RMSE arrows: blue, all same length (unit vectors toward target).
+    - HILP arrows: red, unit-vector direction, alpha ∝ log(hilp_norm+1)
+      so near-zero gradient regions are transparent.
+    - Arrow length is normalized for both types (direction only), magnitude
+      is encoded via color/alpha to avoid invisibility when raw magnitudes differ.
+
+    Args:
+        env_id: Environment ID string.
+        grad_field: Dict from _compute_guidance_grad_fields.
+        target_pos: (2,) world coords of the fixed target (green star).
+        start: (batch, 2) world coords for start marker.
+        goal: (batch, 2) world coords for goal marker.
+
+    Returns:
+        RGBA uint8 numpy image.
+    """
+    X_w = grad_field['x_grid']
+    Y_w = grad_field['y_grid']
+
+    if env_id in OGBENCH_ENVS:
+        X_p = X_w / 4 + 1
+        Y_p = Y_w / 4 + 1
+        tpx = float(target_pos[0]) / 4 + 1
+        tpy = float(target_pos[1]) / 4 + 1
+    else:
+        X_p, Y_p = X_w, Y_w
+        tpx, tpy = float(target_pos[0]), float(target_pos[1])
+
+    def _normalize_grad(grads: np.ndarray):
+        """
+        Normalize each component (U, V) of the gradient field using
+        the global mean and std of the raw magnitudes across all grid points.
+        Returns (U_norm, V_norm, mean_scalar, std_scalar).
+        """
+        U_raw = grads[:, :, 0]
+        V_raw = grads[:, :, 1]
+        mag = np.sqrt(U_raw ** 2 + V_raw ** 2)   # (H, W) per-point magnitude
+        m = float(mag.mean())
+        s = float(mag.std()) + 1e-8
+        # Normalise each vector by (mag - mean) / std so typical arrows ≈ 1 unit
+        scale = (mag - m) / s + 1.0   # shift so mean → 1.0
+        # Avoid negative scales (can flip arrow direction)
+        scale = np.clip(scale, 0.0, None)
+        denom = mag + 1e-8
+        U_norm = U_raw / denom * scale
+        V_norm = V_raw / denom * scale
+        return U_norm, V_norm, m, s
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    maze_grid = get_maze_grid(env_id) if is_grid_env(env_id) else None
+    plot_maze_layout(ax, maze_grid)
+
+    # --- RMSE arrows (blue) — normalize using mean/std of raw magnitudes ---
+    rmse_grads = grad_field['rmse_grads']   # (H, W, 2)
+    U_r, V_r, rmse_mean, rmse_std = _normalize_grad(rmse_grads)
+    ax.quiver(
+        X_p, Y_p, U_r, V_r,
+        color='royalblue',
+        alpha=0.55,
+        angles='xy',
+        pivot='mid',
+        scale=None,
+        zorder=3,
+        label=f'RMSE  (mean={rmse_mean:.2e}, std={rmse_std:.2e})',
+    )
+
+    # --- HILP arrows (red) — normalize using mean/std of raw magnitudes ---
+    hilp_grads = grad_field['hilp_grads']   # (H, W, 2)
+    U_h, V_h, hilp_mean, hilp_std = _normalize_grad(hilp_grads)
+    ax.quiver(
+        X_p, Y_p, U_h, V_h,
+        color='crimson',
+        alpha=0.55,
+        angles='xy',
+        pivot='mid',
+        scale=None,
+        zorder=4,
+        label=f'HILP  (mean={hilp_mean:.2e}, std={hilp_std:.2e})',
+    )
+
+    # Diagnostics
+    import sys as _sys
+    print(
+        f"[TD_field DIAG] RMSE mag mean={rmse_mean:.4e} std={rmse_std:.4e} | "
+        f"HILP mag mean={hilp_mean:.4e} std={hilp_std:.4e}",
+        file=_sys.stderr, flush=True,
+    )
+
+    ax.scatter(tpx, tpy, c='green', marker='*', s=300, zorder=10,
+               edgecolors='darkgreen', linewidth=1.5, label='Target')
+
+    if start is not None and goal is not None:
+        if env_id in OGBENCH_ENVS:
+            start_goal = (np.array(start[0]) / 4 + 1, np.array(goal[0]) / 4 + 1)
+        else:
+            start_goal = (start[0], goal[0])
+        plot_start_goal(ax, start_goal)
+
+    ax.set_title('TD Gradient Field  (blue=RMSE, red=HILP)')
+    ax.legend(loc='upper right', fontsize=8)
+    fig.tight_layout()
+    fig.canvas.draw()
+    img_shape = fig.canvas.get_width_height()[::-1] + (4,)
+    img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).copy().reshape(img_shape)
+    plt.close()
+    return img
+
+
 def make_convergence_animation(
     env_id,
     plan_history,

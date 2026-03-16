@@ -14,6 +14,7 @@ from PIL import Image
 from .df_base import DiffusionForcingBase
 from utils.logging_utils import (
     make_trajectory_images,
+    make_combined_grad_field_image,
     get_random_start_goal,
     make_convergence_animation,
     make_mpc_animation,
@@ -339,6 +340,103 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         return {'X': X, 'Y': Y, 'values': values}
 
+    def _compute_guidance_grad_fields(
+        self,
+        target_pos: np.ndarray,
+        grid_step: float = 2.0,
+    ) -> Optional[dict]:
+        """
+        Compute RMSE and HILP gradient fields over the maze for visualization.
+
+        Args:
+            target_pos: (2,) world coordinates of the fixed target (green star).
+            grid_step: Grid spacing in world coordinates.
+
+        Returns:
+            dict with keys:
+                'x_grid', 'y_grid': (H_g, W_g) world-coord meshgrids
+                'rmse_grads': (H_g, W_g, 2) unit vectors pointing toward target
+                'hilp_grads': (H_g, W_g, 2) autograd-computed gradients
+                'rmse_norms': (H_g, W_g) always 1.0
+                'hilp_norms': (H_g, W_g) ||hilp_grad|| per grid point
+            or None if target_pos is None.
+        """
+        if target_pos is None:
+            return None
+
+        # --- 1. Grid extent (same logic as _compute_hilp_heatmap) ---
+        if is_grid_env(self.env_id):
+            maze_grid = get_maze_grid(self.env_id)
+            H = len(maze_grid)
+            W = len(maze_grid[0])
+            x_min, x_max = (0.5 - 1) * 4, (H + 0.5 - 1) * 4
+            y_min, y_max = (0.5 - 1) * 4, (W + 0.5 - 1) * 4
+        else:
+            obs_mean_np = self.data_mean[:self.pos_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[:self.pos_dim])
+            obs_std_np  = self.data_std[:self.pos_dim].cpu().numpy()  if isinstance(self.data_std,  torch.Tensor) else np.array(self.data_std[:self.pos_dim])
+            x_min, x_max = obs_mean_np[0] - 3 * obs_std_np[0], obs_mean_np[0] + 3 * obs_std_np[0]
+            y_min, y_max = obs_mean_np[1] - 3 * obs_std_np[1], obs_mean_np[1] + 3 * obs_std_np[1]
+
+        xs = np.arange(x_min, x_max, grid_step)
+        ys = np.arange(y_min, y_max, grid_step)
+        X, Y = np.meshgrid(xs, ys)   # (H_g, W_g)
+        N = X.size
+        grid_x_flat = X.ravel().astype(np.float32)
+        grid_y_flat = Y.ravel().astype(np.float32)
+
+        # --- 2. RMSE gradient (analytic, numpy only) ---
+        tx, ty = float(target_pos[0]), float(target_pos[1])
+        dx = grid_x_flat - tx
+        dy = grid_y_flat - ty
+        dist = np.sqrt(dx**2 + dy**2 + 1e-8)
+        # guidance direction = toward target = -(p - t)/dist
+        rmse_gx = -dx / dist
+        rmse_gy = -dy / dist
+        rmse_grads = np.stack([rmse_gx, rmse_gy], axis=-1).reshape(*X.shape, 2)
+        rmse_norms = np.ones(X.shape, dtype=np.float32)
+
+        # --- 3. HILP gradient (batched autograd) ---
+        hilp_grads = np.zeros((*X.shape, 2), dtype=np.float32)
+        hilp_norms = np.zeros(X.shape, dtype=np.float32)
+
+        if hasattr(self, '_hilp_value_fn_instance') and self._hilp_value_fn_instance is not None:
+            try:
+                obs_np = np.zeros((N, self.observation_dim), dtype=np.float32)
+                obs_np[:, 0] = grid_x_flat
+                obs_np[:, 1] = grid_y_flat
+
+                target_np = np.zeros(self.observation_dim, dtype=np.float32)
+                target_np[:2] = target_pos[:2]
+
+                # Must use torch.enable_grad() because validation_step is wrapped
+                # in @torch.no_grad(), which prevents gradient computation even for
+                # tensors with requires_grad=True.
+                with torch.enable_grad():
+                    obs_batch = torch.tensor(obs_np, dtype=torch.float32, device=self.device, requires_grad=True)
+                    target_t = torch.tensor(target_np, dtype=torch.float32, device=self.device).unsqueeze(0).expand(N, -1)
+
+                    values = self._compute_hilp_values(obs_batch, target_t, use_no_grad=False)  # (N,)
+                    values.sum().backward()
+
+                if obs_batch.grad is not None:
+                    hilp_grads = obs_batch.grad[:, :2].detach().cpu().numpy().reshape(*X.shape, 2)
+                    hilp_norms = np.linalg.norm(hilp_grads, axis=-1)
+                else:
+                    import sys as _sys
+                    print(f"[grad_field HILP] obs_batch.grad is None after backward()", file=_sys.stderr, flush=True)
+            except Exception as e:
+                import sys as _sys
+                print(f"[grad_field HILP] skipped: {e}", file=_sys.stderr, flush=True)
+
+        return {
+            'x_grid': X,
+            'y_grid': Y,
+            'rmse_grads': rmse_grads,
+            'hilp_grads': hilp_grads,
+            'rmse_norms': rmse_norms,
+            'hilp_norms': hilp_norms,
+        }
+
     def _build_model(self):
         mean = list(self.observation_mean) + list(self.action_mean)
         std = list(self.observation_std) + list(self.action_std)
@@ -389,8 +487,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         bundles = torch.cat([init_bundle, bundles], dim=1)  # (b, fs+n_frames-1, c)
         bundles = rearrange(
             bundles, "b (t fs) ... -> t b fs ...", fs=self.frame_stack
-        )  # (n_tokens+1, b, fs, c)
-        bundles = bundles.flatten(2, 3).contiguous()  # (n_tokens+1, b, fs*c)
+        )  # (n_tokens, b, fs, c)  where n_tokens = n_seg+1 = (n_frames-1)//fs + 1
+        bundles = bundles.flatten(2, 3).contiguous()  # (n_tokens, b, fs*c)
 
         if self.cfg.external_cond_dim:
             raise ValueError("external_cond_dim not needed in planning")
@@ -438,7 +536,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         )
 
         # Per-dimension loss logging (before reduction)
-        # loss shape: (n_tokens+1, B, fs*C), C = obs_dim + action_dim
+        # loss shape: (n_tokens, B, fs*C), C = obs_dim + action_dim  [n_tokens = xs.shape[0]]
         with torch.no_grad():
             _loss_4d = rearrange(loss.detach(), "t b (fs c) -> t b fs c", fs=self.frame_stack)
             _w = rearrange(weights.float(), "(t fs) b -> t b fs 1", fs=self.frame_stack)
@@ -1532,6 +1630,23 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 # Create forward trajectory image with both plan (red) and node trajectory (blue)
                 plan_positions = plan_unnormalized[:, :, :self.pos_dim].detach().cpu().numpy()
 
+                # [DIAG] START DRIFT: plan_positions[0] vs start in world coordinates
+                import sys as _sys, math as _m
+                _p0_world = plan_positions[0, 0].tolist()
+                _s0_world = start_numpy[0].tolist()
+                _g0_world = goal_numpy[0].tolist()
+                _drift = _m.sqrt(sum((a - b) ** 2 for a, b in zip(_p0_world, _s0_world)))
+                _dist_to_goal = _m.sqrt(sum((a - b) ** 2 for a, b in zip(_p0_world, _g0_world)))
+                print(
+                    f"[START DRIFT] MCTS step={steps} tree={'FWD' if expanded_tree_idx == 1 else 'BWD'} "
+                    f"depth={best_node.depth} | "
+                    f"plan[0]={[round(v,2) for v in _p0_world]} "
+                    f"start={[round(v,2) for v in _s0_world]} "
+                    f"goal={[round(v,2) for v in _g0_world]} | "
+                    f"dist_to_start={_drift:.2f}  dist_to_goal={_dist_to_goal:.2f}",
+                    file=_sys.stderr, flush=True,
+                )
+
                 # [DIAG] H4 (핵심): plan_positions[0] vs start — 시각화되는 첫 frame이 start와 얼마나 떨어져있나
                 if self.tracer is not None:
                     import math as _math
@@ -1560,8 +1675,19 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
                 # Extract best_node's target_node obs_pos (single green point)
                 best_node_target_pos = None
-                if best_node.target_node is not None and best_node.target_node.obs_pos is not None:
-                    best_node_target_pos = best_node.target_node.obs_pos  # shape: (2,)
+                if best_node.target_node is None:
+                    import sys as _sys
+                    print(f"[TARGET MISSING] step={steps}: best_node.target_node is None", file=_sys.stderr, flush=True)
+                elif best_node.target_node.obs_pos is None:
+                    import sys as _sys
+                    print(
+                        f"[TARGET MISSING] step={steps}: target_node='{best_node.target_node.name}' "
+                        f"depth={best_node.target_node.depth} obs_pos is None "
+                        f"(plan_history len={len(best_node.target_node.plan_history)})",
+                        file=_sys.stderr, flush=True,
+                    )
+                else:
+                    best_node_target_pos = best_node.target_node.obs_pos  # (obs_dim,) world coords
 
                 # Compute HILP value heatmap if model is already loaded
                 hilp_heatmap = None
@@ -1590,6 +1716,26 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 self.log_image(
                     f"plan/plan_at_{steps}", Image.fromarray(forward_image)
                 )
+
+                # Gradient field visualizations (RMSE + HILP combined)
+                if best_node_target_pos is not None:
+                    try:
+                        _grad_fields = self._compute_guidance_grad_fields(best_node_target_pos)
+                        if _grad_fields is not None:
+                            _gf_img = make_combined_grad_field_image(
+                                self.env_id,
+                                _grad_fields,
+                                best_node_target_pos,
+                                start_numpy,
+                                goal_numpy,
+                            )
+                            self.log_image(
+                                f"TD_field/grad_field_at_{steps}",
+                                Image.fromarray(_gf_img),
+                            )
+                    except Exception as _gf_err:
+                        import sys as _sys
+                        print(f"[grad_field] skipped: {_gf_err}", file=_sys.stderr, flush=True)
 
                 # Create reverse trajectory image (swap start and goal for visualization)
                 
@@ -2465,16 +2611,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                             _plan_t_fs, "(t fs) b c -> t b (fs c)", fs=self.frame_stack
                         )  # (plan_tokens, 1, fs*c)
                         _sim_pad_tokens = self.n_tokens - _plan_tokens_val - 1
-                        _obs_parent = torch.zeros(
-                            (1, 1, _plan_rearranged.shape[-1]),
-                            device=self.device,
-                        )
                         _sim_pad = torch.zeros(
                             (_sim_pad_tokens, 1, _plan_rearranged.shape[-1]),
                             device=self.device,
                         )
                         value_estimation_plans.append(
-                            torch.cat([_obs_parent, _plan_rearranged, _sim_pad], dim=0)
+                            torch.cat([_plan_rearranged, _sim_pad], dim=0)
                         )  # (n_tokens, 1, fs*c)
 
                     simul_noiselevel_zero_padding_end = time.time()

@@ -444,6 +444,11 @@ class Diffusion(nn.Module):
         sigma = self.add_shape_channels(sigma)
 
         if guidance_fn is not None:
+            # DPS-style guidance: ∂loss/∂x_t flows through the model Jacobian.
+            # This gives net coeff ≈ sqrt_recipm1·sqrt(α_next) - c ≈ 0.41 at high noise,
+            # naturally steering the trajectory toward obs_parent conditioning.
+            # pred_noise is modified; x_start is RECOMPUTED from the modified pred_noise
+            # so that pred_noise and x_start remain consistent via the forward model.
             with torch.enable_grad():
                 x = x.detach().requires_grad_()
 
@@ -452,76 +457,58 @@ class Diffusion(nn.Module):
                     t=clipped_curr_noise_level,
                     external_cond=external_cond,
                 )
-                
-                # Direct Reconstruction Guidance with Normalization
-                # For frozen tokens (curr == next noise level, e.g. obs_parent at level 0),
-                # replace model's (potentially contaminated) pred_x_start with the ground
-                # truth orig_x.  This ensures anchor_target = actual obs_parent_token and
-                # keeps grad[frozen] = 0, consistent with the x update mask at line ~547.
-                with torch.enable_grad():
-                    frozen_mask = self.add_shape_channels(curr_noise_level == next_noise_level)
-                    masked_pred_x_start = torch.where(frozen_mask, orig_x, model_pred.pred_x_start)
-                    guidance_results = guidance_fn(masked_pred_x_start)
-                    
-                    if isinstance(guidance_results, dict):
-                        # Multi-component guidance: compute individual grads for logging and analysis
-                        grad = torch.zeros_like(x)
-                        norms = {}
-                        _tracer = get_tracer()
-                        # Use retain_graph=True for all but the last component to get individual grads
-                        items = list(guidance_results.items())
-                        for i, (name, loss) in enumerate(items):
-                            is_last = (i == len(items) - 1)
-                            g = torch.autograd.grad(loss.sum(), x, retain_graph=not is_last, allow_unused=True)[0]
-                            if g is None:
-                                g = torch.zeros_like(x)
-                            grad = grad + g
-                            norms[name] = g.norm().item()
-                            if _tracer is not None:
-                                with _tracer.scope("gradient_nan_diagnosis", phase="guidance"):
-                                    _tracer.log(
-                                        f"gradient.component.{name}",
-                                        {
-                                            "loss_value":    float(loss.detach().sum()),
-                                            "loss_has_nan":  bool(torch.isnan(loss).any()),
-                                            "loss_has_inf":  bool(torch.isinf(loss).any()),
-                                            "grad_norm":     float(g.detach().norm()),
-                                            "grad_has_nan":  bool(torch.isnan(g).any()),
-                                            "grad_has_inf":  bool(torch.isinf(g).any()),
-                                            "grad_max_abs":  float(g.detach().abs().max()),
-                                        },
-                                        depth=1,
-                                    )
 
-                        # Log individual norm ratios for analysis
-                        total_norm = sum(norms.values())
-                        if total_norm > 1e-8:
-                            ratio_parts = [f"{k}: {v/total_norm:.2%}" for k, v in norms.items()]
-                            print(f"[GUIDANCE RATIO] " + " | ".join(ratio_parts))
-                    else:
-                        guidance_loss = guidance_results
-                        g = torch.autograd.grad(guidance_loss.sum(), x, allow_unused=True)[0]
-                        grad = g if g is not None else torch.zeros_like(x)
-                
-                # Guidance application: pred_noise = prior_noise - grad
-                # grad = d(-dist)/dx points towards the goal. Subtracting it from noise adds it to x.
-                pred_noise = model_pred.pred_noise - grad
-                
-                if pred_noise.abs().max() > self.clip_noise:
-                    pred_noise = torch.clamp(pred_noise, -self.clip_noise, self.clip_noise)
-                    # Warning: gradient is too large and being clipped
-                    print(f"[CLIP WARNING] Gradient clipped at noise limit {self.clip_noise}")
-                
-                # Logging: Only log when guidance is active
-                if guidance_fn is not None:
-                    # mask of the transition we care about (finalizing frames)
-                    mask_final = (curr_noise_level != next_noise_level)
-                    if mask_final.any():
-                        grad_norm = grad.norm(dim=-1) # (T, B)
-                        g_norm_val = grad_norm[mask_final].mean().item() 
-                        print(f"[GUIDANCE STATS] Grad Norm: {g_norm_val:.4f}")
+                guidance_results = guidance_fn(model_pred.pred_x_start)
 
-                x_start = self.predict_start_from_noise(x, clipped_curr_noise_level, pred_noise)
+                if isinstance(guidance_results, dict):
+                    grad = torch.zeros_like(x)
+                    norms = {}
+                    _tracer = get_tracer()
+                    items = list(guidance_results.items())
+                    for i, (name, loss) in enumerate(items):
+                        is_last = (i == len(items) - 1)
+                        g = torch.autograd.grad(loss.sum(), x, retain_graph=not is_last)[0]
+                        grad = grad + g
+                        norms[name] = g.norm().item()
+                        if _tracer is not None:
+                            with _tracer.scope("gradient_nan_diagnosis", phase="guidance"):
+                                _tracer.log(
+                                    f"gradient.component.{name}",
+                                    {
+                                        "loss_value":    float(loss.detach().sum()),
+                                        "loss_has_nan":  bool(torch.isnan(loss).any()),
+                                        "loss_has_inf":  bool(torch.isinf(loss).any()),
+                                        "grad_norm":     float(g.detach().norm()),
+                                        "grad_has_nan":  bool(torch.isnan(g).any()),
+                                        "grad_has_inf":  bool(torch.isinf(g).any()),
+                                        "grad_max_abs":  float(g.detach().abs().max()),
+                                    },
+                                    depth=1,
+                                )
+
+                    total_norm = sum(norms.values())
+                    if total_norm > 1e-8:
+                        ratio_parts = [f"{k}: {v/total_norm:.2%}" for k, v in norms.items()]
+                        print(f"[GUIDANCE RATIO] " + " | ".join(ratio_parts))
+                else:
+                    guidance_loss = guidance_results
+                    grad = torch.autograd.grad(guidance_loss.sum(), x)[0]
+
+            # Apply gradient to pred_noise, then recompute x_start to keep consistency.
+            # Net effect on x_{t-1}: grad * (sqrt_recipm1 * sqrt(α_next) - c)
+            # ≈ 0.41 at high noise (effective anchor), ≈ 0 at low noise (no drift).
+            pred_noise = model_pred.pred_noise - grad
+
+            if pred_noise.abs().max() > self.clip_noise:
+                pred_noise = torch.clamp(pred_noise, -self.clip_noise, self.clip_noise)
+                print(f"[CLIP WARNING] Gradient clipped at noise limit {self.clip_noise}")
+
+            x_start = self.predict_start_from_noise(x, clipped_curr_noise_level, pred_noise)
+
+            mask_final = (curr_noise_level != next_noise_level)
+            if mask_final.any():
+                g_norm_val = grad.detach().norm(dim=-1)[mask_final].mean().item()
+                print(f"[GUIDANCE STATS] Grad Norm (DPS): {g_norm_val:.4f}")
 
         else:
             model_pred = self.model_predictions(
@@ -538,16 +525,15 @@ class Diffusion(nn.Module):
         x_pred = x_start * alpha_next.sqrt() + pred_noise * c + sigma * noise
         
         if guidance_fn is not None and torch.rand(1).item() < 0.05:
-            # Calculate the net coefficient of pred_noise in the update rule:
-            # x_pred = coeff * pred_noise + x_t_term
-            # From our derivation: coeff = c - sqrt(alpha_next) * sqrt_recipm1
+            # DPS net coeff = sqrt_recipm1 * sqrt(alpha_next) - c
             sqrt_recipm1 = extract(self.sqrt_recipm1_alphas_cumprod, clipped_curr_noise_level, x.shape)
-            coeff = c - alpha_next.sqrt() * sqrt_recipm1
-            avg_coeff = coeff.mean().item()
-            
-            print(f"[DIFFUSION DEBUG] Net Guidance Coeff: {avg_coeff:.6f}")
-            print(f"[DIFFUSION DEBUG] Final x_pred norm: {x_pred.norm().item():.6f}")
-            print(f"[DIFFUSION DEBUG] x change norm: {(x_pred - x).norm().item():.6f}\n")
+            net_coeff = sqrt_recipm1 * alpha_next.sqrt() - c
+            unfrozen = (curr_noise_level != next_noise_level)
+            avg_coeff = net_coeff[self.add_shape_channels(unfrozen)].mean().item() if unfrozen.any() else 0.0
+
+            print(f"[DIFFUSION DEBUG] DPS Net Coeff (sqrt_recip*sqrt_a_next - c): {avg_coeff:.4f}")
+            print(f"[DIFFUSION DEBUG] Final x_pred norm: {x_pred.norm().item():.4f}")
+            print(f"[DIFFUSION DEBUG] x change norm: {(x_pred - x).norm().item():.4f}\n")
 
         # only update frames where the noise level decreases
         mask = curr_noise_level == next_noise_level
