@@ -70,17 +70,12 @@ fi
 
 mctd_ckpt_menu "$STATE_DIM" "--no-fresh" || exit 1
 
-# Ensure selected checkpoint is registered in EVAL_BASE
+# model_id is populated directly by scanner — no fallback needed
 SELECTED_MODEL_ID="${MCTD_SELECTED_MODEL_ID:-}"
 if [ -z "$SELECTED_MODEL_ID" ]; then
-    # Auto-generate model_id from date/time path component
-    _date_part=$(echo "$MCTD_SELECTED_CKPT" | grep -oP '\d{4}-\d{2}-\d{2}/\d{2}-\d{2}-\d{2}' || true)
-    if [ -n "$_date_part" ]; then
-        SELECTED_MODEL_ID="local_$(echo "$_date_part" | tr '/-' '' )"
-    else
-        SELECTED_MODEL_ID="local_$(date +%Y%m%d%H%M%S)"
-    fi
-    echo "[model_id] Auto-generated: $SELECTED_MODEL_ID"
+    echo "❌ ERROR: Could not determine model_id for selected checkpoint." >&2
+    echo "   Scanner output is missing model_id field. Please check ckpt_scanner.py." >&2
+    exit 1
 fi
 mctd_ensure_eval_symlink "$MCTD_SELECTED_CKPT" "$SELECTED_MODEL_ID"
 echo "✓ Selected model: $SELECTED_MODEL_ID"

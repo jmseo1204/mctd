@@ -47,6 +47,12 @@ mctd_dim_menu
 TARGET_OBS_DIM="$MCTD_TARGET_OBS_DIM"
 DATASET_CONFIG="$MCTD_DATASET_CONFIG"
 
+# Extract human-readable dataset keywords from config name.
+# Strip leading "og_" and trailing dimension suffixes (_2d, _15d, _29d, _fullstate).
+DATASET_KEYWORDS=$(echo "$DATASET_CONFIG" \
+    | sed 's/^og_//' \
+    | sed 's/_\(2d\|15d\|29d\|fullstate\)$//')
+
 # Training-specific per-dim settings
 case "$TARGET_OBS_DIM" in
     2)
@@ -55,7 +61,6 @@ case "$TARGET_OBS_DIM" in
         RUN_NAME="Train_2D_antmaze"
         MODEL_ID_PREFIX="train_2d"
         LOG_FILE="$PROJECT_DIR/logs/train_2d.log"
-        CKPT_MAP_FILE="$PROJECT_DIR/logs/2d_ckpt_model_map.txt"
         MODEL_ID_FILE="$PROJECT_DIR/logs/current_2d_model_id.txt"
         ;;
     15)
@@ -64,7 +69,6 @@ case "$TARGET_OBS_DIM" in
         RUN_NAME="Train_15D_antmaze"
         MODEL_ID_PREFIX="train_15d"
         LOG_FILE="$PROJECT_DIR/logs/train_15d.log"
-        CKPT_MAP_FILE="$PROJECT_DIR/logs/15d_ckpt_model_map.txt"
         MODEL_ID_FILE="$PROJECT_DIR/logs/current_15d_model_id.txt"
         ;;
     29)
@@ -73,7 +77,6 @@ case "$TARGET_OBS_DIM" in
         RUN_NAME="Train_29D_big"
         MODEL_ID_PREFIX="train_29d"
         LOG_FILE="$PROJECT_DIR/logs/train_29d.log"
-        CKPT_MAP_FILE="$PROJECT_DIR/logs/29d_ckpt_model_map.txt"
         MODEL_ID_FILE="$PROJECT_DIR/logs/current_29d_model_id.txt"
         ;;
 esac
@@ -137,7 +140,7 @@ host_to_docker_path() {
 update_eval_symlink() {
     local model_id="$1"
 
-    # Find latest model.ckpt in OUTPUT_MOUNT_DIR, excluding mctd_eval symlinks
+    # Find latest model.ckpt in raw training outputs only (outputs/ subdir)
     local latest_ckpt="" latest_time=0
     while IFS= read -r f; do
         local ftime
@@ -146,7 +149,7 @@ update_eval_symlink() {
             latest_time=$ftime
             latest_ckpt=$f
         fi
-    done < <(find "$OUTPUT_MOUNT_DIR" -name "model.ckpt" -not -path "*/mctd_eval/*" 2>/dev/null)
+    done < <(find "$OUTPUT_MOUNT_DIR/outputs" -name "model.ckpt" 2>/dev/null)
 
     if [ -z "$latest_ckpt" ]; then
         echo "[symlink] No model.ckpt found in $OUTPUT_MOUNT_DIR, skipping." | tee -a "$LOG_FILE"
@@ -194,15 +197,6 @@ update_eval_symlink() {
     rel_path=$(realpath --relative-to="$eval_dir" "$real_ckpt")
     ln -sf "$rel_path" "$eval_dir/model.ckpt"
     echo "[symlink] $model_id/model.ckpt -> $rel_path  (epoch=$actual_epoch)" | tee -a "$LOG_FILE"
-
-    # Update ckpt_dir → model_id map
-    local ckpt_dir
-    ckpt_dir=$(dirname "$real_ckpt")
-    if [ -f "$CKPT_MAP_FILE" ]; then
-        grep -v "^$ckpt_dir|" "$CKPT_MAP_FILE" > "${CKPT_MAP_FILE}.tmp" 2>/dev/null || true
-        mv "${CKPT_MAP_FILE}.tmp" "$CKPT_MAP_FILE"
-    fi
-    echo "$ckpt_dir|$model_id" >> "$CKPT_MAP_FILE"
 }
 
 # ────────────────────────────────────────────────────────
@@ -252,11 +246,11 @@ read -p "Optional name postfix (leave blank for none): " USER_POSTFIX
 USER_POSTFIX="${USER_POSTFIX// /_}"
 
 # ────────────────────────────────────────────────────────
-# Build MODEL_ID: train_{dim}d_{epoch}ep_{YYYYMMDDHHMMSS}[_{postfix}]
+# Build MODEL_ID: train_{dim}d_{dataset}_{epoch}ep_{YYYYMMDD}_{HHMMSS}[_{postfix}]
 # ────────────────────────────────────────────────────────
 if [ -z "$MODEL_ID" ]; then
-    TIMESTAMP="$(date +%Y%m%d%H%M%S)"
-    MODEL_ID="${MODEL_ID_PREFIX}_j${JUMP_VALUE}_${SELECTED_EPOCH}ep_${TIMESTAMP}"
+    TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+    MODEL_ID="${MODEL_ID_PREFIX}_${DATASET_KEYWORDS}_j${JUMP_VALUE}_${SELECTED_EPOCH}ep_${TIMESTAMP}"
     if [ -n "$USER_POSTFIX" ]; then
         MODEL_ID="${MODEL_ID}_${USER_POSTFIX}"
     fi
@@ -297,7 +291,7 @@ while [ $attempt -lt $MAX_RETRIES ]; do
                 LATEST_TIME=$ftime
                 LATEST_HOST=$f
             fi
-        done < <(find "$OUTPUT_MOUNT_DIR" -name "model.ckpt" -not -path "*/mctd_eval/*" 2>/dev/null)
+        done < <(find "$OUTPUT_MOUNT_DIR/outputs" -name "model.ckpt" 2>/dev/null)
         if [ -n "$LATEST_HOST" ]; then
             LOAD_CKPT="$(host_to_docker_path "$LATEST_HOST")"
         fi
@@ -309,8 +303,9 @@ while [ $attempt -lt $MAX_RETRIES ]; do
         algorithm=$ALGORITHM_CONFIG \
         dataset=$DATASET_CONFIG \
         dataset.jump=$JUMP_VALUE \
-        +name=$RUN_NAME \
-        wandb.mode=offline \
+        +name=$MODEL_ID \
+        experiment.training.data.num_workers=0 \
+        experiment.validation.data.num_workers=0 \
         experiment.validation.limit_batch=0"
 
     if [ -n "$LOAD_CKPT" ]; then
@@ -321,7 +316,7 @@ while [ $attempt -lt $MAX_RETRIES ]; do
         INNER_CMD="$BASE_CMD"
     fi
 
-    FULL_CMD="docker run --rm --gpus all --name mctd_training --shm-size=50g \
+    FULL_CMD="docker run --rm --gpus all --name mctd_training --shm-size=8g \
         -e MUJOCO_GL=osmesa \
         -e HYDRA_FULL_ERROR=1 \
         -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/$DOCKER_USER/.mujoco/mujoco210/bin \
