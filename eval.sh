@@ -85,6 +85,30 @@ if [ ! -f "$CKPT_PATH" ]; then
     echo "❌ ERROR: Checkpoint not found at ${CKPT_PATH}"
     exit 1
 fi
+
+# Auto-detect training dataset from training_config.yaml (written by train.sh).
+# This overrides the hardcoded dataset from mctd_dim_menu so the correct
+# observation normalization stats and episode_len are used.
+_TRAINING_CONFIG="${OUTPUT_DOWNLOADED_DIR}/${SELECTED_MODEL_ID}/training_config.yaml"
+if [ -f "$_TRAINING_CONFIG" ]; then
+    _DETECTED_DATASET=$(python3 -c "
+import yaml, sys
+with open('$_TRAINING_CONFIG') as f:
+    d = yaml.safe_load(f)
+print((d.get('dataset') or {}).get('config', ''))
+" 2>/dev/null)
+    if [ -n "$_DETECTED_DATASET" ] && [ "$_DETECTED_DATASET" != "None" ]; then
+        if [ "$_DETECTED_DATASET" != "$SELECTED_DATASET" ]; then
+            echo "  [config] Overriding dataset: $SELECTED_DATASET → $_DETECTED_DATASET (from training_config.yaml)"
+        fi
+        SELECTED_DATASET="$_DETECTED_DATASET"
+    else
+        echo "  [config] WARNING: training_config.yaml found but no dataset.config field. Using dim-menu default: $SELECTED_DATASET"
+    fi
+else
+    echo "  [config] WARNING: No training_config.yaml for $SELECTED_MODEL_ID. Using dim-menu default: $SELECTED_DATASET"
+    echo "           (Train with current train.sh to save this automatically)"
+fi
 echo ""
 
 # ─────────────────────────────────────────────────────

@@ -1,0 +1,20 @@
+defaults:
+  - df_planning
+
+# -------------------------------------------------------
+# Training-only config: values here are saved to
+# training_config.yaml at train time and auto-detected
+# at eval time (via ckpt weights + training_config.yaml).
+# Edit this file before running train.sh.
+# -------------------------------------------------------
+
+frame_stack: 10
+causal: False
+scheduling_matrix: "pyramid"
+
+diffusion:
+  architecture:
+    network_size: 64
+    num_layers: 6
+    attn_heads: 4
+    dim_feedforward: 256

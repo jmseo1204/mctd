@@ -281,7 +281,7 @@ def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     pair_mask = pair_mask & planning_mask
 
     if not pair_mask.any():
-        return torch.tensor(0.0, device=x.device, requires_grad=True)
+        return x.sum() * 0.0  # connected to x so autograd.grad doesn't fail
 
     # Pairwise squared distances [B, T, T]
     pred_obs_b = pred_obs.transpose(0, 1)  # [B, T, 2]
@@ -301,7 +301,7 @@ def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     # Average over j's that have at least one valid candidate k
     j_has_candidates = pair_mask.any(dim=1)
     if not j_has_candidates.any():
-        return torch.tensor(0.0, device=x.device, requires_grad=True)
+        return x.sum() * 0.0  # connected to x so autograd.grad doesn't fail
 
     mean_loss = topk_rdf_mean_per_j[:, j_has_candidates].sum()
 

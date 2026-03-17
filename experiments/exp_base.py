@@ -21,7 +21,7 @@ from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities.types import TRAIN_DATALOADERS
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from utils.print_utils import cyan
 from utils.distributed_utils import is_rank_zero
@@ -173,6 +173,8 @@ class BaseLightningExperiment(BaseExperiment):
         All training happens here
         """
         if not self.algo:
+            # episode_len is not in YAML schema — inject from dataset config before building
+            self._ensure_episode_len_in_algo_cfg()
             self.algo = self._build_algo()
         if self.cfg.training.compile:
             self.algo = torch.compile(self.algo)
@@ -466,9 +468,86 @@ class BaseLightningExperiment(BaseExperiment):
         with tracer:
             self._validation_impl()
 
+    @staticmethod
+    def _load_ckpt_training_hparams(ckpt_path) -> dict:
+        """Load training_hparams dict from a checkpoint file, if present."""
+        try:
+            ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+            return ckpt.get('training_hparams', {})
+        except Exception as e:
+            print(f"[WARNING] Could not read training_hparams from checkpoint: {e}")
+            return {}
+
+    def _apply_ckpt_hparams_to_cfg(self, hparams: dict) -> None:
+        """Override algorithm config with training_hparams saved in the checkpoint.
+
+        Handles two cases:
+        - Architecture/behavioral params (frame_stack, causal, diffusion.architecture.*,
+          etc.): exist in YAML schema → standard OmegaConf.update().
+        - episode_len: not in YAML schema → set via open_dict on both algorithm and
+          dataset configs so n_tokens and episode loading both use the training value.
+        """
+        if not hparams:
+            return
+
+        # episode_len: not declared in any YAML → inject via open_dict
+        if 'episode_len' in hparams:
+            ep_len = int(hparams['episode_len'])
+            OmegaConf.update(self.root_cfg, "dataset.episode_len", ep_len)
+            with open_dict(self.root_cfg.algorithm):
+                self.root_cfg.algorithm.episode_len = ep_len
+
+        # All other params: declared in df_base.yaml schema → standard update
+        updates = {}
+        for k, v in hparams.items():
+            if k == 'episode_len':
+                continue  # handled above
+            if k == 'diffusion' and isinstance(v, dict):
+                for dk, dv in v.items():
+                    if dk == 'architecture' and isinstance(dv, dict):
+                        for ak, av in dv.items():
+                            updates[f"algorithm.diffusion.architecture.{ak}"] = av
+                    else:
+                        updates[f"algorithm.diffusion.{dk}"] = dv
+            else:
+                updates[f"algorithm.{k}"] = v
+
+        for dotpath, val in updates.items():
+            try:
+                OmegaConf.update(self.root_cfg, dotpath, val, merge=True)
+            except Exception as e:
+                print(f"[WARNING] Could not apply ckpt hparam {dotpath}={val}: {e}")
+
+    def _ensure_episode_len_in_algo_cfg(self) -> None:
+        """Sync algorithm.episode_len from dataset config if not already set.
+
+        Called at training time (episode_len is not in the YAML schema, so it must
+        be injected programmatically from dataset.episode_len before building the algo).
+        At eval time this is a fallback for old checkpoints that have no training_hparams.
+        """
+        if OmegaConf.select(self.root_cfg, "algorithm.episode_len") is None:
+            with open_dict(self.root_cfg.algorithm):
+                self.root_cfg.algorithm.episode_len = int(self.root_cfg.dataset.episode_len)
+
     def _validation_impl(self) -> None:
         """Actual validation implementation (extracted from original validation())."""
         if not self.algo:
+            if self.ckpt_path:
+                hparams = self._load_ckpt_training_hparams(self.ckpt_path)
+                if hparams:
+                    self._apply_ckpt_hparams_to_cfg(hparams)
+                    print(
+                        f"[Info] Applied training hparams from checkpoint: "
+                        f"frame_stack={hparams.get('frame_stack')}, "
+                        f"causal={hparams.get('causal')}, "
+                        f"scheduling_matrix={hparams.get('scheduling_matrix')}, "
+                        f"episode_len={hparams.get('episode_len')}"
+                    )
+                else:
+                    print("[WARNING] No training_hparams in checkpoint — using YAML defaults. "
+                          "Architecture mismatch may cause errors for old checkpoints.")
+            # Fallback: if episode_len still not set (old checkpoint), sync from dataset
+            self._ensure_episode_len_in_algo_cfg()
             self.algo = self._build_algo()
         if self.cfg.validation.compile:
             self.algo = torch.compile(self.algo)

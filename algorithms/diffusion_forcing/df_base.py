@@ -72,6 +72,32 @@ class DiffusionForcingBase(BasePytorchAlgo):
         )
         super().__init__(cfg)
 
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        """Save training hyperparameters to checkpoint for eval-time recovery.
+
+        These are the variables that MUST be identical at train and eval time.
+        At eval time, exp_base reads these and applies them to the config before
+        building the algorithm, so job configs no longer need to carry arch overrides.
+        """
+        from omegaconf import OmegaConf
+        arch = OmegaConf.to_container(self.cfg.diffusion.architecture, resolve=True)
+        hparams = {
+            'frame_stack': int(self.cfg.frame_stack),
+            'causal': bool(self.cfg.causal),
+            'scheduling_matrix': str(self.cfg.scheduling_matrix),
+            'frame_skip': int(self.cfg.frame_skip),
+            'diffusion': {
+                'beta_schedule': str(self.cfg.diffusion.beta_schedule),
+                'objective': str(self.cfg.diffusion.objective),
+                'timesteps': int(self.cfg.diffusion.timesteps),
+                'sampling_timesteps': int(self.cfg.diffusion.sampling_timesteps),
+                'architecture': arch,
+            },
+        }
+        if hasattr(self.cfg, 'episode_len'):
+            hparams['episode_len'] = int(self.cfg.episode_len)
+        checkpoint['training_hparams'] = hparams
+
     def _build_model(self):
         self.diffusion_model = Diffusion(
             x_shape=self.x_stacked_shape,

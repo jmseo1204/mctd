@@ -467,7 +467,9 @@ class Diffusion(nn.Module):
                     items = list(guidance_results.items())
                     for i, (name, loss) in enumerate(items):
                         is_last = (i == len(items) - 1)
-                        g = torch.autograd.grad(loss.sum(), x, retain_graph=not is_last)[0]
+                        g = torch.autograd.grad(loss.sum(), x, retain_graph=not is_last, allow_unused=True)[0]
+                        if g is None:
+                            g = torch.zeros_like(x)
                         grad = grad + g
                         norms[name] = g.norm().item()
                         if _tracer is not None:
@@ -492,7 +494,8 @@ class Diffusion(nn.Module):
                         print(f"[GUIDANCE RATIO] " + " | ".join(ratio_parts))
                 else:
                     guidance_loss = guidance_results
-                    grad = torch.autograd.grad(guidance_loss.sum(), x)[0]
+                    g = torch.autograd.grad(guidance_loss.sum(), x, allow_unused=True)[0]
+                    grad = torch.zeros_like(x) if g is None else g
 
             # Apply gradient to pred_noise, then recompute x_start to keep consistency.
             # Net effect on x_{t-1}: grad * (sqrt_recipm1 * sqrt(α_next) - c)
@@ -508,7 +511,7 @@ class Diffusion(nn.Module):
             mask_final = (curr_noise_level != next_noise_level)
             if mask_final.any():
                 g_norm_val = grad.detach().norm(dim=-1)[mask_final].mean().item()
-                print(f"[GUIDANCE STATS] Grad Norm (DPS): {g_norm_val:.4f}")
+                print(f"[GUIDANCE STATS] Grad Norm: {g_norm_val:.4f}")
 
         else:
             model_pred = self.model_predictions(

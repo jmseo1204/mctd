@@ -56,7 +56,7 @@ DATASET_KEYWORDS=$(echo "$DATASET_CONFIG" \
 # Training-specific per-dim settings
 case "$TARGET_OBS_DIM" in
     2)
-        ALGORITHM_CONFIG="df_planning_2d"
+        ALGORITHM_CONFIG="train_df_planning"
         DEFAULT_JUMP=5
         RUN_NAME="Train_2D_antmaze"
         MODEL_ID_PREFIX="train_2d"
@@ -64,7 +64,7 @@ case "$TARGET_OBS_DIM" in
         MODEL_ID_FILE="$PROJECT_DIR/logs/current_2d_model_id.txt"
         ;;
     15)
-        ALGORITHM_CONFIG="df_planning_15d"
+        ALGORITHM_CONFIG="train_df_planning"
         DEFAULT_JUMP=1
         RUN_NAME="Train_15D_antmaze"
         MODEL_ID_PREFIX="train_15d"
@@ -72,7 +72,7 @@ case "$TARGET_OBS_DIM" in
         MODEL_ID_FILE="$PROJECT_DIR/logs/current_15d_model_id.txt"
         ;;
     29)
-        ALGORITHM_CONFIG="df_planning"
+        ALGORITHM_CONFIG="train_df_planning"
         DEFAULT_JUMP=1
         RUN_NAME="Train_29D_big"
         MODEL_ID_PREFIX="train_29d"
@@ -258,6 +258,98 @@ if [ -z "$MODEL_ID" ]; then
 fi
 echo "$MODEL_ID" > "$MODEL_ID_FILE"
 echo "[model_id] Using: $MODEL_ID" | tee -a "$LOG_FILE"
+
+# ────────────────────────────────────────────────────────
+# save_training_config: persist training-dependent architecture params
+#   so that generate_jobs_generalized.py can auto-detect them at eval time.
+#   Reads configurations/algorithm/{algo}.yaml (+ parent df_planning.yaml) and
+#   writes EVAL_BASE/$model_id/training_config.yaml in plain-YAML format that
+#   extract_from_config() already handles (no WandB value-wrapper needed).
+# ────────────────────────────────────────────────────────
+save_training_config() {
+    local model_id="$1"
+    local algo_config="$2"
+    local dataset_config="$3"   # e.g. og_antmaze_giant_stitch
+    local jump_value="$4"       # e.g. 5
+
+    local base_yaml="$PROJECT_DIR/configurations/algorithm/df_planning.yaml"
+    local algo_yaml="$PROJECT_DIR/configurations/algorithm/${algo_config}.yaml"
+    local dataset_yaml="$PROJECT_DIR/configurations/dataset/${dataset_config}.yaml"
+    local output_dir="$EVAL_BASE/$model_id"
+    local output_file="$output_dir/training_config.yaml"
+
+    mkdir -p "$output_dir"
+
+    python3 - "$base_yaml" "$algo_yaml" "$dataset_yaml" "$dataset_config" "$jump_value" "$output_file" <<'PYEOF'
+import sys, yaml
+
+def load_yaml(path):
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+
+def deep_merge(base, override):
+    result = dict(base)
+    for k, v in override.items():
+        if k == 'defaults':
+            continue
+        if isinstance(v, dict) and isinstance(result.get(k), dict):
+            result[k] = deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+base_path, algo_path, dataset_path, dataset_config_name, jump_value, out_path = \
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+
+merged_algo   = deep_merge(load_yaml(base_path), load_yaml(algo_path))
+dataset_data  = load_yaml(dataset_path)
+
+arch = (merged_algo.get('diffusion') or {}).get('architecture', {})
+
+# Resolve episode_len: algo yaml may use ${dataset.episode_len} interpolation
+episode_len_raw = merged_algo.get('episode_len')
+if isinstance(episode_len_raw, str) and '${' in episode_len_raw:
+    episode_len = dataset_data.get('episode_len')
+else:
+    episode_len = episode_len_raw or dataset_data.get('episode_len')
+
+config_to_save = {
+    'algorithm': {
+        'causal': merged_algo.get('causal'),
+        'scheduling_matrix': merged_algo.get('scheduling_matrix'),
+        'frame_stack': merged_algo.get('frame_stack'),
+        'diffusion': {
+            'architecture': {
+                'attn_heads': arch.get('attn_heads'),
+                'network_size': arch.get('network_size'),
+                'dim_feedforward': arch.get('dim_feedforward'),
+                'num_layers': arch.get('num_layers'),
+            }
+        }
+    },
+    'dataset': {
+        'config': dataset_config_name,            # Hydra config name (e.g. og_antmaze_giant_stitch)
+        'episode_len': episode_len,
+        'jump': int(jump_value) if jump_value.isdigit() else dataset_data.get('jump', 1),
+    }
+}
+
+with open(out_path, 'w') as f:
+    yaml.dump(config_to_save, f, default_flow_style=False)
+print(f"[config] Saved training config to {out_path}")
+PYEOF
+
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "[config] WARNING: Failed to save training_config.yaml (exit $rc)" | tee -a "$LOG_FILE"
+    fi
+}
+
+# Save training-dependent config for later eval job generation
+save_training_config "$MODEL_ID" "$ALGORITHM_CONFIG" "$DATASET_CONFIG" "$JUMP_VALUE"
 
 # ────────────────────────────────────────────────────────
 # Training loop (Docker-based)

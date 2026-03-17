@@ -191,22 +191,54 @@ def detect_network_size_from_ckpt(model_id, downloaded_dir="outputs/downloaded/j
     return None
 
 
+def find_local_training_config(model_id, downloaded_dir="outputs/downloaded/jmseo1204-seoul-national-university/mctd_eval"):
+    """
+    Find training_config.yaml saved by train.sh alongside the checkpoint.
+    Written in plain-YAML format; extract_from_config() handles it without changes.
+    """
+    config_path = Path(downloaded_dir) / model_id / "training_config.yaml"
+    if config_path.exists():
+        return config_path
+    return None
+
+
 def find_config_yaml(model_id, outputs_root="/home/jmseo1204/mctd_outputs"):
     """
     Search for config.yaml in WANDB run directories matching the model_id.
+
+    Priority:
+    1. WandB training run dir: *-{model_id}/files/config.yaml  (run IS the training run)
+    2. Hydra eval run dir: .hydra/config.yaml where load == model_id
+       → picks the OLDEST such file (least contaminated by later config changes)
     """
     outputs_path = Path(outputs_root)
     if not outputs_path.exists():
         return None
-    
-    # Search for directories that end with the model_id
+
+    # 1. Training run: WandB run directory ends with model_id
     pattern = f"*-{model_id}"
     matches = list(outputs_path.glob(f"**/{pattern}/files/config.yaml"))
-    
     if matches:
-        # Return the most recent one if multiple matches
         matches.sort(key=lambda x: x.stat().st_mtime, reverse=True)
         return matches[0]
+
+    # 2. Eval run: .hydra/config.yaml where `load: {model_id}`
+    hydra_matches = []
+    for hydra_cfg in outputs_path.glob("**/.hydra/config.yaml"):
+        try:
+            with open(hydra_cfg, "r") as f:
+                data = yaml.safe_load(f)
+            if isinstance(data, dict) and data.get("load") == model_id:
+                hydra_matches.append(hydra_cfg)
+        except Exception:
+            continue
+    if hydra_matches:
+        # Oldest first — most likely to reflect the original training config
+        hydra_matches.sort(key=lambda x: x.stat().st_mtime)
+        chosen = hydra_matches[0]
+        print(f"  [config detect] Training config not found for {model_id}; "
+              f"using oldest eval .hydra/config.yaml: {chosen}")
+        return chosen
     return None
 
 def get_default_horizon_scale(config_path="configurations/algorithm/df_planning.yaml"):
@@ -251,14 +283,23 @@ def extract_from_config(config_path):
         'frame_stack': resolve_val(get_val(['algorithm', 'frame_stack'])),
         'jump': resolve_val(get_val(['dataset', 'jump'])),
         'frame_skip': resolve_val(get_val(['algorithm', 'frame_skip'])),
+        # Model training-dependent architecture params (must match training config)
+        'causal': get_val(['algorithm', 'causal']),
+        'scheduling_matrix': get_val(['algorithm', 'scheduling_matrix']),
+        'attn_heads': get_val(['algorithm', 'diffusion', 'architecture', 'attn_heads']),
+        # Training dataset identity (used by eval.sh to pick correct dataset)
+        'dataset_config': get_val(['dataset', 'config']),
     }
-    
-    # Fallbacks
+
+    # Fallbacks — try alternative paths when primary lookup fails
     if metadata['episode_len'] is None:
         metadata['episode_len'] = get_val(['dataset', 'episode_len'])
     if metadata['jump'] is None:
-        metadata['jump'] = get_val(['jump']) # Sometimes it is at root
-    
+        metadata['jump'] = get_val(['jump'])  # Sometimes at root
+    if metadata['frame_stack'] is None:
+        # training_config.yaml stores frame_stack directly under algorithm
+        metadata['frame_stack'] = get_val(['algorithm', 'frame_stack'])
+
     return metadata
 
 def resolve_interpolations(config, dataset_cfg):
@@ -302,6 +343,59 @@ def load_full_config(dataset_name, algo_name="df_planning"):
         print(f"Error loading configs: {e}")
         return None
 
+def load_training_hparams_from_ckpt(model_id, downloaded_dir="outputs/downloaded/jmseo1204-seoul-national-university/mctd_eval"):
+    """Load training_hparams saved by df_base.on_save_checkpoint from the checkpoint file.
+
+    New checkpoints (trained after the save_hyperparameters refactor) embed all arch
+    and behavioral params directly.  Returns {} for old checkpoints that predate this.
+    Falls back to Docker if torch is not available on the host.
+    """
+    ckpt_path = Path(downloaded_dir) / model_id / "model.ckpt"
+    if not ckpt_path.exists():
+        return {}
+
+    # Direct load (host has torch)
+    try:
+        import torch
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        hparams = ckpt.get("training_hparams", {})
+        if hparams:
+            print(f"  [ckpt hparams] Loaded training_hparams from checkpoint: {list(hparams.keys())}")
+        return hparams
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"  [ckpt hparams] Direct load failed: {e}")
+        return {}
+
+    # Docker fallback (host lacks torch)
+    try:
+        import subprocess, json as _json
+        real_path = str(ckpt_path.resolve())
+        mount_dir = str(ckpt_path.resolve().parent)
+        script = (
+            "import torch, json; "
+            f"ckpt = torch.load('{real_path}', map_location='cpu', weights_only=False); "
+            "h = ckpt.get('training_hparams', {}); "
+            "print(json.dumps(h))"
+        )
+        result = subprocess.run(
+            ["docker", "run", "--rm", "--entrypoint", "python3",
+             "-v", f"{mount_dir}:{mount_dir}:ro",
+             "mctd:0.1", "-c", script],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            hparams = _json.loads(result.stdout.strip())
+            if hparams:
+                print(f"  [ckpt hparams via docker] Loaded training_hparams: {list(hparams.keys())}")
+            return hparams
+    except Exception as e:
+        print(f"  [ckpt hparams] Docker fallback failed: {e}")
+
+    return {}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate evaluation jobs JSON files.")
     parser.add_argument("--dataset", required=True, help="Dataset config name (e.g., og_antmaze_giant_stitch)")
@@ -313,94 +407,162 @@ def main():
     parser.add_argument("--horizon_scale", type=float, default=None, help="Override Multiplier")
     parser.add_argument("--episode_len", type=int, default=None, help="Override episode_len (useful for offline/local runs without config.yaml)")
     parser.add_argument("--outputs_root", default="/home/jmseo1204/mctd_outputs", help="Root directory of outputs/wandb logs")
-    
+
     args = parser.parse_args()
 
     # 1. Load current project YAMLs as foundation
     full_cfg = load_full_config(args.dataset)
     if full_cfg is None: return
 
-    # 2. Extract model-specific metadata from checkpoint config (if exists)
     print(f"--- Meta Search for Model ID: {args.model_id} ---")
-    config_path = find_config_yaml(args.model_id, args.outputs_root)
-    
-    model_metadata = {}
-    if config_path:
-        print(f"Found saved config for model at: {config_path}")
-        model_metadata = extract_from_config(config_path)
-        print(f"Model-specific metadata (from ckpt): {model_metadata}")
 
-    # 3. Consolidate Config (Prioritize model_metadata for training consistency)
-    actual_episode_len = args.episode_len or model_metadata.get('episode_len') or full_cfg['dataset'].get('episode_len', 50)
-    actual_jump = model_metadata.get('jump') or full_cfg['dataset'].get('jump', 1)
+    # Legacy-path variables (only populated when checkpoint has no training_hparams)
+    actual_network_size = None
+    actual_dim_feedforward = None
+    actual_num_layers = None
+    actual_causal = None
+    actual_scheduling_matrix = None
+    actual_attn_heads = None
 
-    # Detect frame_stack from checkpoint weights (works even without wandb config)
-    obs_dim = len(full_cfg['dataset'].get('observation_mean', [2]))
-    act_dim = full_cfg['dataset'].get('action_dim', 8)
-    detected_frame_stack = detect_frame_stack_from_ckpt(args.model_id, obs_dim, act_dim)
-    actual_frame_stack = model_metadata.get('frame_stack') or detected_frame_stack or full_cfg['algorithm'].get('frame_stack', 10)
+    # 2. Try new path: training_hparams embedded in checkpoint
+    ckpt_hparams = load_training_hparams_from_ckpt(args.model_id)
 
-    # Detect network_size, dim_feedforward, and num_layers from checkpoint weights
-    detected_arch = detect_network_size_from_ckpt(args.model_id)
-    arch_cfg = full_cfg['algorithm'].get('diffusion', {}).get('architecture', {})
-    if isinstance(detected_arch, dict):
-        actual_network_size = detected_arch.get("network_size") or arch_cfg.get('network_size', 256)
-        actual_dim_feedforward = detected_arch.get("dim_feedforward") or arch_cfg.get('dim_feedforward', 1024)
-        actual_num_layers = detected_arch.get("num_layers") or arch_cfg.get('num_layers', 6)
+    if ckpt_hparams:
+        # ── New path: checkpoint carries all training params ──────────────────
+        # episode_len and jump are the only dataset-side values we still need.
+        actual_episode_len = (
+            args.episode_len
+            or ckpt_hparams.get('episode_len')
+            or full_cfg['dataset'].get('episode_len', 50)
+        )
+        actual_jump = full_cfg['dataset'].get('jump', 1)
+        actual_frame_stack = ckpt_hparams.get('frame_stack', 10)
+        has_embedded_hparams = True
+        print(
+            f"  [ckpt hparams] Using embedded training_hparams: "
+            f"episode_len={actual_episode_len}, frame_stack={actual_frame_stack}, "
+            f"causal={ckpt_hparams.get('causal')}, "
+            f"scheduling_matrix={ckpt_hparams.get('scheduling_matrix')}"
+        )
     else:
-        actual_network_size = arch_cfg.get('network_size', 256)
-        actual_dim_feedforward = arch_cfg.get('dim_feedforward', 1024)
-        actual_num_layers = arch_cfg.get('num_layers', 6)
+        # ── Legacy path: detect params from weights + wandb/local config ─────
+        has_embedded_hparams = False
+        config_path = find_config_yaml(args.model_id, args.outputs_root)
 
+        model_metadata = {}
+        if config_path:
+            print(f"Found WandB config for model at: {config_path}")
+            model_metadata = extract_from_config(config_path)
+            print(f"Model-specific metadata (from WandB config): {model_metadata}")
+        else:
+            local_config = find_local_training_config(args.model_id)
+            if local_config:
+                print(f"Found local training config at: {local_config}")
+                model_metadata = extract_from_config(local_config)
+                print(f"Model-specific metadata (from training_config.yaml): {model_metadata}")
+
+        # If training config names a different dataset, reload with that dataset
+        detected_dataset_config = model_metadata.get('dataset_config')
+        if detected_dataset_config and detected_dataset_config != args.dataset:
+            print(f"  [config detect] Training dataset '{detected_dataset_config}' differs from arg '{args.dataset}'. "
+                  f"Reloading config with training dataset.")
+            reloaded = load_full_config(detected_dataset_config)
+            if reloaded:
+                full_cfg = reloaded
+                args.dataset = detected_dataset_config
+            else:
+                print(f"  [config detect] WARNING: Could not load '{detected_dataset_config}'. Keeping '{args.dataset}'.")
+
+        actual_episode_len = args.episode_len or model_metadata.get('episode_len') or full_cfg['dataset'].get('episode_len', 50)
+        actual_jump = model_metadata.get('jump') or full_cfg['dataset'].get('jump', 1)
+
+        obs_dim = len(full_cfg['dataset'].get('observation_mean', [2]))
+        act_dim = full_cfg['dataset'].get('action_dim', 8)
+        detected_frame_stack = detect_frame_stack_from_ckpt(args.model_id, obs_dim, act_dim)
+        actual_frame_stack = model_metadata.get('frame_stack') or detected_frame_stack or full_cfg['algorithm'].get('frame_stack', 10)
+
+        detected_arch = detect_network_size_from_ckpt(args.model_id)
+        arch_cfg = full_cfg['algorithm'].get('diffusion', {}).get('architecture', {})
+        if isinstance(detected_arch, dict):
+            actual_network_size = detected_arch.get("network_size") or arch_cfg.get('network_size', 64)
+            actual_dim_feedforward = detected_arch.get("dim_feedforward") or arch_cfg.get('dim_feedforward', 256)
+            actual_num_layers = detected_arch.get("num_layers") or arch_cfg.get('num_layers', 6)
+        else:
+            actual_network_size = arch_cfg.get('network_size', 64)
+            actual_dim_feedforward = arch_cfg.get('dim_feedforward', 256)
+            actual_num_layers = arch_cfg.get('num_layers', 6)
+
+        actual_causal = model_metadata.get('causal')
+        actual_scheduling_matrix = model_metadata.get('scheduling_matrix')
+        actual_attn_heads = model_metadata.get('attn_heads')
+        missing = [k for k, v in [('causal', actual_causal), ('scheduling_matrix', actual_scheduling_matrix), ('attn_heads', actual_attn_heads)] if v is None]
+        if missing:
+            print(f"WARNING: Could not detect {missing} from saved wandb config. "
+                  f"These will use current yaml defaults, which may be wrong for this checkpoint.")
+        else:
+            print(f"Detected training config: causal={actual_causal}, scheduling_matrix={actual_scheduling_matrix}, attn_heads={actual_attn_heads}")
+
+    # 3. Validate plan_tokens divisibility
     actual_horizon_scale = args.horizon_scale if args.horizon_scale is not None else get_default_horizon_scale()
     actual_seq_div = full_cfg['algorithm'].get('sequence_dividing_factor', 3)
-
-    # Validate plan_tokens divisibility: horizon // frame_stack must be divisible by sequence_dividing_factor
     horizon = int(actual_episode_len * actual_horizon_scale)
     plan_tokens = horizon // actual_frame_stack
     if plan_tokens == 0 or plan_tokens % actual_seq_div != 0:
-        # Find the smallest valid horizon_scale that yields plan_tokens divisible by seq_div
-        min_tokens = actual_seq_div  # at least seq_div tokens
-        min_horizon = min_tokens * actual_frame_stack
+        min_horizon = actual_seq_div * actual_frame_stack
         actual_horizon_scale = min_horizon / actual_episode_len
         horizon = int(actual_episode_len * actual_horizon_scale)
         plan_tokens = horizon // actual_frame_stack
-        print(f"WARNING: original horizon_scale would give invalid plan_tokens. Adjusted horizon_scale to {actual_horizon_scale:.4f} (horizon={horizon}, plan_tokens={plan_tokens})")
+        print(f"WARNING: original horizon_scale would give invalid plan_tokens. "
+              f"Adjusted horizon_scale to {actual_horizon_scale:.4f} (horizon={horizon}, plan_tokens={plan_tokens})")
 
-    print(f"Final Plan: episode_len={actual_episode_len}, frame_stack={actual_frame_stack}, horizon_scale={actual_horizon_scale}, plan_tokens={plan_tokens}")
+    print(f"Final Plan: episode_len={actual_episode_len}, frame_stack={actual_frame_stack}, "
+          f"horizon_scale={actual_horizon_scale}, plan_tokens={plan_tokens}")
 
-    # 4. Build Minimal Basic Config (Let Hydra load YAMLs inside the container)
+    # 4. Build job config
+    # Architecture params (frame_stack, causal, scheduling_matrix, network_size, …) are
+    # NO LONGER included for new checkpoints — exp_base reads them from training_hparams.
+    # Only dataset-side and eval-side params go in the job.
     basic_job_config = {
         "wandb.entity": "jmseo1204-seoul-national-university",
         "wandb.project": "mctd_eval",
         "wandb.group": f"EVAL-{args.model_id}",
         "experiment": "exp_planning",
-        "algorithm": "df_planning", # This tells Hydra to load configurations/algorithm/df_planning.yaml
+        "algorithm": "df_planning",
         "load": args.model_id,
-        "dataset": args.dataset,    # This tells Hydra to load configurations/dataset/[dataset].yaml
+        "dataset": args.dataset,
     }
 
-    # Apply strictly necessary metadata and overrides
     basic_job_config.update({
-        "dataset.episode_len": actual_episode_len,
-        "algorithm.frame_stack": actual_frame_stack,
-        "algorithm.diffusion.architecture.network_size": actual_network_size,
-        "algorithm.diffusion.architecture.dim_feedforward": actual_dim_feedforward,
-        "algorithm.diffusion.architecture.num_layers": actual_num_layers,
         "dataset.jump": actual_jump,
         "algorithm.horizon_scale": actual_horizon_scale,
         "experiment.tasks": ["validation"],
         "experiment.validation.batch_size": 1,
     })
 
+    if not has_embedded_hparams:
+        # Legacy path: checkpoint has no training_hparams — inject all arch params and
+        # episode_len explicitly (exp_base cannot recover them from the checkpoint).
+        basic_job_config.update({
+            "dataset.episode_len": actual_episode_len,
+            "algorithm.frame_stack": actual_frame_stack,
+            "algorithm.diffusion.architecture.network_size": actual_network_size,
+            "algorithm.diffusion.architecture.dim_feedforward": actual_dim_feedforward,
+            "algorithm.diffusion.architecture.num_layers": actual_num_layers,
+        })
+        if actual_causal is not None:
+            basic_job_config["algorithm.causal"] = actual_causal
+        if actual_scheduling_matrix is not None:
+            basic_job_config["algorithm.scheduling_matrix"] = actual_scheduling_matrix
+        if actual_attn_heads is not None:
+            basic_job_config["algorithm.diffusion.architecture.attn_heads"] = actual_attn_heads
+
     # 5. Generate Jobs
     jobs_folder = "jobs"
     if not os.path.exists(jobs_folder):
         os.makedirs(jobs_folder)
-        
+
     total_tasks_num = args.total_tasks_num
     start_task_id = args.start_task_id
-
     count = 0
     for i in range(args.num_tasks):
         if total_tasks_num:
@@ -417,7 +579,7 @@ def main():
             with open(filename, "w") as f:
                 json.dump(job_cfg, f, indent=4)
             count += 1
-                
+
     print(f"Successfully generated {count} jobs in '{jobs_folder}/' folder.")
 
 if __name__ == "__main__":

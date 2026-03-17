@@ -1609,6 +1609,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         # Update qpos with last valid frame position (pos_dim only)
                         _child.sim_state['qpos'][:self.pos_dim] = _child.obs_pos[:self.pos_dim]
 
+                        print(
+                            f"[OBS_POS] tree={active_tree.tag} "
+                            f"depth={parent_node.depth}->{_child.depth} "
+                            f"parent_pos={parent_node.obs_pos[:self.pos_dim].tolist()} "
+                            f"child_pos={_child.obs_pos[:self.pos_dim].tolist()} "
+                            f"new_denoised_end={new_denoised_end} "
+                            f"plan_len={plan_unnormalized.shape[0]}"
+                        )
+
                 # Extract plan by selecting best leaf and combining plans
                 best_info: dict = self._select_best_leaf(expanded_node_infos)
 

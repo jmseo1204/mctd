@@ -41,3 +41,6 @@ diffusion:
   # architecture
   architecture:
     network_size: 64
+    num_layers: 6
+    attn_heads: 4
+    dim_feedforward: 256

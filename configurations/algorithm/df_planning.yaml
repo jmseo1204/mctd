@@ -16,10 +16,9 @@ dataset: ${dataset.dataset}
 pos_dim: 2  # spatial x,y dims for MCTS guidance/visualization (always 2 for AntMaze/PointMaze)
 # non dataset info
 x_shape: null
-frame_stack: 10
+
 context_frames: 1
 use_reward: False
-causal: True
 plot_start_goal: True
 # training hyperparameters
 weight_decay: 1e-4
@@ -41,7 +40,7 @@ parallel_multiple_visits: False
 mctd_num_denoising_steps: 100 # Must be <= sampling_timesteps in df_base.yaml
 parallel_search_num: 1
 mctd_max_search_num: 70
-mctd_guidance_scales: [0.0] # 3.0
+mctd_guidance_scales: [1.0] # 3.0
 padding_mode: "same" # "zero" or "same"
 viz_plans: True
 DEBUG: True
@@ -50,20 +49,18 @@ debug_log_interval: 10 # Log every N MCTS iterations
 debug_memory_profile: True # Enable GPU/CPU memory profiling
 max_plan_hist_keep: 1 # Keep only last N plan histories (memory optimization)
 meeting_delta: 2.0
-episode_len: ${dataset.episode_len} # self.n_tokens = self.episode_len // self.frame_stack
-horizon_scale: 0.3 # horizon = self.episode_len * horizon_scale
+horizon_scale: 0.3 # horizon = episode_len * horizon_scale
 sequence_dividing_factor: 3
 num_tries_for_bad_plans: 3
 open_loop_horizon: 300 #fixme -> best: episode_len*horizon_scale
-val_max_loops: 8 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
+val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
 sub_goal_interval: 5
-scheduling_matrix: "causal"
 
 # HILP value function guidance
 hilp_checkpoint_path: "td_models/hilp_ckpt_latest.pt"
 hilp_obs_dim: 29  # AntMaze observation dimension
 hilp_skill_dim: 32  # HILP phi representation dimension
-anchor_guidance_scale: 3.0 # 2.0
+anchor_guidance_scale: 0.0 # 2.0
 rdf_guidance_scale: 0.0 # 2.0
 mcts_use_sim: false
 use_rollout: false  # If false, skip _rollout_leaf_plan; derive obs_pos from plan_history instead of physical sim
@@ -77,8 +74,3 @@ diffusion:
   use_snr_weighting: True
   snr_clip: 5.0
   ddim_sampling_eta: 0.1
-  architecture:
-    network_size: 256
-    num_layers: 12
-    attn_heads: 8
-    dim_feedforward: 1024
