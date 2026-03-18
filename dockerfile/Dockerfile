@@ -1,4 +1,4 @@
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=Korea/Seoul
 ENV PYTHONUNBUFFERED 1
@@ -84,3 +84,12 @@ COPY ./mujoco/mujoco210 /home/$UNAME/.mujoco/mujoco210
 
 # Add LD_LIBRARY_PATH
 ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/$UNAME/.mujoco/mujoco210/bin
+
+# Install JAX with CUDA 12 GPU support (plugin system, no bundled CUDA libs - uses system/WSL CUDA)
+# Note: jax[cpu] is replaced by jax-cuda12-plugin + jax-cuda12-pjrt for GPU acceleration
+# GPU access on WSL2 requires: -v /usr/lib/wsl:/usr/lib/wsl -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:...
+RUN pip install jax==0.6.2 flax
+RUN pip install --no-deps jax-cuda12-plugin==0.6.2 jax-cuda12-pjrt==0.6.2
+
+# Upgrade wandb: 0.17.x has upload-stall bugs; 0.24+ resolves them
+RUN pip install 'wandb>=0.24.0,<0.25.0'
