@@ -8,14 +8,15 @@ set -e
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$SCRIPT_DIR"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+DOCKERFILE_DIR="$SCRIPT_DIR"
 DOCKER_IMAGE_NAME="mctd"
-DOCKER_IMAGE_TAG="latest"
-DOCKER_USER="jmseo1204"
+DOCKER_IMAGE_TAG="0.1"
+DOCKER_USER="junjolp2026spring"
 CONTAINER_NAME="mctd_container"
 
 # Data paths (adjust as needed)
-OGBENCH_DATA_DIR="/mnt/c/Users/USER/Desktop/test_ogbench/ogbench_data"
+OGBENCH_DATA_DIR="${HOME}/ogbench_data"
 OUTPUT_DIR="${HOME}/mctd_outputs"
 
 echo "====================================================="
@@ -28,12 +29,13 @@ echo ""
 # ─────────────────────────────────────────────────────
 echo "[1] Building Docker image..."
 echo "  Image: ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
-echo "  Context: ${PROJECT_DIR}"
+echo "  Context: ${DOCKERFILE_DIR}"
 echo ""
 
-if docker build -f "${PROJECT_DIR}/Dockerfile.prod" \
+if docker build -f "${DOCKERFILE_DIR}/Dockerfile" \
+   --build-arg UNAME="${DOCKER_USER}" \
    -t "${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}" \
-   "${PROJECT_DIR}"; then
+   "${DOCKERFILE_DIR}"; then
   echo "✓ Image built successfully: ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
 else
   echo "❌ Failed to build image"
