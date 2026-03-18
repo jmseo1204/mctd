@@ -5,6 +5,7 @@ import os
 import sys
 import shlex
 import datetime
+import threading
 import yaml
 from tqdm import tqdm
 
@@ -47,6 +48,32 @@ os.system(f"chmod 777 {today_dir}")
 # Dictionary to keep track of running experiments.
 running_experiments = {gpu: None for gpu in available_gpus}
 last_log_line_count = {}
+last_log_time = {}       # exp_name -> time.time() of last log line seen
+log_streamer_threads = {}  # exp_name -> Thread
+
+
+def _stream_logs_worker(exp_name, server):
+    """Stream container logs to terminal + log file in real-time."""
+    cmd = (["docker", "logs", "-f", exp_name] if server == "localhost"
+           else ["ssh", server, "docker", "logs", "-f", exp_name])
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip()
+            if not line:
+                continue
+            ts = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+            log_file.write(f"{ts} [{exp_name}] {line}\n")
+            last_log_time[exp_name] = time.time()
+            msg = f"[{exp_name[:30]}] {line}"
+            if 'pbar' in globals() and pbar is not None:
+                pbar.write(msg)
+            else:
+                print(msg, flush=True)
+        proc.wait()
+    except Exception:
+        pass
 
 def get_og_dataset_name(dataset_config_name):
     """
@@ -80,6 +107,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -e MUJOCO_GL=osmesa \
         -e HYDRA_FULL_ERROR=1 \
         -e CUDA_VISIBLE_DEVICES=0 \
+        -e WANDB_EXIT_TIMEOUT=120 \
         -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/jmseo1204/.mujoco/mujoco210/bin \
         -v /usr/lib/wsl:/usr/lib/wsl \
         -v {project_dir}:/home/{docker_user}/mctd \
@@ -112,11 +140,11 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         log_write(result.stderr.strip())
         return False
     
-    # Background log harvester for this specific experiment
-    if server == "localhost":
-        # Start a background process to append this container's logs to our main log file
-        log_cmd = f"docker logs -f {exp_name} >> {log_file_path} 2>&1 &"
-        subprocess.Popen(log_cmd, shell=True)
+    # Start real-time log streaming thread (shows in terminal + writes to log file)
+    t = threading.Thread(target=_stream_logs_worker, args=(exp_name, server), daemon=True)
+    t.start()
+    log_streamer_threads[exp_name] = t
+    last_log_time[exp_name] = time.time()
     
     # Wait a moment and check if it's still alive
     time.sleep(0.5)
@@ -206,42 +234,11 @@ try:
         for gpu, exp_name in list(running_experiments.items()):
             server, gpu_id = gpu.split(":")
             
-            # 1. Update status using docker logs
+            # 1. Show elapsed time when no new log lines appear (silent wandb finalization)
             if exp_name:
-                try:
-                    is_running = is_experiment_running(server, exp_name)
-                    
-                    if server == "localhost":
-                        # Fetch logs (both stdout and stderr combined)
-                        log_res = subprocess.run(["docker", "logs", "--tail", "15", exp_name], 
-                                               capture_output=True, text=True)
-                        # Combine stdout and stderr for full visibility
-                        log_out = (log_res.stdout + log_res.stderr).strip()
-                    else:
-                        log_res = subprocess.run(["ssh", server, "docker", "logs", "--tail", "15", exp_name], 
-                                               capture_output=True, text=True)
-                        log_out = (log_res.stdout + log_res.stderr).strip()
-                    
-                    if log_out:
-                        lines = log_out.split("\n")
-                        last_seen = last_log_line_count.get(exp_name, "")
-                        if lines[-1] != last_seen:
-                            # If it's a new line, we might have multiple new lines
-                            for line in lines[-5:]:
-                                if line not in last_seen:
-                                    log_write(f"[{gpu}] {line.strip()}")
-                            last_log_line_count[exp_name] = lines[-1]
-                    
-                    # If the container died, make sure we see the final output
-                    if not is_running and exp_name in running_experiments.values():
-                        if log_out:
-                            log_write(f"!! Container {exp_name} exited. Final logs: !!")
-                            # Write last 5 lines of log_out
-                            for line in log_out.split("\n")[-5:]:
-                                log_write(f"[{gpu}] {line.strip()}")
-
-                except Exception as e:
-                    pass
+                silence_sec = time.time() - last_log_time.get(exp_name, time.time())
+                if silence_sec > 30 and int(silence_sec) % 30 == 0:
+                    log_write(f"[{gpu}] Still running... ({silence_sec:.0f}s since last output — wandb finalizing)")
 
             # 2. Check if finished
             if exp_name is not None and not is_experiment_running(server, exp_name):

@@ -1720,7 +1720,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 hilp_heatmap = None
                 if hasattr(self, '_hilp_value_fn_instance') and self._hilp_value_fn_instance is not None:
                     try:
+                        print(f"[VIZ step={steps}] Computing HILP heatmap (1600 pts)...", flush=True)
                         hilp_heatmap = self._compute_hilp_heatmap(best_node_target_pos)
+                        print(f"[VIZ step={steps}] HILP heatmap done.", flush=True)
                     except Exception as _hm_err:
                         print(f"[HILP heatmap] skipped: {_hm_err}", file=sys.stderr, flush=True)
 
@@ -1747,7 +1749,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 # Gradient field visualizations (RMSE + HILP combined)
                 if best_node_target_pos is not None:
                     try:
+                        print(f"[VIZ step={steps}] Computing guidance grad fields (~900 pts with autograd)...", flush=True)
                         _grad_fields = self._compute_guidance_grad_fields(best_node_target_pos)
+                        print(f"[VIZ step={steps}] Grad fields done.", flush=True)
                         if _grad_fields is not None:
                             _gf_img = make_combined_grad_field_image(
                                 self.env_id,
@@ -1785,12 +1789,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 obs_numpy = obs.detach().cpu().numpy()
 
                 # Use unified plan execution function
+                print(f"[EXEC step={steps}] Executing plan in env ({self.open_loop_horizon} steps)...", flush=True)
                 trajectory_exec, reward_dict = self._execute_plan_in_env(
                     plan_frame_format=plan_unnormalized,
                     envs=envs,
                     agent=agent if "antmaze" in self.env_id else None,
                     use_diffused_action=use_diffused_action,
                 )
+                print(f"[EXEC step={steps}] Execution done. reached={reward_dict['reached']}", flush=True)
 
                 # Process returned rewards and trajectory
                 reached = np.logical_or(reached, reward_dict["reached"])

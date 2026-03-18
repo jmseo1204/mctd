@@ -151,7 +151,7 @@ echo "  Starting Job Execution via scripts/run_jobs.py"
 echo "====================================================="
 echo ""
 
-python3 scripts/run_jobs.py | tee /tmp/mctd_run_jobs.log
+python3 scripts/run_jobs.py 2>&1 | tee /tmp/mctd_run_jobs.log
 
 JOB_EXIT_CODE=$?
 
