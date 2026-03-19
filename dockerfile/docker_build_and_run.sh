@@ -12,7 +12,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DOCKERFILE_DIR="$SCRIPT_DIR"
 DOCKER_IMAGE_NAME="mctd"
 DOCKER_IMAGE_TAG="0.1"
-DOCKER_USER="junjolp2026spring"
+DOCKER_USER="jmseo1204"
 CONTAINER_NAME="mctd_container"
 
 # Data paths (adjust as needed)

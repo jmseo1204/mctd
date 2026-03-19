@@ -1,6 +1,7 @@
 defaults:
   - base_dataset
 env_id:  "antmaze-giant-v0"
+num_tasks: 5
 dataset: "antmaze-giant-navigate-v0"
 save_dir: ~/.ogbench/data
 gamma: 1.0

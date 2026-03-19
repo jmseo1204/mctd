@@ -1,6 +1,7 @@
 defaults:
   - base_dataset
 env_id: "pointmaze-large-v0"
+num_tasks: 5
 dataset: "pointmaze-large-navigate-v0"
 save_dir: ~/ogbench_data
 gamma: 1.0

@@ -114,15 +114,14 @@ echo ""
 # ─────────────────────────────────────────────────────
 # 3. Fixed parameters
 # ─────────────────────────────────────────────────────
-NUM_TASKS=1
+NUM_TASKS=3
 NUM_SEEDS=1
-START_TASK_IDX=2
-TOTAL_TASKS_NUM=5
+START_TASK_IDX=3
 
 echo "Configuration summary:"
 echo "  Dataset    : $SELECTED_DATASET (obs_dim=${STATE_DIM})"
 echo "  Model      : $SELECTED_MODEL_ID"
-echo "  Tasks      : $NUM_TASKS (start=$START_TASK_IDX, total=$TOTAL_TASKS_NUM)  Seeds: $NUM_SEEDS"
+echo "  Tasks      : $NUM_TASKS (start=$START_TASK_IDX)  Seeds: $NUM_SEEDS"
 echo ""
 
 # ─────────────────────────────────────────────────────
@@ -134,8 +133,7 @@ python3 scripts/generate_jobs_generalized.py \
     --model_id "$SELECTED_MODEL_ID" \
     --num_tasks "$NUM_TASKS" \
     --num_seeds "$NUM_SEEDS" \
-    --start_task_id "$START_TASK_IDX" \
-    --total_tasks_num "$TOTAL_TASKS_NUM"
+    --start_task_id "$START_TASK_IDX"
 
 if [ $? -ne 0 ]; then
     echo ""

@@ -1,152 +1,142 @@
 #!/usr/bin/env python3
 """
-Guidance Scale Analysis Script
-Parses experiment logs and generates a summary table of guidance scale performance.
+Guidance Analysis Script (JSONL-based)
+Reads guidance_*.jsonl files and reports per-tree (forward/backward) stats.
 """
 import sys
-import collections
 import os
-from typing import Dict, List, Tuple
+import json
+import collections
+import statistics
+from typing import Dict, List
 
-LOG_DIR = "experiment_logs"
 
-def parse_log_file(log_path: str) -> Tuple[Dict[float, List[float]], Dict[float, List[float]], Dict[float, int], Dict[float, List[float]], Dict[float, Dict[str, List[float]]]]:
-    avg_dist_by_scale = collections.defaultdict(list)
-    final_dist_by_scale = collections.defaultdict(list)
-    clip_warnings_by_scale = collections.defaultdict(int)
-    grad_norms_by_scale = collections.defaultdict(list)
-    ratios_by_scale = collections.defaultdict(lambda: collections.defaultdict(list))
-    
-    current_avg = None
-    current_final = None
-    current_scale = None
-    
-    if not os.path.exists(log_path):
-        return {}, {}, {}, {}, {}
-
-    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+def load_jsonl(path: str) -> List[dict]:
+    records = []
+    with open(path, encoding="utf-8", errors="ignore") as f:
         for line in f:
-            try:
-                # Track clipping warnings
-                if '[CLIP WARNING]' in line:
-                    if current_scale is not None:
-                        clip_warnings_by_scale[current_scale] += 1
-                
-                # Track gradient norms
-                if '[GUIDANCE STATS] Grad Norm:' in line:
-                    grad_norm = float(line.split('Grad Norm:')[1].strip())
-                    if current_scale is not None:
-                        grad_norms_by_scale[current_scale].append(grad_norm)
-                
-                if 'Dist per batch:' in line:
-                    content = line.split('batch:')[1].strip()
-                    content = content.replace('[', '').replace(']', '')
-                    content = content.replace('tensor(', '').replace(')', '')
-                    content = content.replace(', device=\'cuda:0\'', '').replace(', device=\'cuda:1\'', '')
-                    current_avg = [float(x.strip()) for x in content.split(',') if x.strip()]
-                    
-                elif 'Final token dist:' in line:
-                    content = line.split('dist:')[1].strip()
-                    content = content.replace('[', '').replace(']', '')
-                    content = content.replace('tensor(', '').replace(')', '')
-                    content = content.replace(', device=\'cuda:0\'', '').replace(', device=\'cuda:1\'', '')
-                    current_final = [float(x.strip()) for x in content.split(',') if x.strip()]
-                    
-                elif 'Scales:' in line:
-                    content = line.split('Scales:')[1].strip()
-                    content = content.replace('[', '').replace(']', '')
-                    content = content.replace('tensor(', '').replace(')', '')
-                    content = content.replace(', device=\'cuda:0\'', '').replace(', device=\'cuda:1\'', '')
-                    scales = [float(x.strip()) for x in content.split(',') if x.strip()]
-                    
-                    if current_avg and current_final and len(scales) == len(current_avg) == len(current_final):
-                        for s, a, f in zip(scales, current_avg, current_final):
-                            avg_dist_by_scale[s].append(a)
-                            final_dist_by_scale[s].append(f)
-                            current_scale = s  # Track current scale
-                
-                # Track guidance ratios
-                if '[GUIDANCE RATIO]' in line:
-                    if current_scale is not None:
-                        # Format: [GUIDANCE RATIO] anchor: 10.00% | goal: 20.00% | rdf: 70.00%
-                        parts = line.split('RATIO]')[1].strip().split('|')
-                        for p in parts:
-                            name, val = p.strip().split(':')
-                            val_float = float(val.strip().replace('%', ''))
-                            ratios_by_scale[current_scale][name.strip()].append(val_float)
-            except Exception:
+            line = line.strip()
+            if not line:
                 continue
-    
-    return dict(avg_dist_by_scale), dict(final_dist_by_scale), dict(clip_warnings_by_scale), dict(grad_norms_by_scale), {k: dict(v) for k, v in ratios_by_scale.items()}
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
 
-def generate_summary_table(avg_dist_by_scale: Dict[float, List[float]],
-                          final_dist_by_scale: Dict[float, List[float]], 
-                          clip_warnings: Dict[float, int],
-                          grad_norms: Dict[float, List[float]],
-                          ratios: Dict[float, Dict[str, List[float]]],
-                          log_name: str) -> None:
-    if not final_dist_by_scale:
-        print(f"\nNo valid data found in {log_name}.")
+
+def _mean(vals: list) -> float:
+    return statistics.mean(vals) if vals else 0.0
+
+
+def _extract_guidance_records(records: List[dict]) -> List[dict]:
+    """Extract guidance data from SLP-format records (tag=guidance.combined → data={...})
+    or from legacy flat-format records (direct keys)."""
+    out = []
+    for r in records:
+        if r.get("tag") == "guidance.combined":
+            # SLP format: fields are nested under "data"
+            d = r.get("data", {})
+            out.append(d)
+        elif "tree_tag" in r and "eff_goal_scale" in r:
+            # Legacy flat format (old guidance_*.jsonl)
+            out.append(r)
+    return out
+
+
+def analyze(records: List[dict], log_name: str) -> None:
+    guidance_records = _extract_guidance_records(records)
+
+    if not guidance_records:
+        print(f"\nNo guidance records found in {log_name}.")
+        print("  (looking for tag='guidance.combined' or legacy flat format)")
         return
-    
-    baseline_f = None
-    if 0.0 in final_dist_by_scale:
-        baseline_f = sum(final_dist_by_scale[0.0]) / len(final_dist_by_scale[0.0])
-    
-    print("\n" + "="*160)
-    print(f"Analysis for: {log_name}")
-    print("="*160)
-    print(f"{'Scale':<10} {'Avg Batch Dist':<18} {'Avg Final Dist':<18} {'Samples':<10} {'Improvement':<15} {'Clip':<8} {'Grad Norm':<12} {'Ratio (Anc/Goal/RDF)':<25}")
-    print("-" * 160)
-    
-    for scale in sorted(final_dist_by_scale.keys()):
-        # Average Batch Distance
-        a_vals = avg_dist_by_scale.get(scale, [])
-        a_avg = sum(a_vals) / len(a_vals) if a_vals else 0.0
-        
-        # Average Final Token Distance
-        f_vals = final_dist_by_scale[scale]
-        f_avg = sum(f_vals) / len(f_vals)
-        
-        n_samples = len(f_vals)
-        
-        improvement = "Baseline" if scale == 0.0 else (f"{((f_avg - baseline_f) / baseline_f) * 100:+.2f}%" if baseline_f else "-")
-        
-        clip_count = clip_warnings.get(scale, 0)
-        
-        grad_norm_vals = grad_norms.get(scale, [])
-        avg_grad_norm = sum(grad_norm_vals) / len(grad_norm_vals) if grad_norm_vals else 0.0
-        
-        # Guidance Ratios
-        scale_ratios = ratios.get(scale, {})
-        def get_avg_ratio(name):
-            vals = scale_ratios.get(name, [])
-            return sum(vals) / len(vals) if vals else 0.0
-        
-        r_anc = get_avg_ratio("anchor")
-        r_goal = get_avg_ratio("goal")
-        r_rdf = get_avg_ratio("rdf")
-        ratio_str = f"{r_anc:4.1f}% / {r_goal:4.1f}% / {r_rdf:4.1f}%"
-        
-        print(f"{scale:<10.1f} {a_avg:<18.6f} {f_avg:<18.6f} {n_samples:<10} {improvement:<15} {clip_count:<8} {avg_grad_norm:<12.4f} {ratio_str:<25}")
-    
-    print("="*160)
-    print(f"Total samples: {sum(len(v) for v in final_dist_by_scale.values())}\n")
+
+    # Group by (tree_tag, eff_goal_scale)
+    # tree_tag: "bidir_mcts_from_start" (forward) or "bidir_mcts_from_goal" (backward)
+    by_tree: Dict[str, Dict[float, List[dict]]] = collections.defaultdict(
+        lambda: collections.defaultdict(list)
+    )
+    for r in guidance_records:
+        tree = r.get("tree_tag", "unknown")
+        scale = round(float(r.get("eff_goal_scale", 0.0)), 4)
+        by_tree[tree][scale].append(r)
+    records = guidance_records  # use filtered records for rest of analysis
+
+    print("\n" + "=" * 140)
+    print(f"  Guidance Analysis: {log_name}")
+    print("=" * 140)
+
+    tree_order = sorted(by_tree.keys())
+    for tree_tag in tree_order:
+        # Human-readable label
+        if "start" in tree_tag:
+            label = "FORWARD  (bidir_mcts_from_start)"
+        elif "goal" in tree_tag:
+            label = "BACKWARD (bidir_mcts_from_goal)"
+        else:
+            label = tree_tag
+
+        scale_data = by_tree[tree_tag]
+        total_n = sum(len(v) for v in scale_data.values())
+
+        print(f"\n  Tree: {label}  [{total_n} guidance calls]")
+        print(
+            f"  {'Scale':<10} {'DistBatch(mean)':<18} {'FinalTokDist(mean)':<20} "
+            f"{'N':<7} {'GoalInner':<12} {'AnchorLoss':<13} {'GoalLoss':<12} "
+            f"{'G/A Ratio':<12} {'RDFLoss':<10}"
+        )
+        print("  " + "-" * 118)
+
+        for scale in sorted(scale_data.keys()):
+            recs = scale_data[scale]
+            n = len(recs)
+
+            # dist_per_batch and final_token_dist are lists-per-record
+            dpb_vals = [_mean(r["dist_per_batch"]) for r in recs if r.get("dist_per_batch")]
+            ftd_vals = [_mean(r["final_token_dist"]) for r in recs if r.get("final_token_dist")]
+
+            avg_dpb = _mean(dpb_vals)
+            avg_ftd = _mean(ftd_vals)
+            avg_goal_inner = _mean([r.get("goal_inner", 0.0) for r in recs])
+            avg_anchor = _mean([r.get("anchor_loss", 0.0) for r in recs])
+            avg_goal_loss = _mean([r.get("goal_loss", 0.0) for r in recs])
+            avg_ga_ratio = _mean([r.get("goal_anchor_ratio", 0.0) for r in recs])
+            avg_rdf = _mean([r.get("rdf_loss", 0.0) for r in recs])
+
+            print(
+                f"  {scale:<10.4f} {avg_dpb:<18.6f} {avg_ftd:<20.6f} "
+                f"{n:<7} {avg_goal_inner:<12.5f} {avg_anchor:<13.5f} {avg_goal_loss:<12.5f} "
+                f"{avg_ga_ratio:<12.4f} {avg_rdf:<10.5f}"
+            )
+
+    # --- Grad norm & clip summary (SLP format: tag=diffusion.grad_norm / diffusion.clip_warning) ---
+    grad_norms = [r["data"]["grad_norm"] for r in records
+                  if r.get("tag") == "diffusion.grad_norm" and isinstance(r.get("data"), dict)]
+    clip_count = sum(1 for r in records if r.get("tag") == "diffusion.clip_warning")
+    if grad_norms:
+        print(f"\n  Grad Norm  — mean: {_mean(grad_norms):.5f}  "
+              f"min: {min(grad_norms):.5f}  max: {max(grad_norms):.5f}  "
+              f"n={len(grad_norms)}  clips={clip_count}")
+
+    print("\n" + "=" * 140)
+    print(f"  Total guidance records: {sum(len(v) for d in by_tree.values() for v in d.values())}")
+    print("=" * 140 + "\n")
+
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 scripts/guidance_analysis.py <log_file_path>")
+        print("Usage: python3 scripts/guidance_analysis.py <guidance_*.jsonl>")
         return
 
     log_path = sys.argv[1]
-    log_name = os.path.basename(log_path)
-    
     if not os.path.exists(log_path):
-        print(f"Error: File '{log_path}' not found.")
+        print(f"Error: file not found: {log_path}")
         return
 
-    avg_dist, final_dist, clip_warnings, grad_norms, ratios = parse_log_file(log_path)
-    generate_summary_table(avg_dist, final_dist, clip_warnings, grad_norms, ratios, log_name)
+    records = load_jsonl(log_path)
+    analyze(records, os.path.basename(log_path))
+
 
 if __name__ == "__main__":
     main()

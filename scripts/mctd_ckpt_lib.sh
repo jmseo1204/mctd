@@ -77,7 +77,7 @@ mctd_scan_ckpts() {
     )
 
     for _entry in "${_raw[@]:-}"; do
-        [ -n "$_entry" ] && MCTD_CKPT_DIRS+=("$_entry")
+        [ -n "$_entry" ] && MCTD_CKPT_DIRS+=("$_entry") || true
     done
 }
 

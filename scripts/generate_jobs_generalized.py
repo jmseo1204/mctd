@@ -403,7 +403,6 @@ def main():
     parser.add_argument("--num_tasks", type=int, default=5, help="Number of tasks to generate")
     parser.add_argument("--num_seeds", type=int, default=3, help="Number of seeds per task")
     parser.add_argument("--start_task_id", type=int, default=1, help="Starting task index (1-based)")
-    parser.add_argument("--total_tasks_num", type=int, default=None, help="Total number of tasks in the environment (for modulo wrapping)")
     parser.add_argument("--horizon_scale", type=float, default=None, help="Override Multiplier")
     parser.add_argument("--episode_len", type=int, default=None, help="Override episode_len (useful for offline/local runs without config.yaml)")
     parser.add_argument("--outputs_root", default="/home/jmseo1204/mctd_outputs", help="Root directory of outputs/wandb logs")
@@ -561,7 +560,7 @@ def main():
     if not os.path.exists(jobs_folder):
         os.makedirs(jobs_folder)
 
-    total_tasks_num = args.total_tasks_num
+    total_tasks_num = full_cfg['dataset'].get('num_tasks')
     start_task_id = args.start_task_id
     count = 0
     for i in range(args.num_tasks):

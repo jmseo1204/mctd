@@ -1,12 +1,13 @@
 #!/bin/bash
 
-# Integrated Analysis Script
-# This script allows interactive selection of recent logs for analysis
+# Guidance Analysis Script
+# Reads per-job jsonl logs (e.g. logs/20260318_195017_uzrq13fa.jsonl)
+# and reports per-tree (forward/backward) guidance stats.
 
 LOG_DIR="logs"
 
 echo "=========================================="
-echo "    Experiment Log Analysis Tool"
+echo "    Guidance Log Analysis Tool"
 echo "=========================================="
 echo ""
 
@@ -15,32 +16,31 @@ if [ ! -d "$LOG_DIR" ]; then
     exit 1
 fi
 
-# Get 5 most recent log files sorted by modification time
-mapfile -t RECENT_LOGS < <(ls -t "$LOG_DIR"/*.log 2>/dev/null | head -n 5)
+# Get 5 most recent per-job jsonl files (YYYYMMDD_HHMMSS_*.jsonl pattern)
+mapfile -t RECENT_LOGS < <(ls -t "$LOG_DIR"/[0-9]*_*.jsonl 2>/dev/null | head -n 5)
 
 if [ ${#RECENT_LOGS[@]} -eq 0 ]; then
-    echo "No .log files found in '$LOG_DIR'."
+    echo "No per-job jsonl files found in '$LOG_DIR'."
+    echo "(Expected pattern: logs/YYYYMMDD_HHMMSS_<model_id>.jsonl)"
+    echo "Run eval.sh first to generate logs."
     exit 1
 fi
 
-echo "Recent logs in $LOG_DIR/:"
+echo "Recent job logs in $LOG_DIR/:"
 for i in "${!RECENT_LOGS[@]}"; do
     filename=$(basename "${RECENT_LOGS[$i]}")
-    # Mark the default (most recent)
+    size=$(wc -l < "${RECENT_LOGS[$i]}" 2>/dev/null || echo "?")
     if [ $i -eq 0 ]; then
-        echo "[$i] $filename (default)"
+        echo "[$i] $filename  ($size records) (default)"
     else
-        echo "[$i] $filename"
+        echo "[$i] $filename  ($size records)"
     fi
 done
 
 echo ""
 read -p "Select log index to analyze (0-$((${#RECENT_LOGS[@]} - 1)), default: 0): " idx
-
-# Default to 0 if input is empty
 idx=${idx:-0}
 
-# Validate input
 if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 0 ] && [ "$idx" -lt "${#RECENT_LOGS[@]}" ]; then
     SELECTED_LOG="${RECENT_LOGS[$idx]}"
     echo ""

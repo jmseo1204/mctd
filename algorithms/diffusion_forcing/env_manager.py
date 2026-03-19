@@ -115,8 +115,7 @@ class EnvironmentManager:
         # (the direction difference comes from goal-setting in planning code)
         for env_set in [self.envs_forward, self.envs_backward]:
             for i, env in enumerate(env_set.envs):
-                # Convert 0-based task_id to 1-based indexing for ogbench
-                actual_task_id = self.task_id + i + 1
+                actual_task_id = self.task_id + i
                 if self.debug:
                     print(f"[EnvironmentManager] Setting task_id={actual_task_id}")
                 env.set_task(actual_task_id)

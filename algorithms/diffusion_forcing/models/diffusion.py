@@ -490,8 +490,11 @@ class Diffusion(nn.Module):
 
                     total_norm = sum(norms.values())
                     if total_norm > 1e-8:
-                        ratio_parts = [f"{k}: {v/total_norm:.2%}" for k, v in norms.items()]
-                        print(f"[GUIDANCE RATIO] " + " | ".join(ratio_parts))
+                        _t = get_tracer()
+                        if _t is not None:
+                            _t.log("diffusion.guidance_ratio", {
+                                "ratios": {k: v / total_norm for k, v in norms.items()},
+                            }, depth=1)
                 else:
                     guidance_loss = guidance_results
                     g = torch.autograd.grad(guidance_loss.sum(), x, allow_unused=True)[0]
@@ -504,14 +507,22 @@ class Diffusion(nn.Module):
 
             if pred_noise.abs().max() > self.clip_noise:
                 pred_noise = torch.clamp(pred_noise, -self.clip_noise, self.clip_noise)
-                print(f"[CLIP WARNING] Gradient clipped at noise limit {self.clip_noise}")
+                _t = get_tracer()
+                if _t is not None:
+                    _t.log("diffusion.clip_warning", {
+                        "clip_limit": float(self.clip_noise),
+                    }, depth=1)
 
             x_start = self.predict_start_from_noise(x, clipped_curr_noise_level, pred_noise)
 
             mask_final = (curr_noise_level != next_noise_level)
             if mask_final.any():
                 g_norm_val = grad.detach().norm(dim=-1)[mask_final].mean().item()
-                print(f"[GUIDANCE STATS] Grad Norm: {g_norm_val:.4f}")
+                _t = get_tracer()
+                if _t is not None:
+                    _t.log("diffusion.grad_norm", {
+                        "grad_norm": round(g_norm_val, 6),
+                    }, depth=1)
 
         else:
             model_pred = self.model_predictions(
