@@ -13,7 +13,7 @@ action_std: ${dataset.action_std}
 gamma: ${dataset.gamma}
 env_id: ${dataset.env_id}
 dataset: ${dataset.dataset}
-pos_dim: 2  # spatial x,y dims for MCTS guidance/visualization (always 2 for AntMaze/PointMaze)
+pos_dim: 2 # spatial x,y dims for MCTS guidance/visualization (always 2 for AntMaze/PointMaze)
 # non dataset info
 x_shape: null
 
@@ -47,23 +47,23 @@ DEBUG: True
 debug_memory_profile: True # Enable GPU/CPU memory profiling
 profiler_snapshot_interval: 10 # Snapshot GPU memory every N MCTS iterations
 max_plan_hist_keep: 1 # Keep only last N plan histories (memory optimization)
-meeting_delta: 2.0
+meeting_delta: 1.5
 horizon_scale: 0.5 # horizon = episode_len * horizon_scale
 sequence_dividing_factor: 5
 num_tries_for_bad_plans: 3
 open_loop_horizon: 300 #fixme -> best: episode_len*horizon_scale
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
-sub_goal_interval: 3
+sub_goal_interval: 1
 
 # HILP value function guidance
 hilp_checkpoint_path: "td_models/hilp_ckpt_latest.pt"
-hilp_obs_dim: 29  # AntMaze observation dimension
-hilp_skill_dim: 32  # HILP phi representation dimension
+hilp_obs_dim: 29 # AntMaze observation dimension
+hilp_skill_dim: 32 # HILP phi representation dimension
 anchor_guidance_scale: 0.0 # 2.0
 rdf_guidance_scale: 0.0 # 2.0
 mcts_use_sim: false
-use_rollout: false  # If false, skip _rollout_leaf_plan; derive obs_pos from plan_history instead of physical sim
-use_dynamic_obs_padding: false  # If true, use parent_node's obs_pos as padding; if false, always use root_node's obs_pos
+use_rollout: false # If false, skip _rollout_leaf_plan; derive obs_pos from plan_history instead of physical sim
+use_dynamic_obs_padding: false # If true, use parent_node's obs_pos as padding; if false, always use root_node's obs_pos
 
 diffusion:
   clip_noise: 20.0

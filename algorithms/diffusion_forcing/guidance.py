@@ -128,7 +128,7 @@ def goal_guidance(
             pred, target_guidance, reduction="none"
         )  # (T, B, C)
 
-        dist_rmse = torch.sqrt(dist_mse)
+        dist_rmse = torch.sqrt(dist_mse + 1e-8)
 
         # Combined distance: HILP + MSE, weighted at tail positions only
         dist_target =  dist_rmse # + dist_hilp

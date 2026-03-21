@@ -85,11 +85,14 @@ COPY ./mujoco/mujoco210 /home/$UNAME/.mujoco/mujoco210
 # Add LD_LIBRARY_PATH
 ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/$UNAME/.mujoco/mujoco210/bin
 
-# Install JAX with CUDA 12 GPU support (plugin system, no bundled CUDA libs - uses system/WSL CUDA)
-# Note: jax[cpu] is replaced by jax-cuda12-plugin + jax-cuda12-pjrt for GPU acceleration
-# GPU access on WSL2 requires: -v /usr/lib/wsl:/usr/lib/wsl -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:...
-RUN pip install jax==0.6.2 flax
-RUN pip install --no-deps jax-cuda12-plugin==0.6.2 jax-cuda12-pjrt==0.6.2
+# Install JAX with CUDA 12 GPU support (bundled CUDA libs - works on both WSL2 and pure Linux)
+RUN pip install "jax[cuda12]==0.6.2" flax
+
+# Prepend bundled cuDNN path so it takes priority over system-injected cuDNN from NVIDIA container toolkit
+ENV LD_LIBRARY_PATH /home/$UNAME/.local/lib/python3.10/site-packages/nvidia/cudnn/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/$UNAME/.mujoco/mujoco210/bin
 
 # Upgrade wandb: 0.17.x has upload-stall bugs; 0.24+ resolves them
 RUN pip install 'wandb>=0.24.0,<0.25.0'
+
+# Install distrax (JAX-based distributions, required by hilp_gcrl networks)
+RUN pip install distrax==0.1.5

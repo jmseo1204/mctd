@@ -1764,18 +1764,25 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
                 
 
-                # jumpy case (fill the gap)
-                if self.jump > 1:
-                    _plan = []
-                    for t in range(plan_unnormalized.shape[0]):
-                        for j in range(self.jump):
-                            _plan.append(plan_unnormalized[t, :, :self.pos_dim])
-                    plan_unnormalized = torch.stack(_plan)
 
 
                 
                 # Prepare obs for environment execution
                 obs_numpy = obs.detach().cpu().numpy()
+
+                # Reorder plan frames by proximity to resolve FWD-BWD spatial gap
+                plan_unnormalized = self._reorder_plan_by_proximity(plan_unnormalized)
+
+                # Visualize postprocessed plan
+                _pp_plan_np = plan_unnormalized[:, :, :self.pos_dim].detach().cpu().numpy()  # (K, 1, pos_dim)
+                _pp_images = make_trajectory_images(
+                    self.env_id, _pp_plan_np, 1, start_numpy.tolist(), goal_numpy.tolist(), self.plot_end_points
+                )
+                for _pp_i, _pp_img in enumerate(_pp_images):
+                    self.log_image(
+                        f"{namespace}_interaction/postprocessed_plan",
+                        Image.fromarray(_pp_img),
+                    )
 
                 # Use unified plan execution function
                 trajectory_exec, reward_dict = self._execute_plan_in_env(
@@ -3231,7 +3238,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             # Compute action
             if use_diffused_action:
-                plan_frame = plan_frame_format[loop_cnt]
+                plan_frame = plan_frame_format[min(loop_cnt, plan_frame_format.shape[0] - 1)]
                 _, action, _ = self.split_bundle(plan_frame)
             else:
                 action = self._compute_action_from_plan(
@@ -3476,6 +3483,53 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         )
         
         return best_info
+
+    def _reorder_plan_by_proximity(self, plan_unnormalized: torch.Tensor) -> torch.Tensor:
+        """
+        Postprocess a combined FWD+BWD plan by greedily reordering frames in euclidean space.
+
+        Starting from frame idx=0, at each step look ahead at all remaining frames (idx > current):
+          - If any fall within `meeting_delta` distance: pick the one with the highest idx.
+          - Otherwise: pick the nearest frame regardless of distance.
+
+        This resolves spatial discontinuities at the FWD-BWD junction without interpolation.
+        Intermediate frames that are skipped are dropped; the output plan may be shorter than input.
+
+        Args:
+            plan_unnormalized: Tensor shape (T*fs, 1, c), unnormalized (maze coordinate scale).
+
+        Returns:
+            Reordered plan tensor of shape (K, 1, c), K <= T*fs.
+        """
+        n_frames = plan_unnormalized.shape[0]
+        if n_frames <= 1:
+            return plan_unnormalized
+
+        # (N, pos_dim) — positions in maze coordinates
+        positions = plan_unnormalized[:, 0, :self.pos_dim].detach().cpu().numpy()
+        threshold = self.meeting_delta
+
+        result_indices = [0]
+        current_idx = 0
+
+        while current_idx < n_frames - 1:
+            remaining_start = current_idx + 1
+            remaining_pos = positions[remaining_start:]          # (M, pos_dim)
+            dists = np.linalg.norm(remaining_pos - positions[current_idx], axis=1)  # (M,)
+
+            within = np.where(dists <= threshold)[0]            # local indices, ascending
+            if len(within) > 0:
+                # Highest original idx among those within threshold (last element = highest local idx)
+                next_local = int(within[-1])
+            else:
+                # Nearest frame among all remaining
+                next_local = int(np.argmin(dists))
+
+            current_idx = remaining_start + next_local
+            result_indices.append(current_idx)
+
+        idx_tensor = torch.tensor(result_indices, dtype=torch.long, device=plan_unnormalized.device)
+        return plan_unnormalized[idx_tensor]
 
     def _extract_output_plan(
         self,

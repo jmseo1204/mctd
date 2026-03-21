@@ -503,6 +503,9 @@ class Diffusion(nn.Module):
             # Apply gradient to pred_noise, then recompute x_start to keep consistency.
             # Net effect on x_{t-1}: grad * (sqrt_recipm1 * sqrt(α_next) - c)
             # ≈ 0.41 at high noise (effective anchor), ≈ 0 at low noise (no drift).
+            if torch.isnan(grad).any() or torch.isinf(grad).any():
+                grad = torch.zeros_like(grad)
+
             pred_noise = model_pred.pred_noise - grad
 
             if pred_noise.abs().max() > self.clip_noise:
