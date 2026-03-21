@@ -355,8 +355,13 @@ def combined_guidance(planner, x_start, goal, horizon, guidance_scale):
     else:
         scale_list = [float(guidance_scale)]
     eff_goal_scale = float(guidance_scale.mean()) if hasattr(guidance_scale, 'mean') else float(guidance_scale)
-    _anchor_abs = abs(float(anchor_loss))
-    _goal_abs = abs(float(goal_loss))
+    def _to_float(x):
+        """Safe scalar conversion for both scalars and multi-element tensors (uses mean)."""
+        if hasattr(x, 'mean'):
+            return float(x.mean())
+        return float(x)
+    _anchor_abs = abs(_to_float(anchor_loss))
+    _goal_abs = abs(_to_float(goal_loss))
     from utils.tracer import get_tracer as _get_tracer
     _tracer = _get_tracer()
     if _tracer is not None:
@@ -365,13 +370,13 @@ def combined_guidance(planner, x_start, goal, horizon, guidance_scale):
             "guidance_scale_list": scale_list,
             "dist_per_batch": dist_per_batch_list,
             "final_token_dist": final_token_dist_list,
-            "anchor_loss": float(anchor_loss),
+            "anchor_loss": _to_float(anchor_loss),
             "anchor_guidance_scale": float(planner.anchor_guidance_scale),
-            "goal_inner": float(_goal_inner),
-            "goal_loss": float(goal_loss),
+            "goal_inner": _to_float(_goal_inner),
+            "goal_loss": _to_float(goal_loss),
             "eff_goal_scale": eff_goal_scale,
             "goal_anchor_ratio": _goal_abs / (_anchor_abs + 1e-8),
-            "rdf_loss": float(rdf_loss),
+            "rdf_loss": _to_float(rdf_loss),
             "rdf_guidance_scale": float(planner.rdf_guidance_scale),
         }, depth=1)
 

@@ -34,13 +34,14 @@ mctd_skip_level_steps: 10
 time_limit: null
 virtual_visit_weight: 1.0
 warp_threshold: 1.0
-leaf_parallelization: False
+leaf_parallelization: True
 parallel_multiple_visits: False
 
 mctd_num_denoising_steps: 100 # Must be <= sampling_timesteps in df_base.yaml
 parallel_search_num: 1
 mctd_max_search_num: 70
-mctd_guidance_scales: [4.0] # 3.0
+mctd_guidance_scales: [4.0, 4.0] # N sub-trajectories per node expansion
+diverge_threshold: 4.0 # min endpoint distance to count as distinct path (below → deduplicate)
 padding_mode: "same" # "zero" or "same"
 viz_plans: True
 DEBUG: True
@@ -48,8 +49,8 @@ debug_memory_profile: True # Enable GPU/CPU memory profiling
 profiler_snapshot_interval: 10 # Snapshot GPU memory every N MCTS iterations
 max_plan_hist_keep: 1 # Keep only last N plan histories (memory optimization)
 meeting_delta: 1.5
-horizon_scale: 0.5 # horizon = episode_len * horizon_scale
-sequence_dividing_factor: 5
+horizon_scale: 0.3 # horizon = episode_len * horizon_scale
+sequence_dividing_factor: 3
 num_tries_for_bad_plans: 3
 open_loop_horizon: 300 #fixme -> best: episode_len*horizon_scale
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon

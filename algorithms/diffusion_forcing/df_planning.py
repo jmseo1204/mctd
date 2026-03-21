@@ -128,6 +128,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.sub_goal_interval = cfg.sub_goal_interval
         self.viz_plans = cfg.viz_plans
         self.meeting_delta = cfg.get("meeting_delta", 0.5)
+        self.diverge_threshold = cfg.get("diverge_threshold", 2.0)
         self.debug_memory_profile = cfg.get("debug_memory_profile", False)
         self.max_plan_hist_keep = cfg.get("max_plan_hist_keep", 1)  # Memory optimization: limit history
         self.sequence_dividing_factor = cfg.sequence_dividing_factor
@@ -1591,12 +1592,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                             continue
 
                         plan_hist_last: torch.Tensor = info["plan_history"][-1][-1]  # (t*fs, c)
-                        plan_unnormalized: torch.Tensor = self._unnormalize_x(
-                            plan_hist_last.unsqueeze(1)
-                        )  # (t*fs, 1, c)
-
-                        new_denoised_end: int = (parent_node.depth + 1) * seg_size * self.frame_stack
-                        _child.obs_pos = plan_unnormalized[new_denoised_end - 1, 0, :self.observation_dim].cpu().numpy()
+                        _child.obs_pos = self._extract_plan_endpoint_obs_pos(
+                            plan_hist_last, child_depth=parent_node.depth + 1, seg_size=seg_size,
+                        )  # (observation_dim,)
 
                         # Create new sim_state: copy parent's structure and update qpos[:pos_dim] with last valid position
                         _child.sim_state = {}
@@ -1614,23 +1612,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                             "child_depth": _child.depth,
                             "parent_pos": parent_node.obs_pos[:self.pos_dim].tolist(),
                             "child_pos": _child.obs_pos[:self.pos_dim].tolist(),
-                            "new_denoised_end": new_denoised_end,
-                            "plan_len": plan_unnormalized.shape[0],
                         }, depth=0)
 
                 # Extract plan by selecting best leaf and combining plans
                 best_info: dict = self._select_best_leaf(expanded_node_infos)
 
-                # [GUARANTEE] With is_expandable_flag and select() filtering:
-                # - Root unexpandable → terminate at loop start
-                # - Root expandable → at least 1 expandable child exists
-                # - select() only considers expandable children
-                # - Therefore expanded_node_infos is never empty
-                # - Therefore best_info is never None
-                assert best_info is not None, (
-                    "best_info should never be None: root is expandable, "
-                    "select() must have found an expandable child"
-                )
+                # expanded_node_infos can be empty if all candidates were killed by
+                # endpoint deduplication. In that case, skip plan extraction and continue.
+                if best_info is None:
+                    expanded_tree_idx = (expanded_tree_idx + 1) % 2
+                    continue
                 
                 best_node: "TreeNode" = best_info["node"]
                 
@@ -1734,8 +1725,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     goal_numpy,
                     self.plot_end_points,
                 )[0]
+                _path_label = self._node_path_label(
+                    best_node,
+                    is_forward_tree=active_tree.is_tree1,
+                    target_node=best_node.target_node,
+                )
                 self.log_image(
-                    f"plan/plan_at_{steps}", Image.fromarray(forward_image)
+                    f"plan/plan_at_{_path_label}", Image.fromarray(forward_image)
                 )
 
                 # Gradient field visualizations (RMSE + HILP combined)
@@ -2019,6 +2015,91 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             )
 
         return values, infos, achieved_ts
+
+    def _extract_plan_endpoint_obs_pos(
+        self,
+        plan_hists_last: torch.Tensor,  # (t*fs, c) — last denoising step for one candidate
+        child_depth: int,
+        seg_size: int,
+    ) -> np.ndarray:
+        """Extract the obs_pos at the child node's denoised boundary from a plan tensor.
+
+        Factored from the obs_pos extraction logic at line 1599 (use_rollout=false path).
+
+        Args:
+            plan_hists_last: Plan tensor for one candidate, shape (plan_tokens*fs, c).
+            child_depth: Depth of the child node (parent.depth + 1).
+            seg_size: plan_tokens // sequence_dividing_factor.
+
+        Returns:
+            obs_pos: np.ndarray of shape (observation_dim,).
+        """
+        plan_unnormalized = self._unnormalize_x(
+            plan_hists_last.unsqueeze(1)
+        )  # (t*fs, 1, c)
+        new_denoised_end: int = child_depth * seg_size * self.frame_stack
+        return plan_unnormalized[new_denoised_end - 1, 0, :self.observation_dim].cpu().numpy()
+
+    def _deduplicate_by_endpoint(
+        self,
+        expanded_node_candidates: list,  # list of candidate dicts, len B
+        candidate_obs_poses: list,  # list of np.ndarray (observation_dim,), len B
+        values: np.ndarray,  # (B,) — from calculate_values_bidir
+        is_feasible: list,  # list of bool, len B
+    ) -> list:
+        """Among feasible plans from the same parent, kill duplicates whose endpoints
+        are within diverge_threshold. Keep the higher-value plan.
+
+        Args:
+            expanded_node_candidates: Candidate dicts (each has 'parent_node').
+            candidate_obs_poses: Predicted endpoint obs_pos per candidate.
+            values: Value scores per candidate, shape (B,).
+            is_feasible: Feasibility flags per candidate.
+
+        Returns:
+            is_kept: list of bool, len B. True if the plan should create a child node.
+        """
+        B = len(expanded_node_candidates)
+        is_kept = list(is_feasible)  # start with feasibility mask
+
+        # Group candidate indices by parent node name
+        parent_groups: dict = {}  # parent_name -> list of candidate indices
+        for i in range(B):
+            parent_name = expanded_node_candidates[i]["parent_node"].name
+            if parent_name not in parent_groups:
+                parent_groups[parent_name] = []
+            parent_groups[parent_name].append(i)
+
+        # Within each parent group, pairwise deduplicate
+        for parent_name, indices in parent_groups.items():
+            feasible_indices = [i for i in indices if is_kept[i]]
+            for a_idx in range(len(feasible_indices)):
+                i = feasible_indices[a_idx]
+                if not is_kept[i]:
+                    continue
+                for b_idx in range(a_idx + 1, len(feasible_indices)):
+                    j = feasible_indices[b_idx]
+                    if not is_kept[j]:
+                        continue
+                    dist = np.linalg.norm(
+                        candidate_obs_poses[i][:self.pos_dim] - candidate_obs_poses[j][:self.pos_dim]
+                    )
+                    if dist < self.diverge_threshold:
+                        # Duplicate: kill lower-value one
+                        if values[i] >= values[j]:
+                            is_kept[j] = False
+                        else:
+                            is_kept[i] = False
+                            break  # i is killed, no more comparisons for i
+
+        self._tlog("mcts.dedup", {
+            "n_total": B,
+            "n_feasible": sum(is_feasible),
+            "n_kept": sum(is_kept),
+            "parent_groups": {k: len(v) for k, v in parent_groups.items()},
+        }, depth=1)
+
+        return is_kept
 
     def calculate_values_bidir(
         self,
@@ -2339,6 +2420,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     continue
                 if self.leaf_parallelization:
                     for i in range(len(children_node_guidance_scales)):
+                        # Skip slots that already have a child node (created in a previous
+                        # iteration) or are already virtually visited — both mean the slot
+                        # is occupied / scheduled for this round and should not be re-added.
+                        child_slot = selected_node._children_nodes[i]
+                        if child_slot['node'] is not None:
+                            continue
+                        if (not self.parallel_multiple_visits) and child_slot['virtually_visited']:
+                            continue
+
                         # when multiple visits is False, then we need to consider the virtually visited nodes to visit only once
                         expanded_node_candidate = (
                             selected_node.get_expandable_candidate(
@@ -2724,6 +2814,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             # ----------------------SIM (DDIM) LOOP END----------------------------------------
 
+            # Track which candidates had a feasible plan across all retries (before fallback fill)
+            final_is_feasible = [fh is not None for fh in filtered_expanded_node_plan_hists]  # len B
+
             for i in range(len(filtered_expanded_node_plan_hists)):
                 if filtered_expanded_node_plan_hists[i] is None:
                     filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[
@@ -2759,11 +2852,35 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             self._tlog("mcts.value_calc", {"values": values.tolist(), "achieved_infos": achieved_infos.tolist(), "achieved_ts": [str(t) for t in achieved_ts]}, depth=1)
             simul_value_calculation_end = time.time()
 
-            # Node Allocation
+            # Endpoint Deduplication: extract obs_pos per candidate, then kill duplicates
+            candidate_obs_poses = []  # list of np.ndarray (observation_dim,), len B
+            for i in range(len(expanded_node_candidates)):
+                child_depth = expanded_node_candidates[i]["depth"]
+                plan_hists_last_i = expanded_node_plan_hists[-1, :, i]  # (plan_tokens*fs, c)
+                obs_pos_i = self._extract_plan_endpoint_obs_pos(
+                    plan_hists_last_i, child_depth=child_depth, seg_size=seg_size,
+                )  # (observation_dim,)
+                candidate_obs_poses.append(obs_pos_i)
+
+            is_kept = self._deduplicate_by_endpoint(
+                expanded_node_candidates, candidate_obs_poses, values, final_is_feasible,
+            )  # list of bool, len B
+
+            # Node Allocation (skip deduplicated/infeasible candidates)
             simul_node_allocation_start = time.time()
+            # Reset virtually_visited for killed slots so they remain available
+            for i in range(len(expanded_node_candidates)):
+                if not is_kept[i]:
+                    name = expanded_node_candidates[i]["name"]
+                    slot_index = int(name.split('-')[-1])
+                    parent_node = expanded_node_candidates[i]["parent_node"]
+                    parent_node._children_nodes[slot_index]["virtually_visited"] = False
+
             selected_nodes_for_expansion = {}
             expanded_node_infos = {}
             for i in range(len(expanded_node_candidates)):  # B
+                if not is_kept[i]:
+                    continue  # slot remains empty, available for future expansion rounds
                 name = expanded_node_candidates[i]["name"]
                 if name not in expanded_node_infos:
                     selected_nodes_for_expansion[name] = selected_nodes[i]
@@ -2822,9 +2939,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             backprop_start_time = time.time()
             self._tlog("mcts.phase", {"phase": "backprop_start"}, depth=1)
 
+            # Only backpropagate nodes that actually had children created this round
             distinct_selected_nodes = np.unique(selected_nodes)
             for selected_node in distinct_selected_nodes:
-                selected_node.backpropagate()
+                if any(c["node"] is not None for c in selected_node._children_nodes):
+                    selected_node.backpropagate()
 
             self._tlog("mcts.phase", {"phase": "backprop_end"}, depth=1)
             backprop_end_time = time.time()
@@ -3483,6 +3602,57 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         )
         
         return best_info
+
+    def _node_path_label(
+        self,
+        expanding_node: "TreeNode",
+        is_forward_tree: bool,
+        target_node: Optional["TreeNode"],
+    ) -> str:
+        """Build a human-readable path label for plan visualization.
+
+        The label always reads forward-root → ... → backward-root, with the
+        currently-expanding node wrapped in parentheses, and the two trees
+        separated by '_'.
+
+        Examples (node names encoded as last component of the TreeNode name):
+          Backward tree expanding "0-1-3", target forward "0-2-5"
+            → "0-2-5_(3)-1-0"
+          Forward tree expanding "0-2-5", target backward "0-1-3"
+            → "0-2-(5)_3-1-0"
+
+        Args:
+            expanding_node: The TreeNode just expanded.
+            is_forward_tree: True if expanding_node belongs to the forward (start-rooted) tree.
+            target_node: The node in the opposite tree being targeted (may be None).
+
+        Returns:
+            Label string, e.g. "0-2-5_(3)-1-0".
+        """
+        exp_parts = expanding_node.name.split("-")  # e.g. ["0","1","3"]
+
+        if target_node is not None:
+            tgt_parts = target_node.name.split("-")  # e.g. ["0","2","5"]
+        else:
+            tgt_parts = ["?"]
+
+        if is_forward_tree:
+            # Forward side: root → ... → (expanding_node)  e.g. "0-2-(5)"
+            fwd_parts = exp_parts[:-1] + [f"({exp_parts[-1]})"]
+            fwd_label = "-".join(fwd_parts)
+
+            # Backward side: target_node → ... → backward_root  e.g. "3-1-0"
+            bwd_label = "-".join(reversed(tgt_parts))
+        else:
+            # Forward side: root → ... → target_node  e.g. "0-2-5"
+            fwd_label = "-".join(tgt_parts)
+
+            # Backward side: (expanding_node) → ... → backward_root  e.g. "(3)-1-0"
+            bwd_parts = list(reversed(exp_parts))
+            bwd_parts[0] = f"({bwd_parts[0]})"
+            bwd_label = "-".join(bwd_parts)
+
+        return f"{fwd_label}_{bwd_label}"
 
     def _reorder_plan_by_proximity(self, plan_unnormalized: torch.Tensor) -> torch.Tensor:
         """
