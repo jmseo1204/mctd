@@ -24,7 +24,7 @@ class TreeNode():
         self.virtual_visit_count = 0
         # The maximum number of children nodes is same to the number of children node guidances
         self._children_nodes = [
-            {'guidance_scale': self._children_node_guidance_scales[i], 'node': None, "virtually_visited": False}
+            {'guidance_scale': self._children_node_guidance_scales[i], 'node': None, "virtually_visited": False, "permanently_dead": False}
             for i in range(len(self._children_node_guidance_scales))
         ]
 
@@ -49,6 +49,10 @@ class TreeNode():
         # For non-leaf nodes: updated during backpropagation when all children become unexpandable.
         self.is_expandable_flag: bool = self.is_expandable()
 
+        # Reset counter: tracks how many times this node's children have been wiped and
+        # re-opened for expansion (triggered when all children are exhausted but non-terminal).
+        self._reset_count: int = 0
+
     def __lt__(self, other):
         return self.name < other.name
     
@@ -67,13 +71,34 @@ class TreeNode():
         if self.depth == self.terminal_depth:
             return False
         for child_node in self._children_nodes:
-            if child_node["node"] is None and (not consider_virtually_visited or not child_node["virtually_visited"]):
+            if child_node["node"] is None and not child_node["permanently_dead"] and (not consider_virtually_visited or not child_node["virtually_visited"]):
                 return True
         return False
 
+    def mark_slot_permanently_dead(self, slot_index: int):
+        """Mark a child slot as permanently dead (e.g. dedup-killed).
+        Dead slots are skipped by is_expandable() and get_expandable_candidate()
+        and can never be revived, unlike the temporary virtually_visited flag."""
+        self._children_nodes[slot_index]["permanently_dead"] = True
+        self.is_expandable_flag = self.is_expandable()
+
+    def reset_dead_children(self) -> bool:
+        """Wipe all child slots (both permanently_dead and alive-but-exhausted) so the
+        node can be re-expanded from scratch.  Called by select() when every child's
+        subtree is exhausted without any terminal node being reached.
+
+        Returns True if the reset was applied, False if max_resets has been reached."""
+        for slot in self._children_nodes:
+            slot["node"] = None
+            slot["permanently_dead"] = False
+            slot["virtually_visited"] = False
+        self._reset_count += 1
+        self.is_expandable_flag = self.is_expandable()
+        return True
+
     def is_selectable(self):
         for child_node in self._children_nodes:
-            if child_node["node"] is None:
+            if child_node["node"] is None and not child_node["permanently_dead"]:
                 return False
         return True
 
@@ -92,18 +117,28 @@ class TreeNode():
         self.value_estimation_plan = value_estimation_plan
 
     # Following UCT(Upper Confidence Boundary of Tree)
-    def select(self, exp_weight=math.sqrt(2), leaf_parallelization=False):
+    def select(self, exp_weight=math.sqrt(2), leaf_parallelization=False, max_child_resets: int = 3):
         for child_node in self._children_nodes:
-            if child_node["node"] is None:
+            if child_node["node"] is None and not child_node["permanently_dead"]:
                 raise ValueError('Child node is None in select method')
 
         # Filter out unexpandable children - only consider expandable ones for selection
+        # Skip permanently_dead slots (node is None, would cause AttributeError)
         expandable_children_indices = [
             i for i, child_node in enumerate(self._children_nodes)
-            if child_node["node"].is_expandable_flag
+            if not child_node["permanently_dead"] and child_node["node"] is not None and child_node["node"].is_expandable_flag
         ]
 
         if not expandable_children_indices:
+            # All alive children have exhausted subtrees.
+            # If none are terminal and we still have reset budget, wipe children and
+            # return self so the outer selection loop re-expands from this node.
+            alive_slots = [c for c in self._children_nodes
+                           if not c["permanently_dead"] and c["node"] is not None]
+            has_terminal = any(c["node"].is_terminal() for c in alive_slots)
+            if not has_terminal and self._reset_count < max_child_resets:
+                self.reset_dead_children()
+                return self  # outer while-loop re-evaluates: now is_expandable=True → exits
             raise ValueError('No expandable children available for selection')
 
         # Calculate total visit count only for expandable children
@@ -143,7 +178,10 @@ class TreeNode():
     def get_expandable_candidate(self, index=None, consider_virtually_visited=False):
         if index is None:
             remaining_children_indices = [
-                i for i in range(len(self._children_nodes)) if self._children_nodes[i]['node'] is None and (not consider_virtually_visited or not self._children_nodes[i]['virtually_visited'])
+                i for i in range(len(self._children_nodes))
+                if self._children_nodes[i]['node'] is None
+                and not self._children_nodes[i]['permanently_dead']
+                and (not consider_virtually_visited or not self._children_nodes[i]['virtually_visited'])
             ]
             #selected_index = remaining_children_indices[0] # To check the best-of-n MCTD
             selected_index = np.random.choice(remaining_children_indices)

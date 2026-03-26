@@ -315,6 +315,120 @@ def analyze_guidance(records: List[Dict]) -> str:
     return "\n".join(lines)
 
 
+def analyze_timing(records: List[Dict]) -> str:
+    """Analyze timing.* records: latency breakdown of planning and execution."""
+    lines = []
+
+    # --- MPC loop planning time ---
+    mpc_records = get_tag_records(records, "timing.mpc_loop")
+    if mpc_records:
+        planning_ms = [r["data"].get("planning_ms", 0) for r in mpc_records if "data" in r]
+        avg_p = sum(planning_ms) / len(planning_ms)
+        max_p = max(planning_ms)
+        lines.append(f"#### MPC Loop Planning Time (`timing.mpc_loop`, n={len(mpc_records)})\n")
+        lines.append(f"| Metric | Value |")
+        lines.append(f"|--------|-------|")
+        lines.append(f"| Avg planning_ms | {avg_p:.0f} ms |")
+        lines.append(f"| Max planning_ms | {max_p:.0f} ms |")
+        lines.append("")
+
+    # --- MCTS phase breakdown ---
+    phase_records = get_tag_records(records, "timing.phase_breakdown")
+    if phase_records:
+        by_tree: Dict[str, list] = defaultdict(list)
+        for r in phase_records:
+            d = r.get("data", {})
+            by_tree[d.get("tree_tag", "unknown")].append(d)
+
+        for tree_tag, entries in sorted(by_tree.items()):
+            label = "FORWARD" if "start" in tree_tag else ("BACKWARD" if "goal" in tree_tag else tree_tag)
+            def _avg_field(field: str) -> float:
+                vals = [e.get(field, 0) for e in entries if e.get(field) is not None]
+                return sum(vals) / len(vals) if vals else 0.0
+
+            lines.append(f"#### MCTS Phase Breakdown — {label} (`timing.phase_breakdown`, n={len(entries)})\n")
+            lines.append(f"| Phase | Avg ms | Ratio |")
+            lines.append(f"|-------|--------|-------|")
+            total = _avg_field("total_ms")
+            for phase in ("expansion", "selection", "simulation", "backprop"):
+                ms = _avg_field(f"{phase}_ms")
+                ratio = _avg_field(f"{phase}_ratio")
+                lines.append(f"| {phase} | {ms:.0f} | {ratio:.3f} |")
+            lines.append(f"| **total** | **{total:.0f}** | 1.000 |")
+            lines.append("")
+            if _avg_field("expansion_ratio") > 0.95:
+                lines.append("⚠️ Expansion dominates (>95%) — diffusion denoising is the bottleneck.")
+            lines.append("")
+
+    # --- GPU denoising step ---
+    gpu_records = get_tag_records(records, "timing.gpu_sample_step")
+    if gpu_records:
+        gpu_data = [r.get("data", {}) for r in gpu_records]
+        avg_total = sum(d.get("total_gpu_ms", 0) for d in gpu_data) / len(gpu_data)
+        avg_per_step = sum(d.get("mean_per_step_ms", 0) for d in gpu_data) / len(gpu_data)
+        n_steps = gpu_data[0].get("n_denoising_steps", "?")
+        lines.append(f"#### GPU Denoising (`timing.gpu_sample_step`, n={len(gpu_records)})\n")
+        lines.append(f"| Metric | Value |")
+        lines.append(f"|--------|-------|")
+        lines.append(f"| n_denoising_steps | {n_steps} |")
+        lines.append(f"| Avg total_gpu_ms | {avg_total:.0f} ms |")
+        lines.append(f"| Avg ms/step | {avg_per_step:.1f} ms |")
+        lines.append("")
+
+    # --- Guidance overhead in denoising ---
+    gfn_records = get_tag_records(records, "timing.guidance_fn_in_denoising")
+    if gfn_records:
+        gfn_data = [r.get("data", {}) for r in gfn_records]
+        avg_total = sum(d.get("total_ms", 0) for d in gfn_data) / len(gfn_data)
+        avg_mean = sum(d.get("mean_ms", 0) for d in gfn_data) / len(gfn_data)
+        avg_pct = sum(d.get("guidance_pct_of_gpu", 0) for d in gfn_data) / len(gfn_data)
+        lines.append(f"#### Guidance Overhead in Denoising (`timing.guidance_fn_in_denoising`, n={len(gfn_records)})\n")
+        lines.append(f"| Metric | Value |")
+        lines.append(f"|--------|-------|")
+        lines.append(f"| Avg total guidance ms | {avg_total:.0f} ms |")
+        lines.append(f"| Avg ms/call | {avg_mean:.1f} ms |")
+        lines.append(f"| Guidance % of GPU time | {avg_pct:.1f}% |")
+        lines.append("")
+        if avg_pct > 50:
+            lines.append(f"⚠️ Guidance takes {avg_pct:.0f}% of GPU time — consider reducing guidance calls or HILP batch size.")
+        lines.append("")
+
+    # --- HILP guidance breakdown ---
+    hilp_records = get_tag_records(records, "timing.guidance_breakdown")
+    if hilp_records:
+        hilp_data = [r.get("data", {}) for r in hilp_records]
+        avg_hilp_ms = sum(d.get("hilp_ms", 0) for d in hilp_data) / len(hilp_data)
+        lines.append(f"#### HILP Guidance Breakdown (`timing.guidance_breakdown`, n={len(hilp_records)})\n")
+        lines.append(f"| Metric | Value |")
+        lines.append(f"|--------|-------|")
+        lines.append(f"| Avg hilp_ms per call | {avg_hilp_ms:.0f} ms |")
+        lines.append("")
+
+    # --- Plan execution breakdown ---
+    exec_timing = get_tag_records(records, "timing.execute_plan")
+    if exec_timing:
+        exec_data = [r.get("data", {}) for r in exec_timing]
+        avg_total = sum(d.get("total_exec_ms", 0) for d in exec_data) / len(exec_data)
+        avg_action_ms = sum(d.get("action_mean_ms", 0) for d in exec_data) / len(exec_data)
+        avg_env_ms = sum(d.get("env_step_mean_ms", 0) for d in exec_data) / len(exec_data)
+        avg_action_pct = sum(d.get("action_pct", 0) for d in exec_data) / len(exec_data)
+        avg_loop_cnt = sum(d.get("loop_cnt", 0) for d in exec_data) / len(exec_data)
+        lines.append(f"#### Plan Execution (`timing.execute_plan`, n={len(exec_timing)})\n")
+        lines.append(f"| Metric | Value |")
+        lines.append(f"|--------|-------|")
+        lines.append(f"| Avg steps executed | {avg_loop_cnt:.0f} |")
+        lines.append(f"| Avg total_exec_ms | {avg_total:.0f} ms |")
+        lines.append(f"| Avg ms/action | {avg_action_ms:.2f} ms |")
+        lines.append(f"| Avg ms/env_step | {avg_env_ms:.2f} ms |")
+        lines.append(f"| Action compute % | {avg_action_pct:.1f}% |")
+        lines.append("")
+
+    if not lines:
+        return "_No `timing.*` records found. Latency logging may be disabled or this log predates timing instrumentation._\n"
+
+    return "\n".join(lines)
+
+
 def analyze_errors(records: List[Dict]) -> str:
     errors = extract_errors(records)
     if not errors:
@@ -356,6 +470,11 @@ def build_md_report(log_path: Path, records: List[Dict], is_slp: bool, run_meta:
     # Errors
     sections.append("---\n## Errors\n")
     sections.append(analyze_errors(records))
+
+    # Latency / Timing
+    sections.append("---\n## Latency Analysis\n")
+    sections.append("> MPC planning time, MCTS phase breakdown, GPU denoising, guidance overhead, plan execution.\n")
+    sections.append(analyze_timing(records))
 
     # Plan-Following Analysis (the main diagnostic)
     sections.append("---\n## Plan-Following Analysis\n")

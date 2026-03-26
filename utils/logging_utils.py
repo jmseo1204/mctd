@@ -6,6 +6,7 @@ import torch
 import matplotlib.pyplot as plt
 import cv2
 import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgba
 from tqdm import trange, tqdm
 import matplotlib.animation as animation
 from pathlib import Path
@@ -271,11 +272,13 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
         node_trajectory = trajectory.get('node_path')
         best_node_target = trajectory.get('best_node_target')  # single (2,) pos or None
         hilp_heatmap    = trajectory.get('hilp_heatmap')       # dict {X, Y, values} or None
+        hilp_grad_field = trajectory.get('hilp_grad_field')    # dict {x_grid, y_grid, hilp_grads, hilp_norms} or None
     else:
         plan_trajectory = trajectory
         node_trajectory = None
         best_node_target = None
         hilp_heatmap = None
+        hilp_grad_field = None
 
     for batch_idx in range(batch_size):
         fig, ax = plt.subplots()
@@ -295,7 +298,10 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
                 Y_p = Y_w / 4 + 1
             else:
                 X_p, Y_p = X_w, Y_w
-            ax.pcolormesh(X_p, Y_p, vals, shading='auto', cmap='viridis', alpha=0.5, zorder=1)
+            vmin, vmax = float(vals.min()), float(vals.max())
+            mesh = ax.pcolormesh(X_p, Y_p, vals, shading='auto', cmap='viridis', alpha=0.5,
+                                 zorder=1, vmin=vmin, vmax=vmax)
+            fig.colorbar(mesh, ax=ax, label='HILP V(s,g)', fraction=0.03, pad=0.02)
 
         # Plot plan trajectory (red)
         if plan_trajectory is not None:
@@ -319,6 +325,51 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
                 ax.scatter(node_trajectory[:, 0], node_trajectory[:, 1],
                           c='blue', marker='o', s=100, alpha=0.7, edgecolors='darkblue', linewidth=2, zorder=5),
 
+        # Plot guidance gradient arrows
+        # crimson = HILP (or HILP+score) region; steelblue = RMSE region (temporally far)
+        if hilp_grad_field is not None:
+            X_w = hilp_grad_field['x_grid']
+            Y_w = hilp_grad_field['y_grid']
+            hilp_grads = hilp_grad_field['hilp_grads']   # (H_g, W_g, 2)
+            far_mask_grid = hilp_grad_field.get('far_mask_grid', None)  # (H_g, W_g) bool or None
+            if env_id in OGBENCH_ENVS:
+                X_p = X_w / 4 + 1
+                Y_p = Y_w / 4 + 1
+            else:
+                X_p, Y_p = X_w, Y_w
+            U = hilp_grads[:, :, 0]
+            V = hilp_grads[:, :, 1]
+            mag = np.sqrt(U ** 2 + V ** 2) + 1e-8
+            # Pure unit vectors — direction only, uniform arrow length
+            U_n = U / mag
+            V_n = V / mag
+
+            if far_mask_grid is None:
+                far_mask_grid = np.zeros_like(U_n, dtype=bool)
+
+            flat_hilp_mask = (~far_mask_grid).reshape(-1)
+            flat_far_mask = far_mask_grid.reshape(-1)
+            flat_colors = np.empty((U_n.size, 4), dtype=float)
+            flat_colors[flat_hilp_mask] = to_rgba('crimson', alpha=0.6)
+            flat_colors[flat_far_mask] = to_rgba('steelblue', alpha=0.6)
+
+            ax.quiver(
+                X_p.reshape(-1), Y_p.reshape(-1),
+                U_n.reshape(-1), V_n.reshape(-1),
+                color=flat_colors,
+                angles='xy',
+                scale_units='xy',
+                scale=1.0,
+                pivot='mid',
+                width=0.004,
+                zorder=3,
+            )
+
+            if flat_hilp_mask.any():
+                ax.scatter([], [], c='crimson', marker=r'$\rightarrow$', s=120, alpha=0.6, label='HILP grad')
+            if flat_far_mask.any():
+                ax.scatter([], [], c='steelblue', marker=r'$\rightarrow$', s=120, alpha=0.6, label='RMSE grad (far)')
+
         if plot_end_points:
             if env_id in OGBENCH_ENVS:  # OGBench envs
                 start_goal = (np.array(start[batch_idx])/4+1, np.array(goal[batch_idx])/4+1)
@@ -336,9 +387,11 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
             ax.scatter(px, py, c='green', marker='*', s=300, zorder=10,
                        edgecolors='darkgreen', linewidth=1.5, label="Target")
 
-        # Add legend if node_trajectory or target is present
-        if (node_trajectory is not None and len(node_trajectory) > 0) or best_node_target is not None:
-            ax.legend(loc='upper right', fontsize=10)
+        # Add legend if any named element is present
+        if ((node_trajectory is not None and len(node_trajectory) > 0)
+                or best_node_target is not None
+                or hilp_grad_field is not None):
+            ax.legend(loc='upper right', fontsize=8)
 
         # plt.title(f"sample_{batch_idx}")
         fig.tight_layout()
@@ -351,122 +404,6 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
     return images
 
 
-def make_combined_grad_field_image(
-    env_id: str,
-    grad_field: dict,
-    target_pos,
-    start,
-    goal,
-) -> np.ndarray:
-    """
-    Draw RMSE and HILP gradient fields on a single figure.
-
-    - RMSE arrows: blue, all same length (unit vectors toward target).
-    - HILP arrows: red, unit-vector direction, alpha ∝ log(hilp_norm+1)
-      so near-zero gradient regions are transparent.
-    - Arrow length is normalized for both types (direction only), magnitude
-      is encoded via color/alpha to avoid invisibility when raw magnitudes differ.
-
-    Args:
-        env_id: Environment ID string.
-        grad_field: Dict from _compute_guidance_grad_fields.
-        target_pos: (2,) world coords of the fixed target (green star).
-        start: (batch, 2) world coords for start marker.
-        goal: (batch, 2) world coords for goal marker.
-
-    Returns:
-        RGBA uint8 numpy image.
-    """
-    X_w = grad_field['x_grid']
-    Y_w = grad_field['y_grid']
-
-    if env_id in OGBENCH_ENVS:
-        X_p = X_w / 4 + 1
-        Y_p = Y_w / 4 + 1
-        tpx = float(target_pos[0]) / 4 + 1
-        tpy = float(target_pos[1]) / 4 + 1
-    else:
-        X_p, Y_p = X_w, Y_w
-        tpx, tpy = float(target_pos[0]), float(target_pos[1])
-
-    def _normalize_grad(grads: np.ndarray):
-        """
-        Normalize each component (U, V) of the gradient field using
-        the global mean and std of the raw magnitudes across all grid points.
-        Returns (U_norm, V_norm, mean_scalar, std_scalar).
-        """
-        U_raw = grads[:, :, 0]
-        V_raw = grads[:, :, 1]
-        mag = np.sqrt(U_raw ** 2 + V_raw ** 2)   # (H, W) per-point magnitude
-        m = float(mag.mean())
-        s = float(mag.std()) + 1e-8
-        # Normalise each vector by (mag - mean) / std so typical arrows ≈ 1 unit
-        scale = (mag - m) / s + 1.0   # shift so mean → 1.0
-        # Avoid negative scales (can flip arrow direction)
-        scale = np.clip(scale, 0.0, None)
-        denom = mag + 1e-8
-        U_norm = U_raw / denom * scale
-        V_norm = V_raw / denom * scale
-        return U_norm, V_norm, m, s
-
-    fig, ax = plt.subplots(figsize=(7, 7))
-    maze_grid = get_maze_grid(env_id) if is_grid_env(env_id) else None
-    plot_maze_layout(ax, maze_grid)
-
-    # --- RMSE arrows (blue) — normalize using mean/std of raw magnitudes ---
-    rmse_grads = grad_field['rmse_grads']   # (H, W, 2)
-    U_r, V_r, rmse_mean, rmse_std = _normalize_grad(rmse_grads)
-    ax.quiver(
-        X_p, Y_p, U_r, V_r,
-        color='royalblue',
-        alpha=0.55,
-        angles='xy',
-        pivot='mid',
-        scale=None,
-        zorder=3,
-        label=f'RMSE  (mean={rmse_mean:.2e}, std={rmse_std:.2e})',
-    )
-
-    # --- HILP arrows (red) — normalize using mean/std of raw magnitudes ---
-    hilp_grads = grad_field['hilp_grads']   # (H, W, 2)
-    U_h, V_h, hilp_mean, hilp_std = _normalize_grad(hilp_grads)
-    ax.quiver(
-        X_p, Y_p, U_h, V_h,
-        color='crimson',
-        alpha=0.55,
-        angles='xy',
-        pivot='mid',
-        scale=None,
-        zorder=4,
-        label=f'HILP  (mean={hilp_mean:.2e}, std={hilp_std:.2e})',
-    )
-
-    # Diagnostics
-    import sys as _sys
-    print(
-        f"[TD_field DIAG] RMSE mag mean={rmse_mean:.4e} std={rmse_std:.4e} | "
-        f"HILP mag mean={hilp_mean:.4e} std={hilp_std:.4e}",
-        file=_sys.stderr, flush=True,
-    )
-
-    ax.scatter(tpx, tpy, c='green', marker='*', s=300, zorder=10,
-               edgecolors='darkgreen', linewidth=1.5, label='Target')
-
-    if start is not None and goal is not None:
-        if env_id in OGBENCH_ENVS:
-            start_goal = (np.array(start[0]) / 4 + 1, np.array(goal[0]) / 4 + 1)
-        else:
-            start_goal = (start[0], goal[0])
-        plot_start_goal(ax, start_goal)
-
-    ax.set_title('TD Gradient Field  (blue=RMSE, red=HILP)')
-    ax.legend(loc='upper right', fontsize=8)
-    fig.tight_layout()
-    fig.canvas.draw()
-    img_shape = fig.canvas.get_width_height()[::-1] + (4,)
-    img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).copy().reshape(img_shape)
-    plt.close()
-    return img
 
 
 def make_convergence_animation(

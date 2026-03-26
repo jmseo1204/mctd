@@ -1,8 +1,33 @@
 from typing import Optional, Union, Dict, Tuple
+import time
 import torch
 import torch.nn as nn
 import numpy as np
 from einops import rearrange, repeat, reduce
+
+
+def _kde_score_np(query_xy: np.ndarray, data_xy: np.ndarray, sigma: float) -> np.ndarray:
+    """∇log p(query) — Gaussian KDE score function.
+
+    p(s) ∝ Σᵢ exp(-||s - sᵢ||² / (2σ²))
+    ∇log p(s) = Σᵢ wᵢ·(sᵢ - s)/σ²   where wᵢ ∝ exp(-||s-sᵢ||²/(2σ²))
+
+    Always points toward higher training-data density (inside corridors).
+
+    Args:
+        query_xy: (N, 2) world coordinates to evaluate at
+        data_xy:  (M, 2) training data positions (pre-subsampled)
+        sigma:    KDE bandwidth
+
+    Returns:
+        (N, 2) score vectors
+    """
+    diff = data_xy[None, :, :] - query_xy[:, None, :]   # (N, M, 2)
+    sq   = (diff ** 2).sum(-1)                           # (N, M)
+    logw = -sq / (2.0 * sigma ** 2)
+    logw -= logw.max(-1, keepdims=True)                  # numerical stability
+    w    = np.exp(logw)                                  # (N, M)
+    return (w[:, :, None] * diff).sum(1) / (w.sum(-1, keepdims=True) * sigma ** 2)  # (N, 2)
 
 def weighted_loss(
     planner,
@@ -61,6 +86,88 @@ def prepare_pred(planner, x: torch.Tensor) -> torch.Tensor:
     )  # (t*fs, b, c)
     return planner._unnormalize_x(pred)
 
+def compute_guidance_grad_np(
+    planner,
+    obs_np: np.ndarray,
+    target_np: np.ndarray,
+    hilp_fn,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Core guidance gradient logic shared by goal_guidance() and _compute_guidance_grad_fields().
+
+    Given pre-padded obs_np and target_np (both in hilp_obs_dim space):
+      1. Compute ∂V/∂obs via JAX grad (HILP)
+      2. Normalize: ∇V/|∇V|
+      3. Optionally add KDE score:  ∇V/|∇V| + kde_lam·∇log p  (use_score_func_with_TD)
+      4. Compute HILP values V(obs, target) for TD threshold check
+      5. For elements with V < TD_thres_for_far_target → replace with RMSE direction
+
+    Changing logic here automatically propagates to both the diffusion guidance and
+    the plan/plan_at_* visualization arrows.
+
+    Args:
+        planner:    DiffusionForcingPlanning instance (reads config attrs)
+        obs_np:     (N, hilp_obs_dim) float32 — observations padded to HILP input dim
+        target_np:  (1, hilp_obs_dim) or (N, hilp_obs_dim) float32 — target padded to HILP input dim
+        hilp_fn:    HILPJax instance with compute_grads / compute_values_np
+
+    Returns:
+        combined_np:    (N, 2) final guidance direction per observation
+        hilp_values_np: (N,)  HILP value V(obs, target) — for diagnostics / threshold coloring
+    """
+    if target_np.shape[0] == 1:
+        target_xy = np.broadcast_to(target_np[:, :2], (len(obs_np), 2))
+        goal_rep_np = np.broadcast_to(target_np[:1], (len(obs_np), target_np.shape[-1])).copy()
+    else:
+        assert target_np.shape[0] == len(obs_np), (
+            f"target_np.shape[0]={target_np.shape[0]} must be 1 or len(obs_np)={len(obs_np)}"
+        )
+        target_xy = target_np[:, :2]
+        goal_rep_np = target_np.copy()
+
+    # 1. HILP gradient ∂V/∂obs[:2] via JAX
+    hilp_grad_np = hilp_fn.compute_grads(obs_np, goal_rep_np)  # (N, 2)
+
+    # 2. Normalize: ∇V/|∇V|
+    grad_mag = np.linalg.norm(hilp_grad_np, axis=-1, keepdims=True).clip(min=1e-8)
+    hilp_grad_normalized = hilp_grad_np / grad_mag
+
+    # 3. Optionally add KDE score:  ∇V/|∇V| + kde_lam·∇log p
+    use_score_func = getattr(planner, 'use_score_func_with_TD', True)
+    kde_lam = getattr(planner, 'kde_lam', 0.0)
+    if use_score_func and kde_lam > 0.0:
+        query_xy = obs_np[:, :2]
+        if hasattr(planner, "_kde_grid_cache"):
+            kde_score = planner._get_kde_score_grid(query_xy)
+        else:
+            kde_data_xy = planner._get_kde_data_xy()
+            kde_score = _kde_score_np(query_xy, kde_data_xy, sigma=planner.kde_sigma)
+        hilp_combined_np = hilp_grad_normalized + kde_lam * kde_score
+    else:
+        hilp_combined_np = hilp_grad_normalized
+
+    # 4. HILP values V(obs, target) for threshold-based switching
+    # Use planner._compute_hilp_values for consistency with heatmap (same pessimistic
+    # min(v1,v2) path, same _hilp_ref_obs padding). For HILPJax v1==v2 so min is a no-op,
+    # but this keeps the computation identical across heatmap / grad-field / guidance.
+    hilp_values_np = planner._compute_hilp_values(obs_np, goal_rep_np).cpu().numpy()  # (N,)
+
+    # 5. TD threshold: switch to RMSE direction for temporally-far elements (V < TD_thres)
+    TD_thres = getattr(planner, 'TD_thres_for_far_target', None)
+    if TD_thres is not None:
+        far_mask = hilp_values_np < float(TD_thres)  # small V ↔ far from target
+        if far_mask.any():
+            delta = target_xy - obs_np[:, :2]  # (N, 2) vector toward target
+            delta_mag = np.linalg.norm(delta, axis=-1, keepdims=True).clip(min=1e-8)
+            rmse_grad_np = delta / delta_mag           # unit vector toward target
+            combined_np = np.where(far_mask[:, None], rmse_grad_np, hilp_combined_np)
+        else:
+            combined_np = hilp_combined_np
+    else:
+        combined_np = hilp_combined_np
+
+    return combined_np, hilp_values_np
+
+
 def goal_guidance(
     planner, x: torch.Tensor, goal: torch.Tensor, horizon: int
 ) -> Tuple[torch.Tensor, list, list]:
@@ -107,43 +214,104 @@ def goal_guidance(
         )
         tail_pos = tail_pos[tail_pos < T]
 
-        # HILP distance at tail positions only — use full observation_dim (pos+vel) for HILP
-        obs_dim = planner.observation_dim
-        obs_tail = pred[tail_pos, :, :obs_dim].reshape(-1, obs_dim)           # (len*B, observation_dim)
-        goal_tail = target[:, :obs_dim].unsqueeze(0).expand(
-            len(tail_pos), -1, -1
-        ).reshape(-1, obs_dim)                                            # (len*B, observation_dim)
+        # --- HILP unit-vector guidance (pseudo-loss trick for JAX backend) ---
+        # HILPJax breaks PyTorch autograd, so we compute gradients via JAX and
+        # inject them using a pseudo-loss: d/d(pred) = hilp_grad_unit at the
+        # segment tail positions. This matches the older RMSE-based guidance,
+        # which applied guidance to every segment tail instead of only the last one.
+        hilp_fn = getattr(planner, '_hilp_value_fn_instance', None)
 
-        v_tail = planner._compute_hilp_values(
-            obs_tail, goal_tail, use_no_grad=False
-        ).reshape(len(tail_pos), B)                                 # (len, B)
+        if hilp_fn is not None and hasattr(hilp_fn, 'compute_grads'):
+            obs_dim = planner.observation_dim
+            hilp_obs_dim = planner.hilp_obs_dim
+            _ref = getattr(planner, '_hilp_ref_obs', None)
 
-        # Fill full (T, B) tensor — non-tail positions get 0 (no grad)
-        v = torch.zeros(T, B, device=pred.device, dtype=v_tail.dtype)
-        v[tail_pos] = v_tail
-        dist_hilp = (-v).unsqueeze(-1).expand(-1, -1, pred.shape[-1])  # (T, B, C)
+            # Build padded obs at all tail positions (len(tail_pos) * B rows)
+            obs_tail_raw = pred[tail_pos, :, :obs_dim].reshape(-1, obs_dim).detach().cpu().numpy().astype(np.float32)
+            if _ref is not None:
+                obs_tail_np = np.tile(_ref, (len(obs_tail_raw), 1)).astype(np.float32)
+            else:
+                obs_tail_np = np.zeros((len(obs_tail_raw), hilp_obs_dim), np.float32)
+            obs_tail_np[:, :obs_dim] = obs_tail_raw
 
-        # Euclidean (MSE) distance from pred to target
-        dist_mse = nn.functional.mse_loss(
-            pred, target_guidance, reduction="none"
-        )  # (T, B, C)
+            # Build padded target obs for each tail position and batch item
+            target_raw = target[:, :obs_dim].detach().cpu().numpy().astype(np.float32)
+            target_tail_raw = np.repeat(target_raw[None, :, :], len(tail_pos), axis=0).reshape(-1, obs_dim)
+            if _ref is not None:
+                target_np = np.tile(_ref, (len(target_tail_raw), 1)).astype(np.float32)
+            else:
+                target_np = np.zeros((len(target_tail_raw), hilp_obs_dim), np.float32)
+            target_np[:, :obs_dim] = target_tail_raw
 
+            _t0 = time.time()
+            # Delegate all normalization / KDE / TD-threshold logic to shared helper.
+            # Any changes to compute_guidance_grad_np automatically apply here AND
+            # to _compute_guidance_grad_fields (plan/plan_at_* visualization).
+            combined_np, hilp_values_np = compute_guidance_grad_np(
+                planner, obs_tail_np, target_np, hilp_fn
+            )
+            _t_hilp_ms = (time.time() - _t0) * 1000
+
+            # Shape: (len(tail_pos), B, 2) — one unit guidance vector per tail position
+            combined_t  = torch.from_numpy(combined_np).reshape(len(tail_pos), B, 2).to(pred.device)
+            hilp_grad_unit = combined_t.detach()
+
+            # Derive far_mask for logging (matches compute_guidance_grad_np internal logic)
+            TD_thres = getattr(planner, 'TD_thres_for_far_target', None)
+            far_mask = (hilp_values_np < float(TD_thres)) if TD_thres is not None else np.zeros(B, dtype=bool)
+
+            # [TIMING] Log latency per guidance call
+            from utils.tracer import get_tracer as _get_tracer
+            _tracer = _get_tracer()
+            if _tracer:
+                _tracer.log("timing.guidance_breakdown", {
+                    "hilp_ms": round(_t_hilp_ms, 2),
+                    "batch_size": B,
+                    "use_score_func": getattr(planner, 'use_score_func_with_TD', True),
+                    "far_count": int(far_mask.sum()),
+                    "TD_thres": TD_thres,
+                    "hilp_values": hilp_values_np.tolist(),
+                })
+
+            # Pseudo-loss applied to all tail positions → gradient injected at every tail,
+            # matching the historical multi-tail guidance target.
+            pseudo_loss_per_batch = (pred[tail_pos, :, :2] * hilp_grad_unit).sum(dim=(0, 2))  # (B,)
+
+            # --- Diagnostic: is unit vec pointing toward goal? ---
+            from utils.tracer import get_tracer as _get_tracer
+            _tracer2 = _get_tracer()
+            if _tracer2:
+                _u = hilp_grad_unit.detach().cpu()  # (n_tails, B, 2)
+                # direction from pred to goal at each tail
+                _pred_xy = pred[tail_pos, :, :2].detach().cpu()   # (n_tails, B, 2)
+                _goal_xy = target[:, :2].detach().cpu().unsqueeze(0)  # (1, B, 2)
+                _delta = _goal_xy - _pred_xy  # (n_tails, B, 2)
+                _delta_norm = _delta.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                _delta_unit = _delta / _delta_norm  # (n_tails, B, 2)
+                _cos_sim = (_u * _delta_unit).sum(dim=-1)  # (n_tails, B) — 1.0 = perfect alignment
+                _tracer2.log("guidance.unit_vec_diag", {
+                    "unit_vec_mean": [round(v, 4) for v in _u.mean(dim=(0, 1)).tolist()],
+                    "unit_vec_norm_mean": round(_u.norm(dim=-1).mean().item(), 4),
+                    "cos_sim_mean": round(_cos_sim.mean().item(), 4),  # >0 = toward goal
+                    "cos_sim_min":  round(_cos_sim.min().item(), 4),
+                    "pred_to_goal_dist_mean": round(_delta_norm.mean().item(), 4),
+                    "n_tails": len(tail_pos),
+                    "far_count": int(far_mask.sum()),
+                }, depth=1)
+
+            return -pseudo_loss_per_batch.mean(), (-pseudo_loss_per_batch).tolist(), (-pseudo_loss_per_batch).tolist()
+
+        # --- Fallback: RMSE distance to goal ---
+        assert 0, "HILP guidance is not recognized for some reason"
+        dist_mse = nn.functional.mse_loss(pred, target_guidance, reduction="none")  # (T, B, C)
         dist_rmse = torch.sqrt(dist_mse + 1e-8)
-
-        # Combined distance: HILP + MSE, weighted at tail positions only
-        dist_target =  dist_rmse # + dist_hilp
+        dist_target = dist_rmse
 
         target_weight = torch.zeros(T, device=planner.device)
         target_weight[tail_pos] = 1
 
         dist_per_batch = weighted_loss(planner, dist_target, target_weight)
-
-
-        # Specifically for dist_left, the last token is the most important
-        # dist is (t fs) b n
-        last_token_dist = weighted_loss(planner, dist_target, weight=None, dim=(-1,))[
-            -1
-        ]
+        last_token_dist = weighted_loss(planner, dist_target, weight=None, dim=(-1,))[-1]
 
     else:
         raise NotImplementedError(
@@ -209,32 +377,6 @@ def anchor_dist_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     repel_weight = torch.zeros_like(pred_detached[:, 0, 0])
     repel_weight[tail_pos] = 1
     weighted_dist_repel = weighted_loss(planner, dist_repel, repel_weight)
-
-    # [DIAG] H1: anchor target(pred[fs-1]) vs first planning frame(pred[fs]) — 얼마나 떨어져 있나?
-    # [DIAG] H1: weighted_loss 희석 정도 — n_tokens*fs 대비 anchor weight 비율
-    if getattr(planner, 'tracer', None) is not None:
-        _fs = planner.frame_stack
-        _anchor_target_xy = pred_detached[_fs - 1, :, :planner.pos_dim].detach()  # (B, pos_dim)
-        _first_plan_xy    = pred[_fs,     :, :planner.pos_dim].detach()            # (B, pos_dim)
-        _dist_first = (_first_plan_xy - _anchor_target_xy).norm(dim=-1)            # (B,)
-        _n_total_frames = pred.shape[0]
-        _n_anchor_frames = int(anchor_weight.sum().item())
-        planner.tracer.log(
-            "anchor.first_frame_diag",
-            {
-                "anchor_target_xy_b0": _anchor_target_xy[0].cpu().tolist(),
-                "first_plan_xy_b0":    _first_plan_xy[0].cpu().tolist(),
-                "dist_first_to_anchor_b0": float(_dist_first[0].item()),
-                "n_total_frames": _n_total_frames,
-                "n_anchor_frames": _n_anchor_frames,
-                "dilution_ratio": _n_anchor_frames / _n_total_frames,
-                "effective_anchor_scale": float(planner.anchor_guidance_scale * _n_anchor_frames / _n_total_frames),
-                "weighted_dist_anchor_b0": float(weighted_dist_anchor[0].item()),
-                "weighted_dist_repel_b0":  float(weighted_dist_repel[0].item()),
-            },
-            depth=1,
-            source="guidance.py:anchor_dist_guidance",
-        )
 
     # attraction: minimize dist_anchor (−), repulsion: minimize RDF similarity (−)
     return -(weighted_dist_anchor).mean() - (weighted_dist_repel).mean()
@@ -302,13 +444,16 @@ def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     # Return negative loss (gradient descent will minimize repulsion)
     return -mean_loss
 
-def particle_guidance(planner, x: torch.Tensor) -> torch.Tensor:
+def particle_guidance(planner, x: torch.Tensor, group_ids: Optional[list] = None) -> torch.Tensor:
     """
     Particle diversity guidance based on RBF kernel similarity.
 
     Args:
         planner: The DiffusionForcingPlanning instance
         x: (t, b, fs*c) normalized prediction tensor
+        group_ids: Optional list of length b. Elements sharing the same integer id belong
+            to the same sibling group and repel each other. Cross-group pairs are ignored.
+            If None, all pairs repel (original behaviour).
 
     Returns:
         loss: scalar negative diversity loss
@@ -328,60 +473,56 @@ def particle_guidance(planner, x: torch.Tensor) -> torch.Tensor:
     if h == 0:
         h = 1.0  # Fallback to avoid division by zero
 
-    kernel_matrix = torch.exp(-dist_sq / h)
+    kernel_matrix = torch.exp(-dist_sq / h)  # (b, b)
 
-    similarity = (kernel_matrix.sum() - b) / (b * (b - 1))
+    if group_ids is not None:
+        # Repel only within-group siblings; zero out cross-group and self pairs
+        gids = torch.tensor(group_ids, device=x.device, dtype=torch.long)  # (b,)
+        same_group = (gids.unsqueeze(0) == gids.unsqueeze(1)).float()       # (b, b)
+        pair_mask = same_group * (1.0 - torch.eye(b, device=x.device))      # (b, b) — no diagonal
+        n_pairs = pair_mask.sum()
+        if n_pairs == 0:
+            return x.sum() * 0.0
+        similarity = (kernel_matrix * pair_mask).sum() / n_pairs
+    else:
+        similarity = (kernel_matrix.sum() - b) / (b * (b - 1))
 
     return -similarity
 
-def combined_guidance(planner, x_start, goal, horizon, guidance_scale):
+def combined_guidance(planner, x_start, goal, horizon, guidance_scale,
+                      particle_guidance_scale: float = 0.0,
+                      group_ids: Optional[list] = None):
     """
     Combined guidance signals for diffusion model.
+
+    Args:
+        particle_guidance_scale: Scale for particle diversity guidance (0 = disabled).
+            When > 0 and batch_size > 1, a repulsion loss pushes sibling trajectories apart.
+        group_ids: Optional sibling group ids of length b (see particle_guidance).
+            When provided, repulsion is applied only within groups of same id.
 
     Returns:
         guidance_dict: dict of guidance losses
     """
     anchor_loss = anchor_dist_guidance(planner, x_start, horizon) * planner.anchor_guidance_scale
     # NOTE: goal_guidance() no longer takes guidance_scale; scaling is done here only.
-    _goal_inner, dist_per_batch_list, final_token_dist_list = goal_guidance(
+    _goal_inner, _, _ = goal_guidance(
         planner, x_start, goal, horizon
     )
     goal_loss = guidance_scale * _goal_inner
     rdf_loss = segment_rdf_guidance(planner, x_start, horizon) * planner.rdf_guidance_scale
 
-    # --- JSONL logging (replaces print-based logging) ---
-    if hasattr(guidance_scale, 'tolist'):
-        scale_list = guidance_scale.tolist()
-    else:
-        scale_list = [float(guidance_scale)]
-    eff_goal_scale = float(guidance_scale.mean()) if hasattr(guidance_scale, 'mean') else float(guidance_scale)
-    def _to_float(x):
-        """Safe scalar conversion for both scalars and multi-element tensors (uses mean)."""
-        if hasattr(x, 'mean'):
-            return float(x.mean())
-        return float(x)
-    _anchor_abs = abs(_to_float(anchor_loss))
-    _goal_abs = abs(_to_float(goal_loss))
-    from utils.tracer import get_tracer as _get_tracer
-    _tracer = _get_tracer()
-    if _tracer is not None:
-        _tracer.log("guidance.combined", {
-            "tree_tag": getattr(planner, '_current_tree_tag', 'unknown'),
-            "guidance_scale_list": scale_list,
-            "dist_per_batch": dist_per_batch_list,
-            "final_token_dist": final_token_dist_list,
-            "anchor_loss": _to_float(anchor_loss),
-            "anchor_guidance_scale": float(planner.anchor_guidance_scale),
-            "goal_inner": _to_float(_goal_inner),
-            "goal_loss": _to_float(goal_loss),
-            "eff_goal_scale": eff_goal_scale,
-            "goal_anchor_ratio": _goal_abs / (_anchor_abs + 1e-8),
-            "rdf_loss": _to_float(rdf_loss),
-            "rdf_guidance_scale": float(planner.rdf_guidance_scale),
-        }, depth=1)
+    particle_loss = (
+        particle_guidance(planner, x_start, group_ids=group_ids) * particle_guidance_scale
+        if particle_guidance_scale > 0.0
+        else x_start.sum() * 0.0  # zero but connected to x_start for autograd
+    )
 
-    return {
+    result = {
         "anchor": anchor_loss,
         "goal": goal_loss,
         "rdf": rdf_loss,
     }
+    if particle_guidance_scale > 0.0:
+        result["particle"] = particle_loss
+    return result

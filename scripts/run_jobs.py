@@ -37,6 +37,7 @@ docker_user = "jmseo1204"
 home_dir = os.path.expanduser("~")
 project_dir = os.getcwd()
 ogbench_data_dir = os.path.abspath(os.path.join(project_dir, "..", "ogbench_data"))
+hilp_dir = os.path.abspath(os.path.join(project_dir, "..", "HILP"))
 output_mount_dir = "/home/jmseo1204/mctd_outputs"
 os.makedirs(output_mount_dir, exist_ok=True)
 os.system(f"chmod 777 {output_mount_dir}")
@@ -75,6 +76,57 @@ def _stream_logs_worker(exp_name, server):
     except Exception:
         pass
 
+def preprocess_batch_jobs(folder: str) -> None:
+    """Group jobs with identical config (except task_id) into single batched jobs.
+
+    Jobs that only differ in task_id are merged into one file with a task_ids list,
+    so one Docker container handles all tasks and pays startup cost only once.
+    """
+    import glob as _glob
+    files = sorted(_glob.glob(os.path.join(folder, "*.json")))
+    if not files:
+        return
+
+    # Separate out files that already have task_ids (already batched)
+    groups = {}  # canonical_key -> list of (fpath, task_id, base_config)
+    already_batched = []
+    for fpath in files:
+        with open(fpath) as f:
+            config = json.load(f)
+        if "task_ids" in config:
+            already_batched.append(fpath)
+            continue
+        task_id = config.pop("task_id", None)
+        if task_id is None:
+            continue
+        key = json.dumps(config, sort_keys=True)
+        groups.setdefault(key, []).append((fpath, task_id, config))
+
+    merged_count = 0
+    for key, items in groups.items():
+        # Restore task_id for single-job groups
+        if len(items) == 1:
+            fpath, task_id, config = items[0]
+            config["task_id"] = task_id
+            with open(fpath, "w") as f:
+                json.dump(config, f, indent=2)
+            continue
+
+        # Merge: first file becomes the batched job; others are deleted
+        items_sorted = sorted(items, key=lambda x: x[1])  # sort by task_id
+        fpath_keep, _, base_config = items_sorted[0]
+        base_config["task_ids"] = [tid for _, tid, _ in items_sorted]
+        with open(fpath_keep, "w") as f:
+            json.dump(base_config, f, indent=2)
+        for fpath, _, _ in items_sorted[1:]:
+            os.remove(fpath)
+        merged_count += 1
+
+    if merged_count > 0:
+        total_merged = sum(len(items) for items in groups.values() if len(items) > 1)
+        print(f"[JobBatcher] Batched {total_merged} task jobs → {merged_count} merged jobs (startup cost paid once per batch)")
+
+
 def get_og_dataset_name(dataset_config_name):
     """
     Look up the actual OGBench dataset filename from the YAML configuration.
@@ -95,11 +147,14 @@ def get_og_dataset_name(dataset_config_name):
 
 def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
     # Properly quote arguments for Hydra/Shell compatibility
+    # Keys not present in any yaml config must be prefixed with '+' for Hydra
+    _EXTRA_KEYS = {"task_ids"}
     command_args = ""
     for key, value in config.items():
         # Handle lists/dicts as strings for the command line
         val_str = str(value).replace(" ", "")
-        command_args += f"{shlex.quote(f'{key}={val_str}')} "
+        prefix = "+" if key in _EXTRA_KEYS else ""
+        command_args += f"{shlex.quote(f'{prefix}{key}={val_str}')} "
 
     if server == "localhost":
         command = f"""
@@ -115,6 +170,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -v {home_dir}/.netrc:/home/{docker_user}/.netrc \
         -v {home_dir}/.d4rl:/home/{docker_user}/.d4rl \
         -v {ogbench_data_dir}:/home/{docker_user}/.ogbench/data \
+        -v {hilp_dir}:/home/{docker_user}/HILP \
         {docker_image} /bin/bash \
         -c "git config --global --add safe.directory /home/{docker_user}/mctd && cd /home/{docker_user}/mctd && python3 main.py hostname={server} gpu_id={gpu_id} {command_args}"
         """
@@ -130,6 +186,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -v {home_dir}/.netrc:/home/{docker_user}/.netrc \
         -v {home_dir}/.d4rl:/home/{docker_user}/.d4rl \
         -v {ogbench_data_dir}:/home/{docker_user}/.ogbench/data \
+        -v {hilp_dir}:/home/{docker_user}/HILP \
         {docker_image} /bin/bash \
         -c 'git config --global --add safe.directory /home/{docker_user}/mctd && cd /home/{docker_user}/mctd && python3 main.py hostname={server} gpu_id={gpu_id} {command_args}'"
         """
@@ -209,6 +266,9 @@ def is_experiment_running(server, exp_name):
 
 # Need jobs folder exists
 assert os.path.exists(jobs_folder), f"jobs folder does not exist"
+
+# Merge jobs that only differ in task_id so one container handles all tasks
+preprocess_batch_jobs(jobs_folder)
 
 # Get initial total number of jobs
 total_jobs = len([f for f in os.listdir(jobs_folder) if f.endswith('.json')])

@@ -14,7 +14,6 @@ from PIL import Image
 from .df_base import DiffusionForcingBase
 from utils.logging_utils import (
     make_trajectory_images,
-    make_combined_grad_field_image,
     get_random_start_goal,
     make_convergence_animation,
     make_mpc_animation,
@@ -111,6 +110,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.interaction_seed = cfg.interaction_seed
         self.use_random_goals_for_interaction = cfg.use_random_goals_for_interaction
         self.task_id = cfg.task_id
+        # task_ids: list of task IDs to evaluate sequentially in one process.
+        # Set by run_jobs.py when multiple same-config jobs are batched together.
+        raw_ids = cfg.get("task_ids", None)
+        self.task_ids = list(raw_ids) if raw_ids is not None else None  # Optional[List[int]]
         self.dql_model = cfg.dql_model
         self.val_max_loops = cfg.val_max_loops
         self.mctd_guidance_scales = cfg.mctd_guidance_scales
@@ -123,12 +126,23 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.virtual_visit_weight = cfg.virtual_visit_weight
         self.warp_threshold = cfg.warp_threshold * self.jump
         self.leaf_parallelization = cfg.leaf_parallelization
+        if self.leaf_parallelization:
+            _N = len(self.mctd_guidance_scales)
+            assert self.parallel_search_num % _N == 0, (
+                f"With leaf_parallelization=True, parallel_search_num "
+                f"({self.parallel_search_num}) must be a multiple of "
+                f"len(mctd_guidance_scales) ({_N})."
+            )
         self.parallel_multiple_visits = cfg.parallel_multiple_visits
         self.num_tries_for_bad_plans = cfg.num_tries_for_bad_plans
         self.sub_goal_interval = cfg.sub_goal_interval
         self.viz_plans = cfg.viz_plans
         self.meeting_delta = cfg.get("meeting_delta", 0.5)
+        self.plan_feasibility_delta = cfg.get("plan_feasibility_delta", 100.0)
         self.diverge_threshold = cfg.get("diverge_threshold", 2.0)
+        self.min_progress_threshold = cfg.get("min_progress_threshold", 0.0)
+        self.max_child_resets = cfg.get("max_child_resets", 3)
+        self.particle_guidance_scale = cfg.get("particle_guidance_scale", 0.0)
         self.debug_memory_profile = cfg.get("debug_memory_profile", False)
         self.max_plan_hist_keep = cfg.get("max_plan_hist_keep", 1)  # Memory optimization: limit history
         self.sequence_dividing_factor = cfg.sequence_dividing_factor
@@ -143,12 +157,18 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             hilp_path = os.path.join(repo_root, hilp_path)
         self.hilp_checkpoint_path = hilp_path
-        self.hilp_obs_dim = cfg.get("hilp_obs_dim", 29)
-        self.hilp_skill_dim = cfg.get("hilp_skill_dim", 32)
+        self.hilp_obs_dim = cfg.get("hilp_obs_dim", 29)    # used only for legacy .pt checkpoints
+        self.hilp_skill_dim = cfg.get("hilp_skill_dim", 32)  # used only for legacy .pt checkpoints
         # HILP value function instance will be loaded lazily and stored in _hilp_value_fn_instance
         # We don't initialize it here to prevent PyTorch from registering it as a submodule
         self.anchor_guidance_scale = cfg.get("anchor_guidance_scale", 40.0)
         self.rdf_guidance_scale = cfg.get("rdf_guidance_scale", 2.0)
+        self.use_score_func_with_TD = cfg.get("use_score_func_with_TD", True)
+        self.TD_thres_for_far_target = cfg.get("TD_thres_for_far_target", None)
+        self.kde_sigma = cfg.get("kde_sigma", 0.3)
+        self.kde_lam = cfg.get("kde_lam", 2.0)
+        self.kde_sample_ratio = cfg.get("kde_sample_ratio", 0.1)
+        self._kde_save_dir = os.path.expanduser(cfg.get("kde_save_dir", "~/.ogbench/data"))
         self.mcts_use_sim = cfg.get("mcts_use_sim", False)
         self.use_rollout: bool = cfg.get("use_rollout", False)
         self.use_dynamic_obs_padding: bool = cfg.get("use_dynamic_obs_padding", True)
@@ -164,6 +184,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             self.profiler = init_profiler(self.device)
         else:
             self.profiler = None
+
+        # Preload KDE dataset positions (full dataset, done once at init)
+        if self.kde_lam > 0.0:
+            self._load_kde_data_xy()
 
         # Log initialization config
         self._tlog("init.config", {
@@ -184,32 +208,133 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             import sys
             import os
 
-            # Add algorithms directory to path to import cleandiffuser_ex
-            algorithms_dir = os.path.join(os.path.dirname(__file__), "..")
-            if algorithms_dir not in sys.path:
-                sys.path.insert(0, algorithms_dir)
-            from cleandiffuser_ex.hilp import HILP
+            # Add project root to path to import td_models.hilp
+            project_root = os.path.join(os.path.dirname(__file__), "..", "..")
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            if self.hilp_checkpoint_path.endswith(".pkl"):
+                from td_models.hilp import HILPJax
+                hilp_model = HILPJax(self.hilp_checkpoint_path, self.device)
+            else:
+                from td_models.hilp import HILP
+                hilp_model = HILP(
+                    obs_dim=self.hilp_obs_dim,
+                    skill_dim=self.hilp_skill_dim,
+                    device=self.device,
+                    value_hidden_dims=(512, 512, 512),
+                    use_layer_norm=True,
+                )
+                hilp_model.load(self.hilp_checkpoint_path)
+            hilp_model.eval()  # no-op for JAX, sets eval mode for PyTorch HILP
 
-            # Load HILP model
-            hilp_model = HILP(
-                obs_dim=self.hilp_obs_dim,
-                skill_dim=self.hilp_skill_dim,
-                device=self.device,
-                value_hidden_dims=(512, 512, 512),
-                use_layer_norm=True,
-            )
-            hilp_model.load(self.hilp_checkpoint_path)
-            hilp_model.eval()
-
-            # Freeze all parameters to prevent gradient updates
-            for param in hilp_model.parameters():
-                param.requires_grad = False
+            # Freeze PyTorch parameters if present (no-op for JAX-based HILPJax)
+            if hasattr(hilp_model, 'parameters'):
+                for param in hilp_model.parameters():
+                    param.requires_grad = False
+            print(f"[INIT] HILP model loaded: {self.hilp_checkpoint_path}", flush=True)
 
             # Store in a private attribute that won't be registered as a submodule
             object.__setattr__(self, '_hilp_value_fn_instance', hilp_model)
             self._tlog("hilp.init", {"checkpoint_path": self.hilp_checkpoint_path}, depth=0)
 
         return object.__getattribute__(self, '_hilp_value_fn_instance')
+
+    def _load_kde_data_xy(self) -> None:
+        """Preload full training positions (x,y) for KDE score computation.
+
+        Called once at __init__ time. Uses the entire dataset without subsampling
+        so that the density estimate is as accurate as possible.
+        """
+        import os
+        path = os.path.join(self._kde_save_dir, f"{self.dataset}.npz")
+        xy = np.load(path)["observations"][:, :2].astype(np.float32)
+        if self.kde_sample_ratio < 1.0:
+            n = max(1, int(len(xy) * self.kde_sample_ratio))
+            xy = xy[np.random.default_rng(42).choice(len(xy), n, replace=False)]
+        self._kde_data_xy_cache = xy
+        self._tlog("kde.init", {"path": path, "n_samples": len(xy), "ratio": self.kde_sample_ratio}, depth=0)
+        print(f"[INIT] KDE data loaded: {len(xy):,} samples from {path}", flush=True)
+        # Pre-compute spatial grid for O(N) interpolation instead of O(N*M) per-call
+        self._build_or_load_kde_grid()
+
+    def _build_or_load_kde_grid(self) -> None:
+        """Pre-compute a 2-D grid of KDE scores and persist as pkl.
+
+        Grid covers the data extent + 3σ margin at 256×256 resolution.
+        Subsequent runs load the pkl and skip the O(grid_pts × M) computation.
+        The pkl filename encodes sigma and M so stale caches are never reused.
+        """
+        import os, pickle
+        from algorithms.diffusion_forcing.guidance import _kde_score_np as _kde_score
+
+        xy = self._kde_data_xy_cache
+        n = len(xy)
+        pkl_name = f"{self.dataset}_kde_grid_s{self.kde_sigma}_n{n}.pkl"
+        pkl_path = os.path.join(self._kde_save_dir, pkl_name)
+
+        if os.path.exists(pkl_path):
+            with open(pkl_path, "rb") as f:
+                self._kde_grid_cache = pickle.load(f)
+            self._tlog("kde.grid_loaded", {"path": pkl_path}, depth=0)
+            print(f"[INIT] KDE grid loaded from cache: {pkl_path}", flush=True)
+            return
+
+        # Build grid
+        margin = self.kde_sigma * 3.0
+        x_min, x_max = float(xy[:, 0].min()) - margin, float(xy[:, 0].max()) + margin
+        y_min, y_max = float(xy[:, 1].min()) - margin, float(xy[:, 1].max()) + margin
+        res = 256
+        xs = np.linspace(x_min, x_max, res, dtype=np.float32)
+        ys = np.linspace(y_min, y_max, res, dtype=np.float32)
+        grid_pts = np.stack(np.meshgrid(xs, ys, indexing="ij"), axis=-1).reshape(-1, 2)  # (res*res, 2)
+
+        # Compute in chunks to keep memory bounded (~40 MB per chunk for M=100K)
+        chunk = 512
+        parts = []
+        for i in range(0, len(grid_pts), chunk):
+            parts.append(_kde_score(grid_pts[i:i+chunk], xy, self.kde_sigma))
+        grid_scores = np.concatenate(parts, axis=0).reshape(res, res, 2)  # (res, res, 2)
+
+        self._kde_grid_cache = {"xs": xs, "ys": ys, "scores": grid_scores}
+        with open(pkl_path, "wb") as f:
+            pickle.dump(self._kde_grid_cache, f)
+        self._tlog("kde.grid_built", {"path": pkl_path, "res": res, "n_chunks": len(parts)}, depth=0)
+        print(f"[INIT] KDE grid built and saved: {pkl_path} (res={res}x{res}, chunks={len(parts)})", flush=True)
+
+    def _get_kde_score_grid(self, query_xy: np.ndarray) -> np.ndarray:
+        """Fast KDE score via bilinear interpolation on precomputed grid.
+
+        Replaces O(N*M) brute-force with O(N) grid lookup.
+
+        Args:
+            query_xy: (N, 2) world coordinates
+
+        Returns:
+            (N, 2) score vectors ∇log p
+        """
+        grid = self._kde_grid_cache
+        xs, ys = grid["xs"], grid["ys"]
+        scores = grid["scores"]  # (res_x, res_y, 2)
+
+        dx = xs[1] - xs[0]
+        dy = ys[1] - ys[0]
+        qx = np.clip(query_xy[:, 0], xs[0], xs[-1])
+        qy = np.clip(query_xy[:, 1], ys[0], ys[-1])
+
+        ix = np.clip(((qx - xs[0]) / dx).astype(np.int32), 0, len(xs) - 2)
+        iy = np.clip(((qy - ys[0]) / dy).astype(np.int32), 0, len(ys) - 2)
+        tx = ((qx - xs[ix]) / dx)[:, None]
+        ty = ((qy - ys[iy]) / dy)[:, None]
+
+        s00 = scores[ix,   iy  ]  # (N, 2)
+        s10 = scores[ix+1, iy  ]
+        s01 = scores[ix,   iy+1]
+        s11 = scores[ix+1, iy+1]
+        return (s00*(1-tx)*(1-ty) + s10*tx*(1-ty) +
+                s01*(1-tx)*ty     + s11*tx*ty)
+
+    def _get_kde_data_xy(self) -> np.ndarray:
+        return self._kde_data_xy_cache
 
     def _compute_hilp_values(
         self,
@@ -256,9 +381,18 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             f"[HILP Shape Error] Expected 2D tensors (N, D), got {obs_t.shape}"
         )
 
-        # 4. Padding/Cropping to self.hilp_obs_dim
+        # 4. Padding/Cropping to self.hilp_obs_dim.
+        # Use real joint-state reference (qpos+qvel from env) for non-position dims
+        # instead of zeros, so HILP receives in-distribution inputs.
+        _hilp_ref = getattr(self, '_hilp_ref_obs', None)
+
         def _pad(x):
             if x.shape[-1] < self.hilp_obs_dim:
+                if _hilp_ref is not None:
+                    ref_t = torch.from_numpy(_hilp_ref).to(x.device)  # (hilp_obs_dim,)
+                    out = ref_t.unsqueeze(0).expand(x.shape[0], -1).clone()
+                    out[:, : x.shape[-1]] = x
+                    return out
                 padding = torch.zeros(
                     (*x.shape[:-1], self.hilp_obs_dim - x.shape[-1]), device=x.device
                 )
@@ -270,7 +404,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # 5. Compute values
         has_value_attr = hasattr(hilp_value_fn, "value")
-        self._tlog("hilp.debug", {"hilp_type": type(hilp_value_fn).__name__, "has_value": has_value_attr}, depth=1)
 
         if use_no_grad:
             with torch.no_grad():
@@ -342,7 +475,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         grid_step: float = 2.0,
     ) -> Optional[dict]:
         """
-        Compute RMSE and HILP gradient fields over the maze for visualization.
+        Compute HILP gradient field over the maze for visualization.
 
         Args:
             target_pos: (2,) world coordinates of the fixed target (green star).
@@ -351,16 +484,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         Returns:
             dict with keys:
                 'x_grid', 'y_grid': (H_g, W_g) world-coord meshgrids
-                'rmse_grads': (H_g, W_g, 2) unit vectors pointing toward target
-                'hilp_grads': (H_g, W_g, 2) autograd-computed gradients
-                'rmse_norms': (H_g, W_g) always 1.0
+                'hilp_grads': (H_g, W_g, 2) JAX-grad or finite-diff gradients
                 'hilp_norms': (H_g, W_g) ||hilp_grad|| per grid point
-            or None if target_pos is None.
+            or None if target_pos is None or HILP model not loaded.
         """
         if target_pos is None:
             return None
+        if not (hasattr(self, '_hilp_value_fn_instance') and self._hilp_value_fn_instance is not None):
+            return None
 
-        # --- 1. Grid extent (same logic as _compute_hilp_heatmap) ---
+        # --- 1. Grid extent ---
         if is_grid_env(self.env_id):
             maze_grid = get_maze_grid(self.env_id)
             H = len(maze_grid)
@@ -380,55 +513,55 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         grid_x_flat = X.ravel().astype(np.float32)
         grid_y_flat = Y.ravel().astype(np.float32)
 
-        # --- 2. RMSE gradient (analytic, numpy only) ---
-        tx, ty = float(target_pos[0]), float(target_pos[1])
-        dx = grid_x_flat - tx
-        dy = grid_y_flat - ty
-        dist = np.sqrt(dx**2 + dy**2 + 1e-8)
-        # guidance direction = toward target = -(p - t)/dist
-        rmse_gx = -dx / dist
-        rmse_gy = -dy / dist
-        rmse_grads = np.stack([rmse_gx, rmse_gy], axis=-1).reshape(*X.shape, 2)
-        rmse_norms = np.ones(X.shape, dtype=np.float32)
+        # --- 2. Build grid observations padded with reference state ---
+        _hilp_ref = getattr(self, '_hilp_ref_obs', None)
+        if _hilp_ref is not None:
+            obs_np = np.tile(_hilp_ref, (N, 1)).astype(np.float32)
+        else:
+            obs_np = np.zeros((N, self.hilp_obs_dim), dtype=np.float32)
+        obs_np[:, 0] = grid_x_flat
+        obs_np[:, 1] = grid_y_flat
 
-        # --- 3. HILP gradient (batched autograd) ---
-        hilp_grads = np.zeros((*X.shape, 2), dtype=np.float32)
-        hilp_norms = np.zeros(X.shape, dtype=np.float32)
+        target_np = np.zeros((1, self.hilp_obs_dim), dtype=np.float32)
+        if _hilp_ref is not None:
+            target_np[0] = _hilp_ref
+        target_np[0, :self.pos_dim] = target_pos[:self.pos_dim]
 
-        if hasattr(self, '_hilp_value_fn_instance') and self._hilp_value_fn_instance is not None:
-            try:
-                obs_np = np.zeros((N, self.observation_dim), dtype=np.float32)
-                obs_np[:, 0] = grid_x_flat
-                obs_np[:, 1] = grid_y_flat
+        # --- 3. Guidance gradients via shared helper (same logic as goal_guidance) ---
+        # Any changes to guidance.compute_guidance_grad_np propagate here automatically.
+        hilp_fn = self._hilp_value_fn_instance
+        if not hasattr(hilp_fn, 'compute_grads') or not hasattr(hilp_fn, 'compute_values_np'):
+            return None
 
-                target_np = np.zeros(self.observation_dim, dtype=np.float32)
-                target_np[:self.pos_dim] = target_pos[:self.pos_dim]
+        try:
+            combined_flat, values_flat = guidance.compute_guidance_grad_np(
+                self, obs_np, target_np, hilp_fn
+            )
+        except Exception as e:
+            self._tlog("hilp.grad_field_error", {"error": str(e)}, depth=1)
+            return None
 
-                # Must use torch.enable_grad() because validation_step is wrapped
-                # in @torch.no_grad(), which prevents gradient computation even for
-                # tensors with requires_grad=True.
-                with torch.enable_grad():
-                    obs_batch = torch.tensor(obs_np, dtype=torch.float32, device=self.device, requires_grad=True)
-                    target_t = torch.tensor(target_np, dtype=torch.float32, device=self.device).unsqueeze(0).expand(N, -1)
+        combined_grads = combined_flat.reshape(*X.shape, 2)
+        hilp_values = values_flat.reshape(X.shape)
 
-                    values = self._compute_hilp_values(obs_batch, target_t, use_no_grad=False)  # (N,)
-                    values.sum().backward()
+        # far_mask_grid: True where RMSE guidance was used (V < TD_thres)
+        TD_thres = getattr(self, 'TD_thres_for_far_target', None)
+        far_mask_grid = (hilp_values < float(TD_thres)).reshape(X.shape) if TD_thres is not None \
+            else np.zeros(X.shape, dtype=bool)
 
-                if obs_batch.grad is not None:
-                    hilp_grads = obs_batch.grad[:, :self.pos_dim].detach().cpu().numpy().reshape(*X.shape, self.pos_dim)
-                    hilp_norms = np.linalg.norm(hilp_grads, axis=-1)
-                else:
-                    self._tlog("hilp.grad_field_error", {"error": "obs_batch.grad is None after backward()"}, depth=1)
-            except Exception as e:
-                self._tlog("hilp.grad_field_error", {"error": str(e)}, depth=1)
+        print(
+            f"[grad_field] HILP V range: [{values_flat.min():.3f}, {values_flat.max():.3f}]"
+            f"  TD_thres={TD_thres}  far_pts={far_mask_grid.sum()}/{far_mask_grid.size}",
+            flush=True,
+        )
 
         return {
             'x_grid': X,
             'y_grid': Y,
-            'rmse_grads': rmse_grads,
-            'hilp_grads': hilp_grads,
-            'rmse_norms': rmse_norms,
-            'hilp_norms': hilp_norms,
+            'hilp_grads': combined_grads,
+            'hilp_norms': np.linalg.norm(combined_grads, axis=-1),
+            'hilp_values': hilp_values,       # (H_g, W_g) HILP value per grid point
+            'far_mask_grid': far_mask_grid,   # (H_g, W_g) True → RMSE region
         }
 
     def _build_model(self):
@@ -615,10 +748,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         _, batch_size, *_ = xs.shape
         if self.guidance_scale == 0:
             namespace += "_no_guidance_random_walk"
-        horizon = self.episode_len
-        self.interact(
-            batch_size, conditions, namespace
-        )  # interact if environment is installation
+
+        task_ids = self.task_ids if self.task_ids is not None else [self.task_id]
+        for tid in task_ids:
+            if tid != self.task_id:
+                self.task_id = tid
+                # Invalidate env cache so the new task gets freshly configured envs
+                if hasattr(self, "_cached_env_key"):
+                    del self._cached_env_key
+            task_ns = f"{namespace}/task{tid}" if self.task_ids is not None else namespace
+            self.interact(batch_size, conditions, task_ns)
 
     
     def process_segment_noise_levels(
@@ -872,6 +1011,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         noise_level: Optional[np.ndarray] = None,
         plans: Optional[list] = None,
         prefix_len_list: Optional[list] = None,
+        particle_guidance_scale: float = 0.0,
+        group_ids: Optional[list] = None,
     ) -> torch.Tensor:
         """
         Parallel denoising planning with diffusion guidance.
@@ -972,7 +1113,24 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         if guidance_scale is None:
             guidance_fn = lambda x: 0
         else:
-            guidance_fn = lambda x: guidance.combined_guidance(self, x, goal, horizon, guidance_scale)
+            _pgs = particle_guidance_scale  # capture for lambda closure
+            _gids = group_ids               # capture for lambda closure
+            guidance_fn = lambda x: guidance.combined_guidance(
+                self, x, goal, horizon, guidance_scale,
+                particle_guidance_scale=_pgs, group_ids=_gids,
+            )
+
+        # [TIMING] Wrap guidance_fn to measure per-step cost
+        _guidance_call_ms: list = []
+        if guidance_scale is not None:
+            _raw_gfn = guidance_fn
+            def guidance_fn(x, _fn=_raw_gfn):
+                _gt0 = time.time()
+                r = _fn(x)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _guidance_call_ms.append((time.time() - _gt0) * 1000)
+                return r
 
         assert horizon % self.frame_stack == 0, (
             "horizon must be a multiple of frame_stack"
@@ -1086,6 +1244,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             )
 
         stabilization = 0
+        _gpu_step_times = []
 
         for m in range(noise_level.shape[1] - 1):
             # noise_level shape: (b, m, plan_tokens)
@@ -1103,6 +1262,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 pad_tokens,
             )  # (n_tokens, b) noise levels for all tokens
 
+            _gpu_t0 = time.time()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             sample = self.diffusion_model.sample_step(
                 plan_with_given_tokens,  # (n_tokens, b, fs*c)
                 conditions,
@@ -1110,6 +1272,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 to_noise_levels,  # (n_tokens, b)
                 guidance_fn=guidance_fn,
             )  # (n_tokens, b, fs*c)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _gpu_step_times.append(time.time() - _gpu_t0)
 
             # (Not Necessary) Update only tokens whose noise level is actively decreasing this step.
             # This preserves denoised_prefix (level=0) and obs_parent_token (level=0).
@@ -1162,6 +1327,31 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 "plan_frame0_final_xy_b0": _final_xy,
                 "obs_parent_lastframe_xy_b0": _obs_parent_xy,
                 "dist_frame0_to_obsparent": _dist,
+            }, depth=1)
+
+        # [TIMING] Log guidance_fn cost within denoising loop
+        if _guidance_call_ms:
+            _n_g = len(_guidance_call_ms)
+            _g_total = sum(_guidance_call_ms)
+            _gpu_total = sum(_gpu_step_times) * 1000
+            self._tlog("timing.guidance_fn_in_denoising", {
+                "n_calls": _n_g,
+                "total_ms": round(_g_total, 1),
+                "mean_ms": round(_g_total / _n_g, 1),
+                "max_ms": round(max(_guidance_call_ms), 1),
+                "guidance_pct_of_gpu": round(_g_total / (_gpu_total + 1e-6) * 100, 1),
+            }, depth=1)
+
+        # [TIMING] Log GPU sample_step timing per parallel_plan call
+        if _gpu_step_times:
+            _n = len(_gpu_step_times)
+            _total_gpu_ms = sum(_gpu_step_times) * 1000
+            _mean_gpu_ms = _total_gpu_ms / _n
+            self._tlog("timing.gpu_sample_step", {
+                "batch_size": batch_size,
+                "n_denoising_steps": _n,
+                "total_gpu_ms": round(_total_gpu_ms, 1),
+                "mean_per_step_ms": round(_mean_gpu_ms, 1),
             }, depth=1)
 
         # Validate plan_hist shape before returning
@@ -1369,6 +1559,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         agent.load_model(
                             os.path.join(os.getcwd(), "dql", "results", dql_folder), id=200
                         )
+                        print(f"[INIT] DQL agent loaded: {dql_folder}", flush=True)
                 else:
                     env_fns = [lambda: gym.make(self.env_id)] * batch_size
                     agent = None
@@ -1381,7 +1572,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     use_random_goals=self.use_random_goals_for_interaction,
                 )
                 envs_forward, envs_backward = env_manager.create_bidirectional_envs(env_fns)
-                
+                print(f"[INIT] Environments created: {self.env_id} x{batch_size} (task_id={self.task_id})", flush=True)
+
                 # Cache the environments and manager
                 self._cached_envs_forward = envs_forward
                 self._cached_envs_backward = envs_backward
@@ -1471,6 +1663,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             assert np.allclose(initial_sim_state["qpos"][:self.pos_dim], _bidir_start_np[0][:self.pos_dim], atol=1e-5), \
                 f"Physical start position {initial_sim_state['qpos'][:self.pos_dim]} does not match observation start position {_bidir_start_np[0][:self.pos_dim]}"
 
+            # Build full reference observation (real joint state) for HILP.
+            # HILP was trained on 29D obs (qpos+qvel); padding with zeros produces OOD inputs.
+            # Storing this lets _compute_hilp_values use real non-position dims as a base.
+            _ref_full = np.concatenate(
+                [initial_sim_state["qpos"], initial_sim_state["qvel"]]
+            )[: self.hilp_obs_dim].astype(np.float32)
+            self._hilp_ref_obs = _ref_full  # used in _compute_hilp_values._pad
+
             # Derive heuristic goal simulation state from initial state
             goal_sim_state = {
                 "qpos": initial_sim_state["qpos"].copy(),
@@ -1488,14 +1688,19 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             bidir_tree2 = self._init_mcts_tree(
                 horizon,
                 tag="bidir_mcts_from_goal",
-                 root_obs=_bidir_goal_np[0],
-                 root_sim_state=goal_sim_state,
+                root_obs=_bidir_goal_np[0],
+                root_sim_state=goal_sim_state,
+                is_tree1=False,
              )
             
             # Flag: 0 → expand tree1 next, 1 → expand tree2 next
             expanded_tree_idx: int = 0
             # Configurable meeting threshold (Euclidean distance in unnormalized obs space)
             _meeting_delta: float = getattr(self.cfg, "meeting_delta", 2.0)
+
+            _start_pos = _bidir_start_np[0][:self.pos_dim].tolist()
+            _goal_pos  = _bidir_goal_np[0][:self.pos_dim].tolist()
+            print(f"\n[MCTD] Episode start | start={[round(x,1) for x in _start_pos]} → goal={[round(x,1) for x in _goal_pos]} | horizon={horizon} | max_loops={self.val_max_loops}", flush=True)
 
             while not terminate and loops < self.val_max_loops:
                 loops += 1
@@ -1709,12 +1914,21 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     except Exception as _hm_err:
                         self._tlog("hilp.heatmap_error", {"error": str(_hm_err)}, depth=1)
 
+                # Compute HILP gradient field for arrow overlay
+                hilp_grad_field = None
+                if best_node_target_pos is not None:
+                    try:
+                        hilp_grad_field = self._compute_guidance_grad_fields(best_node_target_pos)
+                    except Exception as _gf_err:
+                        self._tlog("hilp.grad_field_error", {"error": str(_gf_err)}, depth=1)
+
                 # Prepare trajectories dict for visualization
                 trajectories_dict = {
                     'plan': plan_positions,  # Red
                     'node_path': node_trajectory if node_trajectory is not None and len(node_trajectory) > 0 else None,  # Blue
                     'best_node_target': best_node_target_pos,  # Green point (target_node.obs_pos)
                     'hilp_heatmap': hilp_heatmap,  # HILP value heatmap (low-alpha overlay)
+                    'hilp_grad_field': hilp_grad_field,  # HILP gradient arrows overlay
                 }
 
                 forward_image = make_trajectory_images(
@@ -1734,29 +1948,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     f"plan/plan_at_{_path_label}", Image.fromarray(forward_image)
                 )
 
-                # Gradient field visualizations (RMSE + HILP combined)
-                if best_node_target_pos is not None:
-                    try:
-                        _grad_fields = self._compute_guidance_grad_fields(best_node_target_pos)
-                        if _grad_fields is not None:
-                            _gf_img = make_combined_grad_field_image(
-                                self.env_id,
-                                _grad_fields,
-                                best_node_target_pos,
-                                start_numpy,
-                                goal_numpy,
-                            )
-                            self.log_image(
-                                f"TD_field/grad_field_at_{steps}",
-                                Image.fromarray(_gf_img),
-                            )
-                    except Exception as _gf_err:
-                        self._tlog("hilp.grad_field_error", {"error": str(_gf_err)}, depth=1)
-
                 # Create reverse trajectory image (swap start and goal for visualization)
                 
                 planning_end_time = time.time()
+                _planning_loop_ms = (planning_end_time - planning_start_time) * 1000
                 planning_time.append(planning_end_time - planning_start_time)
+                self._tlog("timing.mpc_loop", {
+                    "loop": loops,
+                    "planning_ms": round(_planning_loop_ms, 1),
+                }, depth=0)
 
                 
 
@@ -1765,6 +1965,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 
                 # Prepare obs for environment execution
                 obs_numpy = obs.detach().cpu().numpy()
+
+                _t1_expansions = bidir_tree1.p_search_num
+                _t2_expansions = bidir_tree2.p_search_num
+                print(f"[MCTD] Loop {loops}/{self.val_max_loops} | tree1={_t1_expansions}/{self.mctd_max_search_num} tree2={_t2_expansions}/{self.mctd_max_search_num} | plan_frames={plan_unnormalized.shape[0]} | node={best_node.name}", flush=True)
 
                 # Reorder plan frames by proximity to resolve FWD-BWD spatial gap
                 plan_unnormalized = self._reorder_plan_by_proximity(plan_unnormalized)
@@ -1819,6 +2023,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                             (obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]
                         ).detach()
                         
+            # Close tree pbars (kept open during single_step MPC loop)
+            bidir_tree1.pbar.close()
+            bidir_tree2.pbar.close()
+            print(f"[MCTD] Episode done | loops={loops} | steps={steps} | reached={bool(reached.any())} | reward={float(episode_reward.mean()):.3f}", flush=True)
+
             self.log(f"{namespace}/planning_time", np.sum(planning_time))
             self.log(f"{namespace}/episode_reward", episode_reward.mean())
             self.log(f"{namespace}/episode_reward_if_stay", episode_reward_if_stay.mean())
@@ -1826,20 +2035,22 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             self.log(f"{namespace}/success_rate", sum(episode_reward >= 1.0) / batch_size)
 
             # Visualization
-            # samples = min(16, batch_size)
-            samples = 1 # min(32, batch_size)
-            trajectory = torch.stack(trajectory)
-            start = start[:, :self.pos_dim].cpu().numpy().tolist()
-            goal = goal[:, :self.pos_dim].cpu().numpy().tolist()
-            images = make_trajectory_images(
-                self.env_id, trajectory[:, -samples:], samples, start, goal, self.plot_end_points
-            )
-
-            for i, img in enumerate(images):
-                self.log_image(
-                    f"{namespace}_interaction/sample_{i}",
-                    Image.fromarray(img),
+            if len(trajectory) > 0:
+                samples = 1 # min(32, batch_size)
+                trajectory = torch.stack(trajectory)
+                start = start[:, :self.pos_dim].cpu().numpy().tolist()
+                goal = goal[:, :self.pos_dim].cpu().numpy().tolist()
+                images = make_trajectory_images(
+                    self.env_id, trajectory[:, -samples:], samples, start, goal, self.plot_end_points
                 )
+
+                for i, img in enumerate(images):
+                    self.log_image(
+                        f"{namespace}_interaction/sample_{i}",
+                        Image.fromarray(img),
+                    )
+            else:
+                self._tlog("interact.warn", {"msg": "trajectory is empty — no execution steps ran (both trees unexpandable?)"}, depth=0)
 
 
     def pad_init(self, x, is_start=True, batch_first=False):
@@ -2044,16 +2255,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self,
         expanded_node_candidates: list,  # list of candidate dicts, len B
         candidate_obs_poses: list,  # list of np.ndarray (observation_dim,), len B
-        values: np.ndarray,  # (B,) — from calculate_values_bidir
         is_feasible: list,  # list of bool, len B
     ) -> list:
         """Among feasible plans from the same parent, kill duplicates whose endpoints
-        are within diverge_threshold. Keep the higher-value plan.
+        are within diverge_threshold. Keep the plan whose endpoint is closer to the
+        target node (measured by HILP value).
 
         Args:
-            expanded_node_candidates: Candidate dicts (each has 'parent_node').
+            expanded_node_candidates: Candidate dicts (each has 'parent_node', 'target_node').
             candidate_obs_poses: Predicted endpoint obs_pos per candidate.
-            values: Value scores per candidate, shape (B,).
             is_feasible: Feasibility flags per candidate.
 
         Returns:
@@ -2070,8 +2280,26 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 parent_groups[parent_name] = []
             parent_groups[parent_name].append(i)
 
-        # Within each parent group, pairwise deduplicate
+        # Within each parent group, compute HILP values and pairwise deduplicate
         for parent_name, indices in parent_groups.items():
+            # All siblings in the same group share the same target_node (set by _select_dynamic_goal)
+            target_node = expanded_node_candidates[indices[0]].get("target_node")
+            if target_node is not None and target_node.obs_pos is not None:
+                # Stack endpoints for this group → compute V(endpoint_i, target) in one batch
+                group_obs = np.stack([candidate_obs_poses[i] for i in indices])  # (G, obs_dim)
+                target_tiled = np.tile(
+                    target_node.obs_pos[: self.observation_dim], (len(indices), 1)
+                )  # (G, obs_dim)
+                hilp_vals = self._compute_hilp_values(
+                    group_obs[:, : self.observation_dim],
+                    target_tiled,
+                    use_no_grad=True,
+                ).cpu().numpy()  # (G,)
+                group_values = {idx: float(hilp_vals[local_i]) for local_i, idx in enumerate(indices)}
+            else:
+                # Fallback: assign equal value (no preference between duplicates)
+                group_values = {idx: 0.0 for idx in indices}
+
             feasible_indices = [i for i in indices if is_kept[i]]
             for a_idx in range(len(feasible_indices)):
                 i = feasible_indices[a_idx]
@@ -2084,9 +2312,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     dist = np.linalg.norm(
                         candidate_obs_poses[i][:self.pos_dim] - candidate_obs_poses[j][:self.pos_dim]
                     )
-                    if dist < self.diverge_threshold:
-                        # Duplicate: kill lower-value one
-                        if values[i] >= values[j]:
+                    if dist <  self.diverge_threshold:
+                        # Duplicate: kill the one with lower HILP value (farther from target)
+                        if group_values[i] >= group_values[j]:
                             is_kept[j] = False
                         else:
                             is_kept[i] = False
@@ -2247,8 +2475,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         pbar = tqdm(
             total=max_search_num,
-            desc=f"MCTS Search ({tag})",
-            leave=False,
+            desc=f"MCTS ({tag})",
+            leave=True,
             dynamic_ncols=True,
         )
 
@@ -2378,10 +2606,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             #  When leaf parallelization is True, then the selection is done in partially parallel (the children nodes from same parent node are selected at the same time)
             #  When leaf parallelization is False, then the selection is done in fully sequential (only one node is selected at a time)
 
-            # [FINE-GRAIN LOGGING] Log expandable nodes at iteration start
-            if not self.parallel_multiple_visits:  # If parallel multiple visits is False, then we need to list all the nodes to expand
-                expandable_node_names = root_node.get_expandable_node_names()
-
             selection_start_time = time.time()
             self._tlog("mcts.phase", {"phase": "selection_start"}, depth=1)
             psn = self.parallel_search_num
@@ -2389,8 +2613,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             while psn > 0:
                 selected_node = root_node
 
-                # [FINE-GRAIN LOGGING] Log node traversal with child status details
-
+                _selection_exhausted = False
                 while (
                     (
                         not selected_node.is_expandable(
@@ -2402,11 +2625,32 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     and (not selected_node.is_terminal())
                     and (selected_node.is_selectable())
                 ):
-                    selected_node = selected_node.select(
-                        leaf_parallelization=self.leaf_parallelization
-                    )
+                    try:
+                        selected_node = selected_node.select(
+                            leaf_parallelization=self.leaf_parallelization,
+                            max_child_resets=self.max_child_resets,
+                        )
+                    except ValueError:
+                        # Node's subtree is fully exhausted (all children permanently killed
+                        # and reset budget spent). Skip this psn slot gracefully.
+                        self._tlog("mcts.selection", {"msg": "subtree_exhausted", "node": selected_node.name}, depth=1)
+                        _selection_exhausted = True
+                        break
 
-                # [FINE-GRAIN LOGGING] Log final selected node before expansion check
+                # Recompute expandable node names after traversal: select() may call
+                # reset_dead_children() which wipes children and makes previously
+                # non-listed slots expandable again, causing stale-list mismatches.
+                if not self.parallel_multiple_visits:
+                    expandable_node_names = root_node.get_expandable_node_names()
+
+                if _selection_exhausted:
+                    psn -= (
+                        1
+                        if not self.leaf_parallelization
+                        else len(children_node_guidance_scales)
+                    )
+                    continue
+
                 is_term = selected_node.is_terminal()
                 is_exp = selected_node.is_expandable(consider_virtually_visited=(not self.parallel_multiple_visits))
                 is_sel = selected_node.is_selectable()
@@ -2423,8 +2667,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         # Skip slots that already have a child node (created in a previous
                         # iteration) or are already virtually visited — both mean the slot
                         # is occupied / scheduled for this round and should not be re-added.
+                        # Also skip permanently_dead slots (dedup-killed): get_expandable_candidate
+                        # with explicit index bypasses the permanently_dead check, so we guard here.
                         child_slot = selected_node._children_nodes[i]
                         if child_slot['node'] is not None:
+                            continue
+                        if child_slot['permanently_dead']:
                             continue
                         if (not self.parallel_multiple_visits) and child_slot['virtually_visited']:
                             continue
@@ -2615,17 +2863,32 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
                 # Tag current tree for guidance JSONL logging (forward vs backward)
                 self._current_tree_tag = tree.tag
-                # Expansion: input plans (n_tokens(=t), 1, fs*c), output plan_hist # (m+1, plan_tokens*fs, b, c)
+
+                # Expansion: single batched parallel_plan call over all B candidates.
+                # group_ids assigns each candidate an integer sibling-group id (same parent → same id)
+                # so that particle_guidance only repels within-sibling groups, not across parents.
+                # output plan_hist: (m+1, plan_tokens*fs, B, c)
+                _parent_to_gid: dict = {}
+                _group_ids: list = []
+                for _cand in expanded_node_candidates:
+                    _pname = _cand["parent_node"].name
+                    if _pname not in _parent_to_gid:
+                        _parent_to_gid[_pname] = len(_parent_to_gid)
+                    _group_ids.append(_parent_to_gid[_pname])
+                # _group_ids: list[int] of length B — same value = same sibling group
+
                 expanded_node_plan_hists = self.parallel_plan(
-                    start=effective_obs_normalized,
-                    goal=effective_goal_normalized,
+                    start=effective_obs_normalized,            # (B, obs_dim)
+                    goal=effective_goal_normalized,            # (B, obs_dim)
                     horizon=horizon,
                     conditions=conditions,
-                    guidance_scale=expanded_node_guidance_scales, # torch.zeros_like(expanded_node_guidance_scales),
-                    noise_level=expanded_node_noise_levels,
-                    plans=expanded_node_plans,
-                    prefix_len_list=prefix_len_list,
-                )
+                    guidance_scale=expanded_node_guidance_scales,   # (B,)
+                    noise_level=expanded_node_noise_levels,         # (B, m, plan_tokens)
+                    plans=expanded_node_plans,                      # list of B tensors
+                    prefix_len_list=prefix_len_list,                # list of B ints
+                    particle_guidance_scale=self.particle_guidance_scale,
+                    group_ids=_group_ids,
+                )  # (m+1, plan_tokens*fs, B, c)
 
                 # Validate expanded_node_plan_hists shape: (m, plan_tokens*fs, B, c)
                 assert expanded_node_plan_hists.ndim == 4, (
@@ -2639,6 +2902,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
                 self._tlog("mcts.expansion", {
                     "root_node": tree.root_node.name,
+                    "n_expanded_candidates": len(expanded_node_candidates),
+                    "n_valid_candidates": len(valid_candidates),
+                    "n_obs_pos_filtered": len(expanded_node_candidates) - len(valid_candidates),
+                    "unique_parents": len(set(info["parent_node"].name for info in expanded_node_candidates)),
                     "n_candidates": len(expanded_node_candidates),
                     "plan_hists_shape": list(expanded_node_plan_hists.shape),
                 }, depth=1)
@@ -2652,7 +2919,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 simulation_start_time = time.time()
                 self._tlog("mcts.phase", {"phase": "simulation_start", "n_candidates": len(expanded_node_candidates)}, depth=1)
                 
-                def is_feasible_plan_hists(plan_hists): # plan_hists: (m, plan_tokens*fs, b, c)
+                def is_feasible_and_not_short_plan_hists(plan_hists): # plan_hists: (m, plan_tokens*fs, b, c)
                     plans = (
                         self._unnormalize_x(plan_hists[-1])[:-1]
                         .detach()
@@ -2667,8 +2934,21 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     is_feasible = [False] * diffs.shape[1]
                     for i in range(diffs.shape[1]):
                         is_feasible[i] = np.all(
-                            diffs[:, i] < self.meeting_delta
+                            diffs[:, i] < self.plan_feasibility_delta
                         )
+
+                    # Progress filter: kill plans whose sub_plan start-end distance is too small
+                    if self.min_progress_threshold > 0.0:
+                        for i in range(diffs.shape[1]):
+                            if is_feasible[i]:
+                                parent_node = expanded_node_candidates[i]["parent_node"]
+                                if parent_node.obs_pos is not None:
+                                    start_xy = parent_node.obs_pos[:2]
+                                    end_xy = plans[-1, i, :2]
+                                    progress = float(np.linalg.norm(end_xy - start_xy))
+                                    if progress < self.min_progress_threshold:
+                                        is_feasible[i] = False
+
                     return is_feasible
 
                 if not self.mcts_use_sim:
@@ -2677,20 +2957,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     batch_size = expanded_node_plan_hists.shape[2]
                     plans_tokens = rearrange(expanded_node_plan_hists, "m (t fs) b c -> m t fs b c", fs=self.frame_stack)
                     num_tokens_to_check = seg_size
-                    t_rel_idx = torch.arange(num_tokens_to_check, device=self.device).view(-1, 1) # (T_check, 1)
-                    prefixes = torch.tensor(prefix_len_list, device=self.device).view(1, -1) # (1, B)
-                    token_indices = t_rel_idx + prefixes # (T_check, B)
-                    
-                    # Prevent out of range error by clamping to [0, T-1]
-                    # FIX: Use plans_tokens.shape[1] instead of undefined plan_tokens variable
-                    token_indices = torch.clamp(token_indices, max=plans_tokens.shape[1] - 1)
-                    
-                    batch_idx = torch.arange(batch_size, device=self.device)
-                    sliced_hists = plans_tokens[:, token_indices, :, batch_idx]
+
+                    # All candidates in a batch come from parents at the same depth, so prefix_len
+                    # is uniform across the batch. Use a simple slice to avoid PyTorch non-adjacent
+                    # advanced indexing, which swaps the indexed dimensions to the front and produces
+                    # shape (T_check, B, m, fs, c) instead of the expected (m, T_check, fs, B, c).
+                    assert len(set(prefix_len_list)) == 1, \
+                        f"Expected uniform prefix_len across batch, got {prefix_len_list}"
+                    plen = prefix_len_list[0]
+                    t_end = min(plen + num_tokens_to_check, plans_tokens.shape[1])
+                    sliced_hists = plans_tokens[:, plen:t_end, :, :, :]  # (m, T_check, fs, B, c)
                     processed_hists = rearrange(sliced_hists, "m t fs b c -> m (t fs) b c")
 
                     self._tlog("mcts.feasibility", {"phase": "calling", "shape": list(processed_hists.shape)}, depth=1)
-                    is_feasible = is_feasible_plan_hists(processed_hists)
+                    is_feasible = is_feasible_and_not_short_plan_hists(processed_hists)
                     self._tlog("mcts.feasibility", {"phase": "result", "is_feasible": is_feasible}, depth=1)
 
                     for i in range(len(expanded_node_candidates)):
@@ -2789,7 +3069,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     self._tlog("mcts.value_estimation", {"shape": list(value_estimation_plan_hists.shape)}, depth=1)
 
                     # check if any plan is good
-                    is_feasible = is_feasible_plan_hists(value_estimation_plan_hists)
+                    is_feasible = is_feasible_and_not_short_plan_hists(value_estimation_plan_hists)
                     
                     for i in range(len(expanded_node_candidates)): # b
                         if is_feasible[i] and filtered_expanded_node_plan_hists[i] is None:
@@ -2863,17 +3143,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 candidate_obs_poses.append(obs_pos_i)
 
             is_kept = self._deduplicate_by_endpoint(
-                expanded_node_candidates, candidate_obs_poses, values, final_is_feasible,
+                expanded_node_candidates, candidate_obs_poses, final_is_feasible,
             )  # list of bool, len B
 
             # Node Allocation (skip deduplicated/infeasible candidates)
             simul_node_allocation_start = time.time()
-            # Reset virtually_visited for killed slots so they remain available
+            # Dedup-killed slots are permanently dead: never attempt to expand them again.
+            # Kept slots that weren't expanded also release their virtually_visited lock.
             for i in range(len(expanded_node_candidates)):
+                name = expanded_node_candidates[i]["name"]
+                slot_index = int(name.split('-')[-1])
+                parent_node = expanded_node_candidates[i]["parent_node"]
                 if not is_kept[i]:
-                    name = expanded_node_candidates[i]["name"]
-                    slot_index = int(name.split('-')[-1])
-                    parent_node = expanded_node_candidates[i]["parent_node"]
+                    parent_node.mark_slot_permanently_dead(slot_index)
+                else:
                     parent_node._children_nodes[slot_index]["virtually_visited"] = False
 
             selected_nodes_for_expansion = {}
@@ -2918,7 +3201,26 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         expanded_node_infos[name]["current_levels"] = updated_level
 
             for name in selected_nodes_for_expansion:
-                child_node = selected_nodes_for_expansion[name].expand(
+                parent_node_for_expand = selected_nodes_for_expansion[name]
+                # [DIAG] Check if slot already has a node (would be overwritten by expand())
+                _slot_idx = int(name.split('-')[-1])
+                _existing_node = parent_node_for_expand._children_nodes[_slot_idx]['node']
+                _new_ph = expanded_node_infos[name]["plan_history"]
+                _new_plan_xy = None
+                if _new_ph and hasattr(_new_ph[-1], '__getitem__'):
+                    try:
+                        _new_plan_xy = self._unnormalize_x(_new_ph[-1][-1:].unsqueeze(0))[0, 0, :self.pos_dim].detach().cpu().tolist()
+                    except Exception:
+                        pass
+                self._tlog("node.expand_call", {
+                    "tree_tag": tree.tag,
+                    "name": name,
+                    "already_exists": _existing_node is not None,
+                    "existing_plan_id": id(_existing_node.plan_history[-1]) if _existing_node is not None and _existing_node.plan_history else None,
+                    "new_plan_xy_first": _new_plan_xy,
+                    "parent_plan_history_len": len(parent_node_for_expand.plan_history),
+                }, depth=0)
+                child_node = parent_node_for_expand.expand(
                     **expanded_node_infos[name]
                 )
                 expanded_node_infos[name]["node"] = child_node
@@ -2931,6 +3233,21 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             self._tlog("mcts.phase", {"phase": "simulation_end"}, depth=1)
             simulation_end_time = time.time()
             tree.simulation_time.append(simulation_end_time - simulation_start_time)
+
+            # [ITER SUMMARY] Per-iteration node creation stats — key for diagnosing wasted budget
+            n_actual_created = sum(1 for info in expanded_node_infos.values() if info.get("node") is not None)
+            n_candidates_this_iter = len(expanded_node_candidates)
+            n_valid_this_iter = len(valid_candidates)
+            self._tlog("mcts.iter_summary", {
+                "tree_tag": tree.tag,
+                "iter": tree.search_num,
+                "p_search_num_before": tree.p_search_num,
+                "n_candidates": n_candidates_this_iter,
+                "n_valid": n_valid_this_iter,
+                "n_obs_filtered": n_candidates_this_iter - n_valid_this_iter,
+                "n_actual_nodes_created": n_actual_created,
+                "waste_ratio": round(1 - n_actual_created / max(n_candidates_this_iter, 1), 2),
+            }, depth=0)
 
             ######################
             # Backpropagation
@@ -3025,7 +3342,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             if single_step:
                 break
 
-        tree.pbar.close()
+        if not single_step:
+            tree.pbar.close()
 
         # [LOGGING] Record search completion and tree stats
         from utils.tracer import get_tracer
@@ -3041,6 +3359,52 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     "terminal_depth": tree.terminal_depth,
                     "terminal_depth_reached": terminal_depth_reached,
                     "total_nodes_expanded": tree.search_num,
+                },
+                step=tree.search_num,
+                depth=0,
+            )
+
+            # [TIMING SUMMARY] Phase breakdown for bottleneck analysis
+            def _ms(lst): return round(sum(lst) * 1000, 1) if lst else 0.0
+            def _ms_mean(lst): return round((sum(lst) / len(lst)) * 1000, 1) if lst else 0.0
+            sel_ms   = _ms(tree.selection_time)
+            exp_ms   = _ms(tree.expansion_time)   # includes parallel_plan (GPU diffusion)
+            sim_ms   = _ms(tree.simulation_time)   # includes value estimation
+            bp_ms    = _ms(tree.backprop_time)
+            et_ms    = _ms(tree.early_termination_time)
+            nzp_ms   = _ms(tree.simul_noiselevel_zero_padding_time)
+            val_ms   = _ms(tree.simul_value_estimation_time)
+            calc_ms  = _ms(tree.simul_value_calculation_time)
+            alloc_ms = _ms(tree.simul_node_allocation_time)
+            total_ms = sel_ms + exp_ms + sim_ms + bp_ms + et_ms
+            tracer.log(
+                tag="timing.phase_breakdown",
+                data={
+                    "tree_tag": tree.tag,
+                    "n_iters": tree.search_num,
+                    "n_nodes": tree.p_search_num,
+                    "parallel_search_num": self.parallel_search_num,
+                    # total per phase (ms)
+                    "total_ms": total_ms,
+                    "selection_ms": sel_ms,
+                    "expansion_ms": exp_ms,
+                    "simulation_ms": sim_ms,
+                    "backprop_ms": bp_ms,
+                    "early_term_ms": et_ms,
+                    # simulation sub-phases (ms)
+                    "sim_noise_zeropad_ms": nzp_ms,
+                    "sim_value_estimation_ms": val_ms,
+                    "sim_value_calculation_ms": calc_ms,
+                    "sim_node_allocation_ms": alloc_ms,
+                    # mean per iteration (ms)
+                    "mean_selection_ms": _ms_mean(tree.selection_time),
+                    "mean_expansion_ms": _ms_mean(tree.expansion_time),
+                    "mean_simulation_ms": _ms_mean(tree.simulation_time),
+                    "mean_backprop_ms": _ms_mean(tree.backprop_time),
+                    # ratio
+                    "expansion_ratio": round(exp_ms / total_ms, 3) if total_ms > 0 else 0,
+                    "simulation_ratio": round(sim_ms / total_ms, 3) if total_ms > 0 else 0,
+                    "selection_ratio": round(sel_ms / total_ms, 3) if total_ms > 0 else 0,
                 },
                 step=tree.search_num,
                 depth=0,
@@ -3337,6 +3701,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         _agent_pos_log = []          # agent position at each step
         _plan_pos_log = []           # planned position at same step index (for comparison)
 
+        # [TIMING] execution breakdown
+        _exec_t0 = time.time()
+        _env_step_ms: list = []
+        _action_ms: list = []
+
         while loop_cnt < self.open_loop_horizon:
             # Update sub_goal for antmaze (with interval logic)
             if "antmaze" in self.env_id:
@@ -3356,6 +3725,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         sub_goal_sim_state["qpos"][:self.pos_dim] = plan_slice_np[-1, :self.pos_dim]
 
             # Compute action
+            _act_t0 = time.time()
             if use_diffused_action:
                 plan_frame = plan_frame_format[min(loop_cnt, plan_frame_format.shape[0] - 1)]
                 _, action, _ = self.split_bundle(plan_frame)
@@ -3366,11 +3736,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     current_sim_state=current_sim_state,
                     prev_sim_state=prev_sim_state,
                 )
+            _action_ms.append((time.time() - _act_t0) * 1000)
 
             # Execute action in environment
             action_np = action.detach().cpu().numpy()
 
+            _step_t0 = time.time()
             obs_numpy, reward, done, _ = envs.step(np.nan_to_num(action_np))
+            _env_step_ms.append((time.time() - _step_t0) * 1000)
 
             # Ensure obs_numpy is 2D: (batch_size, obs_dim)
             if obs_numpy.ndim == 1:
@@ -3400,6 +3773,21 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             # from the goal towards the start. So done=True initially and we should ignore it.
             if not is_backward and done.any():
                 break
+
+        # [TIMING] Execute plan timing summary
+        _exec_total_ms = (time.time() - _exec_t0) * 1000
+        _n_steps = max(loop_cnt, 1)
+        self._tlog("timing.execute_plan", {
+            "loop_cnt": loop_cnt,
+            "total_exec_ms": round(_exec_total_ms, 1),
+            "env_step_total_ms": round(sum(_env_step_ms), 1),
+            "env_step_mean_ms": round(sum(_env_step_ms) / _n_steps, 2),
+            "env_step_max_ms": round(max(_env_step_ms), 2) if _env_step_ms else 0.0,
+            "action_total_ms": round(sum(_action_ms), 1),
+            "action_mean_ms": round(sum(_action_ms) / _n_steps, 2),
+            "env_step_pct": round(sum(_env_step_ms) / (_exec_total_ms + 1e-6) * 100, 1),
+            "action_pct": round(sum(_action_ms) / (_exec_total_ms + 1e-6) * 100, 1),
+        }, depth=0)
 
         # [EXEC DIAG] Summary log after plan execution
         if "antmaze" in self.env_id and len(_dist_to_subgoal_log) > 0:
@@ -3740,6 +4128,22 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         a_len: int = best_node.depth * seg_size * self.frame_stack
         t1_segments: torch.Tensor = plan_a_full[:a_len]  # (A_len, c)
 
+        # [DIAG] Log plan_a identity (backward node's own segment)
+        try:
+            _pa_xy0 = self._unnormalize_x(plan_a_full[:1].unsqueeze(0))[0, 0, :self.pos_dim].detach().cpu().tolist()
+            _pa_xy_end = self._unnormalize_x(plan_a_full[a_len-1:a_len].unsqueeze(0))[0, 0, :self.pos_dim].detach().cpu().tolist() if a_len > 0 else None
+        except Exception:
+            _pa_xy0, _pa_xy_end = None, None
+        self._tlog("plan_a.identity", {
+            "best_node_name": best_node.name,
+            "best_node_depth": best_node.depth,
+            "plan_a_tensor_id": id(plan_a_full),
+            "plan_a_xy_first": _pa_xy0,
+            "plan_a_xy_at_a_len": _pa_xy_end,
+            "a_len": a_len,
+            "is_tree1": is_tree1,
+        }, depth=0)
+
         # [DIAGNOSTIC] Log plan slicing details
         self._tlog("mcts.extract_plan", {
             "best_node_depth": best_node.depth,
@@ -3774,6 +4178,23 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             t2_flipped: torch.Tensor = torch.flip(
                 plan_b_full[:b_len], [0]
             )  # (B_len, c)
+
+            # [DIAG] Log plan_b identity to detect if same node index has changed sub_path
+            try:
+                _pb_xy0 = self._unnormalize_x(plan_b_full[:1].unsqueeze(0))[0, 0, :self.pos_dim].detach().cpu().tolist()
+                _pb_xy_end = self._unnormalize_x(plan_b_full[b_len-1:b_len].unsqueeze(0))[0, 0, :self.pos_dim].detach().cpu().tolist() if b_len > 0 else None
+            except Exception:
+                _pb_xy0, _pb_xy_end = None, None
+            self._tlog("plan_b.identity", {
+                "best_node_name": best_node.name,
+                "target_node_name": best_node.target_node.name,
+                "target_plan_history_len": len(best_node.target_node.plan_history),
+                "plan_b_tensor_id": id(plan_b_full),
+                "plan_b_xy_first": _pb_xy0,
+                "plan_b_xy_at_b_len": _pb_xy_end,
+                "b_len": b_len,
+                "is_tree1": is_tree1,
+            }, depth=0)
 
             self._tlog("mcts.extract_plan", {"a_len": a_len, "b_len": b_len, "combined": a_len + b_len}, depth=1)
 

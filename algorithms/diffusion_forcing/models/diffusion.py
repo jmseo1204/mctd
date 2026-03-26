@@ -39,6 +39,7 @@ class Diffusion(nn.Module):
         self.cum_snr_decay = cfg.cum_snr_decay
         self.ddim_sampling_eta = cfg.ddim_sampling_eta
         self.clip_noise = cfg.clip_noise
+        self.max_guidance_ratio = cfg.get("max_guidance_ratio", float("inf"))
         self.arch = cfg.architecture
         self.stabilization_level = cfg.stabilization_level
         self.is_causal = is_causal
@@ -460,41 +461,18 @@ class Diffusion(nn.Module):
 
                 guidance_results = guidance_fn(model_pred.pred_x_start)
 
+                _per_guidance_grads = {}
                 if isinstance(guidance_results, dict):
                     grad = torch.zeros_like(x)
-                    norms = {}
-                    _tracer = get_tracer()
                     items = list(guidance_results.items())
-                    for i, (name, loss) in enumerate(items):
+                    for i, (key, loss) in enumerate(items):
                         is_last = (i == len(items) - 1)
                         g = torch.autograd.grad(loss.sum(), x, retain_graph=not is_last, allow_unused=True)[0]
                         if g is None:
                             g = torch.zeros_like(x)
+                        _per_guidance_grads[key] = g
                         grad = grad + g
-                        norms[name] = g.norm().item()
-                        if _tracer is not None:
-                            with _tracer.scope("gradient_nan_diagnosis", phase="guidance"):
-                                _tracer.log(
-                                    f"gradient.component.{name}",
-                                    {
-                                        "loss_value":    float(loss.detach().sum()),
-                                        "loss_has_nan":  bool(torch.isnan(loss).any()),
-                                        "loss_has_inf":  bool(torch.isinf(loss).any()),
-                                        "grad_norm":     float(g.detach().norm()),
-                                        "grad_has_nan":  bool(torch.isnan(g).any()),
-                                        "grad_has_inf":  bool(torch.isinf(g).any()),
-                                        "grad_max_abs":  float(g.detach().abs().max()),
-                                    },
-                                    depth=1,
-                                )
 
-                    total_norm = sum(norms.values())
-                    if total_norm > 1e-8:
-                        _t = get_tracer()
-                        if _t is not None:
-                            _t.log("diffusion.guidance_ratio", {
-                                "ratios": {k: v / total_norm for k, v in norms.items()},
-                            }, depth=1)
                 else:
                     guidance_loss = guidance_results
                     g = torch.autograd.grad(guidance_loss.sum(), x, allow_unused=True)[0]
@@ -505,6 +483,24 @@ class Diffusion(nn.Module):
             # ≈ 0.41 at high noise (effective anchor), ≈ 0 at low noise (no drift).
             if torch.isnan(grad).any() or torch.isinf(grad).any():
                 grad = torch.zeros_like(grad)
+
+            # Soft norm clipping (DPS-respecting): guidance grad를 prior norm 기준으로 제한.
+            # 정상 범위(ratio ≤ max_guidance_ratio)는 그대로 유지, 초과분만 축소.
+            # pred_noise 할당 전에 적용하여 prior 정보 오염을 방지.
+            if self.max_guidance_ratio < float("inf"):
+                prior_norm = model_pred.pred_noise.detach().norm(dim=-1, keepdim=True)
+                grad_norm  = grad.norm(dim=-1, keepdim=True)
+                scale = (self.max_guidance_ratio * prior_norm / (grad_norm + 1e-8)).clamp(max=1.0)
+                grad = grad * scale
+                _per_guidance_grads = {k: v * scale for k, v in _per_guidance_grads.items()}
+                _t = get_tracer()
+                if _t is not None:
+                    _t.log("diffusion.clip_scale", {
+                        "scale_mean": round(scale.mean().item(), 4),
+                        "scale_min":  round(scale.min().item(), 4),
+                        "prior_norm_mean": round(prior_norm.mean().item(), 6),
+                        "grad_norm_mean":  round(grad_norm.mean().item(), 6),
+                    }, depth=1)
 
             pred_noise = model_pred.pred_noise - grad
 
@@ -518,11 +514,53 @@ class Diffusion(nn.Module):
 
             x_start = self.predict_start_from_noise(x, clipped_curr_noise_level, pred_noise)
 
+            _t = get_tracer()
+            if _t is not None:
+                # Log x_start predicted positions stratified by noise level
+                _xs = x_start.detach()           # (batch, n_tokens, dim)
+                _xs_prior = model_pred.pred_x_start.detach()
+                # curr_noise_level: (batch, n_tokens) — use mean across batch per token
+                _nl = clipped_curr_noise_level.detach().float()  # (batch, n_tokens)
+                _nl_mean = _nl.mean(dim=0)  # (n_tokens,) — representative noise per token
+                _high = _nl_mean > 0.5      # high-noise tokens (early denoising)
+                _low  = _nl_mean <= 0.5     # low-noise tokens (late denoising)
+                def _xy_std(t, mask):
+                    if mask.sum() == 0:
+                        return [0.0, 0.0]
+                    return [round(v, 4) for v in t[:, mask, :2].std(dim=(0, 1)).tolist()]
+                def _xy_mean(t, mask):
+                    if mask.sum() == 0:
+                        return [0.0, 0.0]
+                    return [round(v, 4) for v in t[:, mask, :2].mean(dim=(0, 1)).tolist()]
+                _t.log("diffusion.xstart_pos", {
+                    "xstart_mean_xy":       [round(v, 4) for v in _xs[..., :2].mean(dim=(0, 1)).tolist()],
+                    "xstart_std_xy":        [round(v, 4) for v in _xs[..., :2].std(dim=(0, 1)).tolist()],
+                    "prior_xstart_mean_xy": [round(v, 4) for v in _xs_prior[..., :2].mean(dim=(0, 1)).tolist()],
+                    # Stratified by noise level: where does x_start blow up?
+                    "xstart_std_high_noise": _xy_std(_xs, _high),   # noise > 0.5
+                    "xstart_std_low_noise":  _xy_std(_xs, _low),    # noise <= 0.5
+                    "xstart_mean_high_noise": _xy_mean(_xs, _high),
+                    "xstart_mean_low_noise":  _xy_mean(_xs, _low),
+                    "n_high_noise_tokens": int(_high.sum().item()),
+                    "noise_level_mean": round(_nl_mean.mean().item(), 4),
+                }, depth=1)
+
             mask_final = (curr_noise_level != next_noise_level)
             if mask_final.any():
                 g_norm_val = grad.detach().norm(dim=-1)[mask_final].mean().item()
+                prior_norm_val = model_pred.pred_noise.detach().norm(dim=-1)[mask_final].mean().item()
                 _t = get_tracer()
                 if _t is not None:
+                    _per_norms = {
+                        k: round(v.detach().norm(dim=-1)[mask_final].mean().item(), 6)
+                        for k, v in _per_guidance_grads.items()
+                    }
+                    _t.log("diffusion.grad_comparison", {
+                        "prior_norm": round(prior_norm_val, 6),
+                        "guidance_total_norm": round(g_norm_val, 6),
+                        "ratio": round(g_norm_val / (prior_norm_val + 1e-8), 4),
+                        "per_guidance_norms": _per_norms,
+                    }, depth=1)
                     _t.log("diffusion.grad_norm", {
                         "grad_norm": round(g_norm_val, 6),
                     }, depth=1)
@@ -541,16 +579,6 @@ class Diffusion(nn.Module):
 
         x_pred = x_start * alpha_next.sqrt() + pred_noise * c + sigma * noise
         
-        if guidance_fn is not None and torch.rand(1).item() < 0.05:
-            # DPS net coeff = sqrt_recipm1 * sqrt(alpha_next) - c
-            sqrt_recipm1 = extract(self.sqrt_recipm1_alphas_cumprod, clipped_curr_noise_level, x.shape)
-            net_coeff = sqrt_recipm1 * alpha_next.sqrt() - c
-            unfrozen = (curr_noise_level != next_noise_level)
-            avg_coeff = net_coeff[self.add_shape_channels(unfrozen)].mean().item() if unfrozen.any() else 0.0
-
-            print(f"[DIFFUSION DEBUG] DPS Net Coeff (sqrt_recip*sqrt_a_next - c): {avg_coeff:.4f}")
-            print(f"[DIFFUSION DEBUG] Final x_pred norm: {x_pred.norm().item():.4f}")
-            print(f"[DIFFUSION DEBUG] x change norm: {(x_pred - x).norm().item():.4f}\n")
 
         # only update frames where the noise level decreases
         mask = curr_noise_level == next_noise_level
