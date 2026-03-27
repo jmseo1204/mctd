@@ -14,6 +14,7 @@ from PIL import Image
 from .df_base import DiffusionForcingBase
 from utils.logging_utils import (
     make_trajectory_images,
+    make_trajectory_videos,
     get_random_start_goal,
     make_convergence_animation,
     make_mpc_animation,
@@ -144,10 +145,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.max_child_resets = cfg.get("max_child_resets", 3)
         self.particle_guidance_scale = cfg.get("particle_guidance_scale", 0.0)
         self.debug_memory_profile = cfg.get("debug_memory_profile", False)
-        self.max_plan_hist_keep = cfg.get("max_plan_hist_keep", 1)  # Memory optimization: limit history
+        self.profiler_snapshot_frames = cfg.get("profiler_snapshot_frames", cfg.get("max_plan_hist_keep", 20))  # Number of denoising frames kept for video
         self.sequence_dividing_factor = cfg.sequence_dividing_factor
         self.horizon_scale = cfg.horizon_scale
-        self.scheduling_matrix = cfg.get("scheduling_matrix", "pyramid")
+        self.noise_level_building_way = cfg.get("noise_level_building_way", "pyramid")
 
         # HILP value function guidance
         hilp_path = cfg.get("hilp_checkpoint_path", "td_models/hilp_ckpt_latest.pt")
@@ -163,6 +164,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         # We don't initialize it here to prevent PyTorch from registering it as a submodule
         self.anchor_guidance_scale = cfg.get("anchor_guidance_scale", 40.0)
         self.rdf_guidance_scale = cfg.get("rdf_guidance_scale", 2.0)
+        self.rmse_guidance_scale = cfg.get("rmse_guidance_scale", 1.0)
         self.use_score_func_with_TD = cfg.get("use_score_func_with_TD", True)
         self.TD_thres_for_far_target = cfg.get("TD_thres_for_far_target", None)
         self.kde_sigma = cfg.get("kde_sigma", 0.3)
@@ -176,7 +178,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal
         
-        self.profiler_snapshot_interval: int = cfg.get("profiler_snapshot_interval", 10)
+        self.frame_sampling_way: str = cfg.get("frame_sampling_way", "linear")
+        self.validation_video_max_frames: int = int(cfg.get("validation_video_max_frames", 200))
+        self.validation_video_path_stride: int = int(cfg.get("validation_video_path_stride", 4))
+        self.validation_video_fps: int = int(cfg.get("validation_video_fps", 8))
 
         # Initialize memory profiler for debugging
         if self.debug_memory_profile:
@@ -193,7 +198,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self._tlog("init.config", {
             "parallel_search_num": self.parallel_search_num,
             "mctd_max_search_num": self.mctd_max_search_num,
-            "max_plan_hist_keep": self.max_plan_hist_keep,
+            "profiler_snapshot_frames": self.profiler_snapshot_frames,
+            "validation_video_max_frames": self.validation_video_max_frames,
+            "validation_video_path_stride": self.validation_video_path_stride,
+            "validation_video_fps": self.validation_video_fps,
         }, depth=1)
 
     def _tlog(self, tag: str, data: dict, depth: int = 0, source: str = "") -> None:
@@ -534,7 +542,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             return None
 
         try:
-            combined_flat, values_flat = guidance.compute_guidance_grad_np(
+            combined_flat, values_flat, _far_mask_flat, _hilp_flat, _rmse_flat = guidance.compute_guidance_grad_np(
                 self, obs_np, target_np, hilp_fn
             )
         except Exception as e:
@@ -801,7 +809,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 work_array[:start_idx] = current_level
                 steps.append(work_array.copy())
 
-        elif self.scheduling_matrix == 'causal':
+        elif self.noise_level_building_way == 'causal':
             local_horizon = end_idx - start_idx
             uncertainty_scale = getattr(self, "uncertainty_scale", 1)
 
@@ -825,7 +833,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
                 steps.append(work_array.copy())
 
-        elif self.scheduling_matrix == 'smooth' and start_idx > 0:
+        elif self.noise_level_building_way == 'smooth' and start_idx > 0:
             # Phase 1: bilateral ramp — grow the denoised prefix toward B (left ramp)
             # while reducing the new segment head toward 0 (right ramp), so the
             # boundary jump level[B]-level[B-1] drops from N to ≤1.
@@ -1246,6 +1254,60 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         stabilization = 0
         _gpu_step_times = []
 
+        # --- Denoising-step hook: capture prior score & guidance grads per step ---
+        # After processing, _step_captures is stored in self._parallel_plan_step_captures
+        # so callers (_run_mcts_search) can retrieve per-candidate captures for video.
+        _step_captures = []
+        _sc_plan_tokens = plan_tokens
+        _sc_prefix_len_list = prefix_len_list
+        _sc_fs = self.frame_stack
+
+        def _capture_hook(data):
+            """Extract plan-space pred_noise & guidance grads, move to CPU."""
+            pn = data['prior_pred_noise']          # (n_tokens, B, fs*c) GPU
+            pn_chunk = extract_plan_chunk(pn, _sc_plan_tokens, _sc_prefix_len_list)
+            pn_exp = rearrange(pn_chunk, "t b (fs c) -> (t fs) b c", fs=_sc_fs)
+            gg_exp = {}
+            for k, v in data['guidance_grads'].items():
+                v_chunk = extract_plan_chunk(v.detach(), _sc_plan_tokens, _sc_prefix_len_list)
+                gg_exp[k] = rearrange(v_chunk, "t b (fs c) -> (t fs) b c", fs=_sc_fs).cpu()
+            # Clean-space grads: ∂V/∂x̂_0 (no Jacobian — matches crimson HILP grad field direction)
+            gg_clean_exp = {}
+            for k, v in data.get('guidance_grads_clean', {}).items():
+                v_chunk = extract_plan_chunk(v.detach(), _sc_plan_tokens, _sc_prefix_len_list)
+                gg_clean_exp[k] = rearrange(v_chunk, "t b (fs c) -> (t fs) b c", fs=_sc_fs).cpu()
+            # pred_x_start: x̂_0 denoised estimate at this step (n_tokens, B, fs*c)
+            pxs = data.get('pred_x_start')
+            if pxs is not None:
+                pxs_chunk = extract_plan_chunk(pxs.detach(), _sc_plan_tokens, _sc_prefix_len_list)
+                pxs_exp = rearrange(pxs_chunk, "t b (fs c) -> (t fs) b c", fs=_sc_fs).cpu()
+            else:
+                pxs_exp = None
+            # Capture effective DDIM scale: sqrt(1 - alpha_t) for each plan token.
+            # curr_noise_level is an INTEGER timestep index (0..timesteps-1), NOT a float.
+            # Look up alphas_cumprod[t] to get the true alpha, then sqrt(1-alpha) ≈ c coefficient.
+            # High noise (early denoising, large t) → alpha small → sqrt(1-alpha) ≈ 1 (large arrows)
+            # Low noise (late denoising, small t) → alpha → 1 → sqrt(1-alpha) ≈ 0 (small arrows)
+            nl = data.get('curr_noise_level')  # (n_tokens, B) integer GPU tensor
+            if nl is not None:
+                nl_chunk = extract_plan_chunk(nl.unsqueeze(-1), _sc_plan_tokens, _sc_prefix_len_list)  # (plan_tokens, B, 1)
+                nl_int = nl_chunk.squeeze(-1).detach().long()  # (plan_tokens, B) integer timestep indices
+                _n_alphas = self.diffusion_model.alphas_cumprod.shape[0]
+                nl_int_clamped = nl_int.clamp(0, _n_alphas - 1)
+                alpha_t = self.diffusion_model.alphas_cumprod[nl_int_clamped]  # (plan_tokens, B) float
+                nl_cpu = (1.0 - alpha_t).sqrt().cpu()  # (plan_tokens, B) float in [0, 1]
+            else:
+                nl_cpu = None
+            _step_captures.append({
+                'prior_pred_noise': pn_exp.detach().cpu(),  # (plan_tokens*fs, B, c)
+                'guidance_grads': gg_exp,                   # ∂V/∂x_t (through J_θ)
+                'guidance_grads_clean': gg_clean_exp,       # ∂V/∂x̂_0 (clean space)
+                'pred_x_start_pos': pxs_exp,               # x̂_0 positions (plan_tokens*fs, B, c) or None
+                'noise_level': nl_cpu,  # (plan_tokens, B) float sqrt(1-alpha) or None
+            })
+
+        self.diffusion_model._step_hook = _capture_hook
+
         for m in range(noise_level.shape[1] - 1):
             # noise_level shape: (b, m, plan_tokens)
             # Iterating over m denoising steps
@@ -1294,12 +1356,32 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 ) # (plan_tokens, b, fs*c)
             )
 
+        # Clear the denoising-step hook before any further processing
+        self.diffusion_model._step_hook = None
+
         # Stack all denoising steps
         plan_hist = torch.stack(plan_hist)  # (m+1, plan_tokens, b, fs*c)
-        
-        # [MEMORY OPTIMIZATION] Keep only last N histories to save memory
-        if self.max_plan_hist_keep > 0 and plan_hist.shape[0] > self.max_plan_hist_keep:
-            plan_hist = plan_hist[-self.max_plan_hist_keep:]
+
+        # Prepend a null capture so indices align with plan_hist (plan_hist[0] = initial noise,
+        # capture[0] = null; capture[m] = step that produced plan_hist[m]).
+        _step_captures.insert(0, {'prior_pred_noise': None, 'guidance_grads': {}, 'guidance_grads_clean': {}, 'pred_x_start_pos': None})
+
+        # [MEMORY OPTIMIZATION] Keep N frames spanning full denoising process
+        _n_keep = self.profiler_snapshot_frames
+        if _n_keep > 0 and plan_hist.shape[0] > _n_keep:
+            _M = plan_hist.shape[0]
+            if self.frame_sampling_way == 'quadratic':
+                # Dense toward end-of-denoising: idx = (1-(1-t)^2) * (M-1), t = k/(N-1)
+                _t = np.linspace(0.0, 1.0, _n_keep)
+                _t_mapped = 1.0 - (1.0 - _t) ** 2  # quadratic: dense near t=1 (end of denoising)
+                _idx_np = np.round(_t_mapped * (_M - 1)).astype(int)
+                _idx = torch.from_numpy(_idx_np).long()
+            else:
+                # linear: evenly strided
+                _idx = torch.linspace(0, _M - 1, _n_keep).long()
+            plan_hist = plan_hist[_idx]
+            # Apply same subsampling to step captures
+            _step_captures = [_step_captures[i] for i in _idx.tolist()]
         
         # Rearrange to expand tokens into frame stacks
         plan_hist = rearrange(
@@ -1307,6 +1389,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             "m t b (fs c) -> m (t fs) b c",
             fs=self.frame_stack,
         )  # (m+1, plan_tokens*fs, b, c)
+
+        # Store step captures for retrieval by callers (e.g. _run_mcts_search → video loop).
+        # Each entry: {'prior_pred_noise': (plan_tokens*fs, B, c) or None, 'guidance_grads': dict}
+        self._parallel_plan_step_captures = _step_captures
 
         # [DIAG] H2: denoising 완료 후 plan_hist[-1][0] 첫 frame unnormalized x,y
         # plan_hist shape after rearrange: (m+1, plan_tokens*fs, b, c)
@@ -1645,6 +1731,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             first_reach = np.zeros(batch_size)
 
             trajectory = []  # actual trajectory
+            validation_rollout_agent_history: List[np.ndarray] = []
+            validation_rollout_subgoal_history: List[np.ndarray] = []
+            validation_pp_plan_history: List[np.ndarray] = []  # per-step pp_plan for video overlay
 
             # run mpc with diffused actions
             planning_time = []
@@ -1819,6 +1908,184 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                             "child_pos": _child.obs_pos[:self.pos_dim].tolist(),
                         }, depth=0)
 
+                # --- Per-expansion denoising video logging ---
+                # Runs before _select_best_leaf so videos are logged even if the
+                # episode terminates after this loop's plan execution.
+                _v_start_np = start.cpu().numpy()[:, :self.pos_dim]
+                _v_goal_np = goal.cpu().numpy()[:, :self.pos_dim]
+                _v_goal_pos2d = goal.cpu().numpy()[0, :self.pos_dim]            # world coords
+                _v_goal_obs = goal.cpu().numpy()[0, :self.observation_dim].astype(np.float32)  # for HILP
+                _v_gscale = self.mctd_guidance_scales[0] if self.mctd_guidance_scales else 0.0
+                _v_hilp_fn = getattr(self, '_hilp_value_fn_instance', None)
+                _v_hilp_ref = getattr(self, '_hilp_ref_obs', None)
+
+                # Heatmap & grad-field are computed per-candidate based on the target (green star),
+                # not the episode goal.  Cache by target_node name to avoid redundant computation.
+                _v_tgt_vis_cache: dict = {}  # target_node_name → (heatmap, grad_field)
+
+                # Per-candidate step captures from the expansion parallel_plan call.
+                _v_sc_by_name: dict = getattr(self, '_expansion_step_captures_by_name', {})
+                # obs_std for converting normalized pred_noise to world-space arrow scale
+                _v_obs_std_np = (
+                    self.data_std[:self.pos_dim].cpu().numpy()
+                    if isinstance(self.data_std, torch.Tensor)
+                    else np.array(self.data_std[:self.pos_dim])
+                )
+
+                for _vname, _vinfo in expanded_node_infos.items():
+                    _vnode = _vinfo.get("node")
+                    if _vnode is None or not _vnode.plan_history:
+                        continue
+
+                    _v_seg = active_tree.plan_tokens // self.sequence_dividing_factor
+                    _v_alen = _vnode.depth * _v_seg * self.frame_stack
+
+                    # Guidance tail index — single green point at the END of the current sub_plan.
+                    # _v_alen = depth * seg_size * frame_stack is the last denoised frame index + 1.
+                    # We always show exactly ONE green dot: the boundary of the currently denoised segment.
+                    _v_tail_vis = np.array([_v_alen - 1]) if _v_alen > 0 else np.array([], dtype=int)
+
+                    _v_node_traj = self._extract_node_trajectory(_vnode)
+                    _v_tgt_pos = (
+                        _vnode.target_node.obs_pos
+                        if _vnode.target_node is not None and getattr(_vnode.target_node, 'obs_pos', None) is not None
+                        else None
+                    )
+
+                    # Compute heatmap & grad-field for this candidate's target (green star).
+                    # Cache by target_node name so identical targets don't trigger recomputation.
+                    _v_cand_heatmap = None
+                    _v_cand_grad_field = None
+                    if _v_tgt_pos is not None and _v_hilp_fn is not None:
+                        _tgt_name = getattr(_vnode.target_node, 'name', None)
+                        if _tgt_name is not None and _tgt_name in _v_tgt_vis_cache:
+                            _v_cand_heatmap, _v_cand_grad_field = _v_tgt_vis_cache[_tgt_name]
+                        else:
+                            try:
+                                _v_cand_heatmap = self._compute_hilp_heatmap(
+                                    _v_tgt_pos[:self.observation_dim].astype(np.float32)
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                _v_cand_grad_field = self._compute_guidance_grad_fields(
+                                    _v_tgt_pos[:self.pos_dim]
+                                )
+                            except Exception:
+                                pass
+                            if _tgt_name is not None:
+                                _v_tgt_vis_cache[_tgt_name] = (_v_cand_heatmap, _v_cand_grad_field)
+
+                    _v_hist = _vnode.plan_history[-1]  # (K, plan_tokens*fs, c)
+                    _v_K = _v_hist.shape[0]
+                    _v_frames = []
+                    # Per-candidate step captures aligned with plan_history frames
+                    _v_step_caps = _v_sc_by_name.get(_vname)
+
+                    for _vm in range(_v_K):
+                        _v_pu = self._unnormalize_x(_v_hist[_vm].unsqueeze(1))  # (plan_tokens*fs, 1, c)
+                        _v_plan = _v_pu[:_v_alen, :, :self.pos_dim].detach().cpu().numpy() if _v_alen > 0 else None
+
+                        _v_gpos = None
+                        _v_gg = None
+                        _v_pg = None
+                        _v_xs_gpos = None   # pred_x_start position (x̂_0)
+                        _v_xs_gg = None     # ∂V/∂x̂_0 guidance grad (green dashed)
+                        _v_xs_pg = None     # prior score at x̂_0 (yellow dashed)
+
+                        if len(_v_tail_vis) > 0:
+                            _v_gpos = _v_pu[_v_tail_vis, 0, :self.pos_dim].detach().cpu().numpy()  # (n, pos_dim)
+
+                            # --- Gradient arrows from denoising-step hook captures ---
+                            # Captures are only available for the expansion parallel_plan call.
+                            # capture[_vm]['prior_pred_noise']: (plan_tokens*fs, c) on CPU
+                            # capture[_vm]['guidance_grads'][key]: same shape
+                            if _v_step_caps is not None and _vm < len(_v_step_caps):
+                                _sc = _v_step_caps[_vm]
+                                _pn = _sc.get('prior_pred_noise')   # (plan_tokens*fs, c) or None
+                                _gg_dict = _sc.get('guidance_grads', {})
+
+                                # DPS-theory-correct scales:
+                                # sigma_t = sqrt(1-α_t) = noise_level (float [0,1]).
+                                # Prior score ∝ -ε_θ/σ_t: INCREASES as σ_t→0.
+                                #   Proxy: sqrt(α_t) = sqrt(1-σ_t²) → 0..1 (INCREASING)
+                                # Guidance K_g ≈ σ_t proxy: DECREASES as denoising ends.
+                                #   Proxy: σ_t = noise_level → 1..0 (DECREASING)
+                                _sigma_t = 1.0
+                                _prior_scale = 0.0
+                                _nl_data = _sc.get('noise_level')  # (plan_tokens,) float or None
+                                if _nl_data is not None and len(_v_tail_vis) > 0:
+                                    _tail_tok = int(_v_tail_vis[0]) // self.frame_stack
+                                    _tail_tok = min(_tail_tok, len(_nl_data) - 1)
+                                    _sigma_t = float(_nl_data[_tail_tok].clamp(0.0, 1.0).item())
+                                    _prior_scale = float((1.0 - _sigma_t ** 2) ** 0.5)  # sqrt(α_t)
+
+                                # Prior: -ε_θ × sqrt(α_t) — grows as denoising progresses
+                                if _pn is not None:
+                                    _pn_xy = _pn[_v_tail_vis, :self.pos_dim].numpy()
+                                    _v_pg = -_pn_xy * _v_obs_std_np * _prior_scale
+
+                                # Guidance: +grad × σ_t — x̂_0 moves in +grad direction (toward goal)
+                                # DPS: x̂_0_new = x̂_0 + σ_t·grad/√α_t, so +grad = actual movement direction
+                                if _gg_dict:
+                                    _gg_combined = sum(
+                                        v[_v_tail_vis, :self.pos_dim].numpy()
+                                        for v in _gg_dict.values()
+                                    )
+                                    _v_gg = (_gg_combined * _v_obs_std_np) * _sigma_t
+
+                                # --- pred_x_start (x̂_0) visualization ---
+                                # Position: unnormalize captured pred_x_start
+                                _pxs_cpu = _sc.get('pred_x_start_pos')  # (plan_tokens*fs, c) or None
+                                if _pxs_cpu is not None:
+                                    _pxs_t = _pxs_cpu.unsqueeze(1)  # (plan_tokens*fs, 1, c)
+                                    _pxs_world = self._unnormalize_x(_pxs_t)  # (plan_tokens*fs, 1, c)
+                                    _v_xs_gpos = _pxs_world[_v_tail_vis, 0, :self.pos_dim].detach().cpu().numpy()
+
+                                    # Guidance at x̂_0: +g_clean × σ_t
+                                    # g_clean = ∂pseudo_loss/∂x̂_0 = +hilp_unit (toward goal).
+                                    # DPS: x̂_0 shifts by +σ_t·g/√α_t → same direction as crimson field.
+                                    # No negative sign (unlike x_t grad which has Jacobian sign ambiguity).
+                                    _gg_clean_dict = _sc.get('guidance_grads_clean', {})
+                                    if _gg_clean_dict:
+                                        _xs_gg_combined = sum(
+                                            v[_v_tail_vis, :self.pos_dim].numpy()
+                                            for v in _gg_clean_dict.values()
+                                        )
+                                        _v_xs_gg = (_xs_gg_combined * _v_obs_std_np) * _sigma_t
+
+                                    # Prior at x̂_0: same -ε_θ × sqrt(α_t) — prior increases
+                                    if _pn is not None:
+                                        _v_xs_pg = -_pn[_v_tail_vis, :self.pos_dim].numpy() * _v_obs_std_np * _prior_scale
+
+                        _v_td = {
+                            'plan': _v_plan,
+                            'node_path': _v_node_traj if _v_node_traj is not None and len(_v_node_traj) > 0 else None,
+                            'best_node_target': _v_tgt_pos,
+                            'guidance_targets': _v_gpos,
+                            'goal_grad_vectors': _v_gg,
+                            'prior_grad_vectors': _v_pg,
+                            'pred_x_start_pos': _v_xs_gpos,
+                            'pred_x_start_guidance_grad': _v_xs_gg,
+                            'pred_x_start_prior_grad': _v_xs_pg,
+                            'hilp_heatmap': _v_cand_heatmap,
+                            'hilp_grad_field': _v_cand_grad_field,
+                        }
+                        _v_img = make_trajectory_images(
+                            self.env_id, _v_td, 1, _v_start_np, _v_goal_np, self.plot_end_points
+                        )[0]
+                        _v_frames.append(_v_img[:, :, :3])
+
+                    _v_video = np.stack(_v_frames, axis=0).transpose(0, 3, 1, 2)  # (K, 3, H, W)
+                    _v_lbl = self._node_path_label(_vnode, active_tree.is_tree1, _vnode.target_node)
+                    _video_step = self.get_safe_wandb_step(min_step=loops)
+                    print(
+                        f"[wandb-video-debug] key=plan/plan_at_{_v_lbl} shape={_v_video.shape} "
+                        f"dtype={_v_video.dtype} fps=4 step={_video_step}",
+                        flush=True,
+                    )
+                    self.log_video(f"plan/plan_at_{_v_lbl}", _v_video, fps=4, step=_video_step)
+
                 # Extract plan by selecting best leaf and combining plans
                 best_info: dict = self._select_best_leaf(expanded_node_infos)
 
@@ -1922,32 +2189,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     except Exception as _gf_err:
                         self._tlog("hilp.grad_field_error", {"error": str(_gf_err)}, depth=1)
 
-                # Prepare trajectories dict for visualization
-                trajectories_dict = {
-                    'plan': plan_positions,  # Red
-                    'node_path': node_trajectory if node_trajectory is not None and len(node_trajectory) > 0 else None,  # Blue
-                    'best_node_target': best_node_target_pos,  # Green point (target_node.obs_pos)
-                    'hilp_heatmap': hilp_heatmap,  # HILP value heatmap (low-alpha overlay)
-                    'hilp_grad_field': hilp_grad_field,  # HILP gradient arrows overlay
-                }
-
-                forward_image = make_trajectory_images(
-                    self.env_id,
-                    trajectories_dict,
-                    1,
-                    start_numpy,
-                    goal_numpy,
-                    self.plot_end_points,
-                )[0]
-                _path_label = self._node_path_label(
-                    best_node,
-                    is_forward_tree=active_tree.is_tree1,
-                    target_node=best_node.target_node,
-                )
-                self.log_image(
-                    f"plan/plan_at_{_path_label}", Image.fromarray(forward_image)
-                )
-
                 # Create reverse trajectory image (swap start and goal for visualization)
                 
                 planning_end_time = time.time()
@@ -1985,7 +2226,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     )
 
                 # Use unified plan execution function
-                trajectory_exec, reward_dict = self._execute_plan_in_env(
+                trajectory_exec, reward_dict, rollout_viz = self._execute_plan_in_env(
                     plan_frame_format=plan_unnormalized,
                     envs=envs,
                     agent=agent if "antmaze" in self.env_id else None,
@@ -2011,6 +2252,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 if trajectory_exec is not None:
                     trajectory.extend(trajectory_exec)
                     steps += len(trajectory_exec)
+                    if rollout_viz["agent_positions"].size > 0:
+                        validation_rollout_agent_history.append(rollout_viz["agent_positions"])
+                        validation_rollout_subgoal_history.append(rollout_viz["subgoal_positions"])
+                        n_steps_this_loop = rollout_viz["agent_positions"].shape[0]
+                        for _ in range(n_steps_this_loop):
+                            validation_pp_plan_history.append(_pp_plan_np)
 
                     # Update obs and obs_normalized for next planning iteration (if not terminated)
                     if not terminate and len(trajectory_exec) > 0:
@@ -2040,6 +2287,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 trajectory = torch.stack(trajectory)
                 start = start[:, :self.pos_dim].cpu().numpy().tolist()
                 goal = goal[:, :self.pos_dim].cpu().numpy().tolist()
+                rollout_agent_history = validation_rollout_agent_history
+                rollout_subgoal_history = validation_rollout_subgoal_history
                 images = make_trajectory_images(
                     self.env_id, trajectory[:, -samples:], samples, start, goal, self.plot_end_points
                 )
@@ -2049,6 +2298,39 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         f"{namespace}_interaction/sample_{i}",
                         Image.fromarray(img),
                     )
+
+                if rollout_agent_history:
+                    rollout_agent_np = np.concatenate(rollout_agent_history, axis=0)[:, None, :]
+                    rollout_subgoal_np = np.concatenate(rollout_subgoal_history, axis=0)[:, None, :]
+                    pp_plan_per_frame = validation_pp_plan_history if validation_pp_plan_history else None
+                    videos = make_trajectory_videos(
+                        self.env_id,
+                        {"plan": trajectory[:, -samples:].detach().cpu().numpy()},
+                        samples,
+                        start,
+                        goal,
+                        rollout_agent_np,
+                        rollout_subgoal_np,
+                        self.plot_end_points,
+                        max_frames=self.validation_video_max_frames,
+                        path_stride=self.validation_video_path_stride,
+                        postprocessed_plan_per_frame=pp_plan_per_frame,
+                    )
+                    for i, video in enumerate(videos):
+                        if video.shape[0] > 0:
+                            _video_step = self.get_safe_wandb_step()
+                            print(
+                                f"[wandb-video-debug] key={namespace}_interaction/sample_{i}_video "
+                                f"shape={video.shape} dtype={video.dtype} fps={self.validation_video_fps} "
+                                f"step={_video_step}",
+                                flush=True,
+                            )
+                            self.log_video(
+                                f"{namespace}_interaction/sample_{i}_video",
+                                video,
+                                fps=self.validation_video_fps,
+                                step=_video_step,
+                            )
             else:
                 self._tlog("interact.warn", {"msg": "trajectory is empty — no execution steps ran (both trees unexpandable?)"}, depth=0)
 
@@ -2589,7 +2871,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             ## For checking the virtual visit count
             # root_node.check_virtual_visit_count()
             # [MEMORY DEBUG] Periodic memory logging
-            if self.profiler and (tree.search_num > 0) and (tree.search_num % self.profiler_snapshot_interval == 0):
+            if self.profiler and (tree.search_num > 0) and (tree.search_num % 10 == 0):
                 self.profiler.snapshot(
                     f"mcts_search_iter_{tree.search_num}_{tree.tag}",
                     phase=f"mcts_iter_{tree.search_num}"
@@ -2889,6 +3171,24 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     particle_guidance_scale=self.particle_guidance_scale,
                     group_ids=_group_ids,
                 )  # (m+1, plan_tokens*fs, B, c)
+
+                # Build per-candidate step captures for video visualization.
+                # Stored in self._expansion_step_captures_by_name (name → list of per-step dicts).
+                _raw_captures = getattr(self, '_parallel_plan_step_captures', None)
+                _exp_sc_by_name: dict = {}
+                if _raw_captures:
+                    for _sci, _cand in enumerate(expanded_node_candidates):
+                        _exp_sc_by_name[_cand["name"]] = [
+                            {
+                                'prior_pred_noise': step['prior_pred_noise'][:, _sci] if step['prior_pred_noise'] is not None else None,
+                                'guidance_grads': {k: v[:, _sci] for k, v in step['guidance_grads'].items()},
+                                'guidance_grads_clean': {k: v[:, _sci] for k, v in step.get('guidance_grads_clean', {}).items()},
+                                'pred_x_start_pos': step['pred_x_start_pos'][:, _sci] if step.get('pred_x_start_pos') is not None else None,
+                                'noise_level': step['noise_level'][:, _sci] if step.get('noise_level') is not None else None,
+                            }
+                            for step in _raw_captures
+                        ]
+                self._expansion_step_captures_by_name = _exp_sc_by_name
 
                 # Validate expanded_node_plan_hists shape: (m, plan_tokens*fs, B, c)
                 assert expanded_node_plan_hists.ndim == 4, (
@@ -3628,7 +3928,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         use_diffused_action: bool = False,
         parent_sim_state: Optional[dict] = None,
         is_backward: bool = False,
-    ) -> tuple[List[torch.Tensor], dict]:
+    ) -> tuple[List[torch.Tensor], dict, dict]:
         """
         Execute a plan segment in environment with unified action computation.
 
@@ -3646,9 +3946,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             parent_sim_state: Optional sim state (qpos, qvel) to restore before execution
 
         Returns:
-            (trajectory_list, reward_dict)
+            (trajectory_list, reward_dict, rollout_viz)
             - trajectory_list: List of trajectory bundles
             - reward_dict: Dict with keys 'reached', 'episode_reward', etc.
+            - rollout_viz: Dict with per-step agent/sub-goal positions for visualization
         """
         trajectory = []
 
@@ -3690,7 +3991,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             sub_goal_pos = plan_slice_np[sub_goal_idx, :self.pos_dim]
             sub_goal_step = sub_goal_idx
             # Initialize sub_goal_sim_state as current state (will be updated during rollout)
-            sub_goal_sim_state = current_sim_state.copy() if current_sim_state is not None else None
+            sub_goal_sim_state = {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in current_sim_state.items()} if current_sim_state is not None else None
             sub_goal_sim_state["qpos"][:self.pos_dim] = sub_goal_pos
 
         # Execute plan: iterate, ensuring at least open_loop_horizon steps
@@ -3700,6 +4001,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         _dist_to_subgoal_log = []    # dist to sub_goal at each step (antmaze)
         _agent_pos_log = []          # agent position at each step
         _plan_pos_log = []           # planned position at same step index (for comparison)
+        rollout_agent_positions = []
+        rollout_subgoal_positions = []
 
         # [TIMING] execution breakdown
         _exec_t0 = time.time()
@@ -3723,6 +4026,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         _sub_goal_advance_count += 1
                     else:
                         sub_goal_sim_state["qpos"][:self.pos_dim] = plan_slice_np[-1, :self.pos_dim]
+
+            rollout_agent_positions.append(current_sim_state["qpos"][:self.pos_dim].copy())
+            if sub_goal_sim_state is not None:
+                rollout_subgoal_positions.append(sub_goal_sim_state["qpos"][:self.pos_dim].copy())
+            else:
+                rollout_subgoal_positions.append(np.full((self.pos_dim,), np.nan, dtype=np.float32))
 
             # Compute action
             _act_t0 = time.time()
@@ -3824,7 +4133,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             "first_reach": first_reach,
         }
 
-        return trajectory, reward_dict
+        rollout_viz = {
+            "agent_positions": np.asarray(rollout_agent_positions, dtype=np.float32),
+            "subgoal_positions": np.asarray(rollout_subgoal_positions, dtype=np.float32),
+        }
+
+        return trajectory, reward_dict, rollout_viz
 
     def _compute_action_from_plan(
         self,
@@ -3928,7 +4242,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # Execute plan with parent state injection for continuous state stitching
         # This restores parent's complete sim state before rolling out the new plan
-        trajectory, _ = self._execute_plan_in_env(
+        trajectory, _, _ = self._execute_plan_in_env(
             plan_frame_format=plan_slice,
             envs=envs,
             agent=agent if "antmaze" in self.env_id else None,
@@ -4279,4 +4593,3 @@ def log_memory_stats(tracer, tag_prefix: str, step: Optional[int] = None):
         )
     except Exception as e:
         pass
-

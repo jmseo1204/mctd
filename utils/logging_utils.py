@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import cv2
 import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgba
+from matplotlib.patches import FancyArrowPatch
 from tqdm import trange, tqdm
 import matplotlib.animation as animation
 from pathlib import Path
@@ -255,6 +256,295 @@ def plot_start_goal(ax, start_goal: None):
     draw_star((goal_x, goal_y), radius=0.08)
 
 
+def _maybe_add_batch_dim(points):
+    if points is None:
+        return None
+    points = np.asarray(points)
+    if points.ndim == 2:
+        return points[:, None, :]
+    return points
+
+
+def _to_plot_coords(env_id, points):
+    points = np.asarray(points)
+    if env_id in OGBENCH_ENVS:
+        return points / 4 + 1
+    return points
+
+
+def _sample_frame_indices(num_frames, max_frames):
+    if num_frames <= 0:
+        return np.array([], dtype=int)
+    if max_frames is None or max_frames <= 0 or num_frames <= max_frames:
+        return np.arange(num_frames, dtype=int)
+    return np.unique(np.linspace(0, num_frames - 1, num=max_frames, dtype=int))
+
+
+def _sample_history_until(frame_idx, path_stride):
+    if frame_idx < 0:
+        return np.array([], dtype=int)
+    stride = max(int(path_stride or 1), 1)
+    hist_idx = np.arange(0, frame_idx + 1, stride, dtype=int)
+    if hist_idx.size == 0 or hist_idx[-1] != frame_idx:
+        hist_idx = np.append(hist_idx, frame_idx)
+    return hist_idx
+
+
+def _parse_trajectory_plot_inputs(trajectory):
+    if isinstance(trajectory, dict):
+        plot_data = dict(trajectory)
+    else:
+        plot_data = {"plan": trajectory}
+
+    for key in [
+        "plan",
+        "node_path",
+        "best_node_target",
+        "guidance_targets",
+        "goal_grad_vectors",
+        "prior_grad_vectors",
+        "pred_x_start_pos",
+        "pred_x_start_guidance_grad",
+        "pred_x_start_prior_grad",
+        "rollout_agent_history",
+        "rollout_current_agent",
+        "rollout_current_subgoal",
+        "postprocessed_plan",
+    ]:
+        if key in plot_data and plot_data[key] is not None:
+            plot_data[key] = np.asarray(plot_data[key])
+
+    plot_data["plan"] = _maybe_add_batch_dim(plot_data.get("plan"))
+    plot_data["rollout_agent_history"] = _maybe_add_batch_dim(plot_data.get("rollout_agent_history"))
+    plot_data["rollout_current_agent"] = _maybe_add_batch_dim(plot_data.get("rollout_current_agent"))
+    plot_data["rollout_current_subgoal"] = _maybe_add_batch_dim(plot_data.get("rollout_current_subgoal"))
+    plot_data["postprocessed_plan"] = _maybe_add_batch_dim(plot_data.get("postprocessed_plan"))
+    return plot_data
+
+
+def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, plot_end_points=True):
+    plan_trajectory = plot_data.get("plan")
+    node_trajectory = plot_data.get("node_path")
+    best_node_target = plot_data.get("best_node_target")
+    hilp_heatmap = plot_data.get("hilp_heatmap")
+    hilp_grad_field = plot_data.get("hilp_grad_field")
+    guidance_targets = plot_data.get("guidance_targets")
+    goal_grad_vectors = plot_data.get("goal_grad_vectors")
+    prior_grad_vectors = plot_data.get("prior_grad_vectors")
+    pred_x_start_pos = plot_data.get("pred_x_start_pos")
+    pred_x_start_guidance_grad = plot_data.get("pred_x_start_guidance_grad")
+    pred_x_start_prior_grad = plot_data.get("pred_x_start_prior_grad")
+    rollout_agent_history = plot_data.get("rollout_agent_history")
+    rollout_current_agent = plot_data.get("rollout_current_agent")
+    rollout_current_subgoal = plot_data.get("rollout_current_subgoal")
+    postprocessed_plan = plot_data.get("postprocessed_plan")
+
+    if is_grid_env(env_id):
+        maze_grid = get_maze_grid(env_id)
+    else:
+        maze_grid = None
+    plot_maze_layout(ax, maze_grid)
+
+    if hilp_heatmap is not None:
+        X_w = hilp_heatmap["X"]
+        Y_w = hilp_heatmap["Y"]
+        vals = hilp_heatmap["values"]
+        if env_id in OGBENCH_ENVS:
+            X_p = X_w / 4 + 1
+            Y_p = Y_w / 4 + 1
+        else:
+            X_p, Y_p = X_w, Y_w
+        vmin, vmax = float(vals.min()), float(vals.max())
+        mesh = ax.pcolormesh(X_p, Y_p, vals, shading="auto", cmap="viridis", alpha=0.5,
+                             zorder=1, vmin=vmin, vmax=vmax)
+        fig.colorbar(mesh, ax=ax, label="HILP V(s,g)", fraction=0.03, pad=0.02)
+
+    if plan_trajectory is not None:
+        plan_xy = _to_plot_coords(env_id, plan_trajectory[:, batch_idx, :2])
+        ax.scatter(plan_xy[:, 0], plan_xy[:, 1], c=np.arange(len(plan_xy)), cmap="Reds",
+                   alpha=0.8, label="Plan", s=50)
+
+    if postprocessed_plan is not None and len(postprocessed_plan) > 0:
+        pp_xy = _to_plot_coords(env_id, postprocessed_plan[:, batch_idx, :2])
+        ax.scatter(pp_xy[:, 0], pp_xy[:, 1], c=np.arange(len(pp_xy)), cmap="Reds",
+                   alpha=0.7, label="PP Plan", s=30, zorder=6)
+
+    if node_trajectory is not None and len(node_trajectory) > 0:
+        node_xy = _to_plot_coords(env_id, node_trajectory[:, :2])
+        ax.plot(node_xy[:, 0], node_xy[:, 1], "b-", linewidth=2, alpha=0.6, label="Tree Path")
+        ax.scatter(node_xy[:, 0], node_xy[:, 1], c="blue", marker="o", s=100, alpha=0.7,
+                   edgecolors="darkblue", linewidth=2, zorder=5)
+
+    if hilp_grad_field is not None:
+        X_w = hilp_grad_field["x_grid"]
+        Y_w = hilp_grad_field["y_grid"]
+        hilp_grads = hilp_grad_field["hilp_grads"]
+        far_mask_grid = hilp_grad_field.get("far_mask_grid", None)
+        if env_id in OGBENCH_ENVS:
+            X_p = X_w / 4 + 1
+            Y_p = Y_w / 4 + 1
+        else:
+            X_p, Y_p = X_w, Y_w
+        U = hilp_grads[:, :, 0]
+        V = hilp_grads[:, :, 1]
+        mag = np.sqrt(U ** 2 + V ** 2) + 1e-8
+        U_n = U / mag
+        V_n = V / mag
+
+        if far_mask_grid is None:
+            far_mask_grid = np.zeros_like(U_n, dtype=bool)
+
+        flat_hilp_mask = (~far_mask_grid).reshape(-1)
+        flat_far_mask = far_mask_grid.reshape(-1)
+        flat_colors = np.empty((U_n.size, 4), dtype=float)
+        flat_colors[flat_hilp_mask] = to_rgba("crimson", alpha=0.6)
+        flat_colors[flat_far_mask] = to_rgba("steelblue", alpha=0.6)
+
+        ax.quiver(
+            X_p.reshape(-1), Y_p.reshape(-1),
+            U_n.reshape(-1), V_n.reshape(-1),
+            color=flat_colors,
+            angles="xy",
+            scale_units="xy",
+            scale=2.0,
+            pivot="mid",
+            width=0.004,
+            zorder=3,
+        )
+
+        if flat_hilp_mask.any():
+            ax.scatter([], [], c="crimson", marker=r"$\rightarrow$", s=120, alpha=0.6, label="HILP grad")
+        if flat_far_mask.any():
+            ax.scatter([], [], c="steelblue", marker=r"$\rightarrow$", s=120, alpha=0.6, label="RMSE grad (far)")
+
+    if plot_end_points:
+        start_goal = (_to_plot_coords(env_id, np.asarray(start[batch_idx])[:2]),
+                      _to_plot_coords(env_id, np.asarray(goal[batch_idx])[:2]))
+        plot_start_goal(ax, start_goal)
+
+    if best_node_target is not None:
+        pos = _to_plot_coords(env_id, np.asarray(best_node_target).flatten()[:2])
+        ax.scatter(pos[0], pos[1], c="green", marker="*", s=300, zorder=10,
+                   edgecolors="darkgreen", linewidth=1.5, label="Target")
+
+    has_guidance_targets = guidance_targets is not None and len(guidance_targets) > 0
+    if has_guidance_targets:
+        for idx, gpos in enumerate(guidance_targets):
+            gxy = _to_plot_coords(env_id, np.asarray(gpos)[:2])
+            ax.scatter(gxy[0], gxy[1], c="lime", marker="o", s=120, zorder=9,
+                       edgecolors="green", linewidth=1.5,
+                       label="Guidance Tgt" if idx == 0 else "_nolegend_")
+
+    has_goal_grad = has_guidance_targets and goal_grad_vectors is not None and len(goal_grad_vectors) > 0
+    if has_goal_grad:
+        for idx, (gpos, gvec) in enumerate(zip(guidance_targets, goal_grad_vectors)):
+            gxy = _to_plot_coords(env_id, np.asarray(gpos)[:2])
+            if env_id in OGBENCH_ENVS:
+                gdx, gdy = gvec[0] / 4, gvec[1] / 4
+            else:
+                gdx, gdy = float(gvec[0]), float(gvec[1])
+            ax.quiver(gxy[0], gxy[1], gdx, gdy, color="lime", angles="xy", scale_units="xy",
+                      scale=1.0, width=0.006, zorder=12,
+                      label="Guidance grad" if idx == 0 else "_nolegend_")
+
+    has_prior_grad = has_guidance_targets and prior_grad_vectors is not None and len(prior_grad_vectors) > 0
+    if has_prior_grad:
+        for idx, (gpos, pvec) in enumerate(zip(guidance_targets, prior_grad_vectors)):
+            gxy = _to_plot_coords(env_id, np.asarray(gpos)[:2])
+            if env_id in OGBENCH_ENVS:
+                pdx, pdy = pvec[0] / 4, pvec[1] / 4
+            else:
+                pdx, pdy = float(pvec[0]), float(pvec[1])
+            ax.quiver(gxy[0], gxy[1], pdx, pdy, color="yellow", angles="xy", scale_units="xy",
+                      scale=1.0, width=0.006, zorder=12,
+                      label="Prior score" if idx == 0 else "_nolegend_")
+
+    # --- pred_x_start (x̂_0) visualization ---
+    # Lighter green dot + dashed arrows for ∂V/∂x̂_0 (green) and prior score (yellow)
+    has_xs_pos = pred_x_start_pos is not None and len(pred_x_start_pos) > 0
+    if has_xs_pos:
+        for idx, xspos in enumerate(pred_x_start_pos):
+            xsxy = _to_plot_coords(env_id, np.asarray(xspos)[:2])
+            ax.scatter(xsxy[0], xsxy[1], c="lime", marker="o", s=80, zorder=8,
+                       alpha=0.5, edgecolors="green", linewidth=1.0,
+                       label="x̂_0 (pred_x_start)" if idx == 0 else "_nolegend_")
+
+    has_xs_gg = has_xs_pos and pred_x_start_guidance_grad is not None and len(pred_x_start_guidance_grad) > 0
+    if has_xs_gg:
+        _xs_gg_legend_added = False
+        for idx, (xspos, gvec) in enumerate(zip(pred_x_start_pos, pred_x_start_guidance_grad)):
+            xsxy = _to_plot_coords(env_id, np.asarray(xspos)[:2])
+            if env_id in OGBENCH_ENVS:
+                gdx, gdy = float(gvec[0]) / 4, float(gvec[1]) / 4
+            else:
+                gdx, gdy = float(gvec[0]), float(gvec[1])
+            arrow = FancyArrowPatch(
+                posA=(xsxy[0], xsxy[1]),
+                posB=(xsxy[0] + gdx, xsxy[1] + gdy),
+                arrowstyle='-|>', mutation_scale=10,
+                color="lime", linestyle="dashed", linewidth=1.5,
+                transform=ax.transData, zorder=13,
+            )
+            ax.add_patch(arrow)
+            if not _xs_gg_legend_added:
+                ax.plot([], [], color="lime", linestyle="dashed", linewidth=1.5, label="Guidance grad (x̂_0)")
+                _xs_gg_legend_added = True
+
+    has_xs_pg = has_xs_pos and pred_x_start_prior_grad is not None and len(pred_x_start_prior_grad) > 0
+    if has_xs_pg:
+        _xs_pg_legend_added = False
+        for idx, (xspos, pvec) in enumerate(zip(pred_x_start_pos, pred_x_start_prior_grad)):
+            xsxy = _to_plot_coords(env_id, np.asarray(xspos)[:2])
+            if env_id in OGBENCH_ENVS:
+                pdx, pdy = float(pvec[0]) / 4, float(pvec[1]) / 4
+            else:
+                pdx, pdy = float(pvec[0]), float(pvec[1])
+            arrow = FancyArrowPatch(
+                posA=(xsxy[0], xsxy[1]),
+                posB=(xsxy[0] + pdx, xsxy[1] + pdy),
+                arrowstyle='-|>', mutation_scale=10,
+                color="yellow", linestyle="dashed", linewidth=1.5,
+                transform=ax.transData, zorder=13,
+            )
+            ax.add_patch(arrow)
+            if not _xs_pg_legend_added:
+                ax.plot([], [], color="yellow", linestyle="dashed", linewidth=1.5, label="Prior score (x̂_0)")
+                _xs_pg_legend_added = True
+
+    has_rollout_history = rollout_agent_history is not None and len(rollout_agent_history) > 0
+    if has_rollout_history:
+        hist_xy = _to_plot_coords(env_id, rollout_agent_history[:, batch_idx, :2])
+        ax.plot(hist_xy[:, 0], hist_xy[:, 1], color="royalblue", linewidth=2.0, alpha=0.75,
+                label="Agent Path")
+        ax.scatter(hist_xy[:, 0], hist_xy[:, 1], c=np.arange(len(hist_xy)), cmap="Blues",
+                   s=40, alpha=0.85, zorder=8)
+
+    if rollout_current_agent is not None:
+        agent_xy = _to_plot_coords(env_id, rollout_current_agent[0, batch_idx, :2])
+        ax.scatter(agent_xy[0], agent_xy[1], c="deepskyblue", marker="o", s=180, zorder=13,
+                   edgecolors="navy", linewidth=1.5, label="Agent")
+
+    if rollout_current_subgoal is not None:
+        subgoal_xy = _to_plot_coords(env_id, rollout_current_subgoal[0, batch_idx, :2])
+        ax.scatter(subgoal_xy[0], subgoal_xy[1], c="lime", marker="o", s=180, zorder=14,
+                   edgecolors="darkgreen", linewidth=1.5, label="Sub-goal")
+
+    if ((node_trajectory is not None and len(node_trajectory) > 0)
+            or best_node_target is not None
+            or hilp_grad_field is not None
+            or has_guidance_targets
+            or has_goal_grad
+            or has_prior_grad
+            or has_xs_pos
+            or has_xs_gg
+            or has_xs_pg
+            or has_rollout_history
+            or rollout_current_agent is not None
+            or rollout_current_subgoal is not None
+            or postprocessed_plan is not None):
+        ax.legend(loc="upper right", fontsize=8)
+
+
 def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end_points=True):
     """
     Create trajectory visualization images.
@@ -266,134 +556,11 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
     """
     images = []
 
-    # Handle both dict and array inputs for backward compatibility
-    if isinstance(trajectory, dict):
-        plan_trajectory = trajectory.get('plan')
-        node_trajectory = trajectory.get('node_path')
-        best_node_target = trajectory.get('best_node_target')  # single (2,) pos or None
-        hilp_heatmap    = trajectory.get('hilp_heatmap')       # dict {X, Y, values} or None
-        hilp_grad_field = trajectory.get('hilp_grad_field')    # dict {x_grid, y_grid, hilp_grads, hilp_norms} or None
-    else:
-        plan_trajectory = trajectory
-        node_trajectory = None
-        best_node_target = None
-        hilp_heatmap = None
-        hilp_grad_field = None
+    plot_data = _parse_trajectory_plot_inputs(trajectory)
 
     for batch_idx in range(batch_size):
         fig, ax = plt.subplots()
-        if is_grid_env(env_id):
-            maze_grid = get_maze_grid(env_id)
-        else:
-            maze_grid = None
-        plot_maze_layout(ax, maze_grid)
-
-        # Plot HILP value heatmap as a low-alpha background layer
-        if hilp_heatmap is not None:
-            X_w = hilp_heatmap['X']
-            Y_w = hilp_heatmap['Y']
-            vals = hilp_heatmap['values']
-            if env_id in OGBENCH_ENVS:
-                X_p = X_w / 4 + 1
-                Y_p = Y_w / 4 + 1
-            else:
-                X_p, Y_p = X_w, Y_w
-            vmin, vmax = float(vals.min()), float(vals.max())
-            mesh = ax.pcolormesh(X_p, Y_p, vals, shading='auto', cmap='viridis', alpha=0.5,
-                                 zorder=1, vmin=vmin, vmax=vmax)
-            fig.colorbar(mesh, ax=ax, label='HILP V(s,g)', fraction=0.03, pad=0.02)
-
-        # Plot plan trajectory (red)
-        if plan_trajectory is not None:
-            if env_id in OGBENCH_ENVS:  # OGBench envs
-                ax.scatter(plan_trajectory[:, batch_idx, 0]/4+1, plan_trajectory[:, batch_idx, 1]/4+1,
-                          c=np.arange(len(plan_trajectory)), cmap="Reds", alpha=0.8, label="Plan", s=50),
-            else:
-                ax.scatter(plan_trajectory[:, batch_idx, 0], plan_trajectory[:, batch_idx, 1],
-                          c=np.arange(len(plan_trajectory)), cmap="Reds", alpha=0.8, label="Plan", s=50),
-
-        # Plot node trajectory (blue) - tree path from root to leaf
-        if node_trajectory is not None and len(node_trajectory) > 0:
-            if env_id in OGBENCH_ENVS:  # OGBench envs
-                ax.plot(node_trajectory[:, 0]/4+1, node_trajectory[:, 1]/4+1,
-                       'b-', linewidth=2, alpha=0.6, label="Tree Path"),
-                ax.scatter(node_trajectory[:, 0]/4+1, node_trajectory[:, 1]/4+1,
-                          c='blue', marker='o', s=100, alpha=0.7, edgecolors='darkblue', linewidth=2, zorder=5),
-            else:
-                ax.plot(node_trajectory[:, 0], node_trajectory[:, 1],
-                       'b-', linewidth=2, alpha=0.6, label="Tree Path"),
-                ax.scatter(node_trajectory[:, 0], node_trajectory[:, 1],
-                          c='blue', marker='o', s=100, alpha=0.7, edgecolors='darkblue', linewidth=2, zorder=5),
-
-        # Plot guidance gradient arrows
-        # crimson = HILP (or HILP+score) region; steelblue = RMSE region (temporally far)
-        if hilp_grad_field is not None:
-            X_w = hilp_grad_field['x_grid']
-            Y_w = hilp_grad_field['y_grid']
-            hilp_grads = hilp_grad_field['hilp_grads']   # (H_g, W_g, 2)
-            far_mask_grid = hilp_grad_field.get('far_mask_grid', None)  # (H_g, W_g) bool or None
-            if env_id in OGBENCH_ENVS:
-                X_p = X_w / 4 + 1
-                Y_p = Y_w / 4 + 1
-            else:
-                X_p, Y_p = X_w, Y_w
-            U = hilp_grads[:, :, 0]
-            V = hilp_grads[:, :, 1]
-            mag = np.sqrt(U ** 2 + V ** 2) + 1e-8
-            # Pure unit vectors — direction only, uniform arrow length
-            U_n = U / mag
-            V_n = V / mag
-
-            if far_mask_grid is None:
-                far_mask_grid = np.zeros_like(U_n, dtype=bool)
-
-            flat_hilp_mask = (~far_mask_grid).reshape(-1)
-            flat_far_mask = far_mask_grid.reshape(-1)
-            flat_colors = np.empty((U_n.size, 4), dtype=float)
-            flat_colors[flat_hilp_mask] = to_rgba('crimson', alpha=0.6)
-            flat_colors[flat_far_mask] = to_rgba('steelblue', alpha=0.6)
-
-            ax.quiver(
-                X_p.reshape(-1), Y_p.reshape(-1),
-                U_n.reshape(-1), V_n.reshape(-1),
-                color=flat_colors,
-                angles='xy',
-                scale_units='xy',
-                scale=1.0,
-                pivot='mid',
-                width=0.004,
-                zorder=3,
-            )
-
-            if flat_hilp_mask.any():
-                ax.scatter([], [], c='crimson', marker=r'$\rightarrow$', s=120, alpha=0.6, label='HILP grad')
-            if flat_far_mask.any():
-                ax.scatter([], [], c='steelblue', marker=r'$\rightarrow$', s=120, alpha=0.6, label='RMSE grad (far)')
-
-        if plot_end_points:
-            if env_id in OGBENCH_ENVS:  # OGBench envs
-                start_goal = (np.array(start[batch_idx])/4+1, np.array(goal[batch_idx])/4+1)
-            else:
-                start_goal = (start[batch_idx], goal[batch_idx])
-            plot_start_goal(ax, start_goal)
-
-        # Plot best_node's target_node obs_pos (single green star)
-        if best_node_target is not None:
-            pos = np.asarray(best_node_target).flatten()
-            if env_id in OGBENCH_ENVS:
-                px, py = pos[0] / 4 + 1, pos[1] / 4 + 1
-            else:
-                px, py = pos[0], pos[1]
-            ax.scatter(px, py, c='green', marker='*', s=300, zorder=10,
-                       edgecolors='darkgreen', linewidth=1.5, label="Target")
-
-        # Add legend if any named element is present
-        if ((node_trajectory is not None and len(node_trajectory) > 0)
-                or best_node_target is not None
-                or hilp_grad_field is not None):
-            ax.legend(loc='upper right', fontsize=8)
-
-        # plt.title(f"sample_{batch_idx}")
+        _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, plot_end_points)
         fig.tight_layout()
         fig.canvas.draw()
         img_shape = fig.canvas.get_width_height()[::-1] + (4,)
@@ -402,6 +569,57 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
 
         plt.close()
     return images
+
+
+def make_trajectory_videos(env_id, trajectory, batch_size, start, goal, rollout_agent_history,
+                           rollout_subgoal_history, plot_end_points=True, max_frames=200,
+                           path_stride=4, postprocessed_plan_per_frame=None):
+    plot_data = _parse_trajectory_plot_inputs(trajectory)
+    rollout_agent_history = _maybe_add_batch_dim(rollout_agent_history)
+    rollout_subgoal_history = _maybe_add_batch_dim(rollout_subgoal_history)
+    videos = []
+
+    num_frames = 0 if rollout_agent_history is None else rollout_agent_history.shape[0]
+    frame_indices = _sample_frame_indices(num_frames, max_frames)
+    for batch_idx in range(batch_size):
+        frames = []
+        fig, ax = plt.subplots()
+        frame_pbar = tqdm(
+            frame_indices,
+            desc=f"validation video frames ({batch_idx})",
+            leave=True,
+            dynamic_ncols=True,
+        )
+        for frame_idx in frame_pbar:
+            frame_plot_data = dict(plot_data)
+            hist_idx = _sample_history_until(int(frame_idx), path_stride)
+            frame_plot_data["rollout_agent_history"] = rollout_agent_history[hist_idx]
+            frame_plot_data["rollout_current_agent"] = rollout_agent_history[frame_idx : frame_idx + 1]
+            subgoal_frame = rollout_subgoal_history[frame_idx : frame_idx + 1]
+            if np.isnan(subgoal_frame).all():
+                frame_plot_data["rollout_current_subgoal"] = None
+            else:
+                frame_plot_data["rollout_current_subgoal"] = subgoal_frame
+            if postprocessed_plan_per_frame is not None and frame_idx < len(postprocessed_plan_per_frame):
+                frame_plot_data["postprocessed_plan"] = postprocessed_plan_per_frame[frame_idx]
+            else:
+                frame_plot_data["postprocessed_plan"] = None
+
+            _render_trajectory_plot(fig, ax, env_id, frame_plot_data, batch_idx, start, goal, plot_end_points)
+            fig.tight_layout()
+            fig.canvas.draw()
+            img_shape = fig.canvas.get_width_height()[::-1] + (4,)
+            img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).copy().reshape(img_shape)
+            frames.append(img[:, :, :3])
+
+        frame_pbar.close()
+        plt.close(fig)
+
+        if frames:
+            videos.append(np.stack(frames, axis=0).transpose(0, 3, 1, 2))
+        else:
+            videos.append(np.zeros((0, 3, 1, 1), dtype=np.uint8))
+    return videos
 
 
 

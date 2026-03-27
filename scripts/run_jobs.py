@@ -26,6 +26,10 @@ def log_write(message):
     else:
         print(message)
 
+
+def log_finished(step_name):
+    log_write(f"##### {step_name} finished! #####")
+
 available_gpus = ["localhost:0"]
 # each server available gpus
 # available_gpus += [f"rumelhart:{i}" for i in [0,1,2,3,4,5,6,7]]
@@ -269,6 +273,7 @@ assert os.path.exists(jobs_folder), f"jobs folder does not exist"
 
 # Merge jobs that only differ in task_id so one container handles all tasks
 preprocess_batch_jobs(jobs_folder)
+log_finished("job batching")
 
 # Get initial total number of jobs
 total_jobs = len([f for f in os.listdir(jobs_folder) if f.endswith('.json')])
@@ -330,6 +335,7 @@ try:
                 completed_jobs += 1
                 pbar.update(1)
                 pbar.set_postfix({"Finished": exp_name})
+                log_finished(f"job {exp_name}")
 
             # 3. Start new if available
             if running_experiments[gpu] is None and not queue_is_empty:
@@ -378,6 +384,9 @@ try:
                         running_experiments[gpu] = exp_name
                         last_log_line_count[exp_name] = 0
                         job_fail_counts.pop(config_file, None)  # reset on success
+                        task_desc = config.get("task_ids", config.get("task_id", "unknown"))
+                        log_write(f"[START] {exp_name} on {gpu} | dataset={config.get('dataset')} | tasks={task_desc}")
+                        log_finished(f"job launch {exp_name}")
 
                         try:
                             os.remove(f"{jobs_folder}/{config_file}")
@@ -420,4 +429,5 @@ except KeyboardInterrupt:
     print("Cleanup complete. Exiting.")
 
 pbar.close()
+log_finished("all scheduled jobs")
 print(f"\nAll {total_jobs} jobs finished!")

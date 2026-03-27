@@ -332,14 +332,14 @@ class DiffusionForcingBase(BasePytorchAlgo):
 
     def _normalize_x(self, xs):
         shape = [1] * (xs.ndim - self.data_mean.ndim) + list(self.data_mean.shape)
-        mean = self.data_mean.reshape(shape)
-        std = self.data_std.reshape(shape)
+        mean = self.data_mean.reshape(shape).to(xs.device)
+        std = self.data_std.reshape(shape).to(xs.device)
         return (xs - mean) / std
 
     def _unnormalize_x(self, xs):
         shape = [1] * (xs.ndim - self.data_mean.ndim) + list(self.data_mean.shape)
-        mean = self.data_mean.reshape(shape)
-        std = self.data_std.reshape(shape)
+        mean = self.data_mean.reshape(shape).to(xs.device)
+        std = self.data_std.reshape(shape).to(xs.device)
         return xs * std + mean
 
     def _unstack_and_unnormalize(self, xs):

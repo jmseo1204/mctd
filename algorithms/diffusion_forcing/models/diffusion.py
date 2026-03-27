@@ -46,6 +46,9 @@ class Diffusion(nn.Module):
 
         self._build_model()
         self._build_buffer()
+        # Optional per-step hook: called inside ddim_sample with
+        # {'prior_pred_noise': Tensor, 'guidance_grads': dict, 'curr_noise_level': Tensor}
+        self._step_hook = None
 
     def _build_model(self):
         x_channel = self.x_shape[0]
@@ -444,6 +447,12 @@ class Diffusion(nn.Module):
         c = self.add_shape_channels(c)
         sigma = self.add_shape_channels(sigma)
 
+        # Populated in guidance branch; stays empty when guidance is disabled.
+        # Used by _step_hook to report per-guidance gradient contributions.
+        _per_guidance_grads = {}
+        _per_guidance_grads_clean = {}  # ∂V/∂x̂_0 (clean-space grads, no Jacobian)
+        _pred_x_start_raw = None        # x̂_0 before guidance correction
+
         if guidance_fn is not None:
             # DPS-style guidance: ∂loss/∂x_t flows through the model Jacobian.
             # This gives net coeff ≈ sqrt_recipm1·sqrt(α_next) - c ≈ 0.41 at high noise,
@@ -460,13 +469,22 @@ class Diffusion(nn.Module):
                 )
 
                 guidance_results = guidance_fn(model_pred.pred_x_start)
+                _pred_x_start_raw = model_pred.pred_x_start.detach()
 
-                _per_guidance_grads = {}
                 if isinstance(guidance_results, dict):
                     grad = torch.zeros_like(x)
                     items = list(guidance_results.items())
                     for i, (key, loss) in enumerate(items):
                         is_last = (i == len(items) - 1)
+                        # Clean-space grad (∂V/∂x̂_0): must retain graph for subsequent x_t grad
+                        g_clean = torch.autograd.grad(
+                            loss.sum(), model_pred.pred_x_start,
+                            retain_graph=True, allow_unused=True
+                        )[0]
+                        _per_guidance_grads_clean[key] = (
+                            g_clean.detach() if g_clean is not None else torch.zeros_like(model_pred.pred_x_start)
+                        )
+                        # x_t grad (∂V/∂x_t through Jacobian J_θ)
                         g = torch.autograd.grad(loss.sum(), x, retain_graph=not is_last, allow_unused=True)[0]
                         if g is None:
                             g = torch.zeros_like(x)
@@ -475,6 +493,13 @@ class Diffusion(nn.Module):
 
                 else:
                     guidance_loss = guidance_results
+                    g_clean = torch.autograd.grad(
+                        guidance_loss.sum(), model_pred.pred_x_start,
+                        retain_graph=True, allow_unused=True
+                    )[0]
+                    _per_guidance_grads_clean['default'] = (
+                        g_clean.detach() if g_clean is not None else torch.zeros_like(model_pred.pred_x_start)
+                    )
                     g = torch.autograd.grad(guidance_loss.sum(), x, allow_unused=True)[0]
                     grad = torch.zeros_like(x) if g is None else g
 
@@ -493,6 +518,7 @@ class Diffusion(nn.Module):
                 scale = (self.max_guidance_ratio * prior_norm / (grad_norm + 1e-8)).clamp(max=1.0)
                 grad = grad * scale
                 _per_guidance_grads = {k: v * scale for k, v in _per_guidance_grads.items()}
+                _per_guidance_grads_clean = {k: v * scale for k, v in _per_guidance_grads_clean.items()}
                 _t = get_tracer()
                 if _t is not None:
                     _t.log("diffusion.clip_scale", {
@@ -573,6 +599,17 @@ class Diffusion(nn.Module):
             )
             x_start = model_pred.pred_x_start
             pred_noise = model_pred.pred_noise
+
+        # Fire per-step hook (used by parallel_plan to capture score/guidance grads).
+        # Caller registers self._step_hook = fn(dict); fn receives tensors on GPU.
+        if self._step_hook is not None:
+            self._step_hook({
+                'prior_pred_noise': model_pred.pred_noise.detach(),  # (n_tokens, B, dim) – raw score
+                'guidance_grads': _per_guidance_grads,               # dict[name → ∂V/∂x_t tensor]
+                'guidance_grads_clean': _per_guidance_grads_clean,   # dict[name → ∂V/∂x̂_0 tensor]
+                'pred_x_start': _pred_x_start_raw,                   # x̂_0 before guidance (n_tokens, B, dim) or None
+                'curr_noise_level': clipped_curr_noise_level.detach(),
+            })
 
         noise = torch.randn_like(x)
         noise = torch.clamp(noise, -self.clip_noise, self.clip_noise)

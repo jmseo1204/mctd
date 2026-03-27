@@ -91,7 +91,7 @@ def compute_guidance_grad_np(
     obs_np: np.ndarray,
     target_np: np.ndarray,
     hilp_fn,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Core guidance gradient logic shared by goal_guidance() and _compute_guidance_grad_fields().
 
     Given pre-padded obs_np and target_np (both in hilp_obs_dim space):
@@ -153,26 +153,29 @@ def compute_guidance_grad_np(
 
     # 5. TD threshold: switch to RMSE direction for temporally-far elements (V < TD_thres)
     TD_thres = getattr(planner, 'TD_thres_for_far_target', None)
+    N = len(obs_np)
     if TD_thres is not None:
         far_mask = hilp_values_np < float(TD_thres)  # small V ↔ far from target
-        if far_mask.any():
-            delta = target_xy - obs_np[:, :2]  # (N, 2) vector toward target
-            delta_mag = np.linalg.norm(delta, axis=-1, keepdims=True).clip(min=1e-8)
-            rmse_grad_np = delta / delta_mag           # unit vector toward target
-            combined_np = np.where(far_mask[:, None], rmse_grad_np, hilp_combined_np)
-        else:
-            combined_np = hilp_combined_np
+        delta = target_xy - obs_np[:, :2]  # (N, 2) vector toward target
+        delta_mag = np.linalg.norm(delta, axis=-1, keepdims=True).clip(min=1e-8)
+        rmse_grad_np = delta / delta_mag           # unit vector toward target
+        combined_np = np.where(far_mask[:, None], rmse_grad_np, hilp_combined_np)
     else:
+        far_mask = np.zeros(N, dtype=bool)
+        rmse_grad_np = np.zeros((N, 2), dtype=np.float32)
         combined_np = hilp_combined_np
 
-    return combined_np, hilp_values_np
+    return combined_np, hilp_values_np, far_mask, hilp_combined_np, rmse_grad_np
 
 
 def goal_guidance(
     planner, x: torch.Tensor, goal: torch.Tensor, horizon: int
-) -> Tuple[torch.Tensor, list, list]:
+) -> Tuple[torch.Tensor, torch.Tensor, list, list]:
     """
     Target guidance to reach goal/start.
+
+    Returns separate losses for HILP (near target) and RMSE (far target) components
+    so that combined_guidance can apply TD_guidance_scale and rmse_guidance_scale independently.
 
     Args:
         planner: The DiffusionForcingPlanning instance
@@ -180,13 +183,13 @@ def goal_guidance(
           where t=plan_tokens, b=batch_size, fs*c flattened observation
         goal: (b, obs_dim) normalized goal observations
         horizon: planning horizon in timesteps
-        guidance_scale: (b,) guidance scales (unused here; kept for API compat)
 
     Returns:
-        (loss, dist_per_batch_list, final_token_dist_list):
-            loss: scalar negative guidance loss for gradient ascent
-            dist_per_batch_list: per-batch distance values (Python list)
-            final_token_dist_list: final token distance values (Python list)
+        (hilp_loss, rmse_loss, hilp_per_batch_list, rmse_per_batch_list):
+            hilp_loss: scalar pseudo-loss for near-target (HILP) positions; scale with TD_guidance_scale
+            rmse_loss: scalar pseudo-loss for far-target (RMSE) positions; scale with rmse_guidance_scale
+            hilp_per_batch_list: per-batch HILP pseudo-loss values (Python list)
+            rmse_per_batch_list: per-batch RMSE pseudo-loss values (Python list)
     """
     pred = prepare_pred(planner, x)
 
@@ -247,18 +250,19 @@ def goal_guidance(
             # Delegate all normalization / KDE / TD-threshold logic to shared helper.
             # Any changes to compute_guidance_grad_np automatically apply here AND
             # to _compute_guidance_grad_fields (plan/plan_at_* visualization).
-            combined_np, hilp_values_np = compute_guidance_grad_np(
+            combined_np, hilp_values_np, far_mask_np, hilp_combined_np, rmse_grad_np = compute_guidance_grad_np(
                 planner, obs_tail_np, target_np, hilp_fn
             )
             _t_hilp_ms = (time.time() - _t0) * 1000
 
-            # Shape: (len(tail_pos), B, 2) — one unit guidance vector per tail position
-            combined_t  = torch.from_numpy(combined_np).reshape(len(tail_pos), B, 2).to(pred.device)
-            hilp_grad_unit = combined_t.detach()
+            # Shape: (len(tail_pos), B, 2) and (len(tail_pos), B, 1) for masking
+            far_mask_t = torch.from_numpy(far_mask_np).reshape(len(tail_pos), B, 1).to(pred.device)  # bool
+            hilp_t = torch.from_numpy(hilp_combined_np).reshape(len(tail_pos), B, 2).to(pred.device).detach()
+            rmse_t = torch.from_numpy(rmse_grad_np).reshape(len(tail_pos), B, 2).to(pred.device).detach()
 
-            # Derive far_mask for logging (matches compute_guidance_grad_np internal logic)
+            # far_mask for logging
+            far_mask = far_mask_np  # (len(tail_pos)*B,) — keep for tracer below
             TD_thres = getattr(planner, 'TD_thres_for_far_target', None)
-            far_mask = (hilp_values_np < float(TD_thres)) if TD_thres is not None else np.zeros(B, dtype=bool)
 
             # [TIMING] Log latency per guidance call
             from utils.tracer import get_tracer as _get_tracer
@@ -273,15 +277,17 @@ def goal_guidance(
                     "hilp_values": hilp_values_np.tolist(),
                 })
 
-            # Pseudo-loss applied to all tail positions → gradient injected at every tail,
-            # matching the historical multi-tail guidance target.
-            pseudo_loss_per_batch = (pred[tail_pos, :, :2] * hilp_grad_unit).sum(dim=(0, 2))  # (B,)
+            # Separate pseudo-losses for HILP (near) and RMSE (far) positions.
+            # Each is a unit-direction dot-product; scaling is applied externally in combined_guidance.
+            hilp_pseudo_loss = (pred[tail_pos, :, :2] * hilp_t * (~far_mask_t)).sum(dim=(0, 2))  # (B,)
+            rmse_pseudo_loss = (pred[tail_pos, :, :2] * rmse_t * far_mask_t).sum(dim=(0, 2))    # (B,)
 
             # --- Diagnostic: is unit vec pointing toward goal? ---
             from utils.tracer import get_tracer as _get_tracer
             _tracer2 = _get_tracer()
             if _tracer2:
-                _u = hilp_grad_unit.detach().cpu()  # (n_tails, B, 2)
+                # Use combined_np for cosine-similarity diagnostic (same as before)
+                _u = torch.from_numpy(combined_np).reshape(len(tail_pos), B, 2).cpu()
                 # direction from pred to goal at each tail
                 _pred_xy = pred[tail_pos, :, :2].detach().cpu()   # (n_tails, B, 2)
                 _goal_xy = target[:, :2].detach().cpu().unsqueeze(0)  # (1, B, 2)
@@ -299,7 +305,7 @@ def goal_guidance(
                     "far_count": int(far_mask.sum()),
                 }, depth=1)
 
-            return -pseudo_loss_per_batch.mean(), (-pseudo_loss_per_batch).tolist(), (-pseudo_loss_per_batch).tolist()
+            return hilp_pseudo_loss.mean(), rmse_pseudo_loss.mean(), hilp_pseudo_loss.tolist(), rmse_pseudo_loss.tolist()
 
         # --- Fallback: RMSE distance to goal ---
         assert 0, "HILP guidance is not recognized for some reason"
@@ -318,11 +324,17 @@ def goal_guidance(
             "reward guidance not officially supported yet, although implemented"
         )
 
-    return -(dist_per_batch).mean(), dist_per_batch.tolist(), last_token_dist.tolist()
+    zero = x.sum() * 0.0
+    return -(dist_per_batch).mean(), zero, dist_per_batch.tolist(), last_token_dist.tolist()
 
 def anchor_dist_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor:
     """
-    Anchor distance regularization using segment heads.
+    Anchor distance regularization: pulls each segment head toward the end of the
+    previous segment, enforcing temporal continuity between sub-plans.
+
+    Gradient scale is normalized to match goal_guidance: per-active-position magnitude
+    is 1/B regardless of sequence_dividing_factor.  weighted_loss() divides by
+    active_count (= n_segs), so we multiply back by n_active to cancel that factor.
 
     Args:
         planner: The DiffusionForcingPlanning instance
@@ -330,9 +342,8 @@ def anchor_dist_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
         horizon: planning horizon
 
     Returns:
-        loss: scalar negative regularization loss
+        loss: scalar loss (positive → DPS pushes segment heads toward anchors)
     """
-    # x is a tensor of shape [t b (fs c)]
     pred = prepare_pred(planner, x)
     pred_detached = pred.detach()
 
@@ -350,36 +361,12 @@ def anchor_dist_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     anchor_weight[
         planner.frame_stack : planner.frame_stack + horizon : segment_size
     ] = 1
+    n_active = (anchor_weight > 0).sum().float().clamp(min=1)
+
+    # weighted_loss divides by active_count (n_segs); multiply back to cancel that
+    # so the per-position gradient magnitude is 1/B, matching goal_guidance.
     weighted_dist_anchor = weighted_loss(planner, dist_anchor, anchor_weight)
-
-    # Repulsion: tail of segment N is repelled by head of the same segment N.
-    # head_pos: first frame of each segment  [fs, fs+seg, fs+2*seg, ...]
-    # tail_pos: last frame of each segment   [fs+seg-1, fs+2*seg-1, ...]
-    head_pos = torch.arange(
-        planner.frame_stack,
-        planner.frame_stack + horizon,
-        segment_size,
-        device=pred.device,
-    )
-    tail_pos = torch.arange(
-        planner.frame_stack + segment_size - 1,
-        planner.frame_stack + horizon,
-        segment_size,
-        device=pred.device,
-    )
-    assert len(head_pos) == len(tail_pos), "len(head_pos) should be len(tail_pos)"
-
-    repel_plan = torch.zeros_like(pred_detached)
-    repel_plan[tail_pos] = pred_detached[head_pos]  # place head frame at tail position
-    sq_diff = (pred - repel_plan) ** 2               # (T, B, C)
-    dist_repel = torch.exp(-sq_diff / 1.0)           # RDF similarity, h=1; range (0, 1]
-
-    repel_weight = torch.zeros_like(pred_detached[:, 0, 0])
-    repel_weight[tail_pos] = 1
-    weighted_dist_repel = weighted_loss(planner, dist_repel, repel_weight)
-
-    # attraction: minimize dist_anchor (−), repulsion: minimize RDF similarity (−)
-    return -(weighted_dist_anchor).mean() - (weighted_dist_repel).mean()
+    return -(weighted_dist_anchor * n_active).mean()
 
 def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor:
     """
@@ -505,11 +492,14 @@ def combined_guidance(planner, x_start, goal, horizon, guidance_scale,
         guidance_dict: dict of guidance losses
     """
     anchor_loss = anchor_dist_guidance(planner, x_start, horizon) * planner.anchor_guidance_scale
-    # NOTE: goal_guidance() no longer takes guidance_scale; scaling is done here only.
-    _goal_inner, _, _ = goal_guidance(
+    # NOTE: goal_guidance() returns HILP and RMSE components separately so each can be
+    # scaled independently: TD_guidance_scale (via guidance_scale arg) for HILP,
+    # rmse_guidance_scale for the far-target RMSE direction.
+    _hilp_inner, _rmse_inner, _, _ = goal_guidance(
         planner, x_start, goal, horizon
     )
-    goal_loss = guidance_scale * _goal_inner
+    rmse_guidance_scale = getattr(planner, 'rmse_guidance_scale', 1.0)
+    goal_loss = guidance_scale * _hilp_inner + rmse_guidance_scale * _rmse_inner
     rdf_loss = segment_rdf_guidance(planner, x_start, horizon) * planner.rdf_guidance_scale
 
     particle_loss = (

@@ -94,6 +94,19 @@ class BasePytorchAlgo(pl.LightningModule, ABC):
         parameters = self.parameters()
         return torch.optim.Adam(parameters, lr=self.cfg.lr)
 
+    def get_safe_wandb_step(self, min_step: Optional[int] = None) -> int:
+        step_candidates = [int(getattr(self, "global_step", 0))]
+
+        run = getattr(self.logger, "experiment", None)
+        run_step = getattr(run, "step", None)
+        if run_step is not None:
+            step_candidates.append(int(run_step))
+
+        if min_step is not None:
+            step_candidates.append(int(min_step))
+
+        return max(step_candidates)
+
     def log_video(
         self,
         key: str,
@@ -102,6 +115,7 @@ class BasePytorchAlgo(pl.LightningModule, ABC):
         std: Union[np.ndarray, torch.Tensor, Sequence, float] = None,
         fps: int = 12,
         format: str = "mp4",
+        step: Optional[int] = None,
     ):
         """
         Log video to wandb. WandbLogger in pytorch lightning does not support video logging yet, so we call wandb directly.
@@ -144,7 +158,7 @@ class BasePytorchAlgo(pl.LightningModule, ABC):
             {
                 key: wandb.Video(video, fps=fps, format=format),
             },
-            step=self.global_step,
+            step=step if step is not None else self.global_step,
         )
 
     def log_image(
