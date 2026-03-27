@@ -299,6 +299,7 @@ def _parse_trajectory_plot_inputs(trajectory):
     for key in [
         "plan",
         "node_path",
+        "target_node_path",
         "best_node_target",
         "guidance_targets",
         "goal_grad_vectors",
@@ -325,6 +326,8 @@ def _parse_trajectory_plot_inputs(trajectory):
 def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, plot_end_points=True):
     plan_trajectory = plot_data.get("plan")
     node_trajectory = plot_data.get("node_path")
+    target_node_trajectory = plot_data.get("target_node_path")
+    is_forward_tree = plot_data.get("is_forward_tree", True)
     best_node_target = plot_data.get("best_node_target")
     hilp_heatmap = plot_data.get("hilp_heatmap")
     hilp_grad_field = plot_data.get("hilp_grad_field")
@@ -371,9 +374,16 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
 
     if node_trajectory is not None and len(node_trajectory) > 0:
         node_xy = _to_plot_coords(env_id, node_trajectory[:, :2])
-        ax.plot(node_xy[:, 0], node_xy[:, 1], "b-", linewidth=2, alpha=0.6, label="Tree Path")
+        ax.plot(node_xy[:, 0], node_xy[:, 1], "b-", linewidth=2, alpha=0.6, label="Expanding Path")
         ax.scatter(node_xy[:, 0], node_xy[:, 1], c="blue", marker="o", s=100, alpha=0.7,
                    edgecolors="darkblue", linewidth=2, zorder=5)
+
+    if target_node_trajectory is not None and len(target_node_trajectory) > 0:
+        tgt_xy = _to_plot_coords(env_id, target_node_trajectory[:, :2])
+        ax.plot(tgt_xy[:, 0], tgt_xy[:, 1], color="orange", linestyle="-", linewidth=2,
+                alpha=0.6, label="Target Path")
+        ax.scatter(tgt_xy[:, 0], tgt_xy[:, 1], c="orange", marker="o", s=100, alpha=0.7,
+                   edgecolors="darkorange", linewidth=2, zorder=5)
 
     if hilp_grad_field is not None:
         X_w = hilp_grad_field["x_grid"]
@@ -530,6 +540,7 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
                    edgecolors="darkgreen", linewidth=1.5, label="Sub-goal")
 
     if ((node_trajectory is not None and len(node_trajectory) > 0)
+            or (target_node_trajectory is not None and len(target_node_trajectory) > 0)
             or best_node_target is not None
             or hilp_grad_field is not None
             or has_guidance_targets

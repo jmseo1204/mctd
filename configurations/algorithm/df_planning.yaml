@@ -51,12 +51,12 @@ DEBUG: True
 debug_memory_profile: True # Enable GPU/CPU memory profiling
 profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
 frame_sampling_way: "quadratic" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
-meeting_delta: 1.0
+meeting_delta: 1.5
 horizon_scale: 0.3 # horizon = episode_len * horizon_scale
 sequence_dividing_factor: 3
 noise_level_building_way: pyramid
 num_tries_for_bad_plans: 3
-open_loop_horizon: 300 #fixme -> best: episode_len*horizon_scale
+open_loop_horizon: 380 #fixme -> best: episode_len*horizon_scale
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
 sub_goal_interval: 1
 
@@ -68,12 +68,12 @@ sub_goal_interval: 1
 # For legacy .pt checkpoints: hilp_obs_dim / hilp_skill_dim are still needed.
 hilp_checkpoint_path: "td_models/params_1000000_20260324_002241.pkl"
 mctd_guidance_scales: [0.4] # HILP gradient scale for near-target positions (TD_thres or above)
-rmse_guidance_scale: 0.0 # RMSE direction scale for far-target positions (below TD_thres)
-anchor_guidance_scale: 0.3 # 2.0
-rdf_guidance_scale: 0.0 # 2.0
+rmse_guidance_scale: 0.4 # RMSE direction scale for far-target positions (below TD_thres)
+anchor_guidance_scale: 0.4 # 0.4
+rdf_guidance_scale: 0.0
 # HILP guidance mode flags
 use_score_func_with_TD: true # if true: HILP grad + KDE score grad; if false: HILP grad only
-TD_thres_for_far_target: -160.0 # HILP value threshold: V < threshold → use RMSE guidance; null to disable
+TD_thres_for_far_target: 0.0 # HILP value threshold: V < threshold → use RMSE guidance; null to disable
 # KDE-weighted guidance: unit_grad = ∇V/|∇V| + kde_lam·∇log p
 
 # [Kernal Density Estimation for extracting score function of training data]

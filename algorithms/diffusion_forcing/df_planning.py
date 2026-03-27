@@ -1946,6 +1946,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     _v_tail_vis = np.array([_v_alen - 1]) if _v_alen > 0 else np.array([], dtype=int)
 
                     _v_node_traj = self._extract_node_trajectory(_vnode)
+                    _v_is_fwd = active_tree.is_tree1  # True = forward tree expanding
+                    _v_tgt_node_traj = (
+                        self._extract_node_trajectory(_vnode.target_node)
+                        if _vnode.target_node is not None
+                        else None
+                    )
                     _v_tgt_pos = (
                         _vnode.target_node.obs_pos
                         if _vnode.target_node is not None and getattr(_vnode.target_node, 'obs_pos', None) is not None
@@ -2060,7 +2066,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
                         _v_td = {
                             'plan': _v_plan,
+                            'is_forward_tree': _v_is_fwd,
                             'node_path': _v_node_traj if _v_node_traj is not None and len(_v_node_traj) > 0 else None,
+                            'target_node_path': _v_tgt_node_traj if _v_tgt_node_traj is not None and len(_v_tgt_node_traj) > 0 else None,
                             'best_node_target': _v_tgt_pos,
                             'guidance_targets': _v_gpos,
                             'goal_grad_vectors': _v_gg,
@@ -2096,11 +2104,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     continue
                 
                 best_node: "TreeNode" = best_info["node"]
-                
+
+                # Determine if this is the last plan extraction:
+                # (1) counter exhausted, or (2) both trees fully expanded after this step
+                _trees_exhausted = (
+                    not bidir_tree1.root_node.is_expandable_flag and
+                    not bidir_tree2.root_node.is_expandable_flag
+                )
+                is_last_expansion: bool = (loops == self.val_max_loops) or _trees_exhausted
+
                 output_plan = self._extract_output_plan(
                     best_node,
                     plan_tokens=active_tree.plan_tokens,
                     is_tree1=(expanded_tree_idx == 0),
+                    is_last=is_last_expansion,
                 )  # (T_combined*fs, 1, c)
 
                 plan_hist = output_plan.unsqueeze(0)  # (1, T_combined*fs, 1, c)
@@ -4019,13 +4036,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 _plan_idx = min(loop_cnt, plan_frame_format.shape[0] - 1)
                 _plan_pos_log.append(plan_slice_np[_plan_idx, :self.pos_dim].tolist())
 
-                if dist_to_sg < 1.0:
+                if dist_to_sg < self.meeting_delta:
                     if sub_goal_step < plan_frame_format.shape[0] - self.sub_goal_interval:
                         sub_goal_step += self.sub_goal_interval
                         sub_goal_sim_state["qpos"][:self.pos_dim] = plan_slice_np[sub_goal_step, :self.pos_dim]
                         _sub_goal_advance_count += 1
                     else:
-                        sub_goal_sim_state["qpos"][:self.pos_dim] = plan_slice_np[-1, :self.pos_dim]
+                        # Agent reached the last achievable sub_goal — exit MPC loop early
+                        break
 
             rollout_agent_positions.append(current_sim_state["qpos"][:self.pos_dim].copy())
             if sub_goal_sim_state is not None:
@@ -4391,8 +4409,19 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             within = np.where(dists <= threshold)[0]            # local indices, ascending
             if len(within) > 0:
-                # Highest original idx among those within threshold (last element = highest local idx)
-                next_local = int(within[-1])
+                # Convert to original indices (ascending)
+                orig_within = [remaining_start + int(w) for w in within]
+                # Check if all within-threshold states are consecutive from current_idx+1
+                all_consecutive = all(
+                    orig_within[j] == current_idx + 1 + j
+                    for j in range(len(orig_within))
+                )
+                if all_consecutive:
+                    # i→a→b→c all differ by 1: pick the first (a = current_idx+1)
+                    next_local = int(within[0])
+                else:
+                    # Default: highest original idx among those within threshold
+                    next_local = int(within[-1])
             else:
                 # Nearest frame among all remaining
                 next_local = int(np.argmin(dists))
@@ -4408,6 +4437,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         best_node: "TreeNode",
         plan_tokens: int,
         is_tree1: bool,
+        is_last: bool = False,
     ) -> torch.Tensor:
         """
         Construct the final output plan from the best selected leaf TreeNode.
@@ -4512,7 +4542,35 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             self._tlog("mcts.extract_plan", {"a_len": a_len, "b_len": b_len, "combined": a_len + b_len}, depth=1)
 
-            combined = torch.cat([t1_segments, t2_flipped], dim=0)  # (A_len+B_len, c)
+            # Gap check: only combine FWD+BWD if ANY point in one plan is within
+            # meeting_delta of ANY point in the other (minimum pairwise distance).
+            # If not yet met and this is not the last expansion, use FWD plan only.
+            _use_bwd = True
+            if not is_last and a_len > 0 and b_len > 0:
+                _std_np = self.data_std[:self.pos_dim].cpu().numpy() if isinstance(self.data_std, torch.Tensor) else np.array(self.data_std[:self.pos_dim])
+                _mean_np = self.data_mean[:self.pos_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[:self.pos_dim])
+                _seg_a_unnorm = t1_segments[:, :self.pos_dim].detach().cpu().numpy() * _std_np + _mean_np  # (A, pos_dim)
+                _seg_b_unnorm = t2_flipped[:, :self.pos_dim].detach().cpu().numpy() * _std_np + _mean_np   # (B, pos_dim)
+                # Minimum pairwise Euclidean distance between all (a, b) point pairs
+                _diffs = _seg_a_unnorm[:, None, :] - _seg_b_unnorm[None, :, :]  # (A, B, pos_dim)
+                _gap = float(np.linalg.norm(_diffs, axis=2).min())
+                if _gap > self.meeting_delta:
+                    _use_bwd = False
+                    self._tlog("mcts.extract_plan", {
+                        "msg": "FWD+BWD min pairwise gap too large, using FWD only",
+                        "min_gap": round(_gap, 3),
+                        "meeting_delta": self.meeting_delta,
+                        "is_last": is_last,
+                    }, depth=1)
+
+            if _use_bwd:
+                combined = torch.cat([t1_segments, t2_flipped], dim=0)  # (A_len+B_len, c)
+            else:
+                # FWD-only fallback: select the segment that represents the FWD plan.
+                # When is_tree1=True:  t1_segments IS the FWD plan [start→middle_fwd].
+                # When is_tree1=False: t2_flipped is the FWD plan reversed [middle_fwd→start];
+                #   the final `if not is_tree1: flip` below will reverse it to [start→middle_fwd].
+                combined = t1_segments if is_tree1 else t2_flipped
 
 
         if not is_tree1:
