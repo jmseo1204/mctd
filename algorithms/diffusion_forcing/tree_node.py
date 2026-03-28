@@ -231,8 +231,9 @@ class TreeNode():
         else:
             # Non-leaf node: check if all created children are unexpandable
             created_children = [c["node"] for c in self._children_nodes if c["node"] is not None]
-            if created_children and all(not c.is_expandable_flag for c in created_children):
-                # All children are unexpandable → mark parent as unexpandable too
+            has_empty_slots = any(c["node"] is None and not c["permanently_dead"] for c in self._children_nodes)
+            if not has_empty_slots and created_children and all(not c.is_expandable_flag for c in created_children):
+                # All children are unexpandable and no empty slots remain → mark parent as unexpandable too
                 self.is_expandable_flag = False
 
         if self._parent_node is not None:

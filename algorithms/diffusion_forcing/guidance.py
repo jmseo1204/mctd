@@ -91,7 +91,7 @@ def compute_guidance_grad_np(
     obs_np: np.ndarray,
     target_np: np.ndarray,
     hilp_fn,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
     """Core guidance gradient logic shared by goal_guidance() and _compute_guidance_grad_fields().
 
     Given pre-padded obs_np and target_np (both in hilp_obs_dim space):
@@ -125,7 +125,9 @@ def compute_guidance_grad_np(
         goal_rep_np = target_np.copy()
 
     # 1. HILP gradient ∂V/∂obs[:2] via JAX
+    _t_grad0 = time.time()
     hilp_grad_np = hilp_fn.compute_grads(obs_np, goal_rep_np)  # (N, 2)
+    hilp_grad_ms = (time.time() - _t_grad0) * 1000
 
     # 2. Normalize: ∇V/|∇V|
     grad_mag = np.linalg.norm(hilp_grad_np, axis=-1, keepdims=True).clip(min=1e-8)
@@ -149,7 +151,9 @@ def compute_guidance_grad_np(
     # Use planner._compute_hilp_values for consistency with heatmap (same pessimistic
     # min(v1,v2) path, same _hilp_ref_obs padding). For HILPJax v1==v2 so min is a no-op,
     # but this keeps the computation identical across heatmap / grad-field / guidance.
+    _t_val0 = time.time()
     hilp_values_np = planner._compute_hilp_values(obs_np, goal_rep_np).cpu().numpy()  # (N,)
+    hilp_value_ms = (time.time() - _t_val0) * 1000
 
     # 5. TD threshold: switch to RMSE direction for temporally-far elements (V < TD_thres)
     TD_thres = getattr(planner, 'TD_thres_for_far_target', None)
@@ -165,7 +169,7 @@ def compute_guidance_grad_np(
         rmse_grad_np = np.zeros((N, 2), dtype=np.float32)
         combined_np = hilp_combined_np
 
-    return combined_np, hilp_values_np, far_mask, hilp_combined_np, rmse_grad_np
+    return combined_np, hilp_values_np, far_mask, hilp_combined_np, rmse_grad_np, hilp_grad_ms, hilp_value_ms
 
 
 def goal_guidance(
@@ -250,7 +254,7 @@ def goal_guidance(
             # Delegate all normalization / KDE / TD-threshold logic to shared helper.
             # Any changes to compute_guidance_grad_np automatically apply here AND
             # to _compute_guidance_grad_fields (plan/plan_at_* visualization).
-            combined_np, hilp_values_np, far_mask_np, hilp_combined_np, rmse_grad_np = compute_guidance_grad_np(
+            combined_np, hilp_values_np, far_mask_np, hilp_combined_np, rmse_grad_np, _hilp_grad_ms, _hilp_value_ms = compute_guidance_grad_np(
                 planner, obs_tail_np, target_np, hilp_fn
             )
             _t_hilp_ms = (time.time() - _t0) * 1000
@@ -270,6 +274,8 @@ def goal_guidance(
             if _tracer:
                 _tracer.log("timing.guidance_breakdown", {
                     "hilp_ms": round(_t_hilp_ms, 2),
+                    "hilp_grad_ms": round(_hilp_grad_ms, 2),
+                    "hilp_value_ms": round(_hilp_value_ms, 2),
                     "batch_size": B,
                     "use_score_func": getattr(planner, 'use_score_func_with_TD', True),
                     "far_count": int(far_mask.sum()),
@@ -281,29 +287,6 @@ def goal_guidance(
             # Each is a unit-direction dot-product; scaling is applied externally in combined_guidance.
             hilp_pseudo_loss = (pred[tail_pos, :, :2] * hilp_t * (~far_mask_t)).sum(dim=(0, 2))  # (B,)
             rmse_pseudo_loss = (pred[tail_pos, :, :2] * rmse_t * far_mask_t).sum(dim=(0, 2))    # (B,)
-
-            # --- Diagnostic: is unit vec pointing toward goal? ---
-            from utils.tracer import get_tracer as _get_tracer
-            _tracer2 = _get_tracer()
-            if _tracer2:
-                # Use combined_np for cosine-similarity diagnostic (same as before)
-                _u = torch.from_numpy(combined_np).reshape(len(tail_pos), B, 2).cpu()
-                # direction from pred to goal at each tail
-                _pred_xy = pred[tail_pos, :, :2].detach().cpu()   # (n_tails, B, 2)
-                _goal_xy = target[:, :2].detach().cpu().unsqueeze(0)  # (1, B, 2)
-                _delta = _goal_xy - _pred_xy  # (n_tails, B, 2)
-                _delta_norm = _delta.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                _delta_unit = _delta / _delta_norm  # (n_tails, B, 2)
-                _cos_sim = (_u * _delta_unit).sum(dim=-1)  # (n_tails, B) — 1.0 = perfect alignment
-                _tracer2.log("guidance.unit_vec_diag", {
-                    "unit_vec_mean": [round(v, 4) for v in _u.mean(dim=(0, 1)).tolist()],
-                    "unit_vec_norm_mean": round(_u.norm(dim=-1).mean().item(), 4),
-                    "cos_sim_mean": round(_cos_sim.mean().item(), 4),  # >0 = toward goal
-                    "cos_sim_min":  round(_cos_sim.min().item(), 4),
-                    "pred_to_goal_dist_mean": round(_delta_norm.mean().item(), 4),
-                    "n_tails": len(tail_pos),
-                    "far_count": int(far_mask.sum()),
-                }, depth=1)
 
             return hilp_pseudo_loss.mean(), rmse_pseudo_loss.mean(), hilp_pseudo_loss.tolist(), rmse_pseudo_loss.tolist()
 

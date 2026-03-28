@@ -352,31 +352,46 @@ class HILPJax:
             return self._compute_grads_fd(obs_np, goal_np)
 
     def _compute_grads_jax(self, obs_np: np.ndarray, goal_np: np.ndarray) -> np.ndarray:
-        """JAX-native gradient via jax.vmap(jax.grad(...))."""
+        """JAX-native gradient via jax.vmap(jax.grad(...)).
+
+        _grad_fn is compiled once per HILPJax instance and reused across all calls.
+        phi_g is passed as an explicit argument (not captured in the closure) so
+        the XLA-compiled program is goal-agnostic and cache hits across different goals.
+        """
         import jax
         import jax.numpy as jnp
 
-        # Compute phi(goal) once — fixed for all grid points
-        phi_g = self._agent.get_phi_goal(goal_np[:1])   # JAX array
-        if hasattr(phi_g, 'ndim') and phi_g.ndim > 1:
-            phi_g = phi_g[0]
-        phi_g = jnp.array(phi_g)  # (skill_dim,)
+        # Build and cache grad_fn once per instance.
+        # phi_g is an explicit arg → the compiled program does not embed the goal
+        # value, so the same compilation is reused regardless of goal.
+        if not hasattr(self, '_grad_fn'):
+            aggregator = self._aggregator
+            agent = self._agent
 
-        aggregator = self._aggregator
-        agent = self._agent
+            def value_fn(obs_single, phi_g_single):  # (obs_dim,), (skill_dim,) → scalar
+                psi = agent.get_psi(obs_single[None])[0]  # (skill_dim,)
+                if aggregator == "neg_l2":
+                    dist_sq = jnp.sum((psi - phi_g_single) ** 2)
+                    return -jnp.sqrt(jnp.maximum(dist_sq, 1e-6))
+                else:  # inner_prod
+                    return jnp.sum(psi * phi_g_single)
 
-        def value_single(obs_single):   # (obs_dim,) → scalar
-            psi = agent.get_psi(obs_single[None])   # (1, skill_dim)
-            psi = psi[0]                            # (skill_dim,)
-            if aggregator == "neg_l2":
-                dist_sq = jnp.sum((psi - phi_g) ** 2)
-                return -jnp.sqrt(jnp.maximum(dist_sq, 1e-6))
-            else:   # inner_prod
-                return jnp.sum(psi * phi_g)
+            self._grad_fn = jax.jit(jax.vmap(jax.grad(value_fn, argnums=0)))
 
-        grad_fn = jax.vmap(jax.grad(value_single))
-        grads_jnp = grad_fn(jnp.array(obs_np))   # (N, obs_dim)
-        return np.array(grads_jnp)[:, :2]        # (N, 2)
+        # Compute phi(goal) — result cached per unique goal bytes to avoid
+        # redundant Flax forward passes when the goal is constant across calls.
+        goal_key = goal_np[:1].tobytes()
+        if not hasattr(self, '_phi_g_cache') or self._phi_g_cache[0] != goal_key:
+            phi_g = self._agent.get_phi_goal(goal_np[:1])
+            if hasattr(phi_g, 'ndim') and phi_g.ndim > 1:
+                phi_g = phi_g[0]
+            self._phi_g_cache = (goal_key, jnp.array(phi_g))
+        phi_g = self._phi_g_cache[1]  # (skill_dim,)
+
+        N = obs_np.shape[0]
+        phi_g_batch = jnp.broadcast_to(phi_g[None], (N, phi_g.shape[0]))
+        grads_jnp = self._grad_fn(jnp.array(obs_np), phi_g_batch)  # (N, obs_dim)
+        return np.array(grads_jnp)[:, :2]  # (N, 2)
 
     def compute_values_np(self, obs_np: np.ndarray, goal_np: np.ndarray) -> np.ndarray:
         """Compute V(obs, goal) for numpy inputs. Returns (N,) float32.

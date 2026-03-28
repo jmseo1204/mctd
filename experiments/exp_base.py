@@ -445,12 +445,27 @@ class BaseLightningExperiment(BaseExperiment):
         """
         All validation happens here
         """
+        import time as _time, datetime as _dt
+        _val_wall = _dt.datetime.now().strftime("%H:%M:%S")
+        print(f"[LIFECYCLE {_val_wall}] validation() start  (checkpoint={self.ckpt_path})", flush=True)
         # Initialize Tracer for MCTS tree quality analysis
         from utils.tracer import Tracer, set_default_tracer
 
+        # Build a timestamped run_id so each run gets its own validation_anal_*.jsonl
+        # instead of overwriting the fixed "validation_run.jsonl" every time.
+        _val_ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        _val_model_id = "unknown"
+        if self.ckpt_path:
+            import re as _re
+            # Extract model_id from path like ".../uzrq13fa/model.ckpt"
+            _m = _re.search(r"/([a-z0-9]{8})/model\.ckpt", str(self.ckpt_path))
+            if _m:
+                _val_model_id = _m.group(1)
+        _val_run_id = f"validation_anal_{_val_ts}_{_val_model_id}"
+
         try:
             tracer = Tracer(
-                run_id="validation_run",
+                run_id=_val_run_id,
                 purpose="bidirectional_mcts_tree_quality",
                 log_dir="logs",
                 extra_meta={"description": "MCTS tree quality analysis"},
@@ -467,6 +482,19 @@ class BaseLightningExperiment(BaseExperiment):
         """Internal helper to run validation within tracer context."""
         with tracer:
             self._validation_impl()
+        import time as _time, datetime as _dt
+        print(f"[LIFECYCLE {_dt.datetime.now().strftime('%H:%M:%S')}] validation() complete  (wandb finalizing...)", flush=True)
+        # Append validation_complete to the timing tracer file (interact() already closed it,
+        # but append_record() reopens in "a" mode for this one record).
+        try:
+            from algorithms.diffusion_forcing.df_planning import _PROC_T0 as _df_t0
+            _timing_tr = getattr(getattr(self, 'algo', None), 'tracer', None)
+            if _timing_tr is not None:
+                _timing_tr.append_record("lifecycle.validation_complete", {
+                    "elapsed_s": round(_time.time() - _df_t0, 2),
+                })
+        except Exception:
+            pass
 
     @staticmethod
     def _load_ckpt_training_hparams(ckpt_path) -> dict:
@@ -531,6 +559,9 @@ class BaseLightningExperiment(BaseExperiment):
 
     def _validation_impl(self) -> None:
         """Actual validation implementation (extracted from original validation())."""
+        import time as _time, datetime as _dt
+        _impl_t0 = _time.time()
+        print(f"[LIFECYCLE {_dt.datetime.now().strftime('%H:%M:%S')}] _validation_impl start  (building algo/loading ckpt...)", flush=True)
         if not self.algo:
             if self.ckpt_path:
                 hparams = self._load_ckpt_training_hparams(self.ckpt_path)
@@ -552,6 +583,19 @@ class BaseLightningExperiment(BaseExperiment):
         if self.cfg.validation.compile:
             self.algo = torch.compile(self.algo)
 
+        _algo_built_elapsed = _time.time() - _impl_t0
+        print(f"[LIFECYCLE {_dt.datetime.now().strftime('%H:%M:%S')}] algo built  ({_algo_built_elapsed:.1f}s since impl start)  — starting pl.Trainer.validate()", flush=True)
+        # Log to timing tracer (opened in algo.__init__)
+        try:
+            from algorithms.diffusion_forcing.df_planning import _PROC_T0 as _df_t0
+            _timing_tr = getattr(self.algo, 'tracer', None)
+            if _timing_tr is not None:
+                _timing_tr.log("lifecycle.algo_built", {
+                    "elapsed_s": round(_time.time() - _df_t0, 2),
+                    "since_impl_start_s": round(_algo_built_elapsed, 2),
+                }, step=0, depth=0)
+        except Exception:
+            pass
         callbacks = []
 
         trainer = pl.Trainer(

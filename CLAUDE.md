@@ -107,8 +107,8 @@ python test_trajectory_diagnostics.py
 
 **Analysis:**
 ```bash
-bash debug_log_report.sh <path/to/logfile.jsonl>   # JSONL → HTML report
-bash guidance_analysis.sh
+bash latency_analysis.sh                            # timing & job time breakdown
+bash guidance_analysis.sh                            # guidance quality & MCTS debug
 python scripts/generate_jobs_generalized.py         # generate eval job specs
 python scripts/run_jobs.py                          # execute job specs
 ```

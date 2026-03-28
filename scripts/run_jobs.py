@@ -42,6 +42,11 @@ home_dir = os.path.expanduser("~")
 project_dir = os.getcwd()
 ogbench_data_dir = os.path.abspath(os.path.join(project_dir, "..", "ogbench_data"))
 hilp_dir = os.path.abspath(os.path.join(project_dir, "..", "HILP"))
+jax_cache_dir = os.path.expanduser("~/.jax_cache")
+os.makedirs(jax_cache_dir, exist_ok=True)
+os.makedirs(os.path.join(jax_cache_dir, "xla_gpu_per_fusion_autotune_cache_dir"), exist_ok=True)
+# chmod -R is intentionally omitted: cache files may be owned by Docker's UID (1020)
+# and chmod would fail silently or print errors. Cache files are readable without chmod.
 output_mount_dir = "/home/jmseo1204/mctd_outputs"
 os.makedirs(output_mount_dir, exist_ok=True)
 os.system(f"chmod 777 {output_mount_dir}")
@@ -175,6 +180,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -v {home_dir}/.d4rl:/home/{docker_user}/.d4rl \
         -v {ogbench_data_dir}:/home/{docker_user}/.ogbench/data \
         -v {hilp_dir}:/home/{docker_user}/HILP \
+        -v {jax_cache_dir}:/home/{docker_user}/.jax_cache \
         {docker_image} /bin/bash \
         -c "git config --global --add safe.directory /home/{docker_user}/mctd && cd /home/{docker_user}/mctd && python3 main.py hostname={server} gpu_id={gpu_id} {command_args}"
         """
@@ -191,6 +197,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -v {home_dir}/.d4rl:/home/{docker_user}/.d4rl \
         -v {ogbench_data_dir}:/home/{docker_user}/.ogbench/data \
         -v {hilp_dir}:/home/{docker_user}/HILP \
+        -v {jax_cache_dir}:/home/{docker_user}/.jax_cache \
         {docker_image} /bin/bash \
         -c 'git config --global --add safe.directory /home/{docker_user}/mctd && cd /home/{docker_user}/mctd && python3 main.py hostname={server} gpu_id={gpu_id} {command_args}'"
         """

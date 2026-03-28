@@ -69,6 +69,8 @@ class Tracer:
         return False
 
     def _setup(self):
+        if self._active:   # already open — skip re-initialization
+            return
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._log_path = self.log_dir / f"{self.run_id}.jsonl"
         self._fh = open(self._log_path, "a", buffering=1)
@@ -221,6 +223,21 @@ class Tracer:
                 self.log(tag, data, step=step, depth=depth)
                 return
         except ImportError:
+            pass
+
+    def append_record(self, tag: str, data: dict) -> None:
+        """Append a single record to the log file (works even after the tracer is closed)."""
+        if self._log_path is None:
+            return
+        record = {
+            "ts": time.time(),
+            "tag": tag,
+            "data": data,
+        }
+        try:
+            with open(str(self._log_path), "a") as _af:
+                _af.write(json.dumps(record, default=str) + "\n")
+        except Exception:
             pass
 
     def _write(self, record: Dict[str, Any]):

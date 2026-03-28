@@ -1,58 +1,45 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# guidance_analysis.sh
+# Analyzes validation_anal_*.jsonl logs (guidance quality, MCTS debug data).
+#
+# Usage:
+#   bash guidance_analysis.sh                           # auto-selects most recent validation_anal_*.jsonl
+#   bash guidance_analysis.sh <path/to/logfile.jsonl>   # uses specified file
 
-# Guidance Analysis Script
-# Reads per-job jsonl logs (e.g. logs/20260318_195017_uzrq13fa.jsonl)
-# and reports per-tree (forward/backward) guidance stats.
+set -euo pipefail
 
-LOG_DIR="logs"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ANALYZE_PY="$PROJECT_ROOT/scripts/guidance_analysis.py"
+LOG_DIR="$PROJECT_ROOT/logs"
 
-echo "=========================================="
-echo "    Guidance Log Analysis Tool"
-echo "=========================================="
-echo ""
-
-if [ ! -d "$LOG_DIR" ]; then
-    echo "Error: Directory '$LOG_DIR' not found."
-    exit 1
-fi
-
-# Get 5 most recent per-job jsonl files (YYYYMMDD_HHMMSS_*.jsonl pattern)
-mapfile -t RECENT_LOGS < <(ls -t "$LOG_DIR"/[0-9]*_*.jsonl 2>/dev/null | head -n 5)
-
-if [ ${#RECENT_LOGS[@]} -eq 0 ]; then
-    echo "No per-job jsonl files found in '$LOG_DIR'."
-    echo "(Expected pattern: logs/YYYYMMDD_HHMMSS_<model_id>.jsonl)"
-    echo "Run eval.sh first to generate logs."
-    exit 1
-fi
-
-echo "Recent job logs in $LOG_DIR/:"
-for i in "${!RECENT_LOGS[@]}"; do
-    filename=$(basename "${RECENT_LOGS[$i]}")
-    size=$(wc -l < "${RECENT_LOGS[$i]}" 2>/dev/null || echo "?")
-    if [ $i -eq 0 ]; then
-        echo "[$i] $filename  ($size records) (default)"
-    else
-        echo "[$i] $filename  ($size records)"
+if [ $# -lt 1 ]; then
+    LATEST=$(find "$LOG_DIR" -maxdepth 1 -name "validation_anal_*.jsonl" -print 2>/dev/null \
+        | sort -r | head -1)
+    if [ -z "$LATEST" ]; then
+        echo "Error: no validation_anal_*.jsonl files found in $LOG_DIR/"
+        echo "  (run a job first, or pass a log path explicitly)"
+        exit 1
     fi
-done
-
-echo ""
-read -p "Select log index to analyze (0-$((${#RECENT_LOGS[@]} - 1)), default: 0): " idx
-idx=${idx:-0}
-
-if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 0 ] && [ "$idx" -lt "${#RECENT_LOGS[@]}" ]; then
-    SELECTED_LOG="${RECENT_LOGS[$idx]}"
-    echo ""
-    echo "Analyzing: $(basename "$SELECTED_LOG")"
-    echo "=========================================="
-    python3 scripts/guidance_analysis.py "$SELECTED_LOG"
+    LOG_FILE="$LATEST"
+    echo "[guidance_analysis] No file specified, using most recent: $(basename "$LOG_FILE")" >&2
 else
-    echo "Invalid selection."
+    LOG_FILE="$1"
+fi
+
+if [ ! -f "$LOG_FILE" ]; then
+    echo "Error: log file not found: $LOG_FILE"
     exit 1
 fi
 
-echo ""
+PYTHON=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
+if [ -z "$PYTHON" ]; then
+    echo "Error: python or python3 not found in PATH"
+    exit 1
+fi
+
+echo "[guidance_analysis] Analyzing: $(basename "$LOG_FILE")"
+echo "=========================================="
+"$PYTHON" "$ANALYZE_PY" "$LOG_FILE"
 echo "=========================================="
 echo "  Analysis Complete"
 echo "=========================================="

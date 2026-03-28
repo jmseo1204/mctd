@@ -17,6 +17,12 @@ pos_dim: 2 # spatial x,y dims for MCTS guidance/visualization (always 2 for AntM
 # non dataset info
 x_shape: null
 
+#[wandb visualization]
+viz_subplan_denoising: True # set True to upload plan/plan_at_* to wandb (slow)
+viz_agent_rollout: False # set True to upload *_interaction/sample_*_video to wandb (slow)
+viz_final_plans: True
+viz_compare_expanded_to_value: True
+
 context_frames: 1
 use_reward: False
 plot_start_goal: True
@@ -36,7 +42,7 @@ virtual_visit_weight: 1.0
 warp_threshold: 1.0
 parallel_multiple_visits: False
 
-mctd_num_denoising_steps: 100 # Must be <= sampling_timesteps in df_base.yaml
+mctd_num_denoising_steps: 20 # Must be <= sampling_timesteps in df_base.yaml
 leaf_parallelization: True
 parallel_search_num: 8
 mctd_max_search_num: 70
@@ -46,15 +52,14 @@ plan_feasibility_delta: 100.0 # max per-frame movement (world units) to count a 
 max_child_resets: 3 # max times a node's children can be wiped and re-expanded when all are exhausted non-terminal
 particle_guidance_scale: 0.0 # sibling repulsion during denoising (0 = disabled)
 padding_mode: "same" # "zero" or "same"
-viz_plans: True
 DEBUG: True
 debug_memory_profile: True # Enable GPU/CPU memory profiling
 profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
 frame_sampling_way: "quadratic" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
 meeting_delta: 1.5
-horizon_scale: 0.3 # horizon = episode_len * horizon_scale
+horizon_scale: 0.6 # horizon = episode_len * horizon_scale
 sequence_dividing_factor: 3
-noise_level_building_way: pyramid
+noise_level_building_way: smooth # causal or smooth or others
 num_tries_for_bad_plans: 3
 open_loop_horizon: 380 #fixme -> best: episode_len*horizon_scale
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
@@ -67,23 +72,26 @@ sub_goal_interval: 1
 #   If no sidecar exists, inner_prod is used (matches training default).
 # For legacy .pt checkpoints: hilp_obs_dim / hilp_skill_dim are still needed.
 hilp_checkpoint_path: "td_models/params_1000000_20260324_002241.pkl"
-mctd_guidance_scales: [0.4] # HILP gradient scale for near-target positions (TD_thres or above)
+mctd_guidance_scales: [0.3] # HILP gradient scale for near-target positions (TD_thres or above)
 rmse_guidance_scale: 0.4 # RMSE direction scale for far-target positions (below TD_thres)
 anchor_guidance_scale: 0.4 # 0.4
 rdf_guidance_scale: 0.0
 # HILP guidance mode flags
 use_score_func_with_TD: true # if true: HILP grad + KDE score grad; if false: HILP grad only
-TD_thres_for_far_target: 0.0 # HILP value threshold: V < threshold → use RMSE guidance; null to disable
+TD_thres_for_far_target: -160.0 # HILP value threshold: V < threshold → use RMSE guidance; null to disable
 # KDE-weighted guidance: unit_grad = ∇V/|∇V| + kde_lam·∇log p
 
 # [Kernal Density Estimation for extracting score function of training data]
 kde_sigma: 0.2 # KDE bandwidth (world units)
-kde_lam: 0.05 # scale for ∇log p term
+kde_lam: 0.07 # scale for ∇log p term
 kde_sample_ratio: 0.1 # fraction of dataset to use for KDE (1.0 = full dataset)
 kde_save_dir: ${dataset.save_dir} # dataset npz directory for KDE positions
 
+# SIMULATION(REPLANNING)
+mcts_use_sim: false
+replanning_target_level: 20 # noise level to add when replanning already-denoised prefix (default: sampling_timesteps // 3)
+
 # [DEPRECATED]
-mcts_use_sim: false # always false. true version is deprecated
 use_rollout: false # always false. true version is deprecated
 use_dynamic_obs_padding: false # always false. true version is deprecated
 
