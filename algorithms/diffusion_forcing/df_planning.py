@@ -1180,13 +1180,29 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             goal = torch.cat([goal] * batch_size, 0)  # (b, obs_dim)
 
         if guidance_scale is None:
-            guidance_fn = lambda x: 0
+            guidance_fn = None
         else:
             _pgs = particle_guidance_scale  # capture for lambda closure
             _gids = group_ids               # capture for lambda closure
+
+            # smooth 모드: 과거 segment도 forward pass를 거치므로 guidance를
+            # 현재 denoising 중인 segment tail 하나에만 적용해야 한다.
+            # prefix_len_list[i] = i번째 candidate의 이미 denoised된 prefix token 수
+            #   → active segment tail (frame-space) = frame_stack + (prefix_len + seg_size) * frame_stack - 1
+            _active_tails = None
+            if (getattr(self, 'noise_level_building_way', 'causal') == 'smooth'
+                    and prefix_len_list is not None):
+                _seg_t = horizon // self.frame_stack // self.sequence_dividing_factor
+                _active_tails = [
+                    self.frame_stack * (1 + pl + _seg_t) - 1
+                    for pl in prefix_len_list
+                ]
+
+            _pat = _active_tails  # capture for lambda closure
             guidance_fn = lambda x: guidance.combined_guidance(
                 self, x, goal, horizon, guidance_scale,
                 particle_guidance_scale=_pgs, group_ids=_gids,
+                active_tail_per_batch=_pat,
             )
 
         # [TIMING] Wrap guidance_fn to measure per-step cost and capture last loss values
@@ -3213,7 +3229,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         effective_goal_normalized,
                         horizon,
                         conditions,
-                        guidance_scale=torch.zeros_like(expanded_node_guidance_scales),
+                        guidance_scale=None,
                         noise_level=value_estimation_noise_levels,
                         plans=value_estimation_plans,
                         prefix_len_list=prefix_len_list,
@@ -3620,7 +3636,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         if parent_node.plan_history: # and self.use_dynamic_obs_padding:
             # plan_history stores plans in canonical (forward) order via flip_plan_for_insert_hist.
             latest_plan_canonical = parent_node.plan_history[-1][-1]  # (plan_tokens*fs, c)
-            prefix_len_frames = parent_node.depth * segment_size * self.frame_stack
+            prefix_len = parent_node.get_prefix_len(segment_size)
+            prefix_len_frames = prefix_len * self.frame_stack
             full_prefix_canonical = latest_plan_canonical[:prefix_len_frames].unsqueeze(
                 1
             )  # (prefix_len*fs, 1, c)
@@ -3631,7 +3648,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             denoised_prefix = rearrange(
                 full_prefix, "(t fs) b c -> t b (fs c)", fs=self.frame_stack
             )  # (prefix_len, 1, fs*c)
-            prefix_len = denoised_prefix.shape[0]
 
         else:
             denoised_prefix = None

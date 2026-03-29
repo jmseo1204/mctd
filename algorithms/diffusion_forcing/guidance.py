@@ -173,7 +173,8 @@ def compute_guidance_grad_np(
 
 
 def goal_guidance(
-    planner, x: torch.Tensor, goal: torch.Tensor, horizon: int
+    planner, x: torch.Tensor, goal: torch.Tensor, horizon: int,
+    active_tail_per_batch: Optional[list] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, list, list]:
     """
     Target guidance to reach goal/start.
@@ -187,6 +188,9 @@ def goal_guidance(
           where t=plan_tokens, b=batch_size, fs*c flattened observation
         goal: (b, obs_dim) normalized goal observations
         horizon: planning horizon in timesteps
+        active_tail_per_batch: When provided (smooth noise mode), list of length B with
+            per-batch frame-space indices of the single tail to apply guidance to.
+            None → apply to all segment tails (causal mode default).
 
     Returns:
         (hilp_loss, rmse_loss, hilp_per_batch_list, rmse_per_batch_list):
@@ -212,6 +216,69 @@ def goal_guidance(
         T, B = pred.shape[0], pred.shape[1]
         segment_size = horizon // planner.sequence_dividing_factor
 
+        if active_tail_per_batch is not None:
+            # ── smooth mode: per-batch single active tail ──────────────────────
+            # Each candidate has exactly one segment being denoised this turn;
+            # restrict guidance to that tail to avoid perturbing already-denoised
+            # past segments that still participate in the smooth forward pass.
+            _atail = torch.tensor(active_tail_per_batch, device=pred.device)  # (B,)
+            _bidx  = torch.arange(B, device=pred.device)
+
+            obs_dim = planner.observation_dim
+            hilp_obs_dim = planner.hilp_obs_dim
+            _ref = getattr(planner, '_hilp_ref_obs', None)
+
+            obs_tail_raw = pred[_atail, _bidx, :obs_dim].detach().cpu().numpy().astype(np.float32)  # (B, obs_dim)
+            if _ref is not None:
+                obs_tail_np = np.tile(_ref, (B, 1)).astype(np.float32)
+            else:
+                obs_tail_np = np.zeros((B, hilp_obs_dim), np.float32)
+            obs_tail_np[:, :obs_dim] = obs_tail_raw
+
+            target_raw = target[:, :obs_dim].detach().cpu().numpy().astype(np.float32)  # (B, obs_dim)
+            if _ref is not None:
+                target_np = np.tile(_ref, (B, 1)).astype(np.float32)
+            else:
+                target_np = np.zeros((B, hilp_obs_dim), np.float32)
+            target_np[:, :obs_dim] = target_raw
+
+            hilp_fn = getattr(planner, '_hilp_value_fn_instance', None)
+            assert hilp_fn is not None and hasattr(hilp_fn, 'compute_grads'), \
+                "active_tail_per_batch requires HILP guidance to be configured"
+
+            _t0 = time.time()
+            combined_np, hilp_values_np, far_mask_np, hilp_combined_np, rmse_grad_np, _hilp_grad_ms, _hilp_value_ms = compute_guidance_grad_np(
+                planner, obs_tail_np, target_np, hilp_fn
+            )
+            _t_hilp_ms = (time.time() - _t0) * 1000
+
+            # shapes: (B, 1) and (B, 2) — one tail per batch item
+            far_mask_t = torch.from_numpy(far_mask_np).reshape(B, 1).to(pred.device)   # (B, 1)
+            hilp_t     = torch.from_numpy(hilp_combined_np).reshape(B, 2).to(pred.device).detach()  # (B, 2)
+            rmse_t     = torch.from_numpy(rmse_grad_np).reshape(B, 2).to(pred.device).detach()      # (B, 2)
+
+            TD_thres = getattr(planner, 'TD_thres_for_far_target', None)
+            from utils.tracer import get_tracer as _get_tracer
+            _tracer = _get_tracer()
+            if _tracer:
+                _tracer.log("timing.guidance_breakdown", {
+                    "hilp_ms": round(_t_hilp_ms, 2),
+                    "hilp_grad_ms": round(_hilp_grad_ms, 2),
+                    "hilp_value_ms": round(_hilp_value_ms, 2),
+                    "batch_size": B,
+                    "use_score_func": getattr(planner, 'use_score_func_with_TD', True),
+                    "far_count": int(far_mask_np.sum()),
+                    "TD_thres": TD_thres,
+                    "hilp_values": hilp_values_np.tolist(),
+                    "active_tail_mode": "per_batch",
+                })
+
+            # pred[_atail, _bidx, :2]: (B, 2) — gather active tail per batch item
+            hilp_pseudo_loss = (pred[_atail, _bidx, :2] * hilp_t * (~far_mask_t)).sum(dim=1)  # (B,)
+            rmse_pseudo_loss = (pred[_atail, _bidx, :2] * rmse_t * far_mask_t).sum(dim=1)     # (B,)
+            return hilp_pseudo_loss.mean(), rmse_pseudo_loss.mean(), hilp_pseudo_loss.tolist(), rmse_pseudo_loss.tolist()
+
+        # ── causal mode (default): all segment tails ──────────────────────────
         # Tail positions: last frame of each segment
         tail_pos = torch.arange(
             planner.frame_stack + segment_size - 1,
@@ -461,7 +528,8 @@ def particle_guidance(planner, x: torch.Tensor, group_ids: Optional[list] = None
 
 def combined_guidance(planner, x_start, goal, horizon, guidance_scale,
                       particle_guidance_scale: float = 0.0,
-                      group_ids: Optional[list] = None):
+                      group_ids: Optional[list] = None,
+                      active_tail_per_batch: Optional[list] = None):
     """
     Combined guidance signals for diffusion model.
 
@@ -470,6 +538,9 @@ def combined_guidance(planner, x_start, goal, horizon, guidance_scale,
             When > 0 and batch_size > 1, a repulsion loss pushes sibling trajectories apart.
         group_ids: Optional sibling group ids of length b (see particle_guidance).
             When provided, repulsion is applied only within groups of same id.
+        active_tail_per_batch: When provided (smooth noise mode), list of per-batch
+            frame-space indices indicating the single tail position to apply goal
+            guidance to.  None → apply to all segment tails (causal mode default).
 
     Returns:
         guidance_dict: dict of guidance losses
@@ -479,7 +550,8 @@ def combined_guidance(planner, x_start, goal, horizon, guidance_scale,
     # scaled independently: TD_guidance_scale (via guidance_scale arg) for HILP,
     # rmse_guidance_scale for the far-target RMSE direction.
     _hilp_inner, _rmse_inner, _, _ = goal_guidance(
-        planner, x_start, goal, horizon
+        planner, x_start, goal, horizon,
+        active_tail_per_batch=active_tail_per_batch,
     )
     rmse_guidance_scale = getattr(planner, 'rmse_guidance_scale', 1.0)
     goal_loss = guidance_scale * _hilp_inner + rmse_guidance_scale * _rmse_inner

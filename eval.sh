@@ -41,6 +41,12 @@ echo "✓ Container cleanup complete"
 echo "Cleaning up existing job files..."
 rm -f jobs/*.json
 echo "✓ Job files cleanup complete"
+
+echo "Resetting JAX cache..."
+rm -rf ~/.jax_cache
+mkdir -p ~/.jax_cache/xla_gpu_per_fusion_autotune_cache_dir
+chmod -R 777 ~/.jax_cache
+echo "✓ JAX cache reset complete"
 echo ""
 
 # ─────────────────────────────────────────────────────

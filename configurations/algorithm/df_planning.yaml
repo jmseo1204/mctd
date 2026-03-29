@@ -57,10 +57,10 @@ debug_memory_profile: True # Enable GPU/CPU memory profiling
 profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
 frame_sampling_way: "quadratic" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
 meeting_delta: 1.5
-horizon_scale: 0.6 # horizon = episode_len * horizon_scale
-sequence_dividing_factor: 3
-noise_level_building_way: smooth # causal or smooth or others
-num_tries_for_bad_plans: 3
+horizon_scale: 0.4 # horizon = episode_len * horizon_scale
+sequence_dividing_factor: 4
+noise_level_building_way: others # causal or smooth or others
+num_tries_for_bad_plans: 5
 open_loop_horizon: 380 #fixme -> best: episode_len*horizon_scale
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
 sub_goal_interval: 1
@@ -72,7 +72,7 @@ sub_goal_interval: 1
 #   If no sidecar exists, inner_prod is used (matches training default).
 # For legacy .pt checkpoints: hilp_obs_dim / hilp_skill_dim are still needed.
 hilp_checkpoint_path: "td_models/params_1000000_20260324_002241.pkl"
-mctd_guidance_scales: [0.3] # HILP gradient scale for near-target positions (TD_thres or above)
+mctd_guidance_scales: [0.4] # HILP gradient scale for near-target positions (TD_thres or above)
 rmse_guidance_scale: 0.4 # RMSE direction scale for far-target positions (below TD_thres)
 anchor_guidance_scale: 0.4 # 0.4
 rdf_guidance_scale: 0.0
@@ -88,7 +88,7 @@ kde_sample_ratio: 0.1 # fraction of dataset to use for KDE (1.0 = full dataset)
 kde_save_dir: ${dataset.save_dir} # dataset npz directory for KDE positions
 
 # SIMULATION(REPLANNING)
-mcts_use_sim: false
+mcts_use_sim: true
 replanning_target_level: 20 # noise level to add when replanning already-denoised prefix (default: sampling_timesteps // 3)
 
 # [DEPRECATED]

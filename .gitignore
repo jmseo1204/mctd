@@ -177,3 +177,4 @@ checkpoints
 # Pycharm setting
 .idea/
 data/*
+*.html
