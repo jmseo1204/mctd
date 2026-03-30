@@ -166,7 +166,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             hilp_path = os.path.join(repo_root, hilp_path)
         self.hilp_checkpoint_path = hilp_path
         self.hilp_obs_dim = cfg.get("hilp_obs_dim", 29)    # used only for legacy .pt checkpoints
-        self.hilp_skill_dim = cfg.get("hilp_skill_dim", 32)  # used only for legacy .pt checkpoints
+        self.hilp_skill_dim = cfg.get("hilp_skill_dim", 256)  # used only for legacy .pt checkpoints
         # HILP value function instance will be loaded lazily and stored in _hilp_value_fn_instance
         # We don't initialize it here to prevent PyTorch from registering it as a submodule
         self.anchor_guidance_scale = cfg.get("anchor_guidance_scale", 40.0)
@@ -1876,8 +1876,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         )  # (t*fs, 1, c)
 
                         seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
-                        new_denoised_start: int = parent_node.depth * seg_size * self.frame_stack
-                        new_denoised_end: int = (parent_node.depth + 1) * seg_size * self.frame_stack
+                        new_denoised_start: int = self._get_prefix_len_frames_from_depth(parent_node.depth, seg_size)
+                        new_denoised_end: int = self._get_prefix_len_frames_from_depth(parent_node.depth + 1, seg_size)
 
                         _new_sim_state = self._rollout_leaf_plan(
                             leaf_plan_unnormalized=plan_unnormalized,
@@ -1993,7 +1993,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 node_trajectory = self._extract_node_trajectory(best_node)
 
                 # Create forward trajectory image with both plan (red) and node trajectory (blue)
-                plan_positions = plan_unnormalized[:, :, :self.pos_dim].detach().cpu().numpy()
+                #plan_positions = plan_unnormalized[:, :, :self.pos_dim].detach().cpu().numpy()
 
 
                 # Extract best_node's target_node obs_pos (single green point)
@@ -2419,8 +2419,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         plan_unnormalized = self._unnormalize_x(
             plan_hists_last.unsqueeze(1)
         )  # (t*fs, 1, c)
-        new_denoised_end: int = child_depth * seg_size * self.frame_stack
+        new_denoised_end: int = self._get_prefix_len_frames_from_depth(child_depth, seg_size)
         return plan_unnormalized[new_denoised_end - 1, 0, :self.observation_dim].cpu().numpy()
+
+    def _get_prefix_len_frames_from_depth(self, depth: int, seg_size: int) -> int:
+        return depth * seg_size * self.frame_stack
 
     def _deduplicate_by_endpoint(
         self,
@@ -2542,8 +2545,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             # --- Plan A: current tree's denoised plan, sliced to parent depth --- #
             # final_best_plans: (T_total*fs, B, c) -> last denoising step for candidate i
             plan_a_full: torch.Tensor = final_best_plans[:, i]  # (T_total*fs, c)
-            parent_seq_len: int = parent_node.depth * seg_size * self.frame_stack
-            candid_seq_len: int = (parent_node.depth+1) * seg_size * self.frame_stack
+            parent_seq_len: int = self._get_prefix_len_frames_from_depth(parent_node.depth, seg_size)
+            candid_seq_len: int = self._get_prefix_len_frames_from_depth(parent_node.depth + 1, seg_size)
             # Clamp candid_seq_len to actual plan length
             max_seq_len: int = min(final_best_plans.shape[0], candid_seq_len)
             plan_a_sliced: torch.Tensor = plan_a_full[parent_seq_len: max_seq_len].unsqueeze(1)  # (A_len, 1, c)
@@ -3448,7 +3451,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
                     # Compute how many tokens are actually denoised per candidate (depth-based)
                     visualize_denoised_lens = [
-                        expanded_node_candidates[i]["depth"] * seg_size * self.frame_stack
+                        self._get_prefix_len_frames_from_depth(expanded_node_candidates[i]["depth"], seg_size)
                         for i in visualize_indices
                     ]
 
@@ -3636,8 +3639,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         if parent_node.plan_history: # and self.use_dynamic_obs_padding:
             # plan_history stores plans in canonical (forward) order via flip_plan_for_insert_hist.
             latest_plan_canonical = parent_node.plan_history[-1][-1]  # (plan_tokens*fs, c)
-            prefix_len = parent_node.get_prefix_len(segment_size)
-            prefix_len_frames = prefix_len * self.frame_stack
+            prefix_len = parent_node.depth * segment_size  # token 단위 (noisy_total, expanded_plan 슬라이싱에 사용)
+            prefix_len_frames = self._get_prefix_len_frames_from_depth(parent_node.depth, segment_size)
             full_prefix_canonical = latest_plan_canonical[:prefix_len_frames].unsqueeze(
                 1
             )  # (prefix_len*fs, 1, c)
@@ -4193,7 +4196,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             return
 
         seg_size = active_tree.plan_tokens // self.sequence_dividing_factor
-        alen = vnode.depth * seg_size * self.frame_stack
+        alen = self._get_prefix_len_frames_from_depth(vnode.depth, seg_size)
 
         # Single guidance-target index: end of the currently denoised segment.
         tail_vis = np.array([alen - 1]) if alen > 0 else np.array([], dtype=int)
@@ -4426,7 +4429,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             f"best_node.plan_history[-1] must be non-empty, but got {best_node.plan_history[-1]}"
 
         plan_a_full: torch.Tensor = best_node.plan_history[-1][-1]  # (T_total*fs, c)
-        a_len: int = best_node.depth * seg_size * self.frame_stack
+        a_len: int = self._get_prefix_len_frames_from_depth(best_node.depth, seg_size)
         t1_segments: torch.Tensor = plan_a_full[:a_len]  # (A_len, c)
 
         # --- Bidirectional search: target_node handling ---
@@ -4447,7 +4450,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         else:
             # --- Bidirectional: flip plan_B and concat ---
             plan_b_full: torch.Tensor = best_node.target_node.plan_history[-1][-1]  # (T_total*fs, c)
-            b_len: int = best_node.target_node.depth * seg_size * self.frame_stack
+            b_len: int = self._get_prefix_len_frames_from_depth(best_node.target_node.depth, seg_size)
             t2_flipped: torch.Tensor = torch.flip(
                 plan_b_full[:b_len], [0]
             )  # (B_len, c)

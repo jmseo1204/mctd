@@ -59,21 +59,6 @@ class TreeNode():
     def __eq__(self, other):
         return self.name == other.name
 
-    def get_prefix_len(self, seg_size: int) -> int:
-        """Return the number of already-denoised prefix tokens for this node's depth.
-
-        For a node at depth d, the first d segments have been fully denoised by
-        ancestor expansions.  The (d+1)-th segment is the one currently being
-        denoised when this node is expanded.
-
-        Args:
-            seg_size: segment size in tokens (= plan_tokens // sequence_dividing_factor)
-
-        Returns:
-            Number of prefix tokens that are already fixed (= depth * seg_size).
-        """
-        return self.depth * seg_size
-
     def is_root_node(self):
         return self._parent_node is None
     
