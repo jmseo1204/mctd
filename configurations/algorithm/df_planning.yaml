@@ -92,7 +92,7 @@ TD_thres_for_far_target: -200.0 # HILP value threshold: V < threshold → use RM
 
 # [Kernal Density Estimation for extracting score function of training data]
 kde_sigma: 0.2 # KDE bandwidth (world units)
-kde_lam: 0.05 # 0.07 # scale for ∇log p term
+kde_lam: 0.07 # 0.07 # scale for ∇log p term
 kde_sample_ratio: 0.1 # fraction of dataset to use for KDE (1.0 = full dataset)
 kde_save_dir: ${dataset.save_dir} # dataset npz directory for KDE positions
 

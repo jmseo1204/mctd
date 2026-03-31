@@ -15,7 +15,9 @@ test_*.py
 ./*.log
 logs/
 logs_memory_debug/
-
+*.pt
+*.pkl
+*.npz
 
 # agent_config
 .claude/
