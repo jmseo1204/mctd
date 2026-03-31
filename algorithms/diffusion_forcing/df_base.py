@@ -94,8 +94,15 @@ class DiffusionForcingBase(BasePytorchAlgo):
                 'architecture': arch,
             },
         }
-        if hasattr(self.cfg, 'episode_len'):
-            hparams['episode_len'] = int(self.cfg.episode_len)
+        # episode_len is resolved from dataset config at init time (df_planning line 118).
+        # Always save it so eval-time job generation never falls back to stale WandB/hydra configs.
+        episode_len = (
+            int(self.cfg.episode_len) if hasattr(self.cfg, 'episode_len')
+            else int(self.cfg.dataset.episode_len) if hasattr(self.cfg, 'dataset') and hasattr(self.cfg.dataset, 'episode_len')
+            else None
+        )
+        if episode_len is not None:
+            hparams['episode_len'] = episode_len
         checkpoint['training_hparams'] = hparams
 
     def _build_model(self):

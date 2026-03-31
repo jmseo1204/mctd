@@ -472,13 +472,13 @@ def main():
             else:
                 print(f"  [config detect] WARNING: Could not load '{detected_dataset_config}'. Keeping '{args.dataset}'.")
 
-        actual_episode_len = args.episode_len or model_metadata.get('episode_len') or full_cfg['dataset'].get('episode_len', 50)
+        actual_episode_len = args.episode_len or full_cfg['dataset'].get('episode_len') or model_metadata.get('episode_len') or 50
         actual_jump = model_metadata.get('jump') or full_cfg['dataset'].get('jump', 1)
 
         obs_dim = len(full_cfg['dataset'].get('observation_mean', [2]))
         act_dim = full_cfg['dataset'].get('action_dim', 8)
         detected_frame_stack = detect_frame_stack_from_ckpt(args.model_id, obs_dim, act_dim)
-        actual_frame_stack = model_metadata.get('frame_stack') or detected_frame_stack or full_cfg['algorithm'].get('frame_stack', 10)
+        actual_frame_stack = detected_frame_stack or model_metadata.get('frame_stack') or full_cfg['algorithm'].get('frame_stack', 10)
 
         detected_arch = detect_network_size_from_ckpt(args.model_id)
         arch_cfg = full_cfg['algorithm'].get('diffusion', {}).get('architecture', {})
