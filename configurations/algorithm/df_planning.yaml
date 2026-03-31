@@ -37,7 +37,6 @@ parallel_multiple_visits: False
 
 mctd_num_denoising_steps: 20 # Must be <= sampling_timesteps in df_base.yaml
 leaf_parallelization: True
-parallel_search_num: 8
 mctd_max_search_num: 70
 max_child_resets: 3 # max times a node's children can be wiped and re-expanded when all are exhausted non-terminal
 padding_mode: "same" # "zero" or "same"
@@ -45,31 +44,12 @@ DEBUG: True
 debug_memory_profile: True # Enable GPU/CPU memory profiling
 noise_level_building_way: others # causal or smooth or others
 num_tries_for_bad_plans: 5
-open_loop_horizon: 380 #fixme -> best: episode_len*horizon_scale
+open_loop_horizon: 1000 #fixme -> best: episode_len*horizon_scale
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
 sub_goal_interval: 1
-horizon_scale: 0.45 # horizon = episode_len * horizon_scale
-sequence_dividing_factor: 3
-
-#[state proximity threshold]
-warp_threshold: 3.0
-diverge_threshold: 4.0 # min endpoint distance to count as distinct path (below → deduplicate)
-min_progress_threshold: 1.5 # min L2 distance (x,y) between sub_plan start and end; plans below this are discarded (0 = disabled)
-plan_feasibility_delta: 99999.0 # max per-frame movement (world units) to count a plan as feasible (set high to disable)
-meeting_delta: 1.5
-
-#[wandb visualization]
-viz_subplan_denoising: True # set True to upload plan/plan_at_* to wandb (slow)
-viz_agent_rollout: False # set True to upload *_interaction/sample_*_video to wandb (slow)
-viz_final_plans: True
-viz_compare_expanded_to_value: True
-profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
-frame_sampling_way: "quadratic" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
-
-# HILP memoization: precompute phi(s) on a 2D grid and use bilinear interpolation
-# instead of running the full encoder at every MCTS query (speeds up value calls).
-use_hilp_memoization: true # set true to enable
-hilp_memoization_grid_size: 360 # grid resolution per axis (100 → 10 000 pts)
+horizon_scale: 0.50 # horizon = episode_len * horizon_scale
+sequence_dividing_factor: 2
+parallel_search_num: 8
 
 # HILP value function guidance
 # For .pkl checkpoints (JAX/Flax): all hyper-params are auto-detected from the file.
@@ -78,11 +58,32 @@ hilp_memoization_grid_size: 360 # grid resolution per axis (100 → 10 000 pts)
 #   If no sidecar exists, inner_prod is used (matches training default).
 # For legacy .pt checkpoints: hilp_obs_dim / hilp_skill_dim are still needed.
 hilp_checkpoint_path: "td_models/params_1000000_20260324_002241.pkl"
-mctd_guidance_scales: [0.3] # HILP gradient scale for near-target positions (TD_thres or above)
+mctd_guidance_scales: [0.4, 0.1] # HILP gradient scale for near-target positions (TD_thres or above)
 rmse_guidance_scale: 0.4 # RMSE direction scale for far-target positions (below TD_thres)
 anchor_guidance_scale: 0.4 # 0.4
 rdf_guidance_scale: 0.0
-particle_guidance_scale: 0.0 # sibling repulsion during denoising (0 = disabled)
+particle_guidance_scale: 0.1 # sibling repulsion during denoising (0 = disabled)
+
+#[state proximity threshold]
+use_TD_metric_as_dist: true # If true, use HILP temporal distance (-V(s,g)) instead of L2(x,y) for all state proximity checks
+warp_threshold: 3.0
+diverge_threshold: 4.0 # min endpoint distance to count as distinct path (below → deduplicate)
+min_progress_threshold: 1.5 # min distance (x,y) between sub_plan start and end; plans below this are discarded (0 = disabled)
+plan_feasibility_delta: 99999.0 # max per-frame movement (world units) to count a plan as feasible (set high to disable)
+meeting_delta: 1.5
+
+#[wandb visualization]
+viz_subplan_denoising: true # set True to upload plan/plan_at_* to wandb (slow)
+viz_agent_rollout: true # set True to upload *_interaction/sample_*_video to wandb (slow)
+viz_final_plans: True
+viz_compare_expanded_to_value: false
+profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
+frame_sampling_way: "quadratic" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
+
+# HILP memoization: precompute phi(s) on a 2D grid and use bilinear interpolation
+# instead of running the full encoder at every MCTS query (speeds up value calls).
+use_hilp_memoization: true # set true to enable
+hilp_memoization_grid_size: 360 # grid resolution per axis (100 → 10 000 pts)
 
 # HILP guidance mode flags
 use_score_func_with_TD: true # if true: HILP grad + KDE score grad; if false: HILP grad only
@@ -91,7 +92,7 @@ TD_thres_for_far_target: -200.0 # HILP value threshold: V < threshold → use RM
 
 # [Kernal Density Estimation for extracting score function of training data]
 kde_sigma: 0.2 # KDE bandwidth (world units)
-kde_lam: 0.07 # scale for ∇log p term
+kde_lam: 0.05 # 0.07 # scale for ∇log p term
 kde_sample_ratio: 0.1 # fraction of dataset to use for KDE (1.0 = full dataset)
 kde_save_dir: ${dataset.save_dir} # dataset npz directory for KDE positions
 

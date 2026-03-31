@@ -123,14 +123,15 @@ print(d.get('num_tasks', 5))
 " 2>/dev/null)
 NUM_TASKS="${NUM_TASKS:-5}"
 
-NUM_SEEDS=3       # multiple seeds for statistical reliability
+NUM_SEEDS=50      # OGBench official: 50 rollouts per goal (Appendix E.4)
+                  # Reduced alternative: 20 rollouts per goal (author-approved)
 START_TASK_IDX=1  # always start from task 1 (full coverage)
 
 echo "Configuration summary:"
 echo "  Dataset    : $SELECTED_DATASET (obs_dim=${STATE_DIM})"
 echo "  Model      : $SELECTED_MODEL_ID"
 echo "  Tasks      : ${NUM_TASKS} tasks (task IDs ${START_TASK_IDX}–${NUM_TASKS})"
-echo "  Seeds      : ${NUM_SEEDS} per task"
+echo "  Seeds      : ${NUM_SEEDS} per task  (OGBench official: 50 rollouts/goal)"
 echo "  Total jobs : $((NUM_TASKS * NUM_SEEDS))"
 echo ""
 

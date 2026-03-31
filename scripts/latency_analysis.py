@@ -250,24 +250,47 @@ def report_execute_plan(records: List[Dict]):
         return
 
     data = [r.get("data", {}) for r in recs]
-    total = [d.get("total_exec_ms", 0) for d in data]
-    action = [d.get("action_mean_ms", 0) for d in data]
-    env_step = [d.get("env_step_mean_ms", 0) for d in data]
-    action_pct = [d.get("action_pct", 0) for d in data]
+    total    = [d.get("total_exec_ms", 0) for d in data]
     loop_cnt = [d.get("loop_cnt", 0) for d in data]
 
     section("Plan Execution  (timing.execute_plan)")
     table(
         [
-            ("n segments",           len(recs),                        ""),
-            ("avg steps executed",   f"{avg(loop_cnt):.0f}",           ""),
-            ("avg total exec",       f"{avg(total):.0f} ms",           f"max {max(total):.0f} ms"),
-            ("avg ms / action",      f"{avg(action):.2f} ms",          ""),
-            ("avg ms / env_step",    f"{avg(env_step):.2f} ms",        ""),
-            ("action compute %",     f"{avg(action_pct):.1f}%",        ""),
+            ("n segments",         len(recs),                       ""),
+            ("avg steps executed", f"{avg(loop_cnt):.0f}",          f"max {max(loop_cnt):.0f}"),
+            ("avg total exec",     f"{avg(total):.0f} ms",          f"max {max(total):.0f} ms"),
+            ("avg ms / step",      f"{avg(total)/max(avg(loop_cnt),1):.1f} ms", ""),
         ],
         ["Metric", "Mean", "Peak"],
     )
+
+    # Per-component breakdown table
+    components = [
+        ("dist (subgoal TD/L2)",  "dist_total_ms",     "dist_mean_ms",     "dist_pct"),
+        ("action compute",        "action_total_ms",   "action_mean_ms",   "action_pct"),
+        ("env.step()",            "env_step_total_ms", "env_step_mean_ms", "env_step_pct"),
+        ("_get_sim_state()",      "get_state_total_ms","get_state_mean_ms","get_state_pct"),
+        ("overhead (traj/reward)","overhead_total_ms", "overhead_mean_ms", "overhead_pct"),
+    ]
+    rows = []
+    for label, tot_key, mean_key, pct_key in components:
+        tot_vals  = [d.get(tot_key,  0) for d in data]
+        mean_vals = [d.get(mean_key, 0) for d in data]
+        pct_vals  = [d.get(pct_key,  0) for d in data]
+        if any(v > 0 for v in tot_vals):
+            rows.append((
+                label,
+                f"{avg(tot_vals):.0f} ms",
+                f"{avg(mean_vals):.2f} ms/step",
+                f"{avg(pct_vals):.1f}%",
+            ))
+    if rows:
+        print()
+        table(rows, ["Component", "Total (avg)", "Per-step (avg)", "% of exec"])
+
+    env_max = [d.get("env_step_max_ms", 0) for d in data]
+    if any(v > 0 for v in env_max):
+        print(f"\n  env.step() spike: max {max(env_max):.1f} ms")
 
 
 def report_lifecycle(records: List[Dict]):
@@ -378,6 +401,72 @@ def report_expansions(records: List[Dict]):
         print(f"    total GPU time   : {sum(all_expansion_ms):.0f} ms")
 
 
+def report_hilp_viz(records: List[Dict]):
+    """timing.hilp_viz: heatmap + grad-field computation (inside planning_ms)."""
+    recs = get_tag(records, "timing.hilp_viz")
+    if not recs:
+        print("  [timing.hilp_viz] No records — add logging around _compute_hilp_heatmap/_compute_guidance_grad_fields")
+        return
+    data = [r.get("data", {}) for r in recs]
+    hm   = [d.get("heatmap_ms",    0) for d in data]
+    gf   = [d.get("grad_field_ms", 0) for d in data]
+    tot  = [d.get("total_ms",      0) for d in data]
+    section("HILP Viz (inside planning)  (timing.hilp_viz)")
+    table(
+        [
+            ("n calls",           len(recs),                        ""),
+            ("avg heatmap",       f"{avg(hm):.0f} ms",  f"max {max(hm):.0f} ms"),
+            ("avg grad_field",    f"{avg(gf):.0f} ms",  f"max {max(gf):.0f} ms"),
+            ("avg total",         f"{avg(tot):.0f} ms", f"max {max(tot):.0f} ms"),
+        ],
+        ["Metric", "Mean", "Peak"],
+    )
+
+
+def report_plan_postproc(records: List[Dict]):
+    """timing.plan_postproc: reorder + pre-exec viz (between planning_end and exec_start)."""
+    recs = get_tag(records, "timing.plan_postproc")
+    if not recs:
+        print("  [timing.plan_postproc] No records — add logging around _reorder_plan_by_proximity / pre-exec viz")
+        return
+    data    = [r.get("data", {}) for r in recs]
+    reorder = [d.get("reorder_ms",       0) for d in data]
+    viz     = [d.get("pre_exec_viz_ms",  0) for d in data]
+    tot     = [d.get("total_ms",         0) for d in data]
+    nframes = [d.get("n_frames",         0) for d in data]
+    section("Plan Postproc (between planning & exec)  (timing.plan_postproc)")
+    table(
+        [
+            ("n calls",            len(recs),                          ""),
+            ("avg n_frames",       f"{avg(nframes):.0f}",              ""),
+            ("avg reorder",        f"{avg(reorder):.0f} ms",  f"max {max(reorder):.0f} ms"),
+            ("avg pre_exec_viz",   f"{avg(viz):.0f} ms",     f"max {max(viz):.0f} ms"),
+            ("avg total",          f"{avg(tot):.0f} ms",     f"max {max(tot):.0f} ms"),
+        ],
+        ["Metric", "Mean", "Peak"],
+    )
+
+
+def report_post_exec(records: List[Dict]):
+    """timing.post_exec: trajectory stack + viz + log_image after execution."""
+    recs = get_tag(records, "timing.post_exec")
+    if not recs:
+        print("  [timing.post_exec] No records — add logging around post-execution visualization")
+        return
+    data  = [r.get("data", {}) for r in recs]
+    tot   = [d.get("total_ms", 0) for d in data]
+    steps = [d.get("n_steps",  0) for d in data]
+    section("Post-Execution Viz  (timing.post_exec)")
+    table(
+        [
+            ("n calls",        len(recs),                         ""),
+            ("avg n_steps",    f"{avg(steps):.0f}",               ""),
+            ("avg total",      f"{avg(tot):.0f} ms",   f"max {max(tot):.0f} ms"),
+        ],
+        ["Metric", "Mean", "Peak"],
+    )
+
+
 def report_summary(records: List[Dict]):
     """Quick tag count overview to see what timing data is available."""
     from collections import Counter
@@ -418,6 +507,9 @@ def main():
     report_guidance_overhead(records)
     report_guidance_breakdown(records)
     report_execute_plan(records)
+    report_hilp_viz(records)
+    report_plan_postproc(records)
+    report_post_exec(records)
 
 
 if __name__ == "__main__":

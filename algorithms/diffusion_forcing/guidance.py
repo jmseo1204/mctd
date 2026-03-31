@@ -481,50 +481,68 @@ def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     # Return negative loss (gradient descent will minimize repulsion)
     return -mean_loss
 
-def particle_guidance(planner, x: torch.Tensor, group_ids: Optional[list] = None) -> torch.Tensor:
+def particle_guidance(planner, x: torch.Tensor, horizon: int, group_ids: Optional[list] = None) -> torch.Tensor:
     """
-    Particle diversity guidance based on RBF kernel similarity.
+    Particle diversity guidance via pairwise L2 repulsion at segment tail positions.
+
+    Targets the same positions as goal_guidance (segment tail x,y coords), so gradient
+    magnitudes are naturally unit-normalized — matching the scale of goal_guidance and
+    anchor_dist_guidance.
 
     Args:
         planner: The DiffusionForcingPlanning instance
         x: (t, b, fs*c) normalized prediction tensor
+        horizon: planning horizon in timesteps (same as passed to goal_guidance)
         group_ids: Optional list of length b. Elements sharing the same integer id belong
             to the same sibling group and repel each other. Cross-group pairs are ignored.
             If None, all pairs repel (original behaviour).
 
     Returns:
-        loss: scalar negative diversity loss
+        loss: scalar negative mean L2 distance (minimizing pushes particles apart)
     """
     b = x.shape[1]
     if b <= 1:
         return x.sum() * 0.0
 
-    x_flat = rearrange(
-        x, "t b (fs c) -> b (t fs c)", fs=planner.frame_stack
-    )  # (b, t*fs*c)
+    pred = prepare_pred(planner, x)  # (t*fs, b, c) unnormalized
+    T = pred.shape[0]
+    segment_size = horizon // planner.sequence_dividing_factor
 
-    # Shape: [b, b]
-    dist_sq = torch.cdist(x_flat, x_flat, p=2).pow(2)
+    # Tail positions: identical to goal_guidance causal mode
+    tail_pos = torch.arange(
+        planner.frame_stack + segment_size - 1,
+        planner.frame_stack + horizon,
+        segment_size,
+        device=pred.device,
+    )
+    tail_pos = tail_pos[tail_pos < T]  # (n_tails,)
 
-    h = torch.median(dist_sq.detach())
-    if h == 0:
-        h = 1.0  # Fallback to avoid division by zero
+    if len(tail_pos) == 0:
+        return x.sum() * 0.0
 
-    kernel_matrix = torch.exp(-dist_sq / h)  # (b, b)
+    pos_dim = planner.pos_dim  # 2 (x, y)
+    # Extract (x,y) at tail positions: (n_tails, b, pos_dim) → (b, n_tails*pos_dim)
+    tails = pred[tail_pos, :, :pos_dim]                       # (n_tails, b, pos_dim)
+    tails_flat = tails.permute(1, 0, 2).reshape(b, -1)        # (b, n_tails*pos_dim)
+
+    # Pairwise L2 distance — gradient is unit-normalized by construction
+    dist = torch.cdist(tails_flat, tails_flat, p=2)  # (b, b)
 
     if group_ids is not None:
-        # Repel only within-group siblings; zero out cross-group and self pairs
-        gids = torch.tensor(group_ids, device=x.device, dtype=torch.long)  # (b,)
-        same_group = (gids.unsqueeze(0) == gids.unsqueeze(1)).float()       # (b, b)
-        pair_mask = same_group * (1.0 - torch.eye(b, device=x.device))      # (b, b) — no diagonal
+        gids = torch.tensor(group_ids, device=x.device, dtype=torch.long)
+        same_group = (gids.unsqueeze(0) == gids.unsqueeze(1)).float()
+        pair_mask = same_group * (1.0 - torch.eye(b, device=x.device))
         n_pairs = pair_mask.sum()
         if n_pairs == 0:
             return x.sum() * 0.0
-        similarity = (kernel_matrix * pair_mask).sum() / n_pairs
+        mean_dist = (dist * pair_mask).sum() / n_pairs
     else:
-        similarity = (kernel_matrix.sum() - b) / (b * (b - 1))
+        off_diag = 1.0 - torch.eye(b, device=x.device)
+        mean_dist = (dist * off_diag).sum() / off_diag.sum()
 
-    return -similarity
+    # Positive: DPS applies pred_noise -= grad, so pred_x_start moves in grad direction.
+    # grad(mean_dist) w.r.t. pred_i points AWAY from j → repulsion (diversity).
+    return mean_dist
 
 def combined_guidance(planner, x_start, goal, horizon, guidance_scale,
                       particle_guidance_scale: float = 0.0,
@@ -558,7 +576,7 @@ def combined_guidance(planner, x_start, goal, horizon, guidance_scale,
     rdf_loss = segment_rdf_guidance(planner, x_start, horizon) * planner.rdf_guidance_scale
 
     particle_loss = (
-        particle_guidance(planner, x_start, group_ids=group_ids) * particle_guidance_scale
+        particle_guidance(planner, x_start, horizon=horizon, group_ids=group_ids) * particle_guidance_scale
         if particle_guidance_scale > 0.0
         else x_start.sum() * 0.0  # zero but connected to x_start for autograd
     )

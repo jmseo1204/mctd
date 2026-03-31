@@ -397,9 +397,12 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
             X_p, Y_p = X_w, Y_w
         U = hilp_grads[:, :, 0]
         V = hilp_grads[:, :, 1]
-        mag = np.sqrt(U ** 2 + V ** 2) + 1e-8
-        U_n = U / mag
-        V_n = V / mag
+        mag = np.sqrt(U ** 2 + V ** 2)
+        mean_mag = float(mag.mean()) if mag.size > 0 else 1.0
+        std_mag = float(mag.std()) if mag.size > 0 else 0.0
+        scale_denom = max(mean_mag, 1e-8)
+        U_n = U / scale_denom
+        V_n = V / scale_denom
 
         if far_mask_grid is None:
             far_mask_grid = np.zeros_like(U_n, dtype=bool)
