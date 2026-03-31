@@ -13,7 +13,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Docker configuration (matches run_jobs.py / train_interactive.sh)
 DOCKER_USER="jmseo1204"
 DOCKER_PROJECT="/home/$DOCKER_USER/mctd"
-OGBENCH_DATA_DIR="/mnt/c/Users/USER/Desktop/test_ogbench/ogbench_data"
+OGBENCH_DATA_DIR="$(dirname "$PROJECT_DIR")/ogbench_data"
 HOME_DIR="$HOME"
 
 # Source shared checkpoint utilities (sets MCTD_DOCKER_IMAGE, MCTD_DOCKER_OUTPUTS,
