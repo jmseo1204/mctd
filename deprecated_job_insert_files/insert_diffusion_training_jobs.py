@@ -1,9 +1,14 @@
 import os
+import sys
 import copy
 import json
 from datetime import datetime
+from pathlib import Path
 
-wandb_entity = "jmseo1204-seoul-national-university"
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+from project_config import WANDB_ENTITY
+
+wandb_entity = WANDB_ENTITY
 wandb_project = "mctd_eval"
 
 configs = [

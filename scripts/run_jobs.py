@@ -8,6 +8,7 @@ import datetime
 import threading
 import yaml
 from tqdm import tqdm
+from project_config import DOCKER_USER as _cfg_docker_user, WANDB_ENTITY as _cfg_wandb_entity
 
 # Logging setup
 LOG_DIR = "logs"
@@ -37,7 +38,8 @@ available_gpus = ["localhost:0"]
 
 jobs_folder = "jobs"
 docker_image = "mctd:0.1"
-docker_user = "jmseo1204"
+docker_user = _cfg_docker_user
+wandb_entity = _cfg_wandb_entity
 home_dir = os.path.expanduser("~")
 project_dir = os.getcwd()
 ogbench_data_dir = os.path.abspath(os.path.join(project_dir, "..", "ogbench_data"))
@@ -45,7 +47,7 @@ hilp_dir = os.path.abspath(os.path.join(project_dir, "..", "HILP"))
 jax_cache_dir = os.path.expanduser("~/.jax_cache")
 os.makedirs(jax_cache_dir, exist_ok=True)
 os.makedirs(os.path.join(jax_cache_dir, "xla_gpu_per_fusion_autotune_cache_dir"), exist_ok=True)
-output_mount_dir = "/home/jmseo1204/mctd_outputs"
+output_mount_dir = f"/home/{docker_user}/mctd_outputs"
 os.makedirs(output_mount_dir, exist_ok=True)
 os.system(f"chmod 777 {output_mount_dir}")
 # Ensure today's date dir is writable by Docker (uid 1020) if already created by host user
@@ -170,7 +172,8 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -e HYDRA_FULL_ERROR=1 \
         -e CUDA_VISIBLE_DEVICES=0 \
         -e WANDB_EXIT_TIMEOUT=120 \
-        -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/jmseo1204/.mujoco/mujoco210/bin \
+        -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/{docker_user}/.mujoco/mujoco210/bin \
+        -e WANDB_ENTITY={wandb_entity} \
         -v /usr/lib/wsl:/usr/lib/wsl \
         -v {project_dir}:/home/{docker_user}/mctd \
         -v {output_mount_dir}:/home/{docker_user}/mctd/outputs \

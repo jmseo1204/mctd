@@ -1,14 +1,19 @@
 import os
+import sys
 import copy
 import json
 from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+from project_config import WANDB_ENTITY
 
 # seeds 0 to 9 to match antmaze script
 seeds = list(range(3))
 # Task IDs 1 to 5 for Giant Maze (Environment requirement)
 task_ids = [1, 2, 3, 4, 5]
 
-wandb_entity = "jmseo1204-seoul-national-university"
+wandb_entity = WANDB_ENTITY
 wandb_project = "mctd_eval"
 
 # repeat_num 3 to match antmaze script for robustness

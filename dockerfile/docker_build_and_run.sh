@@ -9,10 +9,11 @@ set -e
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/project_config.sh
+source "$PROJECT_DIR/scripts/project_config.sh"
 DOCKERFILE_DIR="$SCRIPT_DIR"
 DOCKER_IMAGE_NAME="mctd"
 DOCKER_IMAGE_TAG="0.1"
-DOCKER_USER="jmseo1204"
 CONTAINER_NAME="mctd_container"
 
 # Data paths (adjust as needed)

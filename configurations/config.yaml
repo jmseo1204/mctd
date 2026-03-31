@@ -10,7 +10,7 @@ jump: 1 # global jump flag will be passed into configuration of experiment, data
 
 wandb:
   group: algorithm.task_id # wandb group name
-  entity: jmseo1204-seoul-national-university # wandb account name / organization name [fixme]
+  entity: ${oc.env:WANDB_ENTITY,jmseo1204-seoul-national-university} # set via WANDB_ENTITY env var (see scripts/project_config.sh)
   project: mctd_eval # wandb project name; if not provided, defaults to root folder name [fixme]
   mode: online # set wandb logging to online, offline or dryrun
 

@@ -10,8 +10,11 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Load central user config (DOCKER_USER) before anything else
+# shellcheck source=scripts/project_config.sh
+source "$PROJECT_DIR/scripts/project_config.sh"
+
 # Docker configuration (matches run_jobs.py / train_interactive.sh)
-DOCKER_USER="jmseo1204"
 DOCKER_PROJECT="/home/$DOCKER_USER/mctd"
 OGBENCH_DATA_DIR="$(dirname "$PROJECT_DIR")/ogbench_data"
 HOME_DIR="$HOME"
@@ -388,6 +391,7 @@ fi
 FULL_CMD="docker run --rm --gpus all --name mctd_training --shm-size=8g \
     -e MUJOCO_GL=osmesa \
     -e HYDRA_FULL_ERROR=1 \
+    -e WANDB_ENTITY=$WANDB_ENTITY \
     -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/$DOCKER_USER/.mujoco/mujoco210/bin \
     -v /usr/lib/wsl:/usr/lib/wsl \
     -v $PROJECT_DIR:$DOCKER_PROJECT \

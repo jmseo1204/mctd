@@ -8,7 +8,8 @@
 
 set -e
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DOCKER_USER="jmseo1204"
+# shellcheck source=scripts/project_config.sh
+source "$PROJECT_DIR/scripts/project_config.sh"
 DOCKER_IMAGE="mctd:0.1"
 
 # 데이터셋: ~/.ogbench/data 우선, 없으면 ../ogbench_data fallback

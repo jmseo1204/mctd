@@ -4,9 +4,14 @@ import numpy as np
 import inspect
 from collections import defaultdict
 import os
+import sys
 import json
+from pathlib import Path
 
-wandb_entity = "jmseo1204-seoul-national-university"
+sys.path.insert(0, str(Path(__file__).parent / "scripts"))
+from project_config import WANDB_ENTITY
+
+wandb_entity = WANDB_ENTITY
 wandb_project = "mctd_eval"
 
 group_names = [

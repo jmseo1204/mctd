@@ -22,11 +22,14 @@
 _MCTD_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MCTD_PROJECT_DIR="${MCTD_PROJECT_DIR:-$(cd "$_MCTD_LIB_DIR/.." && pwd)}"
 
+# ── Load central user config (sets DOCKER_USER) ───────────────────────────────
+source "$_MCTD_LIB_DIR/project_config.sh"
+
 # ── Shared constants (callers may override before sourcing) ──────────────────
 MCTD_DOCKER_IMAGE="${MCTD_DOCKER_IMAGE:-mctd:0.1}"
-MCTD_DOCKER_USER="${MCTD_DOCKER_USER:-jmseo1204}"
+MCTD_DOCKER_USER="${MCTD_DOCKER_USER:-$DOCKER_USER}"
 MCTD_DOCKER_OUTPUTS="/home/$MCTD_DOCKER_USER/mctd/outputs"
-MCTD_OUTPUT_MOUNT_DIR="${MCTD_OUTPUT_MOUNT_DIR:-/home/jmseo1204/mctd_outputs}"
+MCTD_OUTPUT_MOUNT_DIR="${MCTD_OUTPUT_MOUNT_DIR:-/home/$DOCKER_USER/mctd_outputs}"
 MCTD_EVAL_BASE="$MCTD_OUTPUT_MOUNT_DIR"
 
 # ── mctd_dim_menu ─────────────────────────────────────────────────────────────

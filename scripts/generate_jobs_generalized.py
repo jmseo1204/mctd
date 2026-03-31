@@ -5,8 +5,9 @@ import argparse
 from datetime import datetime
 import copy
 from pathlib import Path
+from project_config import DOCKER_USER as _DOCKER_USER, WANDB_ENTITY as _WANDB_ENTITY
 
-def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir="outputs/downloaded/jmseo1204-seoul-national-university/mctd_eval"):
+def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/mctd_eval"):
     """
     Infer frame_stack from checkpoint weights.
     init_mlp.0.weight has shape (hidden, x_dim + k_embed_dim + external_cond_dim).
@@ -80,7 +81,7 @@ def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir="out
     return None
 
 
-def detect_network_size_from_ckpt(model_id, downloaded_dir="outputs/downloaded/jmseo1204-seoul-national-university/mctd_eval"):
+def detect_network_size_from_ckpt(model_id, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/mctd_eval"):
     """
     Infer network_size (hidden dimension) from checkpoint weights.
     Checks transformer layer self_attn.in_proj_weight shape[1] for hidden dim.
@@ -191,7 +192,7 @@ def detect_network_size_from_ckpt(model_id, downloaded_dir="outputs/downloaded/j
     return None
 
 
-def find_local_training_config(model_id, downloaded_dir="outputs/downloaded/jmseo1204-seoul-national-university/mctd_eval"):
+def find_local_training_config(model_id, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/mctd_eval"):
     """
     Find training_config.yaml saved by train.sh alongside the checkpoint.
     Written in plain-YAML format; extract_from_config() handles it without changes.
@@ -202,7 +203,9 @@ def find_local_training_config(model_id, downloaded_dir="outputs/downloaded/jmse
     return None
 
 
-def find_config_yaml(model_id, outputs_root="/home/jmseo1204/mctd_outputs"):
+def find_config_yaml(model_id, outputs_root=None):
+    if outputs_root is None:
+        outputs_root = f"/home/{_DOCKER_USER}/mctd_outputs"
     """
     Search for config.yaml in WANDB run directories matching the model_id.
 
@@ -343,7 +346,7 @@ def load_full_config(dataset_name, algo_name="df_planning"):
         print(f"Error loading configs: {e}")
         return None
 
-def load_training_hparams_from_ckpt(model_id, downloaded_dir="outputs/downloaded/jmseo1204-seoul-national-university/mctd_eval"):
+def load_training_hparams_from_ckpt(model_id, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/mctd_eval"):
     """Load training_hparams saved by df_base.on_save_checkpoint from the checkpoint file.
 
     New checkpoints (trained after the save_hyperparameters refactor) embed all arch
@@ -405,7 +408,7 @@ def main():
     parser.add_argument("--start_task_id", type=int, default=1, help="Starting task index (1-based)")
     parser.add_argument("--horizon_scale", type=float, default=None, help="Override Multiplier")
     parser.add_argument("--episode_len", type=int, default=None, help="Override episode_len (useful for offline/local runs without config.yaml)")
-    parser.add_argument("--outputs_root", default="/home/jmseo1204/mctd_outputs", help="Root directory of outputs/wandb logs")
+    parser.add_argument("--outputs_root", default=f"/home/{_DOCKER_USER}/mctd_outputs", help="Root directory of outputs/wandb logs")
 
     args = parser.parse_args()
 
@@ -531,7 +534,7 @@ def main():
     # NO LONGER included for new checkpoints — exp_base reads them from training_hparams.
     # Only dataset-side and eval-side params go in the job.
     basic_job_config = {
-        "wandb.entity": "jmseo1204-seoul-national-university",
+        "wandb.entity": _WANDB_ENTITY,
         "wandb.project": "mctd_eval",
         "wandb.group": f"EVAL-{args.model_id}",
         "experiment": "exp_planning",
