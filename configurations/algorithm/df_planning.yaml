@@ -37,7 +37,7 @@ parallel_multiple_visits: False
 
 mctd_num_denoising_steps: 20 # Must be <= sampling_timesteps in df_base.yaml
 leaf_parallelization: True
-mctd_max_search_num: 70
+mctd_max_search_num: 40
 max_child_resets: 3 # max times a node's children can be wiped and re-expanded when all are exhausted non-terminal
 padding_mode: "same" # "zero" or "same"
 DEBUG: True
@@ -47,9 +47,9 @@ num_tries_for_bad_plans: 5
 open_loop_horizon: 1000 #fixme -> best: episode_len*horizon_scale
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
 sub_goal_interval: 1
-horizon_scale: 0.50 # horizon = episode_len * horizon_scale
-sequence_dividing_factor: 2
-parallel_search_num: 8
+horizon_scale: 0.48 # horizon = episode_len * horizon_scale
+sequence_dividing_factor: 3
+parallel_search_node: 3 # parallel_search_num = parallel_search_node * sequence_dividing_factor
 
 # HILP value function guidance
 # For .pkl checkpoints (JAX/Flax): all hyper-params are auto-detected from the file.
