@@ -518,12 +518,12 @@ class BaseLightningExperiment(BaseExperiment):
         if not hparams:
             return
 
-        # episode_len: not declared in any YAML → inject via open_dict
+        # episode_len: now declared in df_planning.yaml as ${dataset.episode_len}.
+        # Update dataset.episode_len first; algorithm.episode_len interpolates from it.
         if 'episode_len' in hparams:
             ep_len = int(hparams['episode_len'])
-            OmegaConf.update(self.root_cfg, "dataset.episode_len", ep_len)
-            with open_dict(self.root_cfg.algorithm):
-                self.root_cfg.algorithm.episode_len = ep_len
+            OmegaConf.update(self.root_cfg, "dataset.episode_len", ep_len, merge=True)
+            OmegaConf.update(self.root_cfg, "algorithm.episode_len", ep_len, merge=True)
 
         # All other params: declared in df_base.yaml schema → standard update
         updates = {}

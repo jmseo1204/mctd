@@ -190,6 +190,9 @@ class PlanExecutorMixin:
         _reached_last_subgoal = False
         rollout_agent_positions = []
         rollout_subgoal_positions = []
+        mujoco_frames = []
+        _mujoco_renderer = getattr(self, "_cached_mujoco_renderer", None)
+        _overhead_camera = getattr(self, "_cached_overhead_camera", None)
 
         # [TIMING] execution breakdown
         _exec_t0 = time.time()
@@ -251,6 +254,19 @@ class PlanExecutorMixin:
             # Ensure obs_numpy is 2D: (batch_size, obs_dim)
             if obs_numpy.ndim == 1:
                 obs_numpy = obs_numpy[None, :]  # Add batch dimension
+
+            # [MUJOCO RENDER] Capture overhead frame after each step
+            if _mujoco_renderer is not None and _overhead_camera is not None:
+                try:
+                    import mujoco as _mujoco
+                    import numpy as _np
+                    _mujoco_renderer.update_scene(envs.envs[0].data, camera=_overhead_camera)
+                    _frame = _mujoco_renderer.render()
+                    # Rotate 90° clockwise to correct overhead orientation
+                    _frame = _np.rot90(_frame, k=3)
+                    mujoco_frames.append(_frame.copy())
+                except Exception:
+                    pass
 
             _overhead_t0 = time.time()
 
@@ -333,6 +349,7 @@ class PlanExecutorMixin:
         rollout_viz = {
             "agent_positions": np.asarray(rollout_agent_positions, dtype=np.float32),
             "subgoal_positions": np.asarray(rollout_subgoal_positions, dtype=np.float32),
+            "mujoco_frames": np.stack(mujoco_frames) if mujoco_frames else None,
         }
 
         return trajectory, reward_dict, rollout_viz

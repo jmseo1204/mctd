@@ -94,15 +94,19 @@ class DiffusionForcingBase(BasePytorchAlgo):
                 'architecture': arch,
             },
         }
-        # episode_len is resolved from dataset config at init time (df_planning line 118).
-        # Always save it so eval-time job generation never falls back to stale WandB/hydra configs.
-        episode_len = (
+        # Save effective (subsampled) episode_len = raw_episode_len // jump.
+        # jump is now in df_base.yaml as ${jump}, so self.cfg.jump is always available.
+        # This ensures eval-time job generation gets the model-aligned episode_len directly
+        # without relying on stale WandB/hydra configs.
+        jump = int(self.cfg.get('jump', 1))
+        hparams['jump'] = jump
+        raw_episode_len = (
             int(self.cfg.episode_len) if hasattr(self.cfg, 'episode_len')
             else int(self.cfg.dataset.episode_len) if hasattr(self.cfg, 'dataset') and hasattr(self.cfg.dataset, 'episode_len')
             else None
         )
-        if episode_len is not None:
-            hparams['episode_len'] = episode_len
+        if raw_episode_len is not None:
+            hparams['episode_len'] = raw_episode_len // jump
         checkpoint['training_hparams'] = hparams
 
     def _build_model(self):

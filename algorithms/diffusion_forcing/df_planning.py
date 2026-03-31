@@ -20,6 +20,7 @@ from utils.logging_utils import (
     make_mpc_animation,
     get_maze_grid,
     is_grid_env,
+    _sample_frame_indices,
 )
 from utils.tracer import Tracer, set_default_tracer, get_tracer
 from .tree_node import TreeNode
@@ -212,6 +213,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.validation_video_fps: int = int(cfg.get("validation_video_fps", 8))
         self.viz_subplan_denoising: bool = bool(cfg.get("viz_subplan_denoising", False))
         self.viz_agent_rollout: bool = bool(cfg.get("viz_agent_rollout", False))
+        self.viz_mujoco_renderer: bool = bool(cfg.get("viz_mujoco_renderer", False))
         self.viz_compare_expanded_to_value: bool = bool(cfg.get("viz_compare_expanded_to_value", False))
 
         # Initialize memory profiler for debugging
@@ -221,9 +223,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         else:
             self.profiler = None
 
-        # Preload KDE dataset positions (full dataset, done once at init)
-        if self.kde_lam > 0.0:
-            self._load_kde_data_xy()
+        # KDE is only needed during planning (interact/eval), not training.
+        # Loaded lazily on first interact() call.
 
         print(f"[LIFECYCLE +{time.time()-_PROC_T0:.1f}s] algo.__init__ complete", flush=True)
 
@@ -1192,11 +1193,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         conditions: Optional[Any] = None,
         namespace: str = "validation",
     ) -> None:
+        # Lazy KDE load: skip during training, load once on first eval/interact call.
+        if self.kde_lam > 0.0 and not hasattr(self, "_kde_data_xy_cache"):
+            self._load_kde_data_xy()
+
         try:
             import gym
             import ogbench
             from stable_baselines3.common.vec_env import DummyVecEnv
-            from algorithms.diffusion_forcing.env_manager import EnvironmentManager
         except ImportError:
             print(
                 "d4rl import not successful, skipping environment interaction. Check d4rl installation."
@@ -1233,47 +1237,44 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             use_diffused_action = False
             agent = None  # Initialize agent to None; will be set for antmaze
 
-            # [ENV CACHING] Check if environment is cached and batch_size matches
-            env_cache_key = f"{self.env_id}_{batch_size}"
+            # [ENV CACHING] Check if environment is cached
+            env_cache_key = f"{self.env_id}_{self.task_id}"
             if (
-                hasattr(self, "_cached_envs_forward")
+                hasattr(self, "_cached_envs")
                 and hasattr(self, "_cached_env_key")
                 and self._cached_env_key == env_cache_key
             ):
-                # Reuse cached bidirectional environments
-                envs_forward = self._cached_envs_forward
-                envs_backward = self._cached_envs_backward
+                # Reuse cached single environment
+                envs = self._cached_envs
                 agent = getattr(self, "_cached_agent", None)
-                envs_forward.reset()
-                envs_backward.reset()
+                envs.reset()
                 if not (self.env_id in OGBENCH_ENVS):
-                    envs_forward.seed(self.interaction_seed)
-                    envs_backward.seed(self.interaction_seed)
-                # For backward compatibility
-                envs = envs_forward
+                    envs.seed(self.interaction_seed)
             else:
-                # Create new bidirectional environments
+                # Create single environment
+                # Use higher resolution when mujoco renderer is enabled
+                _render_size = 480 if (self.viz_agent_rollout and self.viz_mujoco_renderer) else 200
                 if self.env_id in OGBENCH_ENVS:
                     if "pointmaze" in self.env_id:
-                        env_fns = [
-                            lambda: ogbench.locomaze.maze.make_maze_env(
-                                "point", "maze", maze_type=self.env_id.split("-")[1]
-                            )
-                        ] * batch_size
+                        _maze_type = self.env_id.split("-")[1]
+                        env_fn = lambda: ogbench.locomaze.maze.make_maze_env(
+                            "point", "maze", maze_type=_maze_type,
+                            width=_render_size, height=_render_size,
+                        )
                         use_diffused_action = True
                     elif "antmaze" in self.env_id:
-                        env_fns = [
-                            lambda: ogbench.locomaze.maze.make_maze_env(
-                                "ant", "maze", maze_type=self.env_id.split("-")[1]
-                            )
-                        ] * batch_size
+                        _maze_type = self.env_id.split("-")[1]
+                        env_fn = lambda: ogbench.locomaze.maze.make_maze_env(
+                            "ant", "maze", maze_type=_maze_type,
+                            width=_render_size, height=_render_size,
+                        )
                         from dql.main_Antmaze import hyperparameters
                         from dql.agents.ql_diffusion import Diffusion_QL as Agent
 
                         params = hyperparameters[self.dataset]
-                        
+
                         # Create temporary env to get dimensions
-                        _temp_env = DummyVecEnv(env_fns)
+                        _temp_env = DummyVecEnv([env_fn])
                         state_dim = _temp_env.observation_space.shape[0]
                         action_dim = _temp_env.action_space.shape[0]
                         max_action = float(_temp_env.action_space.high[0])
@@ -1323,37 +1324,55 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         )
                         print(f"[INIT] DQL agent loaded: {dql_folder}", flush=True)
                 else:
-                    env_fns = [lambda: gym.make(self.env_id)] * batch_size
+                    env_fn = lambda: gym.make(self.env_id)
                     agent = None
 
-                # Create bidirectional environments using EnvironmentManager
-                env_manager = EnvironmentManager(
-                    env_id=self.env_id,
-                    batch_size=batch_size,
-                    task_id=self.task_id,
-                    use_random_goals=self.use_random_goals_for_interaction,
-                )
-                envs_forward, envs_backward = env_manager.create_bidirectional_envs(env_fns)
-                print(f"[INIT] Environments created: {self.env_id} x{batch_size} (task_id={self.task_id})", flush=True)
+                # Create single DummyVecEnv and set task
+                envs = DummyVecEnv([env_fn])
+                if self.env_id in OGBENCH_ENVS:
+                    envs.envs[0].set_task(self.task_id)
+                elif self.use_random_goals_for_interaction:
+                    envs.envs[0].set_target()
+                print(f"[INIT] Environment created: {self.env_id} x1 (task_id={self.task_id})", flush=True)
 
-                # Cache the environments and manager
-                self._cached_envs_forward = envs_forward
-                self._cached_envs_backward = envs_backward
-                self._cached_env_manager = env_manager
+                # Cache environment and agent
+                self._cached_envs = envs
                 self._cached_env_key = env_cache_key
                 if agent is not None:
-                    self._cached_agent = agent  # Cache agent if it was created
-                
-                # For backward compatibility, also cache single envs reference
-                envs = envs_forward  # Default to forward environment
-                self._cached_envs = envs
+                    self._cached_agent = agent
+
+                # [MUJOCO RENDERER] Create overhead renderer for viz_mujoco_renderer
+                if self.viz_agent_rollout and self.viz_mujoco_renderer:
+                    try:
+                        import mujoco as _mujoco
+                        _inner = envs.envs[0]
+                        _fb_w = getattr(_inner, "width", 200)
+                        _fb_h = getattr(_inner, "height", 200)
+                        _renderer = _mujoco.Renderer(_inner.model, _fb_h, _fb_w)
+                        _cam = _mujoco.MjvCamera()
+                        _cam.type = _mujoco.mjtCamera.mjCAMERA_FREE
+                        _cam.azimuth = 0.0
+                        _cam.elevation = -90.0
+                        if "giant" in self.env_id:
+                            _cam.lookat[:] = [26.0, 18.0, 0.0]
+                            _cam.distance = 70.0
+                        else:  # large (default)
+                            _cam.lookat[:] = [20.0, 14.0, 0.0]
+                            _cam.distance = 55.0
+                        self._cached_mujoco_renderer = _renderer
+                        self._cached_overhead_camera = _cam
+                        print(f"[INIT] MuJoCo overhead renderer created ({_fb_w}x{_fb_h})", flush=True)
+                    except Exception as _re:
+                        print(f"[WARN] MuJoCo renderer init failed: {_re}", flush=True)
+                        self._cached_mujoco_renderer = None
+                        self._cached_overhead_camera = None
 
             # [ENV CACHING END] Environment setup complete (cached or new)
 
             terminate = False
             obs_mean = self.data_mean[: self.observation_dim]
             obs_std = self.data_std[: self.observation_dim]
-            obs = envs_forward.reset()
+            obs = envs.reset()
             # Randomize the goal for each environment
             if (
                 self.env_id in OGBENCH_ENVS
@@ -1361,7 +1380,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 pass
             else:
                 if self.use_random_goals_for_interaction:
-                    for env in envs_forward.envs:
+                    for env in envs.envs:
                         env.set_target()
 
             obs = torch.from_numpy(obs).float().to(self.device)
@@ -1372,27 +1391,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
             if self.env_id in OGBENCH_ENVS:  # OGBench
                 goal = np.vstack(
-                    [envs_forward.reset_infos[i]["goal"] for i in range(len(envs_forward.reset_infos))]
+                    [envs.reset_infos[i]["goal"] for i in range(len(envs.reset_infos))]
                 )
             else:
-                goal = np.concatenate([[env.env._target] for env in envs_forward.envs])
+                goal = np.concatenate([[env.env._target] for env in envs.envs])
             goal = torch.Tensor(goal).float().to(self.device)
             goal = torch.cat([goal, torch.zeros_like(goal)], -1)
             goal = goal[:, : self.observation_dim]
             goal_normalized = ((goal - obs_mean[None]) / obs_std[None]).detach()
-            
-            # ────────────────────────────────────────────────────────────────
-            # Bidirectional Environment Setup
-            # ────────────────────────────────────────────────────────────────
-            # For tree2 (backward direction), set up environment to start from goal
-            # and plan towards start. We do this by:
-            # 1. Creating a goal_sim_state (heuristic goal state for tree2)
-            # 2. Will be set explicitly when tree2 needs to execute
-            goal_qpos = goal.cpu().numpy()[0, :self.pos_dim]  # (pos_dim,) - goal coordinates
-            
-            # Reset envs_backward to a known state
-            envs_backward.reset()
-            # envs_backward will be reused in rollouts with _set_sim_state as needed
 
             steps = 0
             loops = 0  # Loop counter for bidirectional MCTS planning
@@ -1405,6 +1411,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             validation_rollout_agent_history: List[np.ndarray] = []
             validation_rollout_subgoal_history: List[np.ndarray] = []
             validation_pp_plan_history: List[np.ndarray] = []  # per-step pp_plan for video overlay
+            validation_mujoco_frame_history: List[np.ndarray] = []  # per-step mujoco render frames
 
             # run mpc with diffused actions
             planning_time = []
@@ -1418,7 +1425,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             _bidir_start_np = start.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
             _bidir_goal_np = goal.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
             # Capture initial physical state (always, regardless of use_rollout)
-            initial_sim_state = self._get_sim_state(envs_forward)
+            initial_sim_state = self._get_sim_state(envs)
             assert initial_sim_state is not None, "Failed to capture initial sim state"
             assert np.allclose(initial_sim_state["qpos"][:self.pos_dim], _bidir_start_np[0][:self.pos_dim], atol=1e-5), \
                 f"Physical start position {initial_sim_state['qpos'][:self.pos_dim]} does not match observation start position {_bidir_start_np[0][:self.pos_dim]}"
@@ -1524,7 +1531,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                             new_denoised_start_idx=new_denoised_start,
                             new_denoised_end_idx=new_denoised_end,
                             agent=agent,
-                            envs=envs_forward if active_tree is bidir_tree1 else envs_backward,
+                            envs=envs,
                             parent_sim_state=parent_node.sim_state,
                             is_backward=(active_tree is bidir_tree2),
                         )
@@ -1761,6 +1768,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         n_steps_this_loop = rollout_viz["agent_positions"].shape[0]
                         for _ in range(n_steps_this_loop):
                             validation_pp_plan_history.append(_pp_plan_np)
+                    _mj_frames = rollout_viz.get("mujoco_frames")
+                    if _mj_frames is not None and len(_mj_frames) > 0:
+                        validation_mujoco_frame_history.append(_mj_frames)
 
             # Close tree pbars (kept open during single_step MPC loop)
             bidir_tree1.pbar.close()
@@ -1824,6 +1834,31 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                                 fps=self.validation_video_fps,
                                 step=_video_step,
                             )
+
+                # [MUJOCO RENDER VIDEO] Log overhead MuJoCo render video
+                if (
+                    self.viz_agent_rollout
+                    and self.viz_mujoco_renderer
+                    and validation_mujoco_frame_history
+                ):
+                    _mj_all = np.concatenate(validation_mujoco_frame_history, axis=0)  # (T, H, W, 3)
+                    _mj_n = _mj_all.shape[0]
+                    _mj_indices = _sample_frame_indices(_mj_n, self.validation_video_max_frames)
+                    _mj_sampled = _mj_all[_mj_indices]  # (N, H, W, 3)
+                    _mj_video = _mj_sampled.transpose(0, 3, 1, 2)  # (N, C, H, W)
+                    _mj_step = self.get_safe_wandb_step()
+                    print(
+                        f"[wandb-video-debug] key={namespace}_interaction/mujoco_render "
+                        f"shape={_mj_video.shape} dtype={_mj_video.dtype} fps={self.validation_video_fps} "
+                        f"step={_mj_step}",
+                        flush=True,
+                    )
+                    self.log_video(
+                        f"{namespace}_interaction/mujoco_render",
+                        _mj_video,
+                        fps=self.validation_video_fps,
+                        step=_mj_step,
+                    )
 
             _post_exec_ms = (time.time() - _post_exec_t0) * 1000
             self._tlog("timing.post_exec", {

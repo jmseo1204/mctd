@@ -12,6 +12,7 @@ class PlanningExperiment(BaseLightningExperiment):
         df_planning=DiffusionForcingPlanning,
         df_planning_2d=DiffusionForcingPlanning,
         df_planning_15d=DiffusionForcingPlanning,
+        train_df_planning=DiffusionForcingPlanning,
     )
 
     compatible_datasets = dict(

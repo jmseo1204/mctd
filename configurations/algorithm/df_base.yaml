@@ -21,6 +21,7 @@ chunk_size: 1 # -1 for full trajectory diffusion, number to specify diffusion ch
 scheduling_matrix: autoregressive
 noise_level: random_all
 causal: True
+jump: ${jump}
 
 diffusion:
   # training

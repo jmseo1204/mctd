@@ -428,13 +428,13 @@ def main():
 
     if ckpt_hparams:
         # ── New path: checkpoint carries all training params ──────────────────
-        # episode_len and jump are the only dataset-side values we still need.
+        # episode_len in ckpt is already effective (raw // jump), saved by on_save_checkpoint.
+        actual_jump = ckpt_hparams.get('jump', 1)
         actual_episode_len = (
             args.episode_len
             or ckpt_hparams.get('episode_len')
-            or full_cfg['dataset'].get('episode_len', 50)
+            or full_cfg['dataset'].get('episode_len', 50) // actual_jump
         )
-        actual_jump = full_cfg['dataset'].get('jump', 1)
         actual_frame_stack = ckpt_hparams.get('frame_stack', 10)
         has_embedded_hparams = True
         print(
@@ -472,12 +472,21 @@ def main():
             else:
                 print(f"  [config detect] WARNING: Could not load '{detected_dataset_config}'. Keeping '{args.dataset}'.")
 
-        actual_episode_len = args.episode_len or full_cfg['dataset'].get('episode_len') or model_metadata.get('episode_len') or 50
-        actual_jump = model_metadata.get('jump') or full_cfg['dataset'].get('jump', 1)
+        # Determine jump first (needed to divide dataset raw episode_len).
+        # metadata already stores the effective (divided) episode_len, so no post-processing there.
+        actual_jump = model_metadata.get('jump') or 1
+        dataset_episode_len = full_cfg['dataset'].get('episode_len')
+        actual_episode_len = (
+            args.episode_len
+            or (dataset_episode_len // actual_jump if dataset_episode_len else None)
+            or model_metadata.get('episode_len')
+            or 50
+        )
 
         obs_dim = len(full_cfg['dataset'].get('observation_mean', [2]))
         act_dim = full_cfg['dataset'].get('action_dim', 8)
         detected_frame_stack = detect_frame_stack_from_ckpt(args.model_id, obs_dim, act_dim)
+        actual_frame_stack = detected_frame_stack or model_metadata.get('frame_stack') or full_cfg['algorithm'].get('frame_stack', 10)
         actual_frame_stack = detected_frame_stack or model_metadata.get('frame_stack') or full_cfg['algorithm'].get('frame_stack', 10)
 
         detected_arch = detect_network_size_from_ckpt(args.model_id)

@@ -47,9 +47,10 @@ num_tries_for_bad_plans: 5
 open_loop_horizon: 1000 #fixme -> best: episode_len*horizon_scale
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
 sub_goal_interval: 1
-horizon_scale: 0.48 # horizon = episode_len * horizon_scale
+horizon_scale: 0.45 # horizon = episode_len * horizon_scale
 sequence_dividing_factor: 3
 parallel_search_node: 3 # parallel_search_num = parallel_search_node * len(mctd_guidance_scales)
+episode_len: 200 # 1000(giant) // 5(jump)
 
 # HILP value function guidance
 # For .pkl checkpoints (JAX/Flax): all hyper-params are auto-detected from the file.
@@ -73,10 +74,11 @@ plan_feasibility_delta: 99999.0 # max per-frame movement (world units) to count 
 meeting_delta: 1.5
 
 #[wandb visualization]
-viz_subplan_denoising: true # set True to upload plan/plan_at_* to wandb (slow)
 viz_agent_rollout: true # set True to upload *_interaction/sample_*_video to wandb (slow)
 viz_final_plans: True
 viz_compare_expanded_to_value: false
+viz_mujoco_renderer: true
+viz_subplan_denoising: true # set True to upload plan/plan_at_* to wandb (slow)
 profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
 frame_sampling_way: "quadratic" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
 
@@ -100,9 +102,9 @@ kde_save_dir: ${dataset.save_dir} # dataset npz directory for KDE positions
 mcts_use_sim: true
 replanning_target_level: 10 # noise level to add when replanning already-denoised prefix (default: sampling_timesteps // 3)
 
-# [DEPRECATED]
-use_rollout: false # always false. true version is deprecated
-use_dynamic_obs_padding: false # always false. true version is deprecated
+# [MPC-style agent control]
+use_rollout: false
+use_dynamic_obs_padding: false
 
 diffusion:
   clip_noise: 20.0

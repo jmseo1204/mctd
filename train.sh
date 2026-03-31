@@ -5,13 +5,10 @@
 # - Filters checkpoints by obs_dim via Docker Python scan
 # - Checkpoint named: train_{dim}d_{epoch}ep_{YYYYMMDDHHMMSS}[_{postfix}]
 # - Uses Docker (mctd:0.1) — no conda dependency
-# - Auto-restarts on crash, up to MAX_RETRIES
 
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MAX_RETRIES=20
-RETRY_DELAY=30
 
 # Docker configuration (matches run_jobs.py / train_interactive.sh)
 DOCKER_USER="jmseo1204"
@@ -364,84 +361,56 @@ echo "Dataset     : $DATASET_CONFIG  (jump=$JUMP_VALUE)" | tee -a "$LOG_FILE"
 echo "Model ID    : $MODEL_ID" | tee -a "$LOG_FILE"
 echo "========================================" | tee -a "$LOG_FILE"
 
-attempt=0
-while [ $attempt -lt $MAX_RETRIES ]; do
-    attempt=$((attempt + 1))
-    echo "" | tee -a "$LOG_FILE"
-    echo "[$(date)] Attempt $attempt / $MAX_RETRIES" | tee -a "$LOG_FILE"
+LOAD_CKPT=""
+if [ -n "$SELECTED_CKPT" ]; then
+    LOAD_CKPT="$(host_to_docker_path "$SELECTED_CKPT")"
+fi
 
-    # On attempt 1 use user-selected ckpt; on retry find latest in OUTPUT_MOUNT_DIR
-    LOAD_CKPT=""
-    if [ "$attempt" -eq 1 ] && [ -n "$SELECTED_CKPT" ]; then
-        LOAD_CKPT="$(host_to_docker_path "$SELECTED_CKPT")"
-    elif [ "$attempt" -gt 1 ]; then
-        LATEST_HOST=""
-        LATEST_TIME=0
-        while IFS= read -r f; do
-            ftime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
-            if [ "$ftime" -gt "$LATEST_TIME" ]; then
-                LATEST_TIME=$ftime
-                LATEST_HOST=$f
-            fi
-        done < <(find "$OUTPUT_MOUNT_DIR/outputs" -name "model.ckpt" 2>/dev/null)
-        if [ -n "$LATEST_HOST" ]; then
-            LOAD_CKPT="$(host_to_docker_path "$LATEST_HOST")"
-        fi
-    fi
+BASE_CMD="python3 main.py \
+    experiment.tasks=[training] \
+    experiment=exp_planning \
+    algorithm=$ALGORITHM_CONFIG \
+    dataset=$DATASET_CONFIG \
+    dataset.jump=$JUMP_VALUE \
+    +name=$MODEL_ID \
+    experiment.training.data.num_workers=0 \
+    experiment.validation.data.num_workers=0 \
+    experiment.validation.limit_batch=0"
 
-    BASE_CMD="python3 main.py \
-        experiment.tasks=[training] \
-        experiment=exp_planning \
-        algorithm=$ALGORITHM_CONFIG \
-        dataset=$DATASET_CONFIG \
-        dataset.jump=$JUMP_VALUE \
-        +name=$MODEL_ID \
-        experiment.training.data.num_workers=0 \
-        experiment.validation.data.num_workers=0 \
-        experiment.validation.limit_batch=0"
+if [ -n "$LOAD_CKPT" ]; then
+    echo "[$(date)] Resuming from (docker path): $LOAD_CKPT" | tee -a "$LOG_FILE"
+    INNER_CMD="$BASE_CMD +load=$LOAD_CKPT"
+else
+    echo "[$(date)] Starting fresh training" | tee -a "$LOG_FILE"
+    INNER_CMD="$BASE_CMD"
+fi
 
-    if [ -n "$LOAD_CKPT" ]; then
-        echo "[$(date)] Resuming from (docker path): $LOAD_CKPT" | tee -a "$LOG_FILE"
-        INNER_CMD="$BASE_CMD +load=$LOAD_CKPT"
-    else
-        echo "[$(date)] Starting fresh training" | tee -a "$LOG_FILE"
-        INNER_CMD="$BASE_CMD"
-    fi
+FULL_CMD="docker run --rm --gpus all --name mctd_training --shm-size=8g \
+    -e MUJOCO_GL=osmesa \
+    -e HYDRA_FULL_ERROR=1 \
+    -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/$DOCKER_USER/.mujoco/mujoco210/bin \
+    -v /usr/lib/wsl:/usr/lib/wsl \
+    -v $PROJECT_DIR:$DOCKER_PROJECT \
+    -v $OUTPUT_MOUNT_DIR:$DOCKER_OUTPUTS \
+    -v $OGBENCH_DATA_DIR:/home/$DOCKER_USER/.ogbench/data \
+    -v $HOME_DIR/.netrc:/home/$DOCKER_USER/.netrc \
+    -v $HOME_DIR/.d4rl:/home/$DOCKER_USER/.d4rl \
+    $DOCKER_IMAGE /bin/bash \
+    -c 'cd $DOCKER_PROJECT && git config --global --add safe.directory $DOCKER_PROJECT 2>/dev/null; $INNER_CMD'"
 
-    FULL_CMD="docker run --rm --gpus all --name mctd_training --shm-size=8g \
-        -e MUJOCO_GL=osmesa \
-        -e HYDRA_FULL_ERROR=1 \
-        -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/$DOCKER_USER/.mujoco/mujoco210/bin \
-        -v /usr/lib/wsl:/usr/lib/wsl \
-        -v $PROJECT_DIR:$DOCKER_PROJECT \
-        -v $OUTPUT_MOUNT_DIR:$DOCKER_OUTPUTS \
-        -v $OGBENCH_DATA_DIR:/home/$DOCKER_USER/.ogbench/data \
-        -v $HOME_DIR/.netrc:/home/$DOCKER_USER/.netrc \
-        -v $HOME_DIR/.d4rl:/home/$DOCKER_USER/.d4rl \
-        $DOCKER_IMAGE /bin/bash \
-        -c 'cd $DOCKER_PROJECT && git config --global --add safe.directory $DOCKER_PROJECT 2>/dev/null; $INNER_CMD'"
+echo "[$(date)] Docker command: $FULL_CMD" | tee -a "$LOG_FILE"
 
-    echo "[$(date)] Docker command: $FULL_CMD" | tee -a "$LOG_FILE"
+set +e
+eval "$FULL_CMD" 2>&1 | tee -a "$LOG_FILE"
+EXIT_CODE=${PIPESTATUS[0]}
+set -e
 
-    set +e
-    eval "$FULL_CMD" 2>&1 | tee -a "$LOG_FILE"
-    EXIT_CODE=${PIPESTATUS[0]}
-    set -e
+update_eval_symlink "$MODEL_ID"
 
-    update_eval_symlink "$MODEL_ID"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "[$(date)] Training completed successfully!" | tee -a "$LOG_FILE"
+    exit 0
+fi
 
-    if [ $EXIT_CODE -eq 0 ]; then
-        echo "[$(date)] Training completed successfully!" | tee -a "$LOG_FILE"
-        exit 0
-    fi
-
-    echo "[$(date)] Training crashed with exit code $EXIT_CODE" | tee -a "$LOG_FILE"
-
-    if [ $attempt -lt $MAX_RETRIES ]; then
-        echo "[$(date)] Waiting ${RETRY_DELAY}s before retry..." | tee -a "$LOG_FILE"
-        sleep $RETRY_DELAY
-    fi
-done
-
-echo "[$(date)] Max retries ($MAX_RETRIES) reached. Giving up." | tee -a "$LOG_FILE"
+echo "[$(date)] Training failed with exit code $EXIT_CODE" | tee -a "$LOG_FILE"
 exit 1
