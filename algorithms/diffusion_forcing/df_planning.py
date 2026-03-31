@@ -150,7 +150,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.jump = cfg.jump
         self.time_limit = cfg.time_limit
         self.parallel_search_node = cfg.parallel_search_node
-        self.parallel_search_num = self.parallel_search_node * cfg.sequence_dividing_factor
+        self.parallel_search_num = self.parallel_search_node * len(cfg.mctd_guidance_scales)
         self.virtual_visit_weight = cfg.virtual_visit_weight
         self.warp_threshold = cfg.warp_threshold * self.jump
         self.leaf_parallelization = cfg.leaf_parallelization
