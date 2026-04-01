@@ -13,8 +13,8 @@ action_std: ${dataset.action_std}
 gamma: ${dataset.gamma}
 env_id: ${dataset.env_id}
 dataset: ${dataset.dataset}
-pos_dim: 2 # spatial x,y dims for MCTS guidance/visualization (always 2 for AntMaze/PointMaze)
 # non dataset info
+pos_dim: 2 # spatial x,y dims for MCTS guidance/visualization (always 2 for AntMaze/PointMaze)
 x_shape: null
 
 context_frames: 1

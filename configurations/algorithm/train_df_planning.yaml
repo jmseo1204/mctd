@@ -14,7 +14,7 @@ scheduling_matrix: "pyramid"
 
 diffusion:
   architecture:
-    network_size: 64
-    num_layers: 6
-    attn_heads: 4
-    dim_feedforward: 256
+    network_size: 128
+    num_layers: 12
+    attn_heads: 8
+    dim_feedforward: 512
