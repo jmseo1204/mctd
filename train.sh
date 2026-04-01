@@ -35,6 +35,11 @@ mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$OUTPUT_MOUNT_DIR"
 
 # ────────────────────────────────────────────────────────
+# GPU selection (before interactive menus)
+# ────────────────────────────────────────────────────────
+mctd_select_gpus
+
+# ────────────────────────────────────────────────────────
 # Step 1: Select state dimension
 # ────────────────────────────────────────────────────────
 echo "===================================================="
@@ -220,6 +225,11 @@ else
 fi
 
 # ────────────────────────────────────────────────────────
+# GPU availability check (after container cleanup to avoid false positives)
+# ────────────────────────────────────────────────────────
+mctd_check_gpu_availability
+
+# ────────────────────────────────────────────────────────
 # Scan checkpoints via Docker
 # ────────────────────────────────────────────────────────
 echo "========================================"
@@ -388,7 +398,12 @@ else
     INNER_CMD="$BASE_CMD"
 fi
 
-FULL_CMD="docker run --rm --gpus all --name mctd_training --shm-size=8g \
+# Derive --gpus flag from AVAILABLE_GPUS (e.g. "localhost:1" → "device=1")
+_gpu_ids=$(echo "$AVAILABLE_GPUS" | tr ',' '\n' | grep '^localhost:' | sed 's/localhost://' | tr '\n' ',' | sed 's/,$//')
+_DOCKER_GPUS="all"
+[ -n "$_gpu_ids" ] && _DOCKER_GPUS="device=${_gpu_ids}"
+
+FULL_CMD="docker run --rm --gpus \"$_DOCKER_GPUS\" --name mctd_training --shm-size=8g \
     -e MUJOCO_GL=osmesa \
     -e HYDRA_FULL_ERROR=1 \
     -e WANDB_ENTITY=$WANDB_ENTITY \

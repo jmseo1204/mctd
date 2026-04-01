@@ -49,6 +49,10 @@ chmod -R 777 ~/.jax_cache
 echo "✓ JAX cache reset complete"
 echo ""
 
+# GPU selection + availability check (after container cleanup to avoid false positives)
+mctd_select_gpus
+mctd_check_gpu_availability
+
 # ─────────────────────────────────────────────────────
 # 1. Select state dimension
 # ─────────────────────────────────────────────────────
@@ -155,6 +159,7 @@ echo "  Starting Job Execution via scripts/run_jobs.py"
 echo "====================================================="
 echo ""
 
+export AVAILABLE_GPUS
 python3 scripts/run_jobs.py 2>&1 | tee /tmp/mctd_run_jobs.log
 
 JOB_EXIT_CODE=$?

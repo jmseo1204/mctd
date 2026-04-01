@@ -32,6 +32,172 @@ MCTD_DOCKER_OUTPUTS="/home/$MCTD_DOCKER_USER/mctd/outputs"
 MCTD_OUTPUT_MOUNT_DIR="${MCTD_OUTPUT_MOUNT_DIR:-/home/$DOCKER_USER/mctd_outputs}"
 MCTD_EVAL_BASE="$MCTD_OUTPUT_MOUNT_DIR"
 
+# ── mctd_select_gpus ──────────────────────────────────────────────────────────
+# Display a table of all detected GPUs (status, VRAM, running processes with
+# user / PID / uptime), prompt the user to pick GPU index(es), then override
+# the AVAILABLE_GPUS variable (and export it so child processes inherit it).
+#
+# Usage: mctd_select_gpus
+# Side-effect: sets + exports AVAILABLE_GPUS="localhost:N[,localhost:M,...]"
+mctd_select_gpus() {
+    if ! command -v nvidia-smi &>/dev/null; then
+        echo "[gpu-select] nvidia-smi not found — keeping AVAILABLE_GPUS=${AVAILABLE_GPUS:-localhost:0}"
+        return 0
+    fi
+
+    local _n_gpus
+    _n_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')
+    if ! [[ "$_n_gpus" =~ ^[0-9]+$ ]] || [ "$_n_gpus" -eq 0 ]; then
+        echo "[gpu-select] No GPUs detected — keeping AVAILABLE_GPUS=${AVAILABLE_GPUS:-localhost:0}"
+        return 0
+    fi
+
+    echo ""
+    echo "====================================================="
+    echo "  GPU Status"
+    echo "====================================================="
+    printf "  %-4s  %-10s  %-28s  %s\n" "IDX" "STATUS" "NAME" "VRAM (Used / Total)"
+    local _bar; _bar=$(printf '─%.0s' {1..74})
+    printf "  %s\n" "$_bar"
+
+    local _idx _info _name _mem_used _mem_total _procs _proc_line
+    local _pid _pname _pmem _psinfo _user _etime
+    for _idx in $(seq 0 $((_n_gpus - 1))); do
+        _info=$(nvidia-smi -i "$_idx" \
+            --query-gpu=name,memory.used,memory.total \
+            --format=csv,noheader 2>/dev/null) || continue
+
+        _name=$(    echo "$_info" | cut -d',' -f1 | sed 's/^ *//')
+        _mem_used=$(echo "$_info" | cut -d',' -f2 | sed 's/^ *//;s/ MiB//')
+        _mem_total=$(echo "$_info"| cut -d',' -f3 | sed 's/^ *//;s/ MiB//')
+
+        _procs=$(nvidia-smi -i "$_idx" \
+            --query-compute-apps=pid,process_name,used_gpu_memory \
+            --format=csv,noheader 2>/dev/null | sed '/^[[:space:]]*$/d') || true
+
+        local _status
+        [ -n "$_procs" ] && _status="OCCUPIED" || _status="FREE"
+        [ "${#_name}" -gt 27 ] && _name="${_name:0:24}..."
+
+        printf "  %-4s  %-10s  %-28s  %s / %s MiB\n" \
+            "$_idx" "$_status" "$_name" "$_mem_used" "$_mem_total"
+
+        if [ -n "$_procs" ]; then
+            while IFS= read -r _proc_line; do
+                [ -z "$_proc_line" ] && continue
+                _pid=$(  echo "$_proc_line" | cut -d',' -f1 | tr -d ' ')
+                _pname=$(echo "$_proc_line" | cut -d',' -f2 | sed 's/^ *//')
+                _pmem=$( echo "$_proc_line" | cut -d',' -f3 | sed 's/^ *//')
+
+                _psinfo=$(ps -p "$_pid" -o user=,etime= 2>/dev/null | head -1) || true
+                _user=$( echo "$_psinfo" | awk '{print $1}')
+                _etime=$(echo "$_psinfo" | awk '{print $2}')
+                [ -z "$_user"  ] && _user="?"
+                [ -z "$_etime" ] && _etime="?"
+
+                printf "       ↳ PID %-7s  %-18s  user: %-12s  uptime: %-10s  %s\n" \
+                    "$_pid" "$_pname" "$_user" "$_etime" "$_pmem"
+            done <<< "$_procs"
+        fi
+    done
+
+    printf "  %s\n" "$_bar"
+    echo ""
+    echo "  Current: AVAILABLE_GPUS=${AVAILABLE_GPUS:-localhost:0}"
+    echo "  (Press Enter to keep current, Ctrl-C to abort)"
+    echo ""
+    read -rp "  Select GPU index(es) [space- or comma-separated, e.g. '0' or '0 1']: " _input
+
+    local _indices
+    _indices=$(echo "$_input" | tr ',' ' ' | tr -s ' ' | sed 's/^ //;s/ $//')
+    if [ -z "$_indices" ]; then
+        echo "  → Keeping AVAILABLE_GPUS=${AVAILABLE_GPUS:-localhost:0}"
+        echo ""
+        export AVAILABLE_GPUS="${AVAILABLE_GPUS:-localhost:0}"
+        return 0
+    fi
+
+    # Validate indices and build new value
+    local _new_gpus="" _idx_in
+    for _idx_in in $_indices; do
+        if ! [[ "$_idx_in" =~ ^[0-9]+$ ]]; then
+            echo "  ❌ Invalid index '$_idx_in' — keeping current selection"
+            export AVAILABLE_GPUS="${AVAILABLE_GPUS:-localhost:0}"
+            return 0
+        fi
+        if [ "$_idx_in" -ge "$_n_gpus" ]; then
+            echo "  ❌ Index $_idx_in out of range (0–$((_n_gpus - 1))) — keeping current selection"
+            export AVAILABLE_GPUS="${AVAILABLE_GPUS:-localhost:0}"
+            return 0
+        fi
+        _new_gpus="${_new_gpus:+$_new_gpus,}localhost:${_idx_in}"
+    done
+
+    AVAILABLE_GPUS="$_new_gpus"
+    export AVAILABLE_GPUS
+    echo "  ✓ AVAILABLE_GPUS set to: $AVAILABLE_GPUS"
+    echo ""
+}
+
+# ── mctd_check_gpu_availability ───────────────────────────────────────────────
+# Check that every localhost GPU listed in AVAILABLE_GPUS is free.
+# Call AFTER killing any previous MCTD containers so they don't false-positive.
+# Exits the calling script with status 1 if any GPU is occupied.
+#
+# Usage: mctd_check_gpu_availability
+mctd_check_gpu_availability() {
+    if ! command -v nvidia-smi &>/dev/null; then
+        echo "[gpu-check] nvidia-smi not found — skipping GPU availability check"
+        return 0
+    fi
+
+    echo "Checking GPU availability (AVAILABLE_GPUS=${AVAILABLE_GPUS:-localhost:0})..."
+
+    local _old_ifs="$IFS"
+    local _entry _host _gpu _procs
+    local _any_occupied=0
+
+    IFS=","
+    for _entry in ${AVAILABLE_GPUS:-localhost:0}; do
+        IFS="$_old_ifs"
+        _host="${_entry%%:*}"
+        _gpu="${_entry##*:}"
+
+        # Only check GPUs on the local machine
+        if [ "$_host" != "localhost" ]; then
+            IFS=","
+            continue
+        fi
+
+        _procs="$(nvidia-smi -i "$_gpu" \
+            --query-compute-apps=pid,process_name,used_gpu_memory \
+            --format=csv,noheader 2>/dev/null)" || true
+
+        if [ -n "$_procs" ]; then
+            _any_occupied=1
+            echo "  ✗ GPU $_gpu is occupied:"
+            echo "$_procs" | while IFS= read -r _line; do
+                echo "      $_line"
+            done
+        else
+            echo "  ✓ GPU $_gpu is free"
+        fi
+
+        IFS=","
+    done
+    IFS="$_old_ifs"
+
+    if [ "$_any_occupied" -ne 0 ]; then
+        echo ""
+        echo "❌ ERROR: One or more GPUs are occupied — cannot start."
+        echo "   Kill the processes above, or update AVAILABLE_GPUS in:"
+        echo "   $MCTD_PROJECT_DIR/scripts/project_config.sh"
+        exit 1
+    fi
+
+    echo ""
+}
+
 # ── mctd_dim_menu ─────────────────────────────────────────────────────────────
 # Prompts user to pick obs dim.
 # Sets globals: MCTD_TARGET_OBS_DIM  MCTD_DATASET_CONFIG

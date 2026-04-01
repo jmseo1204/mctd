@@ -170,7 +170,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
 
     if server == "localhost":
         command = f"""
-        docker run -d --gpus all --name {exp_name} --shm-size=50g \
+        docker run -d --gpus "device={gpu_id}" --name {exp_name} --shm-size=50g \
         -e MUJOCO_GL=osmesa \
         -e HYDRA_FULL_ERROR=1 \
         -e CUDA_VISIBLE_DEVICES=0 \
