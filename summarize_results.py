@@ -9,10 +9,10 @@ import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
-from project_config import WANDB_ENTITY
+from project_config import WANDB_ENTITY, WANDB_PROJECT
 
 wandb_entity = WANDB_ENTITY
-wandb_project = "mctd_eval"
+wandb_project = WANDB_PROJECT
 
 group_names = [
     "PMMN-PMCTD",

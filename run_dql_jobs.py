@@ -7,13 +7,13 @@ from pathlib import Path
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
-from project_config import DOCKER_USER
+from project_config import DOCKER_USER, DOCKER_IMAGE, AVAILABLE_GPUS
 
-available_gpus = ["localhost:0"]
+available_gpus = AVAILABLE_GPUS
 # available_gpus += [f"levine:{i}" for i in [0,1,2,3,4,5,6,7]]
 
+docker_image = DOCKER_IMAGE
 jobs_folder = "dql_jobs"
-docker_image = "mctd:0.1"
 docker_user = DOCKER_USER
 home_dir = os.path.expanduser("~")
 project_dir = os.getcwd()

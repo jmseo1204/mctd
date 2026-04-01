@@ -5,9 +5,10 @@ import argparse
 from datetime import datetime
 import copy
 from pathlib import Path
-from project_config import DOCKER_USER as _DOCKER_USER, WANDB_ENTITY as _WANDB_ENTITY
+from project_config import DOCKER_USER as _DOCKER_USER, WANDB_ENTITY as _WANDB_ENTITY, \
+    DOCKER_IMAGE as _DOCKER_IMAGE, WANDB_PROJECT as _WANDB_PROJECT
 
-def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/mctd_eval"):
+def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
     """
     Infer frame_stack from checkpoint weights.
     init_mlp.0.weight has shape (hidden, x_dim + k_embed_dim + external_cond_dim).
@@ -62,7 +63,7 @@ def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir=f"ou
         result = subprocess.run(
             ["docker", "run", "--rm", "--entrypoint", "python3",
              "-v", f"{mount_dir}:{mount_dir}:ro",
-             "mctd:0.1", "-c", script],
+             _DOCKER_IMAGE, "-c", script],
             capture_output=True, text=True, timeout=120
         )
         if result.returncode == 0:
@@ -81,7 +82,7 @@ def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir=f"ou
     return None
 
 
-def detect_network_size_from_ckpt(model_id, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/mctd_eval"):
+def detect_network_size_from_ckpt(model_id, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
     """
     Infer network_size (hidden dimension) from checkpoint weights.
     Checks transformer layer self_attn.in_proj_weight shape[1] for hidden dim.
@@ -163,7 +164,7 @@ def detect_network_size_from_ckpt(model_id, downloaded_dir=f"outputs/downloaded/
         result = subprocess.run(
             ["docker", "run", "--rm", "--entrypoint", "python3",
              "-v", f"{mount_dir}:{mount_dir}:ro",
-             "mctd:0.1", "-c", script],
+             _DOCKER_IMAGE, "-c", script],
             capture_output=True, text=True, timeout=120
         )
         if result.returncode == 0:
@@ -192,7 +193,7 @@ def detect_network_size_from_ckpt(model_id, downloaded_dir=f"outputs/downloaded/
     return None
 
 
-def find_local_training_config(model_id, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/mctd_eval"):
+def find_local_training_config(model_id, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
     """
     Find training_config.yaml saved by train.sh alongside the checkpoint.
     Written in plain-YAML format; extract_from_config() handles it without changes.
@@ -346,7 +347,7 @@ def load_full_config(dataset_name, algo_name="df_planning"):
         print(f"Error loading configs: {e}")
         return None
 
-def load_training_hparams_from_ckpt(model_id, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/mctd_eval"):
+def load_training_hparams_from_ckpt(model_id, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
     """Load training_hparams saved by df_base.on_save_checkpoint from the checkpoint file.
 
     New checkpoints (trained after the save_hyperparameters refactor) embed all arch
@@ -385,7 +386,7 @@ def load_training_hparams_from_ckpt(model_id, downloaded_dir=f"outputs/downloade
         result = subprocess.run(
             ["docker", "run", "--rm", "--entrypoint", "python3",
              "-v", f"{mount_dir}:{mount_dir}:ro",
-             "mctd:0.1", "-c", script],
+             _DOCKER_IMAGE, "-c", script],
             capture_output=True, text=True, timeout=120
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -535,7 +536,7 @@ def main():
     # Only dataset-side and eval-side params go in the job.
     basic_job_config = {
         "wandb.entity": _WANDB_ENTITY,
-        "wandb.project": "mctd_eval",
+        "wandb.project": _WANDB_PROJECT,
         "wandb.group": f"EVAL-{args.model_id}",
         "experiment": "exp_planning",
         "algorithm": "df_planning",

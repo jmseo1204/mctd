@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-from project_config import WANDB_ENTITY
+from project_config import WANDB_ENTITY, WANDB_PROJECT
 
 # seeds 0 to 9 to match antmaze script
 seeds = list(range(3))
@@ -14,7 +14,7 @@ seeds = list(range(3))
 task_ids = [1, 2, 3, 4, 5]
 
 wandb_entity = WANDB_ENTITY
-wandb_project = "mctd_eval"
+wandb_project = WANDB_PROJECT
 
 # repeat_num 3 to match antmaze script for robustness
 repeat_num = 1

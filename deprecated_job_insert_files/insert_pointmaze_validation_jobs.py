@@ -6,13 +6,13 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-from project_config import WANDB_ENTITY
+from project_config import WANDB_ENTITY, WANDB_PROJECT
 
 seeds = list(range(10))
 task_ids = [1,2,3,4,5]
 
 wandb_entity = WANDB_ENTITY
-wandb_project = "mctd_eval"
+wandb_project = WANDB_PROJECT
 
 basic_configs = [
     ##############################################################

@@ -5,3 +5,6 @@
 # =============================================================
 DOCKER_USER="jmseo1204"
 WANDB_ENTITY="jmseo1204-seoul-national-university"
+DOCKER_IMAGE="mctd:0.1"
+WANDB_PROJECT="mctd_eval"
+AVAILABLE_GPUS="localhost:0"   # comma-separated, e.g. "localhost:0,localhost:1"

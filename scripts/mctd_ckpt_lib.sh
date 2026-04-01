@@ -26,7 +26,7 @@ MCTD_PROJECT_DIR="${MCTD_PROJECT_DIR:-$(cd "$_MCTD_LIB_DIR/.." && pwd)}"
 source "$_MCTD_LIB_DIR/project_config.sh"
 
 # ── Shared constants (callers may override before sourcing) ──────────────────
-MCTD_DOCKER_IMAGE="${MCTD_DOCKER_IMAGE:-mctd:0.1}"
+MCTD_DOCKER_IMAGE="${MCTD_DOCKER_IMAGE:-$DOCKER_IMAGE}"
 MCTD_DOCKER_USER="${MCTD_DOCKER_USER:-$DOCKER_USER}"
 MCTD_DOCKER_OUTPUTS="/home/$MCTD_DOCKER_USER/mctd/outputs"
 MCTD_OUTPUT_MOUNT_DIR="${MCTD_OUTPUT_MOUNT_DIR:-/home/$DOCKER_USER/mctd_outputs}"

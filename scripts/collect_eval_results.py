@@ -16,8 +16,7 @@ import time
 from collections import defaultdict
 
 import yaml
-from project_config import WANDB_ENTITY
-WANDB_PROJECT = "mctd_eval"
+from project_config import WANDB_ENTITY, WANDB_PROJECT
 
 # Possible metric keys logged by df_planning.py's interact()
 SUCCESS_METRIC_KEYS = [

@@ -8,7 +8,9 @@ import datetime
 import threading
 import yaml
 from tqdm import tqdm
-from project_config import DOCKER_USER as _cfg_docker_user, WANDB_ENTITY as _cfg_wandb_entity
+from project_config import DOCKER_USER as _cfg_docker_user, WANDB_ENTITY as _cfg_wandb_entity, \
+    DOCKER_IMAGE as _cfg_docker_image, WANDB_PROJECT as _cfg_wandb_project, \
+    AVAILABLE_GPUS as _cfg_available_gpus
 
 # Logging setup
 LOG_DIR = "logs"
@@ -31,15 +33,16 @@ def log_write(message):
 def log_finished(step_name):
     log_write(f"##### {step_name} finished! #####")
 
-available_gpus = ["localhost:0"]
+available_gpus = _cfg_available_gpus
 # each server available gpus
 # available_gpus += [f"rumelhart:{i}" for i in [0,1,2,3,4,5,6,7]]
 # available_gpus += [f"levine:{i}" for i in [0,1,2,3,4,5,6,7]]
 
 jobs_folder = "jobs"
-docker_image = "mctd:0.1"
+docker_image = _cfg_docker_image
 docker_user = _cfg_docker_user
 wandb_entity = _cfg_wandb_entity
+wandb_project = _cfg_wandb_project
 home_dir = os.path.expanduser("~")
 project_dir = os.getcwd()
 ogbench_data_dir = os.path.abspath(os.path.join(project_dir, "..", "ogbench_data"))
@@ -174,6 +177,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -e WANDB_EXIT_TIMEOUT=120 \
         -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/{docker_user}/.mujoco/mujoco210/bin \
         -e WANDB_ENTITY={wandb_entity} \
+        -e WANDB_PROJECT={wandb_project} \
         -v /usr/lib/wsl:/usr/lib/wsl \
         -v {project_dir}:/home/{docker_user}/mctd \
         -v {output_mount_dir}:/home/{docker_user}/mctd/outputs \

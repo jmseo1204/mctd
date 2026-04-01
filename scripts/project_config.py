@@ -16,5 +16,8 @@ def _load_config() -> dict:
     return config
 
 _cfg = _load_config()
-DOCKER_USER:  str = _cfg.get("DOCKER_USER",  "jmseo1204")
-WANDB_ENTITY: str = _cfg.get("WANDB_ENTITY", "jmseo1204-seoul-national-university")
+DOCKER_USER:    str       = _cfg.get("DOCKER_USER",    "jmseo1204")
+WANDB_ENTITY:   str       = _cfg.get("WANDB_ENTITY",   "jmseo1204-seoul-national-university")
+DOCKER_IMAGE:   str       = _cfg.get("DOCKER_IMAGE",   "mctd:0.1")
+WANDB_PROJECT:  str       = _cfg.get("WANDB_PROJECT",  "mctd_eval")
+AVAILABLE_GPUS: list[str] = _cfg.get("AVAILABLE_GPUS", "localhost:0").split(",")

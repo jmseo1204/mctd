@@ -7,14 +7,14 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
-from project_config import WANDB_ENTITY
+from project_config import WANDB_ENTITY, WANDB_PROJECT
 
 # Define configurations for Maze2D and AntMaze Stitch (Medium) datasets
 # Based on insert_pointmaze_validation_jobs.py and insert_antmaze_validation_jobs.py
 # "Stitch" usually corresponds to Medium/Large datasets in offline RL benchmarks.
 
 wandb_entity = WANDB_ENTITY
-wandb_project = "mctd_eval" # Default from repo
+wandb_project = WANDB_PROJECT
 
 configs = [
     # Maze2D (PointMaze) Medium - Often considered a stitch task in D4RL context (multimodal data)
