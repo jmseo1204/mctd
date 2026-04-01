@@ -170,10 +170,10 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
 
     if server == "localhost":
         command = f"""
-        docker run -d --gpus "device={gpu_id}" --name {exp_name} --shm-size=50g \
+        docker run -d --gpus all --name {exp_name} --shm-size=50g \
         -e MUJOCO_GL=osmesa \
         -e HYDRA_FULL_ERROR=1 \
-        -e CUDA_VISIBLE_DEVICES=0 \
+        -e CUDA_VISIBLE_DEVICES={gpu_id} \
         -e WANDB_EXIT_TIMEOUT=120 \
         -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/{docker_user}/.mujoco/mujoco210/bin \
         -e WANDB_ENTITY={wandb_entity} \

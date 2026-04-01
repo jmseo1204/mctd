@@ -398,12 +398,12 @@ else
     INNER_CMD="$BASE_CMD"
 fi
 
-# Derive --gpus flag from AVAILABLE_GPUS (e.g. "localhost:1" → "device=1")
+# Derive CUDA_VISIBLE_DEVICES from AVAILABLE_GPUS (e.g. "localhost:4,localhost:5" → "4,5")
 _gpu_ids=$(echo "$AVAILABLE_GPUS" | tr ',' '\n' | grep '^localhost:' | sed 's/localhost://' | tr '\n' ',' | sed 's/,$//')
-_DOCKER_GPUS="all"
-[ -n "$_gpu_ids" ] && _DOCKER_GPUS="device=${_gpu_ids}"
+_CUDA_VIS_FLAG=""
+[ -n "$_gpu_ids" ] && _CUDA_VIS_FLAG="-e CUDA_VISIBLE_DEVICES=${_gpu_ids}"
 
-FULL_CMD="docker run --rm --gpus \"$_DOCKER_GPUS\" --name mctd_training --shm-size=8g \
+FULL_CMD="docker run --rm --gpus all ${_CUDA_VIS_FLAG} --name mctd_training --shm-size=8g \
     -e MUJOCO_GL=osmesa \
     -e HYDRA_FULL_ERROR=1 \
     -e WANDB_ENTITY=$WANDB_ENTITY \
