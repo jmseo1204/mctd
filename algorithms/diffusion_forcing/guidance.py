@@ -51,7 +51,7 @@ def weighted_loss(
         dist
     )  # guidance observation and action with separate weights
     # dist_a = torch.sum(dist_a, -1, keepdim=True).sqrt()
-    dist_o = dist_o[:, :, :planner.pos_dim]
+    dist_o = dist_o[:, :, planner.pos_dim_indices]
     dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=1)
     dist_o = (dist_o + 1e-6).sqrt()
     # dist_o = torch.tanh(dist_o / 2)  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
@@ -274,8 +274,9 @@ def goal_guidance(
                 })
 
             # pred[_atail, _bidx, :2]: (B, 2) — gather active tail per batch item
-            hilp_pseudo_loss = (pred[_atail, _bidx, :2] * hilp_t * (~far_mask_t)).sum(dim=1)  # (B,)
-            rmse_pseudo_loss = (pred[_atail, _bidx, :2] * rmse_t * far_mask_t).sum(dim=1)     # (B,)
+            _pos = pred[_atail, _bidx][:, planner.pos_dim_indices]  # (B, pos_dim)
+            hilp_pseudo_loss = (_pos * hilp_t * (~far_mask_t)).sum(dim=1)  # (B,)
+            rmse_pseudo_loss = (_pos * rmse_t * far_mask_t).sum(dim=1)     # (B,)
             return hilp_pseudo_loss.mean(), rmse_pseudo_loss.mean(), hilp_pseudo_loss.tolist(), rmse_pseudo_loss.tolist()
 
         # ── causal mode (default): all segment tails ──────────────────────────
@@ -352,8 +353,9 @@ def goal_guidance(
 
             # Separate pseudo-losses for HILP (near) and RMSE (far) positions.
             # Each is a unit-direction dot-product; scaling is applied externally in combined_guidance.
-            hilp_pseudo_loss = (pred[tail_pos, :, :2] * hilp_t * (~far_mask_t)).sum(dim=(0, 2))  # (B,)
-            rmse_pseudo_loss = (pred[tail_pos, :, :2] * rmse_t * far_mask_t).sum(dim=(0, 2))    # (B,)
+            _pos = pred[tail_pos][:, :, planner.pos_dim_indices]  # (n_tails, B, pos_dim)
+            hilp_pseudo_loss = (_pos * hilp_t * (~far_mask_t)).sum(dim=(0, 2))  # (B,)
+            rmse_pseudo_loss = (_pos * rmse_t * far_mask_t).sum(dim=(0, 2))    # (B,)
 
             return hilp_pseudo_loss.mean(), rmse_pseudo_loss.mean(), hilp_pseudo_loss.tolist(), rmse_pseudo_loss.tolist()
 
@@ -436,7 +438,7 @@ def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
     total_T = pred.shape[0]
 
     # Extract observation part (first pos_dim dimensions for position)
-    pred_obs = pred[:, :, :planner.pos_dim]  # Shape: [T, B, pos_dim]
+    pred_obs = pred[:, :, planner.pos_dim_indices]  # Shape: [T, B, pos_dim]
 
     # Create indices for pairwise comparison
     indices = torch.arange(total_T, device=x.device)
@@ -520,9 +522,9 @@ def particle_guidance(planner, x: torch.Tensor, horizon: int, group_ids: Optiona
     if len(tail_pos) == 0:
         return x.sum() * 0.0
 
-    pos_dim = planner.pos_dim  # 2 (x, y)
+    pos_dim_indices = planner.pos_dim_indices
     # Extract (x,y) at tail positions: (n_tails, b, pos_dim) → (b, n_tails*pos_dim)
-    tails = pred[tail_pos, :, :pos_dim]                       # (n_tails, b, pos_dim)
+    tails = pred[tail_pos][:, :, pos_dim_indices]              # (n_tails, b, pos_dim)
     tails_flat = tails.permute(1, 0, 2).reshape(b, -1)        # (b, n_tails*pos_dim)
 
     # Pairwise L2 distance — gradient is unit-normalized by construction

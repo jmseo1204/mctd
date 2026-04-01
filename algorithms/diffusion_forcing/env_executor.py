@@ -77,7 +77,7 @@ class PlanExecutorMixin:
 
             state_29d = np.concatenate([current_sim_state["qpos"], current_sim_state["qvel"]], axis=0)  # (29,)
             state_input = state_29d[np.newaxis, :]  # (1, 29)
-            sub_goal_pos = sub_goal_sim_state["qpos"][:self.pos_dim]  # (pos_dim,)
+            sub_goal_pos = sub_goal_sim_state["qpos"][:2]  # physical: qpos[:2] = world (x,y)
 
             action = agent.sample_action(state_input, sub_goal_pos)
             return torch.from_numpy(action).float().reshape(1, -1)
@@ -86,14 +86,14 @@ class PlanExecutorMixin:
             assert current_sim_state is not None, "current_sim_state must be provided for pointmaze"
             assert sub_goal_sim_state is not None, "sub_goal_sim_state must be provided for pointmaze"
 
-            current_pos = torch.tensor(current_sim_state["qpos"][:self.pos_dim], dtype=torch.float32).unsqueeze(0)  # (1, pos_dim)
-            current_vel = torch.tensor(current_sim_state["qvel"][:self.pos_dim], dtype=torch.float32).unsqueeze(0)  # (1, pos_dim)
-            target_pos = torch.tensor(sub_goal_sim_state["qpos"][:self.pos_dim], dtype=torch.float32).unsqueeze(0)  # (1, pos_dim)
+            current_pos = torch.tensor(current_sim_state["qpos"][:2], dtype=torch.float32).unsqueeze(0)  # (1, 2): physical world (x,y)
+            current_vel = torch.tensor(current_sim_state["qvel"][:2], dtype=torch.float32).unsqueeze(0)  # (1, 2): physical world (x,y)
+            target_pos = torch.tensor(sub_goal_sim_state["qpos"][:2], dtype=torch.float32).unsqueeze(0)  # (1, 2): physical world (x,y)
 
             if prev_sim_state is None:
                 plan_vel = target_pos - current_pos
             else:
-                prev_pos = torch.tensor(prev_sim_state["qpos"][:self.pos_dim], dtype=torch.float32).unsqueeze(0)  # (1, pos_dim)
+                prev_pos = torch.tensor(prev_sim_state["qpos"][:2], dtype=torch.float32).unsqueeze(0)  # (1, 2): physical world (x,y)
                 plan_vel = target_pos - prev_pos
 
             action = 12.5 * (target_pos - current_pos) + 1.2 * (plan_vel - current_vel)
@@ -143,8 +143,8 @@ class PlanExecutorMixin:
         current_sim_state = self._get_sim_state(envs)
         qpos = current_sim_state["qpos"]  # shape: (15,)
         qvel = current_sim_state["qvel"]  # shape: (14,)
-        # Concatenate qpos and qvel, then slice to observation_dim (supports both 15D and 29D modes)
-        obs_flat = np.concatenate([qpos, qvel], axis=0)[:self.observation_dim]
+        # Select obs_dim_indices from [qpos, qvel] concatenation (generalizes contiguous and non-contiguous cases)
+        obs_flat = np.concatenate([qpos, qvel], axis=0)[self.obs_dim_indices]
         obs_numpy = obs_flat[np.newaxis, :]
 
 
@@ -173,16 +173,16 @@ class PlanExecutorMixin:
                 _plan_obs = plan_slice_np[:, :self.observation_dim]  # (T*fs, obs_dim)
                 dists_to_plan = self._compute_state_temporal_dist_np(_plan_obs, _cur_rep)
             else:
-                current_pos = current_sim_state["qpos"][:self.pos_dim]
-                plan_positions = plan_slice_np[:, :self.pos_dim]  # (T*fs, pos_dim)
+                current_pos = current_sim_state["qpos"][:2]  # physical (x,y) always at qpos[:2]
+                plan_positions = plan_slice_np[:, self.pos_dim_indices]  # (T*fs, pos_dim)
                 dists_to_plan = np.linalg.norm(plan_positions - current_pos, axis=1)
             nearest_frame = int(np.argmin(dists_to_plan))
             sub_goal_idx = min(nearest_frame + self.sub_goal_interval, plan_frame_format.shape[0] - 1)
-            sub_goal_pos = plan_slice_np[sub_goal_idx, :self.pos_dim]
+            sub_goal_pos = plan_slice_np[sub_goal_idx, self.pos_dim_indices]
             sub_goal_step = sub_goal_idx
             # Initialize sub_goal_sim_state as current state (will be updated during rollout)
             sub_goal_sim_state = {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in current_sim_state.items()} if current_sim_state is not None else None
-            sub_goal_sim_state["qpos"][:self.pos_dim] = sub_goal_pos
+            sub_goal_sim_state["qpos"][:2] = sub_goal_pos  # physical: qpos[:2] is always world (x,y)
 
         # Execute plan: iterate, ensuring at least open_loop_horizon steps
         prev_sim_state = None
@@ -209,24 +209,24 @@ class PlanExecutorMixin:
             if "antmaze" in self.env_id:
                 _dist_t0 = time.time()
                 if self.use_TD_metric_as_dist:
-                    _cur_obs = np.concatenate([current_sim_state["qpos"], current_sim_state["qvel"]])[:self.observation_dim].reshape(1, -1)
-                    _sg_obs = np.concatenate([sub_goal_sim_state["qpos"], sub_goal_sim_state["qvel"]])[:self.observation_dim].reshape(1, -1)
+                    _cur_obs = np.concatenate([current_sim_state["qpos"], current_sim_state["qvel"]])[self.obs_dim_indices].reshape(1, -1)
+                    _sg_obs = np.concatenate([sub_goal_sim_state["qpos"], sub_goal_sim_state["qvel"]])[self.obs_dim_indices].reshape(1, -1)
                     dist_to_sg = float(self._compute_state_temporal_dist_np(_cur_obs, _sg_obs)[0])
                 else:
-                    dist_to_sg = np.linalg.norm(current_sim_state["qpos"][:self.pos_dim] - sub_goal_sim_state["qpos"][:self.pos_dim])
+                    dist_to_sg = np.linalg.norm(current_sim_state["qpos"][:2] - sub_goal_sim_state["qpos"][:2])  # physical
                 _dist_ms.append((time.time() - _dist_t0) * 1000)
 
                 if dist_to_sg < self.meeting_delta:
                     if sub_goal_step < plan_frame_format.shape[0] - self.sub_goal_interval:
                         sub_goal_step += self.sub_goal_interval
-                        sub_goal_sim_state["qpos"][:self.pos_dim] = plan_slice_np[sub_goal_step, :self.pos_dim]
+                        sub_goal_sim_state["qpos"][:2] = plan_slice_np[sub_goal_step, self.pos_dim_indices]
                     # else:
                         # Reached last sub_goal — take one final step to collect reward, then exit
                         # _reached_last_subgoal = True
 
-            rollout_agent_positions.append(current_sim_state["qpos"][:self.pos_dim].copy())
+            rollout_agent_positions.append(current_sim_state["qpos"][:2].copy())  # physical (x,y)
             if sub_goal_sim_state is not None:
-                rollout_subgoal_positions.append(sub_goal_sim_state["qpos"][:self.pos_dim].copy())
+                rollout_subgoal_positions.append(sub_goal_sim_state["qpos"][:2].copy())  # physical (x,y)
             else:
                 rollout_subgoal_positions.append(np.full((self.pos_dim,), np.nan, dtype=np.float32))
 
@@ -401,8 +401,8 @@ class PlanExecutorMixin:
         current_sim_state = self._get_sim_state(envs)
         assert current_sim_state is not None, "Failed to get current sim state"
 
-        parent_qpos = parent_sim_state["qpos"][:self.pos_dim]
-        current_qpos = current_sim_state["qpos"][:self.pos_dim]
+        parent_qpos = parent_sim_state["qpos"][:2]  # physical (x,y)
+        current_qpos = current_sim_state["qpos"][:2]  # physical (x,y)
 
         qpos_diff = np.linalg.norm(current_qpos - parent_qpos)
         assert qpos_diff < 1e-5, (
@@ -432,15 +432,15 @@ class PlanExecutorMixin:
         # Extract x,y positions: if batch dimension exists, extract it
         if trajectory_all_obs.dim() == 3:
             # Shape is (T, batch, obs_dim)
-            trajectory_obs_positions = trajectory_all_obs[:, 0, :self.pos_dim].detach().cpu().numpy()  # (T, pos_dim)
+            trajectory_obs_positions = trajectory_all_obs[:, 0, self.pos_dim_indices].detach().cpu().numpy()  # (T, pos_dim)
         else:
             # Shape is (T, obs_dim) - batch was singleton and got removed
-            trajectory_obs_positions = trajectory_all_obs[:, :self.pos_dim].detach().cpu().numpy()  # (T, pos_dim)
+            trajectory_obs_positions = trajectory_all_obs[:, self.pos_dim_indices].detach().cpu().numpy()  # (T, pos_dim)
 
         # Also get final obs for state update
         obs, _, _ = self.split_bundle(trajectory[-1])
 
         final_sim_state = self._get_sim_state(envs)  # dummy sim_state
-        final_sim_state["qpos"][:self.pos_dim] = obs[0, :self.pos_dim]
+        final_sim_state["qpos"][:2] = obs[0, self.pos_dim_indices]  # physical: qpos[:2] = world (x,y)
 
         return final_sim_state

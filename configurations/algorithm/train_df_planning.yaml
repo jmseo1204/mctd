@@ -8,6 +8,23 @@ defaults:
 # Edit this file before running train.sh.
 # -------------------------------------------------------
 
+# ── Training data specification (read by train.sh) ──────────────────────────
+# train_dataset_config: Hydra dataset config name (configurations/dataset/<name>.yaml)
+train_dataset_config: "og_antmaze_giant_stitch"
+# train_jump: frame stride for training data (1 = every frame)
+train_jump: 5
+
+# ── Dimension indices ────────────────────────────────────────────────────────
+# obs_dim_indices: which indices of the dataset observation to use.
+#   - Must be consistent with train_dataset_config's observation_shape.
+#   - Saved to training_hparams and restored at eval time automatically.
+obs_dim_indices: [0, 1]
+# pos_dim_indices: which obs vector indices are spatial (x,y) position.
+#   - Used for MCTS guidance and plan visualization.
+#   - [0,1] for all current AntMaze/PointMaze datasets.
+pos_dim_indices: [0, 1]
+
+# ── Architecture ─────────────────────────────────────────────────────────────
 frame_stack: 10
 causal: False
 scheduling_matrix: "pyramid"

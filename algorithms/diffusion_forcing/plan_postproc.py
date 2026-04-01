@@ -121,7 +121,7 @@ class PlanPostprocMixin:
                         dist = float(self._compute_state_temporal_dist_np(_obs_i, _obs_j)[0])
                     else:
                         dist = np.linalg.norm(
-                            candidate_obs_poses[i][:self.pos_dim] - candidate_obs_poses[j][:self.pos_dim]
+                            candidate_obs_poses[i][self.pos_dim_indices] - candidate_obs_poses[j][self.pos_dim_indices]
                         )
                     if dist < self.diverge_threshold:
                         # Duplicate: kill the one with lower HILP value (farther from target)
@@ -163,7 +163,7 @@ class PlanPostprocMixin:
             obs_frames = plan_unnormalized[:, 0, :self.observation_dim].detach().cpu().numpy()  # (N, obs_dim)
         else:
             # (N, pos_dim) — positions in maze coordinates
-            positions = plan_unnormalized[:, 0, :self.pos_dim].detach().cpu().numpy()
+            positions = plan_unnormalized[:, 0, self.pos_dim_indices].detach().cpu().numpy()
 
         result_indices = [0]
         current_idx = 0
@@ -248,10 +248,10 @@ class PlanPostprocMixin:
             _goal_ab = np.tile(_seg_b_unnorm, (A, 1))
             return float(self._compute_state_temporal_dist_np(_obs_ab, _goal_ab).min())
         else:
-            _std_np = self.data_std[:self.pos_dim].cpu().numpy() if isinstance(self.data_std, torch.Tensor) else np.array(self.data_std[:self.pos_dim])
-            _mean_np = self.data_mean[:self.pos_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[:self.pos_dim])
-            _seg_a_unnorm = t1_segments[:, :self.pos_dim].detach().cpu().numpy() * _std_np + _mean_np
-            _seg_b_unnorm = t2_flipped[:, :self.pos_dim].detach().cpu().numpy() * _std_np + _mean_np
+            _std_np = self.data_std[self.pos_dim_indices].cpu().numpy() if isinstance(self.data_std, torch.Tensor) else np.array(self.data_std)[self.pos_dim_indices]
+            _mean_np = self.data_mean[self.pos_dim_indices].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean)[self.pos_dim_indices]
+            _seg_a_unnorm = t1_segments[:, self.pos_dim_indices].detach().cpu().numpy() * _std_np + _mean_np
+            _seg_b_unnorm = t2_flipped[:, self.pos_dim_indices].detach().cpu().numpy() * _std_np + _mean_np
             _diffs = _seg_a_unnorm[:, None, :] - _seg_b_unnorm[None, :, :]  # (A, B, pos_dim)
             return float(np.linalg.norm(_diffs, axis=2).min())
 

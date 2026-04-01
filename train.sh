@@ -40,69 +40,84 @@ mkdir -p "$OUTPUT_MOUNT_DIR"
 mctd_select_gpus
 
 # ────────────────────────────────────────────────────────
-# Step 1: Select state dimension
+# Read training parameters from train_df_planning.yaml
+# (no user prompts for dataset / jump — edit the YAML to change them)
 # ────────────────────────────────────────────────────────
 echo "===================================================="
 echo "  MCTD Training Launcher"
 echo "===================================================="
 
-# Step 1: Select state dimension (shared menu → MCTD_TARGET_OBS_DIM, MCTD_DATASET_CONFIG)
-mctd_dim_menu
+ALGORITHM_CONFIG="train_df_planning"
+TRAIN_YAML="$PROJECT_DIR/configurations/algorithm/train_df_planning.yaml"
+DF_YAML="$PROJECT_DIR/configurations/algorithm/df_planning.yaml"
+DF_BASE_YAML="$PROJECT_DIR/configurations/algorithm/df_base.yaml"
 
-TARGET_OBS_DIM="$MCTD_TARGET_OBS_DIM"
-DATASET_CONFIG="$MCTD_DATASET_CONFIG"
+# Read training parameters from YAML (inline Python, yaml is stdlib-available)
+eval "$(python3 - "$TRAIN_YAML" "$DF_YAML" "$DF_BASE_YAML" <<'PYEOF'
+import sys, yaml, json, shlex, os
 
-# Extract human-readable dataset keywords from config name.
-# Strip leading "og_" and trailing dimension suffixes (_2d, _15d, _29d, _fullstate).
+def load_yaml(path):
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+def deep_merge(base, override):
+    result = dict(base)
+    for k, v in override.items():
+        if k in ('defaults',):
+            continue
+        if isinstance(v, dict) and isinstance(result.get(k), dict):
+            result[k] = deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+train_path, df_path, df_base_path = sys.argv[1], sys.argv[2], sys.argv[3]
+merged = deep_merge(deep_merge(load_yaml(df_base_path), load_yaml(df_path)), load_yaml(train_path))
+
+dataset_config = str(merged.get('train_dataset_config', 'og_antmaze_giant_stitch'))
+jump           = str(merged.get('train_jump', 5))
+obs_idx        = merged.get('obs_dim_indices')
+pos_idx        = merged.get('pos_dim_indices', [0, 1])
+obs_dim        = str(len(obs_idx)) if obs_idx else 'unknown'
+obs_dim_json   = json.dumps(obs_idx) if obs_idx else 'null'
+pos_dim_json   = json.dumps(list(pos_idx)) if pos_idx else '[0,1]'
+frame_stack    = str(merged.get('frame_stack', 'unknown'))
+arch = (merged.get('diffusion') or {}).get('architecture', {})
+network_size = str(arch.get('network_size', 'unknown'))
+num_layers   = str(arch.get('num_layers', 'unknown'))
+attn_heads   = str(arch.get('attn_heads', 'unknown'))
+
+print(f"DATASET_CONFIG={shlex.quote(dataset_config)}")
+print(f"JUMP_VALUE={shlex.quote(jump)}")
+print(f"TARGET_OBS_DIM={shlex.quote(obs_dim)}")
+print(f"OBS_DIM_JSON={shlex.quote(obs_dim_json)}")
+print(f"POS_DIM_JSON={shlex.quote(pos_dim_json)}")
+print(f"TRAIN_FRAME_STACK={shlex.quote(frame_stack)}")
+print(f"TRAIN_NETWORK_SIZE={shlex.quote(network_size)}")
+print(f"TRAIN_NUM_LAYERS={shlex.quote(num_layers)}")
+print(f"TRAIN_ATTN_HEADS={shlex.quote(attn_heads)}")
+PYEOF
+)"
+
+echo "Read training config from $TRAIN_YAML:"
+echo "  dataset_config  = $DATASET_CONFIG"
+echo "  jump            = $JUMP_VALUE"
+echo "  obs_dim         = $TARGET_OBS_DIM  (obs_dim_indices=$OBS_DIM_JSON)"
+echo "  frame_stack     = $TRAIN_FRAME_STACK"
+echo "  network         = size=$TRAIN_NETWORK_SIZE  layers=$TRAIN_NUM_LAYERS  heads=$TRAIN_ATTN_HEADS"
+echo ""
+
+# Derived display values
 DATASET_KEYWORDS=$(echo "$DATASET_CONFIG" \
     | sed 's/^og_//' \
     | sed 's/_\(2d\|15d\|29d\|fullstate\)$//')
-
-# Training-specific per-dim settings
-case "$TARGET_OBS_DIM" in
-    2)
-        ALGORITHM_CONFIG="train_df_planning"
-        DEFAULT_JUMP=5
-        RUN_NAME="Train_2D_antmaze"
-        MODEL_ID_PREFIX="train_2d"
-        LOG_FILE="$PROJECT_DIR/logs/train_2d.log"
-        MODEL_ID_FILE="$PROJECT_DIR/logs/current_2d_model_id.txt"
-        ;;
-    15)
-        ALGORITHM_CONFIG="train_df_planning"
-        DEFAULT_JUMP=1
-        RUN_NAME="Train_15D_antmaze"
-        MODEL_ID_PREFIX="train_15d"
-        LOG_FILE="$PROJECT_DIR/logs/train_15d.log"
-        MODEL_ID_FILE="$PROJECT_DIR/logs/current_15d_model_id.txt"
-        ;;
-    29)
-        ALGORITHM_CONFIG="train_df_planning"
-        DEFAULT_JUMP=1
-        RUN_NAME="Train_29D_big"
-        MODEL_ID_PREFIX="train_29d"
-        LOG_FILE="$PROJECT_DIR/logs/train_29d.log"
-        MODEL_ID_FILE="$PROJECT_DIR/logs/current_29d_model_id.txt"
-        ;;
-esac
-
-# ────────────────────────────────────────────────────────
-# Step 2: Select jump value
-# ────────────────────────────────────────────────────────
-echo "Selected: ${TARGET_OBS_DIM}D  algorithm=$ALGORITHM_CONFIG  dataset=$DATASET_CONFIG"
-echo ""
-echo "dataset.jump: frame stride for training data (1 = use every frame)"
-read -p "Enter jump value [default: $DEFAULT_JUMP]: " JUMP_INPUT
-if [ -z "$JUMP_INPUT" ]; then
-    JUMP_VALUE=$DEFAULT_JUMP
-elif [[ "$JUMP_INPUT" =~ ^[0-9]+$ ]] && [ "$JUMP_INPUT" -ge 1 ]; then
-    JUMP_VALUE=$JUMP_INPUT
-else
-    echo "Invalid jump value '$JUMP_INPUT'. Exiting."
-    exit 1
-fi
-echo "Using jump=$JUMP_VALUE"
-echo ""
+MODEL_ID_PREFIX="train_${TARGET_OBS_DIM}d"
+LOG_FILE="$PROJECT_DIR/logs/train_${TARGET_OBS_DIM}d.log"
+MODEL_ID_FILE="$PROJECT_DIR/logs/current_${TARGET_OBS_DIM}d_model_id.txt"
+RUN_NAME="Train_${TARGET_OBS_DIM}D_antmaze"
 
 # ────────────────────────────────────────────────────────
 # Trap: log any unexpected exit/error/signal
@@ -154,7 +169,10 @@ update_eval_symlink() {
             latest_time=$ftime
             latest_ckpt=$f
         fi
-    done < <(find "$OUTPUT_MOUNT_DIR/outputs" -name "model.ckpt" 2>/dev/null)
+    done < <(find "$OUTPUT_MOUNT_DIR" \
+        -regextype posix-extended \
+        -regex ".*/[0-9]{4}-[0-9]{2}-[0-9]{2}/.*" \
+        -name "model.ckpt" 2>/dev/null)
 
     if [ -z "$latest_ckpt" ]; then
         echo "[symlink] No model.ckpt found in $OUTPUT_MOUNT_DIR, skipping." | tee -a "$LOG_FILE"
@@ -230,19 +248,45 @@ fi
 mctd_check_gpu_availability
 
 # ────────────────────────────────────────────────────────
-# Scan checkpoints via Docker
+# Scan checkpoints via Docker and filter by arch match
 # ────────────────────────────────────────────────────────
 echo "========================================"
-echo "[$(date)] Searching for ${TARGET_OBS_DIM}D checkpoints (obs_dim=$TARGET_OBS_DIM)..."
-echo "[$(date)] Scanning checkpoints via Docker (filtering obs_dim=$TARGET_OBS_DIM)..."
+echo "[$(date)] Scanning all checkpoints via Docker..."
 
-mctd_scan_ckpts "$TARGET_OBS_DIM"
+mctd_scan_ckpts 0   # 0 = no obs_dim filter; show all
+
+# Filter: keep only checkpoints matching the current train_df_planning.yaml arch.
+# A field value of "unknown" in the checkpoint is treated as a wildcard (matches anything).
+MCTD_CKPT_DIRS_FILTERED=()
+for _entry in "${MCTD_CKPT_DIRS[@]:-}"; do
+    [ -z "$_entry" ] && continue
+    _c_obs=$(   echo "$_entry" | cut -d'|' -f6)
+    _c_jump=$(  echo "$_entry" | cut -d'|' -f7)
+    _c_ds=$(    echo "$_entry" | cut -d'|' -f8)
+    _c_fs=$(    echo "$_entry" | cut -d'|' -f9)
+    _c_net=$(   echo "$_entry" | cut -d'|' -f10)
+    _c_layers=$(echo "$_entry" | cut -d'|' -f11)
+    _c_heads=$( echo "$_entry" | cut -d'|' -f12)
+    # For each field: skip only if both are known AND they differ
+    _match=1
+    [[ "$_c_obs"    != "unknown" && "$_c_obs"    != "$TARGET_OBS_DIM"     ]] && _match=0
+    [[ "$_c_jump"   != "unknown" && "$_c_jump"   != "$JUMP_VALUE"         ]] && _match=0
+    [[ "$_c_ds"     != "unknown" && "$_c_ds"     != "$DATASET_CONFIG"     ]] && _match=0
+    [[ "$_c_fs"     != "unknown" && "$_c_fs"     != "$TRAIN_FRAME_STACK"  ]] && _match=0
+    [[ "$_c_net"    != "unknown" && "$_c_net"    != "$TRAIN_NETWORK_SIZE" ]] && _match=0
+    [[ "$_c_layers" != "unknown" && "$_c_layers" != "$TRAIN_NUM_LAYERS"   ]] && _match=0
+    [[ "$_c_heads"  != "unknown" && "$_c_heads"  != "$TRAIN_ATTN_HEADS"   ]] && _match=0
+    [ "$_match" -eq 1 ] && MCTD_CKPT_DIRS_FILTERED+=("$_entry")
+done
+MCTD_CKPT_DIRS=("${MCTD_CKPT_DIRS_FILTERED[@]:-}")
+echo "[$(date)] Found ${#MCTD_CKPT_DIRS[@]} matching checkpoint(s) for current arch config."
+
 CKPT_DIRS=("${MCTD_CKPT_DIRS[@]:-}")
 
 # ────────────────────────────────────────────────────────
 # Present checkpoint menu and let user select
 # ────────────────────────────────────────────────────────
-mctd_ckpt_menu "$TARGET_OBS_DIM"
+mctd_ckpt_menu
 
 SELECTED_CKPT="${MCTD_SELECTED_CKPT:-}"
 SELECTED_EPOCH="${MCTD_SELECTED_EPOCH:-0}"
@@ -281,6 +325,8 @@ save_training_config() {
     local algo_config="$2"
     local dataset_config="$3"   # e.g. og_antmaze_giant_stitch
     local jump_value="$4"       # e.g. 5
+    local obs_dim_json="$5"     # JSON list e.g. [0,1]
+    local pos_dim_json="$6"     # JSON list e.g. [0,1]
 
     local base_yaml="$PROJECT_DIR/configurations/algorithm/df_planning.yaml"
     local algo_yaml="$PROJECT_DIR/configurations/algorithm/${algo_config}.yaml"
@@ -290,8 +336,9 @@ save_training_config() {
 
     mkdir -p "$output_dir"
 
-    python3 - "$base_yaml" "$algo_yaml" "$dataset_yaml" "$dataset_config" "$jump_value" "$output_file" <<'PYEOF'
-import sys, yaml
+    python3 - "$base_yaml" "$algo_yaml" "$dataset_yaml" "$dataset_config" "$jump_value" \
+              "$obs_dim_json" "$pos_dim_json" "$output_file" <<'PYEOF'
+import sys, yaml, json
 
 def load_yaml(path):
     try:
@@ -311,11 +358,11 @@ def deep_merge(base, override):
             result[k] = v
     return result
 
-base_path, algo_path, dataset_path, dataset_config_name, jump_value, out_path = \
-    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+base_path, algo_path, dataset_path, dataset_config_name, jump_value, \
+    obs_dim_json, pos_dim_json, out_path = sys.argv[1:]
 
-merged_algo   = deep_merge(load_yaml(base_path), load_yaml(algo_path))
-dataset_data  = load_yaml(dataset_path)
+merged_algo  = deep_merge(load_yaml(base_path), load_yaml(algo_path))
+dataset_data = load_yaml(dataset_path)
 
 arch = (merged_algo.get('diffusion') or {}).get('architecture', {})
 
@@ -326,11 +373,16 @@ if isinstance(episode_len_raw, str) and '${' in episode_len_raw:
 else:
     episode_len = episode_len_raw or dataset_data.get('episode_len')
 
+obs_dim_indices = json.loads(obs_dim_json) if obs_dim_json != 'null' else None
+pos_dim_indices = json.loads(pos_dim_json) if pos_dim_json not in ('null', '') else [0, 1]
+
 config_to_save = {
     'algorithm': {
         'causal': merged_algo.get('causal'),
         'scheduling_matrix': merged_algo.get('scheduling_matrix'),
         'frame_stack': merged_algo.get('frame_stack'),
+        'obs_dim_indices': obs_dim_indices,
+        'pos_dim_indices': pos_dim_indices,
         'diffusion': {
             'architecture': {
                 'attn_heads': arch.get('attn_heads'),
@@ -341,7 +393,7 @@ config_to_save = {
         }
     },
     'dataset': {
-        'config': dataset_config_name,            # Hydra config name (e.g. og_antmaze_giant_stitch)
+        'config': dataset_config_name,
         'episode_len': episode_len,
         'jump': int(jump_value) if jump_value.isdigit() else dataset_data.get('jump', 1),
     }
@@ -359,7 +411,8 @@ PYEOF
 }
 
 # Save training-dependent config for later eval job generation
-save_training_config "$MODEL_ID" "$ALGORITHM_CONFIG" "$DATASET_CONFIG" "$JUMP_VALUE"
+save_training_config "$MODEL_ID" "$ALGORITHM_CONFIG" "$DATASET_CONFIG" "$JUMP_VALUE" \
+    "$OBS_DIM_JSON" "$POS_DIM_JSON"
 
 # ────────────────────────────────────────────────────────
 # Training loop (Docker-based)

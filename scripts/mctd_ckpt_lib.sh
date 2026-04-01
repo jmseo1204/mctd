@@ -199,7 +199,8 @@ mctd_check_gpu_availability() {
 }
 
 # ── mctd_dim_menu ─────────────────────────────────────────────────────────────
-# Prompts user to pick obs dim.
+# [LEGACY] Prompts user to pick obs dim.  Kept for backward compatibility with
+# old scripts; new train.sh reads these values from train_df_planning.yaml.
 # Sets globals: MCTD_TARGET_OBS_DIM  MCTD_DATASET_CONFIG
 mctd_dim_menu() {
     echo "Select dataset:"
@@ -216,21 +217,23 @@ mctd_dim_menu() {
         4) MCTD_TARGET_OBS_DIM=2;  MCTD_DATASET_CONFIG="og_antmaze_giant_stitch"             ;;
         *) echo "Invalid selection '$_mctd_dim_sel'. Exiting." >&2; return 1 ;;
     esac
-    echo "✓ Selected state dim: $MCTD_TARGET_OBS_DIM"
-    echo "✓ Selected dataset:   $MCTD_DATASET_CONFIG"
+    echo "Obs dim: $MCTD_TARGET_OBS_DIM"
+    echo "Dataset: $MCTD_DATASET_CONFIG"
 }
 
-# ── mctd_scan_ckpts <target_obs_dim> ─────────────────────────────────────────
-# Scans MCTD_OUTPUT_MOUNT_DIR via Docker for model.ckpt files whose
-# data_mean.shape[0] matches target_obs_dim.
+# ── mctd_scan_ckpts [target_obs_dim] ─────────────────────────────────────────
+# Scans MCTD_OUTPUT_MOUNT_DIR via Docker for model.ckpt files.
+#
+# Optional target_obs_dim (>0): filter by obs_dim. 0 or omitted: show all.
 #
 # Uses scripts/ckpt_scanner.py which provides:
 #   - mtime-based metadata cache (skips torch.load on unchanged files)
 #   - realpath deduplication (symlinks and originals show as one entry)
 #
-# Fills global MCTD_CKPT_DIRS with entries: "name|model_id|host_path|mtime|epoch"
+# Fills global MCTD_CKPT_DIRS with 12-field pipe-delimited entries:
+#   name|model_id|host_path|mtime|epoch|obs_dim|jump|dataset|frame_stack|network_size|num_layers|attn_heads
 mctd_scan_ckpts() {
-    local target_dim="$1"
+    local target_dim="${1:-0}"
     MCTD_CKPT_DIRS=()
 
     local scanner_host="$MCTD_PROJECT_DIR/scripts/ckpt_scanner.py"
@@ -244,7 +247,7 @@ mctd_scan_ckpts() {
             -v "$scanner_host":"$scanner_docker":ro \
             "$MCTD_DOCKER_IMAGE" \
             "$scanner_docker" "$MCTD_DOCKER_OUTPUTS" "$MCTD_OUTPUT_MOUNT_DIR" "$target_dim" \
-            2>/dev/null | grep -E '^[^|]+\|[^|]+\|[^|]+\|[0-9]+\|[0-9]+$'
+            2>/dev/null | grep -E '^[^|]+(\|[^|]*){4,}'
     )
 
     for _entry in "${_raw[@]:-}"; do
@@ -252,27 +255,34 @@ mctd_scan_ckpts() {
     done
 }
 
-# ── mctd_ckpt_menu <dim> [--no-fresh] ────────────────────────────────────────
-# Displays checkpoint list sorted by recency and prompts for selection.
+# ── mctd_ckpt_menu [--no-fresh] ──────────────────────────────────────────────
+# Displays checkpoint list (sorted by recency) with extended arch metadata,
+# then prompts the user to select one.
+#
 # Reads global MCTD_CKPT_DIRS (populated by mctd_scan_ckpts).
-# Each entry has 5 fields: name|model_id|host_path|mtime|epoch
+# Each entry has 12 fields:
+#   name|model_id|host_path|mtime|epoch|obs_dim|jump|dataset|frame_stack|network_size|num_layers|attn_heads
+#
 # Sets globals:
 #   MCTD_SELECTED_CKPT        host path of selected model.ckpt (empty = fresh)
 #   MCTD_SELECTED_EPOCH       epoch number of selected ckpt
 #   MCTD_SELECTED_MODEL_ID    model_id extracted directly from scanner output
+#   MCTD_SELECTED_DATASET     dataset config of selected ckpt (may be "unknown")
+#   MCTD_SELECTED_OBS_DIM     obs_dim of selected ckpt (may be "unknown")
 #
 # --no-fresh: hides "[0] Start from scratch" (use for eval scripts)
 #             returns 1 if user enters invalid index
 mctd_ckpt_menu() {
-    local dim="$1"
-    local no_fresh="${2:-}"
+    local no_fresh="${1:-}"
 
     MCTD_SELECTED_CKPT=""
     MCTD_SELECTED_EPOCH=0
     MCTD_SELECTED_MODEL_ID=""
+    MCTD_SELECTED_DATASET=""
+    MCTD_SELECTED_OBS_DIM=""
 
     if [ ${#MCTD_CKPT_DIRS[@]} -eq 0 ]; then
-        echo "No existing ${dim}D checkpoints found."
+        echo "No checkpoints found."
         return 0
     fi
 
@@ -282,18 +292,27 @@ mctd_ckpt_menu() {
 
     echo ""
     echo "========================================"
-    echo "Found ${#_sorted[@]} checkpoint(s) with obs_dim=${dim}:"
+    echo "Found ${#_sorted[@]} checkpoint(s):"
     echo "========================================"
     [ "$no_fresh" != "--no-fresh" ] && echo "  [0] Start from scratch (fresh training)"
 
     local i
     for i in "${!_sorted[@]}"; do
-        local _e _ckpt_model_id _epoch_num
+        local _e _model_id _epoch _obs_dim _jump _dataset _fs _net _layers _heads
         _e="${_sorted[$i]}"
-        _ckpt_model_id=$(echo "$_e" | cut -d'|' -f2)
-        _epoch_num=$(echo "$_e"     | cut -d'|' -f5)
-        _epoch_num="${_epoch_num:-0}"
-        printf "  [%d] %s  (epoch %s)\n" "$((i+1))" "$_ckpt_model_id" "$_epoch_num"
+        _model_id=$(echo "$_e" | cut -d'|' -f2)
+        _epoch=$(   echo "$_e" | cut -d'|' -f5)
+        _obs_dim=$( echo "$_e" | cut -d'|' -f6)
+        _jump=$(    echo "$_e" | cut -d'|' -f7)
+        _dataset=$( echo "$_e" | cut -d'|' -f8)
+        _fs=$(      echo "$_e" | cut -d'|' -f9)
+        _net=$(     echo "$_e" | cut -d'|' -f10)
+        _layers=$(  echo "$_e" | cut -d'|' -f11)
+        _heads=$(   echo "$_e" | cut -d'|' -f12)
+        _epoch="${_epoch:-0}"
+        printf "  [%d] %-20s  dataset=%-38s obs=%s  jump=%s  fs=%s  net=%sL%sh%s  (epoch %s)\n" \
+            "$((i+1))" "$_model_id" "$_dataset" "$_obs_dim" "$_jump" "$_fs" \
+            "$_net" "$_layers" "$_heads" "$_epoch"
     done
     echo ""
 
@@ -320,8 +339,10 @@ mctd_ckpt_menu() {
     local _idx=$((_sel - 1))
     local _e="${_sorted[$_idx]}"
     MCTD_SELECTED_MODEL_ID=$(echo "$_e" | cut -d'|' -f2)
-    MCTD_SELECTED_CKPT=$(echo "$_e"     | cut -d'|' -f3)
-    MCTD_SELECTED_EPOCH=$(echo "$_e"    | cut -d'|' -f5)
+    MCTD_SELECTED_CKPT=$(    echo "$_e" | cut -d'|' -f3)
+    MCTD_SELECTED_EPOCH=$(   echo "$_e" | cut -d'|' -f5)
+    MCTD_SELECTED_OBS_DIM=$( echo "$_e" | cut -d'|' -f6)
+    MCTD_SELECTED_DATASET=$( echo "$_e" | cut -d'|' -f8)
     MCTD_SELECTED_EPOCH="${MCTD_SELECTED_EPOCH:-0}"
     echo "Selected: $MCTD_SELECTED_CKPT  (epoch $MCTD_SELECTED_EPOCH)"
     echo "Model ID: $MCTD_SELECTED_MODEL_ID"

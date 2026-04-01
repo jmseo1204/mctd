@@ -94,6 +94,17 @@ class DiffusionForcingBase(BasePytorchAlgo):
                 'architecture': arch,
             },
         }
+        # Save obs/pos dimension indices so eval-time algo reconstruction uses
+        # the exact same observation selection as training.
+        _obs_idx = self.cfg.get('obs_dim_indices', None)
+        if _obs_idx is not None:
+            hparams['obs_dim_indices'] = list(_obs_idx)
+        _pos_idx = self.cfg.get('pos_dim_indices', None)
+        if _pos_idx is not None:
+            hparams['pos_dim_indices'] = list(_pos_idx)
+        _dataset_cfg = self.cfg.get('train_dataset_config', None)
+        if _dataset_cfg is not None:
+            hparams['dataset_config'] = str(_dataset_cfg)
         # Save effective (subsampled) episode_len = raw_episode_len // jump.
         # jump is now in df_base.yaml as ${jump}, so self.cfg.jump is always available.
         # This ensures eval-time job generation gets the model-aligned episode_len directly

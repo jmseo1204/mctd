@@ -53,8 +53,8 @@ class PlanVizMixin:
             y_min, y_max = (0.5 - 1) * 4, (W + 0.5 - 1) * 4
         else:
             import torch
-            obs_mean_np = self.data_mean[:self.pos_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[:self.pos_dim])
-            obs_std_np  = self.data_std[:self.pos_dim].cpu().numpy()  if isinstance(self.data_std,  torch.Tensor) else np.array(self.data_std[:self.pos_dim])
+            obs_mean_np = self.data_mean[self.pos_dim_indices].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean)[self.pos_dim_indices]
+            obs_std_np  = self.data_std[self.pos_dim_indices].cpu().numpy()  if isinstance(self.data_std,  torch.Tensor) else np.array(self.data_std)[self.pos_dim_indices]
             x_min, x_max = obs_mean_np[0] - 3 * obs_std_np[0], obs_mean_np[0] + 3 * obs_std_np[0]
             y_min, y_max = obs_mean_np[1] - 3 * obs_std_np[1], obs_mean_np[1] + 3 * obs_std_np[1]
 
@@ -66,7 +66,7 @@ class PlanVizMixin:
 
         # Build obs_batch: use goal_obs as template, swap in grid x,y
         obs_batch  = np.tile(goal_obs_np, (N, 1)).astype(np.float32)
-        obs_batch[:, :self.pos_dim] = grid_xy
+        obs_batch[:, self.pos_dim_indices] = grid_xy
 
         # goal_batch: same goal obs repeated for each grid point
         goal_batch = np.tile(goal_obs_np, (N, 1)).astype(np.float32)
@@ -109,8 +109,8 @@ class PlanVizMixin:
             y_min, y_max = (0.5 - 1) * 4, (W + 0.5 - 1) * 4
         else:
             import torch
-            obs_mean_np = self.data_mean[:self.pos_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[:self.pos_dim])
-            obs_std_np  = self.data_std[:self.pos_dim].cpu().numpy()  if isinstance(self.data_std,  torch.Tensor) else np.array(self.data_std[:self.pos_dim])
+            obs_mean_np = self.data_mean[self.pos_dim_indices].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean)[self.pos_dim_indices]
+            obs_std_np  = self.data_std[self.pos_dim_indices].cpu().numpy()  if isinstance(self.data_std,  torch.Tensor) else np.array(self.data_std)[self.pos_dim_indices]
             x_min, x_max = obs_mean_np[0] - 3 * obs_std_np[0], obs_mean_np[0] + 3 * obs_std_np[0]
             y_min, y_max = obs_mean_np[1] - 3 * obs_std_np[1], obs_mean_np[1] + 3 * obs_std_np[1]
 
@@ -133,7 +133,7 @@ class PlanVizMixin:
         target_np = np.zeros((1, self.hilp_obs_dim), dtype=np.float32)
         if _hilp_ref is not None:
             target_np[0] = _hilp_ref
-        target_np[0, :self.pos_dim] = target_pos[:self.pos_dim]
+        target_np[0, self.pos_dim_indices] = target_pos[self.pos_dim_indices]
 
         # --- 3. Guidance gradients via shared helper (same logic as goal_guidance) ---
         # Any changes to guidance.compute_guidance_grad_np propagate here automatically.
@@ -186,7 +186,7 @@ class PlanVizMixin:
         while current_node is not None:
             # Extract position from sim_state if available
             if current_node.sim_state is not None:
-                pos = current_node.sim_state["qpos"][:self.pos_dim]
+                pos = current_node.sim_state["qpos"][:2]  # physical: qpos[:2] = world (x,y)
                 trajectory.append(pos)
             elif current_node.obs_pos is not None:
                 trajectory.append(current_node.obs_pos)
@@ -279,7 +279,7 @@ class PlanVizMixin:
                     pass
                 try:
                     cand_grad_field = self._compute_guidance_grad_fields(
-                        tgt_pos[:self.pos_dim]
+                        tgt_pos[self.pos_dim_indices]
                     )
                 except Exception:
                     pass
@@ -294,12 +294,12 @@ class PlanVizMixin:
 
         for m in range(hist.shape[0]):
             pu = self._unnormalize_x(hist[m].unsqueeze(1))  # (plan_tokens*fs, 1, c)
-            plan = pu[:alen, :, :self.pos_dim].detach().cpu().numpy() if alen > 0 else None
+            plan = pu[:alen, :, self.pos_dim_indices].detach().cpu().numpy() if alen > 0 else None
 
             gpos = xs_gpos = gg = pg = xs_gg = xs_pg = None
 
             if len(tail_vis) > 0:
-                gpos = pu[tail_vis, 0, :self.pos_dim].detach().cpu().numpy()
+                gpos = pu[tail_vis, 0, self.pos_dim_indices].detach().cpu().numpy()
 
                 if step_caps is not None and m < len(step_caps):
                     sc = step_caps[m]
@@ -318,12 +318,12 @@ class PlanVizMixin:
 
                     # Prior: -ε_θ × sqrt(α_t) — grows as denoising progresses
                     if pn is not None:
-                        pg = -pn[tail_vis, :self.pos_dim].numpy() * obs_std_np * prior_scale
+                        pg = -pn[tail_vis][:, self.pos_dim_indices].numpy() * obs_std_np * prior_scale
 
                     # Guidance: +grad × σ_t — x̂_0 moves toward goal
                     if gg_dict:
                         gg = (
-                            sum(v[tail_vis, :self.pos_dim].numpy() for v in gg_dict.values())
+                            sum(v[tail_vis][:, self.pos_dim_indices].numpy() for v in gg_dict.values())
                             * obs_std_np
                         ) * sigma_t
 
@@ -331,17 +331,17 @@ class PlanVizMixin:
                     pxs_cpu = sc.get('pred_x_start_pos')
                     if pxs_cpu is not None:
                         pxs_world = self._unnormalize_x(pxs_cpu.unsqueeze(1))
-                        xs_gpos = pxs_world[tail_vis, 0, :self.pos_dim].detach().cpu().numpy()
+                        xs_gpos = pxs_world[tail_vis, 0, self.pos_dim_indices].detach().cpu().numpy()
 
                         gg_clean_dict = sc.get('guidance_grads_clean', {})
                         if gg_clean_dict:
                             xs_gg = (
-                                sum(v[tail_vis, :self.pos_dim].numpy() for v in gg_clean_dict.values())
+                                sum(v[tail_vis][:, self.pos_dim_indices].numpy() for v in gg_clean_dict.values())
                                 * obs_std_np
                             ) * sigma_t
 
                         if pn is not None:
-                            xs_pg = -pn[tail_vis, :self.pos_dim].numpy() * obs_std_np * prior_scale
+                            xs_pg = -pn[tail_vis][:, self.pos_dim_indices].numpy() * obs_std_np * prior_scale
 
             td = {
                 'plan': plan,

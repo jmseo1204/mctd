@@ -3,13 +3,20 @@
 MCTD checkpoint scanner with mtime-based metadata cache and realpath deduplication.
 
 Usage (run inside Docker):
-    python3 ckpt_scanner.py <docker_outputs_path> <host_output_mount_dir> <target_obs_dim>
+    python3 ckpt_scanner.py <docker_outputs_path> <host_output_mount_dir> [target_obs_dim]
 
-Output (stdout): one line per unique checkpoint matching target_obs_dim:
-    name|host_path|mtime|epoch
+    target_obs_dim: optional integer filter; 0 or omitted → show all checkpoints.
+
+Output (stdout): one line per unique checkpoint:
+    name|model_id|host_path|mtime|epoch|obs_dim|jump|dataset|frame_stack|network_size|num_layers|attn_heads
+
+    Unknown fields are emitted as the literal string "unknown".
 
 Cache file: <docker_outputs_path>/ckpt_scan_cache.json
-    { "<realpath_inside_docker>": {"obs_dim": int, "epoch": int, "mtime": int} }
+    { "<realpath_inside_docker>": { "obs_dim": int, "epoch": int, "mtime": int,
+                                    "jump": int|null, "dataset": str|null,
+                                    "frame_stack": int|null, "network_size": int|null,
+                                    "num_layers": int|null, "attn_heads": int|null } }
 
 Directory layout understood:
     NEW-STYLE (flat, preferred):
@@ -39,6 +46,8 @@ from pathlib import Path
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+_UNKNOWN = "unknown"
+
 
 def _name_priority(name: str) -> int:
     if name.startswith("[eval] local_"):
@@ -50,17 +59,59 @@ def _name_priority(name: str) -> int:
     return 0
 
 
+def _extract_arch_metadata(ckpt: dict) -> dict:
+    """Extract arch metadata from a loaded checkpoint dict.
+
+    Returns a dict with keys: obs_dim, jump, dataset, frame_stack,
+    network_size, num_layers, attn_heads.  Missing values are None.
+    """
+    sd = ckpt.get("state_dict", {})
+    dm = sd.get("data_mean")
+    # obs_dim from data_mean shape (legacy fallback)
+    obs_dim_from_mean = int(dm.shape[0]) if dm is not None else None
+
+    result = {
+        "obs_dim": obs_dim_from_mean,
+        "jump": None,
+        "dataset": None,
+        "frame_stack": None,
+        "network_size": None,
+        "num_layers": None,
+        "attn_heads": None,
+    }
+
+    hp = ckpt.get("training_hparams")
+    if not isinstance(hp, dict):
+        return result
+
+    # obs_dim: prefer len(obs_dim_indices) over data_mean shape
+    obs_idx = hp.get("obs_dim_indices")
+    if obs_idx is not None:
+        result["obs_dim"] = len(obs_idx)
+
+    result["jump"] = hp.get("jump")
+    result["dataset"] = hp.get("dataset_config")
+    result["frame_stack"] = hp.get("frame_stack")
+
+    arch = hp.get("diffusion", {}).get("architecture", {})
+    result["network_size"] = arch.get("network_size")
+    result["num_layers"] = arch.get("num_layers")
+    result["attn_heads"] = arch.get("attn_heads")
+
+    return result
+
+
 def main():
-    if len(sys.argv) < 4:
+    if len(sys.argv) < 3:
         print(
-            "Usage: ckpt_scanner.py <docker_outputs> <host_mount_dir> <target_dim>",
+            "Usage: ckpt_scanner.py <docker_outputs> <host_mount_dir> [target_dim]",
             file=sys.stderr,
         )
         sys.exit(1)
 
     docker_outputs = sys.argv[1]
     host_mount_dir = sys.argv[2]
-    target_dim     = int(sys.argv[3])
+    target_dim = int(sys.argv[3]) if len(sys.argv) >= 4 else 0  # 0 = no filter
 
     base       = Path(docker_outputs)
     cache_path = base / "ckpt_scan_cache.json"
@@ -74,7 +125,7 @@ def main():
 
     cache_dirty = False
 
-    # realpath_str → (best_name, host_path, mtime, epoch)
+    # realpath_str → (best_name, host_path, mtime, epoch, meta_dict)
     best: dict[str, tuple] = {}
 
     for ckpt_path in sorted(base.rglob("model.ckpt")):
@@ -84,12 +135,9 @@ def main():
 
             # ── Classify path ────────────────────────────────────────────────
             if _DATE_RE.match(parts[0]):
-                # Raw Hydra output: YYYY-MM-DD/HH-MM-SS/.../model.ckpt
-                # Skip — these are shown only via their registered model_id symlink.
-                continue
+                continue  # Raw Hydra output — skip
 
             if parts[0] == "downloaded":
-                # Old-style: downloaded/.../mctd_eval/<model_id>/model.ckpt
                 if "mctd_eval" not in parts:
                     continue
                 idx      = list(parts).index("mctd_eval")
@@ -97,13 +145,11 @@ def main():
                 name     = f"[eval] {model_id}"
                 host_path = host_mount_dir + str(ckpt_path)[len(docker_outputs):]
             elif len(parts) == 2 and parts[1] == "model.ckpt":
-                # New-style flat: <model_id>/model.ckpt
                 model_id  = parts[0]
                 name      = model_id
                 host_path = host_mount_dir + str(ckpt_path)[len(docker_outputs):]
             else:
-                # Unrecognised structure — skip
-                continue
+                continue  # Unrecognised structure
 
             # ── Metadata: cache hit or full load ─────────────────────────────
             real_path = ckpt_path.resolve()
@@ -111,24 +157,29 @@ def main():
             mtime     = int(real_path.stat().st_mtime)
 
             cached = cache.get(real_key)
-            if cached and cached.get("mtime") == mtime:
-                obs_dim = cached["obs_dim"]
-                epoch   = cached["epoch"]
+            if cached and cached.get("mtime") == mtime and "network_size" in cached:
+                # Cache hit with full arch metadata
+                meta = {k: cached.get(k) for k in ("obs_dim", "jump", "dataset",
+                                                     "frame_stack", "network_size",
+                                                     "num_layers", "attn_heads")}
+                epoch = cached["epoch"]
             else:
-                ckpt    = torch.load(str(real_path), map_location="cpu", weights_only=False)
-                sd      = ckpt.get("state_dict", {})
-                dm      = sd.get("data_mean")
-                obs_dim = int(dm.shape[0]) if dm is not None else None
-                epoch   = int(ckpt.get("epoch", 0))
-                cache[real_key] = {"obs_dim": obs_dim, "epoch": epoch, "mtime": mtime}
+                ckpt  = torch.load(str(real_path), map_location="cpu", weights_only=False)
+                meta  = _extract_arch_metadata(ckpt)
+                epoch = int(ckpt.get("epoch", 0))
+                cache[real_key] = {
+                    "mtime": mtime, "epoch": epoch,
+                    **meta,
+                }
                 cache_dirty = True
 
-            if obs_dim != target_dim:
+            # ── Optional obs_dim filter ──────────────────────────────────────
+            if target_dim > 0 and meta.get("obs_dim") != target_dim:
                 continue
 
             # ── Dedup: keep highest-priority name per realpath ───────────────
             if real_key not in best or _name_priority(name) < _name_priority(best[real_key][0]):
-                best[real_key] = (name, host_path, mtime, epoch)
+                best[real_key] = (name, host_path, mtime, epoch, meta)
 
         except Exception as e:
             print(f"SCAN_ERR {ckpt_path}: {e}", file=sys.stderr)
@@ -142,9 +193,22 @@ def main():
             print(f"Cache write error: {e}", file=sys.stderr)
 
     # ── Emit results ──────────────────────────────────────────────────────────
-    for name, host_path, mtime, epoch in best.values():
+    def _f(v) -> str:
+        """Format a possibly-None metadata value."""
+        return str(v) if v is not None else _UNKNOWN
+
+    for name, host_path, mtime, epoch, meta in best.values():
         model_id = name[len("[eval] "):] if name.startswith("[eval] ") else name
-        print(f"{name}|{model_id}|{host_path}|{mtime}|{epoch}")
+        print(
+            f"{name}|{model_id}|{host_path}|{mtime}|{epoch}"
+            f"|{_f(meta.get('obs_dim'))}"
+            f"|{_f(meta.get('jump'))}"
+            f"|{_f(meta.get('dataset'))}"
+            f"|{_f(meta.get('frame_stack'))}"
+            f"|{_f(meta.get('network_size'))}"
+            f"|{_f(meta.get('num_layers'))}"
+            f"|{_f(meta.get('attn_heads'))}"
+        )
 
 
 if __name__ == "__main__":

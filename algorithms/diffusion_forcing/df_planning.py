@@ -109,8 +109,19 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.env_id = cfg.env_id
         self.dataset = cfg.dataset
         self.action_dim = len(cfg.action_mean)
-        self.observation_dim = len(cfg.observation_mean)
-        self.pos_dim = cfg.get("pos_dim", 2)  # Spatial dims for MCTS/guidance (x, y)
+        # obs_dim_indices: which indices of the dataset observation vector to use.
+        # Defaults to all dims (backward compat). Set from training_hparams at eval time.
+        _obs_idx = cfg.get("obs_dim_indices", None)
+        self.obs_dim_indices: list = (
+            list(_obs_idx) if _obs_idx is not None
+            else list(range(len(cfg.observation_mean)))
+        )
+        self.observation_dim: int = len(self.obs_dim_indices)
+        # pos_dim_indices: which obs vector indices are spatial (x,y) position.
+        # Physical qpos[:2] is always world (x,y) in AntMaze/PointMaze — kept separate.
+        _pos_idx = cfg.get("pos_dim_indices", None)
+        self.pos_dim_indices: list = list(_pos_idx) if _pos_idx is not None else [0, 1]
+        self.pos_dim: int = len(self.pos_dim_indices)
         self.use_reward = cfg.use_reward
         self.unstacked_dim = (
             self.observation_dim + self.action_dim + int(self.use_reward)
@@ -128,8 +139,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.gamma = cfg.gamma
         self.reward_mean = cfg.reward_mean
         self.reward_std = cfg.reward_std
-        self.observation_mean = np.array(cfg.observation_mean[: self.observation_dim])
-        self.observation_std = np.array(cfg.observation_std[: self.observation_dim])
+        self.observation_mean = np.array(cfg.observation_mean)[self.obs_dim_indices]
+        self.observation_std = np.array(cfg.observation_std)[self.obs_dim_indices]
         self.action_mean = np.array(cfg.action_mean[: self.action_dim])
         self.action_std = np.array(cfg.action_std[: self.action_dim])
         self.open_loop_horizon = cfg.open_loop_horizon
@@ -293,12 +304,12 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 x_min, x_max = (0.5 - 1) * 4, (H + 0.5 - 1) * 4
                 y_min, y_max = (0.5 - 1) * 4, (W + 0.5 - 1) * 4
             else:
-                obs_mean_np = (self.data_mean[:self.pos_dim].cpu().numpy()
-                               if isinstance(self.data_mean, torch.Tensor)
-                               else np.array(self.data_mean[:self.pos_dim]))
-                obs_std_np  = (self.data_std[:self.pos_dim].cpu().numpy()
-                               if isinstance(self.data_std, torch.Tensor)
-                               else np.array(self.data_std[:self.pos_dim]))
+                _dm = (self.data_mean.cpu().numpy() if isinstance(self.data_mean, torch.Tensor)
+                       else np.array(self.data_mean))
+                _ds = (self.data_std.cpu().numpy() if isinstance(self.data_std, torch.Tensor)
+                       else np.array(self.data_std))
+                obs_mean_np = _dm[self.pos_dim_indices]
+                obs_std_np  = _ds[self.pos_dim_indices]
                 x_min, x_max = obs_mean_np[0] - 3 * obs_std_np[0], obs_mean_np[0] + 3 * obs_std_np[0]
                 y_min, y_max = obs_mean_np[1] - 3 * obs_std_np[1], obs_mean_np[1] + 3 * obs_std_np[1]
 
@@ -1427,8 +1438,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # Capture initial physical state (always, regardless of use_rollout)
             initial_sim_state = self._get_sim_state(envs)
             assert initial_sim_state is not None, "Failed to capture initial sim state"
-            assert np.allclose(initial_sim_state["qpos"][:self.pos_dim], _bidir_start_np[0][:self.pos_dim], atol=1e-5), \
-                f"Physical start position {initial_sim_state['qpos'][:self.pos_dim]} does not match observation start position {_bidir_start_np[0][:self.pos_dim]}"
+            assert np.allclose(initial_sim_state["qpos"][:2], _bidir_start_np[0][self.pos_dim_indices], atol=1e-5), \
+                f"Physical start position {initial_sim_state['qpos'][:2]} does not match observation start position {_bidir_start_np[0][self.pos_dim_indices]}"
 
             # Build full reference observation (real joint state) for HILP.
             # HILP was trained on 29D obs (qpos+qvel); padding with zeros produces OOD inputs.
@@ -1444,7 +1455,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 "qvel": np.zeros_like(initial_sim_state["qvel"]),  # Goal is assumed static
             }
             # Replace x, y coordinates with goal coordinates
-            goal_sim_state["qpos"][:self.pos_dim] = _bidir_goal_np[0][:self.pos_dim]
+            goal_sim_state["qpos"][:2] = _bidir_goal_np[0][self.pos_dim_indices]
 
             bidir_tree1 = self._init_mcts_tree(
                 horizon,
@@ -1465,8 +1476,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # Configurable meeting threshold (Euclidean distance in unnormalized obs space)
             _meeting_delta: float = getattr(self.cfg, "meeting_delta", 2.0)
 
-            _start_pos = _bidir_start_np[0][:self.pos_dim].tolist()
-            _goal_pos  = _bidir_goal_np[0][:self.pos_dim].tolist()
+            _start_pos = _bidir_start_np[0][self.pos_dim_indices].tolist()
+            _goal_pos  = _bidir_goal_np[0][self.pos_dim_indices].tolist()
             print(f"\n[MCTD] Episode start | start={[round(x,1) for x in _start_pos]} → goal={[round(x,1) for x in _goal_pos]} | horizon={horizon} | max_loops={self.val_max_loops}", flush=True)
 
             # Single-shot planning state
@@ -1537,7 +1548,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         )
                         assert _new_sim_state is not None, "_new_sim_state is None"
                         _child.sim_state = _new_sim_state
-                        _child.obs_pos = np.concatenate([_new_sim_state["qpos"], _new_sim_state["qvel"]])[:self.observation_dim]
+                        _child.obs_pos = np.concatenate([_new_sim_state["qpos"], _new_sim_state["qvel"]])[self.obs_dim_indices]
                 
                 else:
                     # Derive obs_pos from plan_history without physical simulation
@@ -1561,15 +1572,15 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                             else:
                                 _child.sim_state[k] = v
                         # Update qpos with last valid frame position (pos_dim only)
-                        _child.sim_state['qpos'][:self.pos_dim] = _child.obs_pos[:self.pos_dim]
+                        _child.sim_state['qpos'][:2] = _child.obs_pos[self.pos_dim_indices]
 
 
                 # --- Per-expansion denoising video logging ---
                 # Runs before _select_best_leaf so videos are logged even if the
                 # episode terminates after this loop's plan execution.
-                _v_start_np = start.cpu().numpy()[:, :self.pos_dim]
-                _v_goal_np = goal.cpu().numpy()[:, :self.pos_dim]
-                _v_goal_pos2d = goal.cpu().numpy()[0, :self.pos_dim]            # world coords
+                _v_start_np = start.cpu().numpy()[:, self.pos_dim_indices]
+                _v_goal_np = goal.cpu().numpy()[:, self.pos_dim_indices]
+                _v_goal_pos2d = goal.cpu().numpy()[0, self.pos_dim_indices]            # world coords
                 _v_goal_obs = goal.cpu().numpy()[0, :self.observation_dim].astype(np.float32)  # for HILP
                 _v_gscale = self.mctd_guidance_scales[0] if self.mctd_guidance_scales else 0.0
                 _v_hilp_fn = getattr(self, '_hilp_value_fn_instance', None)
@@ -1583,10 +1594,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 _v_sc_by_name: dict = getattr(self, '_expansion_step_captures_by_name', {})
                 # obs_std for converting normalized pred_noise to world-space arrow scale
                 _v_obs_std_np = (
-                    self.data_std[:self.pos_dim].cpu().numpy()
-                    if isinstance(self.data_std, torch.Tensor)
-                    else np.array(self.data_std[:self.pos_dim])
-                )
+                    self.data_std.cpu().numpy() if isinstance(self.data_std, torch.Tensor)
+                    else np.array(self.data_std)
+                )[self.pos_dim_indices]
 
                 for _vname, _vinfo in (expanded_node_infos.items() if self.viz_subplan_denoising else []):
                     # Always log expanded stage denoising
@@ -1650,8 +1660,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 plan_unnormalized = self._unnormalize_x(output_plan.unsqueeze(0))[-1]  # (T_combined*fs, 1, c)
 
                 # Visualization with both forward and reverse trajectories
-                start_numpy = start.cpu().numpy()[:, :self.pos_dim]
-                goal_numpy = goal.cpu().numpy()[:, :self.pos_dim]
+                start_numpy = start.cpu().numpy()[:, self.pos_dim_indices]
+                goal_numpy = goal.cpu().numpy()[:, self.pos_dim_indices]
 
                 # [only for viz] Extract best_node's tree trajectory (sim_state sequence from root to leaf)
                 node_trajectory = self._extract_node_trajectory(best_node)
@@ -1710,7 +1720,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
                 # Visualize postprocessed plan
                 _ppviz_t0 = time.time()
-                _pp_plan_np = plan_unnormalized[:, :, :self.pos_dim].detach().cpu().numpy()  # (K, 1, pos_dim)
+                _pp_plan_np = plan_unnormalized[:, :, self.pos_dim_indices].detach().cpu().numpy()  # (K, 1, pos_dim)
                 _pp_images = make_trajectory_images(
                     self.env_id, _pp_plan_np, 1, start_numpy.tolist(), goal_numpy.tolist(), self.plot_end_points
                 )
@@ -1788,8 +1798,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             if len(trajectory) > 0:
                 samples = 1 # min(32, batch_size)
                 trajectory = torch.stack(trajectory)
-                start = start[:, :self.pos_dim].cpu().numpy().tolist()
-                goal = goal[:, :self.pos_dim].cpu().numpy().tolist()
+                start = start[:, self.pos_dim_indices].cpu().numpy().tolist()
+                goal = goal[:, self.pos_dim_indices].cpu().numpy().tolist()
                 rollout_agent_history = validation_rollout_agent_history
                 rollout_subgoal_history = validation_rollout_subgoal_history
                 images = make_trajectory_images(
@@ -2628,8 +2638,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     # Compute per-batch distance from final plan token to goal (unnormalized positions)
                     _final_plan = self._unnormalize_x(expanded_node_plan_hists[-1])  # (plan_tokens*fs, B, c)
                     _goal_unnorm = self._unnormalize_x(effective_goal_normalized)    # (B, obs_dim)
-                    _final_pos = _final_plan[-1, :, :self.pos_dim].detach().cpu().numpy()  # (B, pos_dim)
-                    _goal_pos = _goal_unnorm[:, :self.pos_dim].detach().cpu().numpy()       # (B, pos_dim)
+                    _final_pos = _final_plan[-1, :, self.pos_dim_indices].detach().cpu().numpy()  # (B, pos_dim)
+                    _goal_pos = _goal_unnorm[:, self.pos_dim_indices].detach().cpu().numpy()       # (B, pos_dim)
                     _dist_per_batch = np.linalg.norm(_final_pos - _goal_pos, axis=-1).tolist()  # [B]
                     _scales = (
                         expanded_node_guidance_scales.tolist()

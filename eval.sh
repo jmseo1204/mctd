@@ -54,37 +54,22 @@ mctd_select_gpus
 mctd_check_gpu_availability
 
 # ─────────────────────────────────────────────────────
-# 1. Select state dimension
+# 1. Scan ALL checkpoints and let user select by index
 # ─────────────────────────────────────────────────────
-echo "Scanning all checkpoints to identify available state dimensions..."
-mctd_dim_menu || exit 1
-STATE_DIM="$MCTD_TARGET_OBS_DIM"
-SELECTED_DATASET="$MCTD_DATASET_CONFIG"
-echo ""
-
-DATASET_YAML="${CONFIG_DATASET_DIR}/${SELECTED_DATASET}.yaml"
-if [ ! -f "$DATASET_YAML" ]; then
-    echo "❌ ERROR: Dataset config not found: ${DATASET_YAML}"
-    exit 1
-fi
-
-# ─────────────────────────────────────────────────────
-# 2. Scan and select checkpoint
-# ─────────────────────────────────────────────────────
-mctd_scan_ckpts "$STATE_DIM"
+echo "Scanning all checkpoints..."
+mctd_scan_ckpts 0   # 0 = no obs_dim filter; show all
 
 if [ ${#MCTD_CKPT_DIRS[@]} -eq 0 ]; then
-    echo "❌ ERROR: No checkpoints found with obs_dim=${STATE_DIM}"
+    echo "❌ ERROR: No checkpoints found in $MCTD_OUTPUT_MOUNT_DIR"
     exit 1
 fi
 
-mctd_ckpt_menu "$STATE_DIM" "--no-fresh" || exit 1
+mctd_ckpt_menu "--no-fresh" || exit 1
 
 # model_id is populated directly by scanner — no fallback needed
 SELECTED_MODEL_ID="${MCTD_SELECTED_MODEL_ID:-}"
 if [ -z "$SELECTED_MODEL_ID" ]; then
     echo "❌ ERROR: Could not determine model_id for selected checkpoint." >&2
-    echo "   Scanner output is missing model_id field. Please check ckpt_scanner.py." >&2
     exit 1
 fi
 mctd_ensure_eval_symlink "$MCTD_SELECTED_CKPT" "$SELECTED_MODEL_ID"
@@ -96,28 +81,47 @@ if [ ! -f "$CKPT_PATH" ]; then
     exit 1
 fi
 
-# Auto-detect training dataset from training_config.yaml (written by train.sh).
-# This overrides the hardcoded dataset from mctd_dim_menu so the correct
-# observation normalization stats and episode_len are used.
+# ─────────────────────────────────────────────────────
+# 2. Auto-detect dataset and obs_dim from checkpoint metadata
+# Priority: training_config.yaml > scanner metadata > error
+# ─────────────────────────────────────────────────────
+SELECTED_DATASET="${MCTD_SELECTED_DATASET:-unknown}"
+STATE_DIM="${MCTD_SELECTED_OBS_DIM:-unknown}"
+
 _TRAINING_CONFIG="${OUTPUT_DOWNLOADED_DIR}/${SELECTED_MODEL_ID}/training_config.yaml"
 if [ -f "$_TRAINING_CONFIG" ]; then
-    _DETECTED_DATASET=$(python3 -c "
-import yaml, sys
+    _DETECTED=$(python3 -c "
+import yaml, json, sys
 with open('$_TRAINING_CONFIG') as f:
     d = yaml.safe_load(f)
-print((d.get('dataset') or {}).get('config', ''))
+ds = (d.get('dataset') or {}).get('config', '')
+obs_idx = (d.get('algorithm') or {}).get('obs_dim_indices')
+obs_dim = str(len(obs_idx)) if obs_idx else ''
+print(ds)
+print(obs_dim)
 " 2>/dev/null)
-    if [ -n "$_DETECTED_DATASET" ] && [ "$_DETECTED_DATASET" != "None" ]; then
-        if [ "$_DETECTED_DATASET" != "$SELECTED_DATASET" ]; then
-            echo "  [config] Overriding dataset: $SELECTED_DATASET → $_DETECTED_DATASET (from training_config.yaml)"
-        fi
-        SELECTED_DATASET="$_DETECTED_DATASET"
-    else
-        echo "  [config] WARNING: training_config.yaml found but no dataset.config field. Using dim-menu default: $SELECTED_DATASET"
-    fi
+    _DETECTED_DATASET=$(echo "$_DETECTED" | sed -n '1p')
+    _DETECTED_DIM=$(    echo "$_DETECTED" | sed -n '2p')
+    [ -n "$_DETECTED_DATASET" ] && [ "$_DETECTED_DATASET" != "None" ] && SELECTED_DATASET="$_DETECTED_DATASET"
+    [ -n "$_DETECTED_DIM"     ] && [ "$_DETECTED_DIM"     != "None" ] && STATE_DIM="$_DETECTED_DIM"
+    echo "  [config] Loaded metadata from training_config.yaml: dataset=$SELECTED_DATASET obs_dim=$STATE_DIM"
 else
-    echo "  [config] WARNING: No training_config.yaml for $SELECTED_MODEL_ID. Using dim-menu default: $SELECTED_DATASET"
-    echo "           (Train with current train.sh to save this automatically)"
+    echo "  [config] No training_config.yaml for $SELECTED_MODEL_ID — using scanner metadata."
+    echo "           dataset=$SELECTED_DATASET  obs_dim=$STATE_DIM"
+fi
+
+# If dataset still unknown, fail with guidance
+if [ "$SELECTED_DATASET" = "unknown" ] || [ -z "$SELECTED_DATASET" ]; then
+    echo "❌ ERROR: Could not determine training dataset for $SELECTED_MODEL_ID." >&2
+    echo "   This is a legacy checkpoint without training_config.yaml." >&2
+    echo "   Create $MCTD_EVAL_BASE/$SELECTED_MODEL_ID/training_config.yaml with dataset.config field." >&2
+    exit 1
+fi
+
+DATASET_YAML="${CONFIG_DATASET_DIR}/${SELECTED_DATASET}.yaml"
+if [ ! -f "$DATASET_YAML" ]; then
+    echo "❌ ERROR: Dataset config not found: ${DATASET_YAML}"
+    exit 1
 fi
 echo ""
 

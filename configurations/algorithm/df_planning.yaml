@@ -14,7 +14,13 @@ gamma: ${dataset.gamma}
 env_id: ${dataset.env_id}
 dataset: ${dataset.dataset}
 # non dataset info
-pos_dim: 2 # spatial x,y dims for MCTS guidance/visualization (always 2 for AntMaze/PointMaze)
+# obs_dim_indices: which indices of the dataset observation to use (null = use all).
+#   Loaded from training_hparams at eval time; set explicitly in train_df_planning.yaml.
+obs_dim_indices: null
+# pos_dim_indices: which indices of the observation vector represent spatial (x,y) position.
+#   Note: physical qpos[:2] is always world (x,y) in AntMaze/PointMaze regardless of obs selection.
+pos_dim_indices: [0, 1]
+# x_shape: computed at runtime in DiffusionForcingPlanning.__init__ as (obs_dim + action_dim,)
 x_shape: null
 
 context_frames: 1
