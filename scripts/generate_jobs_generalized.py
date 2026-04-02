@@ -8,7 +8,7 @@ from pathlib import Path
 from project_config import DOCKER_USER as _DOCKER_USER, WANDB_ENTITY as _WANDB_ENTITY, \
     DOCKER_IMAGE as _DOCKER_IMAGE, WANDB_PROJECT as _WANDB_PROJECT
 
-def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
+def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir=f"/home/{_DOCKER_USER}/mctd_outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
     """
     Infer frame_stack from checkpoint weights.
     init_mlp.0.weight has shape (hidden, x_dim + k_embed_dim + external_cond_dim).
@@ -82,7 +82,7 @@ def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir=f"ou
     return None
 
 
-def detect_network_size_from_ckpt(model_id, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
+def detect_network_size_from_ckpt(model_id, downloaded_dir=f"/home/{_DOCKER_USER}/mctd_outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
     """
     Infer network_size (hidden dimension) from checkpoint weights.
     Checks transformer layer self_attn.in_proj_weight shape[1] for hidden dim.
@@ -193,7 +193,7 @@ def detect_network_size_from_ckpt(model_id, downloaded_dir=f"outputs/downloaded/
     return None
 
 
-def find_local_training_config(model_id, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
+def find_local_training_config(model_id, downloaded_dir=f"/home/{_DOCKER_USER}/mctd_outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
     """
     Find training_config.yaml saved by train.sh alongside the checkpoint.
     Written in plain-YAML format; extract_from_config() handles it without changes.
@@ -290,7 +290,14 @@ def extract_from_config(config_path):
         # Model training-dependent architecture params (must match training config)
         'causal': get_val(['algorithm', 'causal']),
         'scheduling_matrix': get_val(['algorithm', 'scheduling_matrix']),
+        'padding_mode': get_val(['algorithm', 'padding_mode']),
+        'context_frames': get_val(['algorithm', 'context_frames']),
+        'obs_dim_indices': get_val(['algorithm', 'obs_dim_indices']),
+        'pos_dim_indices': get_val(['algorithm', 'pos_dim_indices']),
         'attn_heads': get_val(['algorithm', 'diffusion', 'architecture', 'attn_heads']),
+        'network_size': get_val(['algorithm', 'diffusion', 'architecture', 'network_size']),
+        'num_layers': get_val(['algorithm', 'diffusion', 'architecture', 'num_layers']),
+        'dim_feedforward': get_val(['algorithm', 'diffusion', 'architecture', 'dim_feedforward']),
         # Training dataset identity (used by eval.sh to pick correct dataset)
         'dataset_config': get_val(['dataset', 'config']),
     }
@@ -347,7 +354,7 @@ def load_full_config(dataset_name, algo_name="df_planning"):
         print(f"Error loading configs: {e}")
         return None
 
-def load_training_hparams_from_ckpt(model_id, downloaded_dir=f"outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
+def load_training_hparams_from_ckpt(model_id, downloaded_dir=f"/home/{_DOCKER_USER}/mctd_outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
     """Load training_hparams saved by df_base.on_save_checkpoint from the checkpoint file.
 
     New checkpoints (trained after the save_hyperparameters refactor) embed all arch
@@ -420,6 +427,7 @@ def main():
     print(f"--- Meta Search for Model ID: {args.model_id} ---")
 
     # Legacy-path variables (only populated when checkpoint has no training_hparams)
+    actual_obs_dim_indices: list = []
     actual_network_size = None
     actual_dim_feedforward = None
     actual_num_layers = None
@@ -440,16 +448,27 @@ def main():
             or full_cfg['dataset'].get('episode_len', 50) // actual_jump
         )
         actual_frame_stack = ckpt_hparams.get('frame_stack', 10)
-        has_embedded_hparams = True
+        actual_obs_dim_indices = ckpt_hparams.get('obs_dim_indices')
+        actual_causal = ckpt_hparams.get('causal')
+        actual_scheduling_matrix = ckpt_hparams.get('scheduling_matrix')
+        actual_padding_mode = ckpt_hparams.get('padding_mode')
+        actual_context_frames = ckpt_hparams.get('context_frames')
+        actual_frame_skip = ckpt_hparams.get('frame_skip')
+        actual_external_cond_dim = ckpt_hparams.get('external_cond_dim')
+        actual_uncertainty_scale = ckpt_hparams.get('uncertainty_scale')
+        _arch = (ckpt_hparams.get('diffusion') or {}).get('architecture', {})
+        actual_network_size = _arch.get('network_size')
+        actual_dim_feedforward = _arch.get('dim_feedforward')
+        actual_num_layers = _arch.get('num_layers')
+        actual_attn_heads = _arch.get('attn_heads')
         print(
             f"  [ckpt hparams] Using embedded training_hparams: "
             f"episode_len={actual_episode_len}, frame_stack={actual_frame_stack}, "
-            f"causal={ckpt_hparams.get('causal')}, "
-            f"scheduling_matrix={ckpt_hparams.get('scheduling_matrix')}"
+            f"causal={actual_causal}, "
+            f"scheduling_matrix={actual_scheduling_matrix}"
         )
     else:
         # ── Legacy path: detect params from weights + wandb/local config ─────
-        has_embedded_hparams = False
         config_path = find_config_yaml(args.model_id, args.outputs_root)
 
         model_metadata = {}
@@ -487,26 +506,35 @@ def main():
             or 50
         )
 
-        obs_dim = len(full_cfg['dataset'].get('observation_mean', [2]))
+        # obs_dim_indices: prefer from training_config.yaml (set after our fix), else infer from dataset
+        actual_obs_dim_indices = (
+            model_metadata.get('obs_dim_indices')
+            or list(range(len(full_cfg['dataset'].get('observation_mean', [0, 0]))))
+        )
+        obs_dim = len(actual_obs_dim_indices)
         act_dim = full_cfg['dataset'].get('action_dim', 8)
         detected_frame_stack = detect_frame_stack_from_ckpt(args.model_id, obs_dim, act_dim)
-        actual_frame_stack = detected_frame_stack or model_metadata.get('frame_stack') or full_cfg['algorithm'].get('frame_stack', 10)
         actual_frame_stack = detected_frame_stack or model_metadata.get('frame_stack') or full_cfg['algorithm'].get('frame_stack', 10)
 
         detected_arch = detect_network_size_from_ckpt(args.model_id)
         arch_cfg = full_cfg['algorithm'].get('diffusion', {}).get('architecture', {})
         if isinstance(detected_arch, dict):
-            actual_network_size = detected_arch.get("network_size") or arch_cfg.get('network_size', 64)
-            actual_dim_feedforward = detected_arch.get("dim_feedforward") or arch_cfg.get('dim_feedforward', 256)
-            actual_num_layers = detected_arch.get("num_layers") or arch_cfg.get('num_layers', 6)
+            actual_network_size = detected_arch.get("network_size") or model_metadata.get('network_size') or arch_cfg.get('network_size', 64)
+            actual_dim_feedforward = detected_arch.get("dim_feedforward") or model_metadata.get('dim_feedforward') or arch_cfg.get('dim_feedforward', 256)
+            actual_num_layers = detected_arch.get("num_layers") or model_metadata.get('num_layers') or arch_cfg.get('num_layers', 6)
         else:
-            actual_network_size = arch_cfg.get('network_size', 64)
-            actual_dim_feedforward = arch_cfg.get('dim_feedforward', 256)
-            actual_num_layers = arch_cfg.get('num_layers', 6)
+            actual_network_size = model_metadata.get('network_size') or arch_cfg.get('network_size', 64)
+            actual_dim_feedforward = model_metadata.get('dim_feedforward') or arch_cfg.get('dim_feedforward', 256)
+            actual_num_layers = model_metadata.get('num_layers') or arch_cfg.get('num_layers', 6)
 
         actual_causal = model_metadata.get('causal')
         actual_scheduling_matrix = model_metadata.get('scheduling_matrix')
         actual_attn_heads = model_metadata.get('attn_heads')
+        actual_padding_mode = model_metadata.get('padding_mode')
+        actual_context_frames = model_metadata.get('context_frames')
+        actual_frame_skip = model_metadata.get('frame_skip')
+        actual_external_cond_dim = None  # not recoverable from legacy configs
+        actual_uncertainty_scale = None  # not recoverable from legacy configs
         missing = [k for k, v in [('causal', actual_causal), ('scheduling_matrix', actual_scheduling_matrix), ('attn_heads', actual_attn_heads)] if v is None]
         if missing:
             print(f"WARNING: Could not detect {missing} from saved wandb config. "
@@ -531,14 +559,11 @@ def main():
           f"horizon_scale={actual_horizon_scale}, plan_tokens={plan_tokens}")
 
     # 4. Build job config
-    # Architecture params (frame_stack, causal, scheduling_matrix, network_size, …) are
-    # NO LONGER included for new checkpoints — exp_base reads them from training_hparams.
-    # Only dataset-side and eval-side params go in the job.
     basic_job_config = {
         "wandb.entity": _WANDB_ENTITY,
         "wandb.project": _WANDB_PROJECT,
         "wandb.group": f"EVAL-{args.model_id}",
-        "experiment": "exp_planning",
+        "experiment": "base_pytorch",
         "algorithm": "df_planning",
         "load": args.model_id,
         "dataset": args.dataset,
@@ -549,24 +574,34 @@ def main():
         "algorithm.horizon_scale": actual_horizon_scale,
         "experiment.tasks": ["validation"],
         "experiment.validation.batch_size": 1,
+        "experiment.validation.precision": 32,
+        "experiment.validation.inference_mode": False,
+        "experiment.validation.limit_batch": 1,
     })
 
-    if not has_embedded_hparams:
-        # Legacy path: checkpoint has no training_hparams — inject all arch params and
-        # episode_len explicitly (exp_base cannot recover them from the checkpoint).
-        basic_job_config.update({
-            "dataset.episode_len": actual_episode_len,
-            "algorithm.frame_stack": actual_frame_stack,
-            "algorithm.diffusion.architecture.network_size": actual_network_size,
-            "algorithm.diffusion.architecture.dim_feedforward": actual_dim_feedforward,
-            "algorithm.diffusion.architecture.num_layers": actual_num_layers,
-        })
-        if actual_causal is not None:
-            basic_job_config["algorithm.causal"] = actual_causal
-        if actual_scheduling_matrix is not None:
-            basic_job_config["algorithm.scheduling_matrix"] = actual_scheduling_matrix
-        if actual_attn_heads is not None:
-            basic_job_config["algorithm.diffusion.architecture.attn_heads"] = actual_attn_heads
+    # Always embed all resolved arch params so exp_base.py can skip reloading the ckpt.
+    arch_overrides = {
+        "dataset.episode_len": actual_episode_len,
+        "algorithm.jump": actual_jump,
+        "algorithm.frame_stack": actual_frame_stack,
+        "algorithm.obs_dim_indices": actual_obs_dim_indices,
+        "algorithm.diffusion.architecture.network_size": actual_network_size,
+        "algorithm.diffusion.architecture.dim_feedforward": actual_dim_feedforward,
+        "algorithm.diffusion.architecture.num_layers": actual_num_layers,
+    }
+    for key, val in [
+        ("algorithm.causal",                                actual_causal),
+        ("algorithm.scheduling_matrix",                     actual_scheduling_matrix),
+        ("algorithm.padding_mode",                          actual_padding_mode),
+        ("algorithm.context_frames",                        actual_context_frames),
+        ("algorithm.frame_skip",                            actual_frame_skip),
+        ("algorithm.external_cond_dim",                     actual_external_cond_dim),
+        ("algorithm.uncertainty_scale",                     actual_uncertainty_scale),
+        ("algorithm.diffusion.architecture.attn_heads",     actual_attn_heads),
+    ]:
+        if val is not None:
+            arch_overrides[key] = val
+    basic_job_config.update(arch_overrides)
 
     # 5. Generate Jobs
     jobs_folder = "jobs"
@@ -583,7 +618,7 @@ def main():
             task_id = start_task_id + i
         for seed in range(args.num_seeds):
             job_cfg = copy.deepcopy(basic_job_config)
-            job_cfg["experiment.validation.seed"] = seed
+            job_cfg["algorithm.interaction_seed"] = seed
             job_cfg["algorithm.task_id"] = task_id
             job_cfg["+name"] = f"EVAL_{args.model_id}_T{task_id}_S{seed}"
 

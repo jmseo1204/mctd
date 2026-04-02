@@ -506,6 +506,40 @@ class BaseLightningExperiment(BaseExperiment):
             print(f"[WARNING] Could not read training_hparams from checkpoint: {e}")
             return {}
 
+    @staticmethod
+    def _load_cache_hparams(ckpt_path) -> dict:
+        """Load training params from training_config.yaml stored alongside the checkpoint.
+
+        training_config.yaml is written by train.sh and contains the full contents of
+        ckpt_df_planning.yaml (all ckpt-bound params) plus dataset metadata.
+        Returns a dict in the same flat format as training_hparams so _apply_ckpt_hparams_to_cfg
+        can consume it unchanged.
+        """
+        try:
+            import yaml as _yaml
+            import pathlib as _pl
+            config_path = _pl.Path(ckpt_path).parent / "training_config.yaml"
+            if not config_path.exists():
+                return {}
+            with open(config_path) as f:
+                data = _yaml.safe_load(f)
+            algo = data.get('algorithm', {})
+            ds   = data.get('dataset', {})
+            # algo is the full ckpt_df_planning.yaml content — already in the right format
+            hparams = dict(algo)
+            # episode_len lives in dataset section (not in ckpt_df_planning.yaml itself)
+            if ds.get('episode_len') is not None:
+                hparams.setdefault('episode_len', ds['episode_len'])
+            if ds.get('jump') is not None:
+                hparams.setdefault('jump', ds['jump'])
+            if ds.get('config') is not None:
+                hparams.setdefault('dataset_config', ds['config'])
+            print(f"[Info] Loaded hparams from training_config.yaml: {list(hparams.keys())}")
+            return hparams
+        except Exception as e:
+            print(f"[WARNING] Could not read training_config.yaml: {e}")
+            return {}
+
     def _apply_ckpt_hparams_to_cfg(self, hparams: dict) -> None:
         """Override algorithm config with training_hparams saved in the checkpoint.
 
@@ -525,7 +559,7 @@ class BaseLightningExperiment(BaseExperiment):
             OmegaConf.update(self.root_cfg, "dataset.episode_len", ep_len, merge=True)
             OmegaConf.update(self.root_cfg, "algorithm.episode_len", ep_len, merge=True)
 
-        # All other params: declared in df_base.yaml schema → standard update
+        # All other params: declared in df_planning.yaml schema → standard update
         updates = {}
         for k, v in hparams.items():
             if k == 'episode_len':
@@ -546,16 +580,36 @@ class BaseLightningExperiment(BaseExperiment):
             except Exception as e:
                 print(f"[WARNING] Could not apply ckpt hparam {dotpath}={val}: {e}")
 
-    def _ensure_episode_len_in_algo_cfg(self) -> None:
-        """Sync algorithm.episode_len from dataset config if not already set.
+    def _ensure_algo_cfg_fallbacks(self) -> None:
+        """Fill null algorithm config values that were not restored from training_hparams.
 
-        Called at training time (episode_len is not in the YAML schema, so it must
-        be injected programmatically from dataset.episode_len before building the algo).
-        At eval time this is a fallback for old checkpoints that have no training_hparams.
+        Triggered in two cases:
+        1. Old checkpoint with no training_hparams at all (pre-dating on_save_checkpoint).
+        2. New checkpoint missing a specific key (e.g. jump added after the ckpt was saved).
+        In both cases df_planning.yaml schema stubs stay null and would crash __init__.
         """
+        # episode_len: injected from dataset config (also called at train time since
+        # episode_len is not a static YAML value but derived from dataset).
         if OmegaConf.select(self.root_cfg, "algorithm.episode_len") is None:
             with open_dict(self.root_cfg.algorithm):
                 self.root_cfg.algorithm.episode_len = int(self.root_cfg.dataset.episode_len)
+
+        # jump: fall back to root config value (set via CLI e.g. jump=5, default=1).
+        if OmegaConf.select(self.root_cfg, "algorithm.jump") is None:
+            root_jump = OmegaConf.select(self.root_cfg, "jump")
+            fallback = int(root_jump) if root_jump is not None else 1
+            OmegaConf.update(self.root_cfg, "algorithm.jump", fallback, merge=True)
+            print(f"[Info] algorithm.jump was null — set to {fallback} from root config (old checkpoint fallback).")
+
+        # normalization stats + env_id + dataset: injected from dataset config.
+        for key in ('observation_mean', 'observation_std', 'action_mean', 'action_std',
+                    'reward_mean', 'reward_std', 'env_id', 'dataset'):
+            if OmegaConf.select(self.root_cfg, f"algorithm.{key}") is None:
+                val = OmegaConf.select(self.root_cfg, f"dataset.{key}")
+                if val is not None:
+                    OmegaConf.update(self.root_cfg, f"algorithm.{key}", val, merge=True)
+                    print(f"[Info] Synced algorithm.{key} from dataset config (old checkpoint fallback).")
+
 
     def _validation_impl(self) -> None:
         """Actual validation implementation (extracted from original validation())."""
@@ -563,22 +617,42 @@ class BaseLightningExperiment(BaseExperiment):
         _impl_t0 = _time.time()
         print(f"[LIFECYCLE {_dt.datetime.now().strftime('%H:%M:%S')}] _validation_impl start  (building algo/loading ckpt...)", flush=True)
         if not self.algo:
+            # Load ckpt-bound params only when they haven't been pre-populated by CLI args.
+            # generate_jobs_generalized.py always embeds ALL of the following in the job spec,
+            # so all of them being non-null means we came from job generation.
+            _prepopulated_keys = [
+                "algorithm.frame_stack",
+                "algorithm.causal",
+                "algorithm.scheduling_matrix",
+                "algorithm.jump",
+                "algorithm.padding_mode",
+                "algorithm.context_frames",
+            ]
+            _cfg_prepopulated = all(
+                OmegaConf.select(self.root_cfg, k) is not None for k in _prepopulated_keys
+            )
+            if _cfg_prepopulated:
+                print("[Info] Arch params already populated by CLI args — still loading ckpt metadata for remaining null params.")
             if self.ckpt_path:
+                # 1. Try training_hparams embedded in the checkpoint
                 hparams = self._load_ckpt_training_hparams(self.ckpt_path)
+                # 2. Fallback: training_config.yaml saved by train.sh alongside the ckpt
+                if not hparams:
+                    hparams = self._load_cache_hparams(self.ckpt_path)
                 if hparams:
                     self._apply_ckpt_hparams_to_cfg(hparams)
                     print(
-                        f"[Info] Applied training hparams from checkpoint: "
+                        f"[Info] Applied training hparams: "
                         f"frame_stack={hparams.get('frame_stack')}, "
                         f"causal={hparams.get('causal')}, "
                         f"scheduling_matrix={hparams.get('scheduling_matrix')}, "
                         f"episode_len={hparams.get('episode_len')}"
                     )
                 else:
-                    print("[WARNING] No training_hparams in checkpoint — using YAML defaults. "
-                          "Architecture mismatch may cause errors for old checkpoints.")
-            # Fallback: if episode_len still not set (old checkpoint), sync from dataset
-            self._ensure_episode_len_in_algo_cfg()
+                    print("[WARNING] No training params found in ckpt or training_config.yaml — "
+                          "using YAML defaults. Architecture mismatch may cause errors.")
+            # Last resort: fill any remaining null schema stubs
+            self._ensure_algo_cfg_fallbacks()
             self.algo = self._build_algo()
         if self.cfg.validation.compile:
             self.algo = torch.compile(self.algo)

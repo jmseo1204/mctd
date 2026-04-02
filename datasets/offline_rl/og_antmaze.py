@@ -18,9 +18,7 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
         self.save_dir = cfg.save_dir # Using default save_dir, "~/.ogbench/data"
         self.env_id = cfg.env_id
         self.dataset_name = cfg.dataset
-        self.pos_dim = cfg.get("pos_dim", 2)  # Spatial dims for MCTS (x, y)
         self.n_frames = cfg.episode_len + 1
-        self.gamma = cfg.gamma
         self.split = split
         if self.split != "training":
             self.jump = 1
@@ -65,9 +63,7 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
         self._raw_actions = np.reshape(self.dataset["actions"], (-1, sample_length, self.dataset["actions"].shape[-1]))
         raw_terminals = np.zeros((self._raw_obs.shape[0], sample_length))
         raw_terminals[:, -1] = 1
-        raw_rewards = raw_terminals
-        self._raw_rewards = raw_rewards
-        self._raw_values = self.compute_value(raw_rewards) * (1 - self.gamma) * 4 - 1
+        self._raw_rewards = raw_terminals
 
         self._n_episodes = self._raw_obs.shape[0]
         self._n_windows = sample_length - self.n_frames + 1
@@ -148,13 +144,6 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
                 f"[GPU Cache] WARNING: CUDA OOM while caching ({total_mb:.1f} MB). "
                 f"This can happen due to VRAM fragmentation. Falling back to CPU loading."
             )
-
-    def compute_value(self, reward):
-        # numerical stable way to compute value
-        value = np.copy(reward)
-        for i in range(reward.shape[1] - 2, -1, -1):
-            value[:, i] += self.gamma * value[:, i + 1]
-        return value
 
     def __len__(self):
         return self.total_samples

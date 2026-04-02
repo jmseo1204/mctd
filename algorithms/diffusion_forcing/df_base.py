@@ -52,9 +52,9 @@ class DiffusionForcingBase(BasePytorchAlgo):
         self.frame_stack = cfg.frame_stack
         self.x_stacked_shape = list(self.x_shape)
         self.x_stacked_shape[0] *= cfg.frame_stack
-        self.guidance_scale = cfg.guidance_scale
+        self.guidance_scale = cfg.get('guidance_scale', 2.0)
         self.context_frames = cfg.context_frames
-        self.chunk_size = cfg.chunk_size
+        self.chunk_size = cfg.get('chunk_size', 50)
         self.external_cond_dim = cfg.external_cond_dim
         self.causal = cfg.causal
 
@@ -63,7 +63,8 @@ class DiffusionForcingBase(BasePytorchAlgo):
         self.sampling_timesteps = cfg.diffusion.sampling_timesteps
         self.clip_noise = cfg.diffusion.clip_noise
 
-        self.cfg.diffusion.cum_snr_decay = self.cfg.diffusion.cum_snr_decay ** (self.frame_stack * cfg.frame_skip)
+        self._cum_snr_decay_raw = float(self.cfg.diffusion.cum_snr_decay)  # original value before frame_stack power
+        self.cfg.diffusion.cum_snr_decay = self._cum_snr_decay_raw ** (self.frame_stack * cfg.frame_skip)
 
         self.validation_step_outputs = []
         self._dim_loss_logger = _DimLossJsonlLogger(
@@ -84,14 +85,25 @@ class DiffusionForcingBase(BasePytorchAlgo):
         hparams = {
             'frame_stack': int(self.cfg.frame_stack),
             'causal': bool(self.cfg.causal),
-            'scheduling_matrix': str(self.cfg.scheduling_matrix),
             'frame_skip': int(self.cfg.frame_skip),
+            'uncertainty_scale': float(self.cfg.uncertainty_scale),
+            'external_cond_dim': int(self.cfg.external_cond_dim),
             'diffusion': {
                 'beta_schedule': str(self.cfg.diffusion.beta_schedule),
                 'objective': str(self.cfg.diffusion.objective),
                 'timesteps': int(self.cfg.diffusion.timesteps),
                 'sampling_timesteps': int(self.cfg.diffusion.sampling_timesteps),
                 'architecture': arch,
+                # Diffusion behavior params — saved here so eval config can be null
+                # (restored before model build via _apply_ckpt_hparams_to_cfg).
+                # cum_snr_decay: save the PRE-modification value; __init__ applies
+                # the frame_stack power, so restoring the raw value avoids double-application.
+                'schedule_fn_kwargs': OmegaConf.to_container(self.cfg.diffusion.schedule_fn_kwargs, resolve=True),
+                'use_fused_snr': bool(self.cfg.diffusion.use_fused_snr),
+                'snr_clip': float(self.cfg.diffusion.snr_clip),
+                'cum_snr_decay': self._cum_snr_decay_raw,
+                'clip_noise': float(self.cfg.diffusion.clip_noise),
+                'stabilization_level': int(self.cfg.diffusion.stabilization_level),
             },
         }
         # Save obs/pos dimension indices so eval-time algo reconstruction uses
@@ -105,8 +117,22 @@ class DiffusionForcingBase(BasePytorchAlgo):
         _dataset_cfg = self.cfg.get('train_dataset_config', None)
         if _dataset_cfg is not None:
             hparams['dataset_config'] = str(_dataset_cfg)
+        _padding_mode = self.cfg.get('padding_mode', None)
+        if _padding_mode is not None:
+            hparams['padding_mode'] = str(_padding_mode)
+        _context_frames = self.cfg.get('context_frames', None)
+        if _context_frames is not None:
+            hparams['context_frames'] = int(_context_frames)
+        # Dataset normalization stats — required to build the model at eval time
+        # (observation_dim = len(observation_mean), etc.) without a dataset config.
+        for _key in ('observation_mean', 'observation_std', 'action_mean', 'action_std',
+                     'reward_mean', 'reward_std', 'env_id', 'dataset'):
+            _val = self.cfg.get(_key, None)
+            if _val is not None:
+                from omegaconf import OmegaConf as _OC
+                hparams[_key] = _OC.to_container(_val, resolve=True) if hasattr(_val, '_metadata') else _val
         # Save effective (subsampled) episode_len = raw_episode_len // jump.
-        # jump is now in df_base.yaml as ${jump}, so self.cfg.jump is always available.
+        # jump is declared in both train_df_planning.yaml and df_planning.yaml, so self.cfg.jump is always available.
         # This ensures eval-time job generation gets the model-aligned episode_len directly
         # without relying on stale WandB/hydra configs.
         jump = int(self.cfg.get('jump', 1))

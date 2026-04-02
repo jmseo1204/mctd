@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Ckpt-bound config: parameters that define the trained model.
+#   - Saved to ckpt training_hparams via on_save_checkpoint().
+#   - Read by train.sh (yaml.safe_load) to identify/filter checkpoints.
+#   - Composed into train_df_planning.yaml via Hydra defaults.
+# Edit this file to change the model you are training.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Training data identity ────────────────────────────────────────────────────
+# train_dataset_config: Hydra dataset config name (configurations/dataset/<name>.yaml)
+train_dataset_config: "og_antmaze_giant_stitch"
+# jump: frame stride for training data. Saved to ckpt for eval-time recovery.
+jump: 5
+
+# ── Dimension indices ────────────────────────────────────────────────────────
+# obs_dim_indices: which indices of the dataset observation to use.
+obs_dim_indices: [0, 1]
+# pos_dim_indices: which obs indices are spatial (x,y) position.
+pos_dim_indices: [0, 1]
+
+# ── Model / architecture ─────────────────────────────────────────────────────
+frame_stack: 10
+frame_skip: 1
+causal: False
+scheduling_matrix: "pyramid"
+context_frames: 1
+padding_mode: "same"
+uncertainty_scale: 1
+external_cond_dim: 0
+
+# ── Diffusion ─────────────────────────────────────────────────────────────────
+diffusion:
+  timesteps: 1000
+  sampling_timesteps: 100
+  beta_schedule: linear
+  schedule_fn_kwargs: {}
+  objective: pred_x0
+  use_fused_snr: False
+  snr_clip: 5.0
+  cum_snr_decay: 0.98
+  clip_noise: 20.0
+  stabilization_level: 10
+  # Architecture (saved to ckpt training_hparams and auto-detected at eval)
+  architecture:
+    network_size: 128
+    num_layers: 12
+    attn_heads: 8
+    dim_feedforward: 512

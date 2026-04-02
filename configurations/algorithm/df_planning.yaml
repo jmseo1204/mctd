@@ -1,38 +1,13 @@
-defaults:
-  - df_base
+# ─────────────────────────────────────────────────────────────────────────────
+# Eval-only config: fully self-contained (no defaults chain).
+# Edit this file before running eval.sh.
+# Train config → train_df_planning.yaml (separate, no cross-dependency).
+# ─────────────────────────────────────────────────────────────────────────────
 
-# dataset info
-data_mean: null
-data_std: null
-reward_mean: ${dataset.reward_mean}
-reward_std: ${dataset.reward_std}
-observation_mean: ${dataset.observation_mean}
-observation_std: ${dataset.observation_std}
-action_mean: ${dataset.action_mean}
-action_std: ${dataset.action_std}
-gamma: ${dataset.gamma}
-env_id: ${dataset.env_id}
-dataset: ${dataset.dataset}
-# non dataset info
-# obs_dim_indices: which indices of the dataset observation to use (null = use all).
-#   Loaded from training_hparams at eval time; set explicitly in train_df_planning.yaml.
-obs_dim_indices: null
-# pos_dim_indices: which indices of the observation vector represent spatial (x,y) position.
-#   Note: physical qpos[:2] is always world (x,y) in AntMaze/PointMaze regardless of obs selection.
-pos_dim_indices: [0, 1]
-# x_shape: computed at runtime in DiffusionForcingPlanning.__init__ as (obs_dim + action_dim,)
-x_shape: null
-
-context_frames: 1
+# ── Planning / interaction ────────────────────────────────────────────────────
 use_reward: False
 plot_start_goal: True
-# training hyperparameters
-weight_decay: 1e-4
-warmup_steps: 10000
-# diffusion-related
-guidance_scale: 2.0
-chunk_size: 50
-interaction_seed: ${experiment.validation.seed}
+interaction_seed: 1
 use_random_goals_for_interaction: False
 task_id: 1
 dql_model: null
@@ -40,15 +15,13 @@ mctd_skip_level_steps: 10
 time_limit: null
 virtual_visit_weight: 1.0
 parallel_multiple_visits: False
-
-mctd_num_denoising_steps: 20 # Must be <= sampling_timesteps in df_base.yaml
+mctd_num_denoising_steps: 20
 leaf_parallelization: True
 mctd_max_search_num: 40
-max_child_resets: 3 # max times a node's children can be wiped and re-expanded when all are exhausted non-terminal
-padding_mode: "same" # "zero" or "same"
+max_child_resets: 3
 DEBUG: True
-debug_memory_profile: True # Enable GPU/CPU memory profiling
-noise_level_building_way: others # causal or smooth or others
+debug_memory_profile: True
+noise_level_building_way: others # smooth, causal, or others
 num_tries_for_bad_plans: 5
 open_loop_horizon: 1000 #fixme -> best: episode_len*horizon_scale
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
@@ -65,21 +38,21 @@ episode_len: 200 # 1000(giant) // 5(jump)
 #   If no sidecar exists, inner_prod is used (matches training default).
 # For legacy .pt checkpoints: hilp_obs_dim / hilp_skill_dim are still needed.
 hilp_checkpoint_path: "td_models/params_1000000_20260324_002241.pkl"
-mctd_guidance_scales: [0.4, 0.1] # HILP gradient scale for near-target positions (TD_thres or above)
+mctd_guidance_scales: [0.3, 0.1] # HILP gradient scale for near-target positions (TD_thres or above)
 rmse_guidance_scale: 0.4 # RMSE direction scale for far-target positions (below TD_thres)
 anchor_guidance_scale: 0.4 # 0.4
 rdf_guidance_scale: 0.0
 particle_guidance_scale: 0.1 # sibling repulsion during denoising (0 = disabled)
 
-#[state proximity threshold]
-use_TD_metric_as_dist: true # If true, use HILP temporal distance (-V(s,g)) instead of L2(x,y) for all state proximity checks
+# [state proximity threshold]
+use_TD_metric_as_dist: true # If true, use HILP temporal distance (-V(s,g)) instead of L2(x,y)
 warp_threshold: 3.0
 diverge_threshold: 4.0 # min endpoint distance to count as distinct path (below → deduplicate)
-min_progress_threshold: 1.5 # min distance (x,y) between sub_plan start and end; plans below this are discarded (0 = disabled)
-plan_feasibility_delta: 99999.0 # max per-frame movement (world units) to count a plan as feasible (set high to disable)
+min_progress_threshold: 1.5 # min distance (x,y) between sub_plan start and end
+plan_feasibility_delta: 99999.0 # max per-frame movement (world units) to count a plan as feasible
 meeting_delta: 1.5
 
-#[wandb visualization]
+# [wandb visualization]
 viz_agent_rollout: true # set True to upload *_interaction/sample_*_video to wandb (slow)
 viz_final_plans: True
 viz_compare_expanded_to_value: false
@@ -89,35 +62,84 @@ profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visu
 frame_sampling_way: "quadratic" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
 
 # HILP memoization: precompute phi(s) on a 2D grid and use bilinear interpolation
-# instead of running the full encoder at every MCTS query (speeds up value calls).
 use_hilp_memoization: true # set true to enable
-hilp_memoization_grid_size: 360 # grid resolution per axis (100 → 10 000 pts)
+hilp_memoization_grid_size: 360 # grid resolution per axis
 
 # HILP guidance mode flags
 use_score_func_with_TD: true # if true: HILP grad + KDE score grad; if false: HILP grad only
-TD_thres_for_far_target: -200.0 # HILP value threshold: V < threshold → use RMSE guidance; null to disable
+TD_thres_for_far_target: -200.0 # HILP value threshold: V < threshold → use RMSE guidance
 # KDE-weighted guidance: unit_grad = ∇V/|∇V| + kde_lam·∇log p
-
-# [Kernal Density Estimation for extracting score function of training data]
 kde_sigma: 0.2 # KDE bandwidth (world units)
-kde_lam: 0.07 # 0.07 # scale for ∇log p term
+kde_lam: 0.07 # scale for ∇log p term
 kde_sample_ratio: 0.1 # fraction of dataset to use for KDE (1.0 = full dataset)
-kde_save_dir: ${dataset.save_dir} # dataset npz directory for KDE positions
+kde_save_dir: "~/.ogbench/data" # dataset npz directory for KDE positions
 
-# SIMULATION(REPLANNING)
+# SIMULATION (REPLANNING)
 mcts_use_sim: true
-replanning_target_level: 10 # noise level to add when replanning already-denoised prefix (default: sampling_timesteps // 3)
+replanning_target_level: 10 # noise level to add when replanning already-denoised prefix
 
 # [MPC-style agent control]
 use_rollout: false
 use_dynamic_obs_padding: false
 
+# ── Inherited from root config ────────────────────────────────────────────────
+debug: ${debug}
+jump: null # schema stub: restored from ckpt training_hparams via _apply_ckpt_hparams_to_cfg
+
+# ── Dataset info ─────────────────────────────────────────────────────────────
+# null at eval time; filled from ckpt training_hparams before model build.
+# At train time, train_df_planning.yaml overrides these with ${dataset.xxx}.
+data_mean: null
+data_std: null
+reward_mean: null
+reward_std: null
+observation_mean: null
+observation_std: null
+action_mean: null
+action_std: null
+env_id: null
+dataset: null
+# x_shape: computed at runtime from obs_dim + action_dim in DiffusionForcingPlanning.__init__
+x_shape: null
+
+# ── Schema stubs: restored from ckpt training_hparams at eval time ───────────
+# All values here are null — actual values are overwritten by _apply_ckpt_hparams_to_cfg()
+# before the model is built. Keys must exist for OmegaConf.update() to succeed.
+obs_dim_indices: null
+pos_dim_indices: null
+frame_stack: null
+frame_skip: null
+causal: null
+scheduling_matrix: null
+context_frames: null
+padding_mode: null
+dataset_config: null
+
+# ── Model build params: restored from ckpt training_hparams ─────────────────
+external_cond_dim: null
+uncertainty_scale: null
+
+# ── Diffusion ─────────────────────────────────────────────────────────────────
 diffusion:
-  clip_noise: 20.0
-  max_guidance_ratio: 1.5 # soft norm clip: guidance/prior norm 상한 (inf = disabled)
-  stabilization_level: 10
-  beta_schedule: linear
-  objective: pred_x0
-  use_snr_weighting: True
-  snr_clip: 5.0
-  ddim_sampling_eta: 0.1
+  # Eval-specific diffusion params
+  ddim_sampling_eta: 0.1 # used during MCTS DDIM sampling; absent in train config
+  max_guidance_ratio: 1.5 # soft norm clip for guidance (inf = disabled); eval only
+  # Schema stubs restored from ckpt training_hparams (actual values come from ckpt)
+  timesteps: null
+  sampling_timesteps: null
+  beta_schedule: null
+  objective: null
+  architecture:
+    network_size: null
+    num_layers: null
+    attn_heads: null
+    dim_feedforward: null
+  # Schema stubs: restored from ckpt training_hparams (actual values come from ckpt)
+  # cum_snr_decay: on_save_checkpoint saves the PRE-modification value so __init__
+  #   can apply frame_stack power exactly once, as during training.
+  schedule_fn_kwargs: null
+  use_fused_snr: null
+  snr_clip: null
+  cum_snr_decay: null
+  clip_noise: null
+  stabilization_level: null

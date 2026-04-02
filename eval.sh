@@ -82,11 +82,11 @@ if [ ! -f "$CKPT_PATH" ]; then
 fi
 
 # ─────────────────────────────────────────────────────
-# 2. Auto-detect dataset and obs_dim from checkpoint metadata
+# 2. Auto-detect dataset and obs_dim_indices from checkpoint metadata
 # Priority: training_config.yaml > scanner metadata > error
 # ─────────────────────────────────────────────────────
 SELECTED_DATASET="${MCTD_SELECTED_DATASET:-unknown}"
-STATE_DIM="${MCTD_SELECTED_OBS_DIM:-unknown}"
+OBS_DIM_INDICES="${MCTD_SELECTED_OBS_DIM_INDICES:-unknown}"
 
 _TRAINING_CONFIG="${OUTPUT_DOWNLOADED_DIR}/${SELECTED_MODEL_ID}/training_config.yaml"
 if [ -f "$_TRAINING_CONFIG" ]; then
@@ -96,19 +96,21 @@ with open('$_TRAINING_CONFIG') as f:
     d = yaml.safe_load(f)
 ds = (d.get('dataset') or {}).get('config', '')
 obs_idx = (d.get('algorithm') or {}).get('obs_dim_indices')
-obs_dim = str(len(obs_idx)) if obs_idx else ''
 print(ds)
-print(obs_dim)
+print(json.dumps(obs_idx) if obs_idx else '')
 " 2>/dev/null)
     _DETECTED_DATASET=$(echo "$_DETECTED" | sed -n '1p')
-    _DETECTED_DIM=$(    echo "$_DETECTED" | sed -n '2p')
+    _DETECTED_INDICES=$(echo "$_DETECTED" | sed -n '2p')
     [ -n "$_DETECTED_DATASET" ] && [ "$_DETECTED_DATASET" != "None" ] && SELECTED_DATASET="$_DETECTED_DATASET"
-    [ -n "$_DETECTED_DIM"     ] && [ "$_DETECTED_DIM"     != "None" ] && STATE_DIM="$_DETECTED_DIM"
-    echo "  [config] Loaded metadata from training_config.yaml: dataset=$SELECTED_DATASET obs_dim=$STATE_DIM"
+    [ -n "$_DETECTED_INDICES" ] && [ "$_DETECTED_INDICES" != "None" ] && OBS_DIM_INDICES="$_DETECTED_INDICES"
+    echo "  [config] Loaded metadata from training_config.yaml: dataset=$SELECTED_DATASET obs_dim_indices=$OBS_DIM_INDICES"
 else
     echo "  [config] No training_config.yaml for $SELECTED_MODEL_ID — using scanner metadata."
-    echo "           dataset=$SELECTED_DATASET  obs_dim=$STATE_DIM"
+    echo "           dataset=$SELECTED_DATASET  obs_dim_indices=$OBS_DIM_INDICES"
 fi
+
+# Derive count for display only
+STATE_DIM=$(python3 -c "import json; v='$OBS_DIM_INDICES'; print(len(json.loads(v)) if v not in ('unknown','') else '?')" 2>/dev/null || echo "?")
 
 # If dataset still unknown, fail with guidance
 if [ "$SELECTED_DATASET" = "unknown" ] || [ -z "$SELECTED_DATASET" ]; then
@@ -128,7 +130,7 @@ echo ""
 # ─────────────────────────────────────────────────────
 # 3. Fixed parameters
 # ─────────────────────────────────────────────────────
-NUM_TASKS=5
+NUM_TASKS=1
 NUM_SEEDS=1
 START_TASK_IDX=4
 

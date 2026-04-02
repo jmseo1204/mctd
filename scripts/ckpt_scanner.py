@@ -8,12 +8,13 @@ Usage (run inside Docker):
     target_obs_dim: optional integer filter; 0 or omitted → show all checkpoints.
 
 Output (stdout): one line per unique checkpoint:
-    name|model_id|host_path|mtime|epoch|obs_dim|jump|dataset|frame_stack|network_size|num_layers|attn_heads
+    name|model_id|host_path|mtime|epoch|obs_dim_indices|jump|dataset|frame_stack|network_size|num_layers|attn_heads
 
+    obs_dim_indices: compact JSON list e.g. [0,1] or [0,1,...,28]  (never a bare count)
     Unknown fields are emitted as the literal string "unknown".
 
 Cache file: <docker_outputs_path>/ckpt_scan_cache.json
-    { "<realpath_inside_docker>": { "obs_dim": int, "epoch": int, "mtime": int,
+    { "<realpath_inside_docker>": { "obs_dim_indices": list[int], "epoch": int, "mtime": int,
                                     "jump": int|null, "dataset": str|null,
                                     "frame_stack": int|null, "network_size": int|null,
                                     "num_layers": int|null, "attn_heads": int|null } }
@@ -42,6 +43,7 @@ import re
 import sys
 import json
 import torch
+import numpy as np
 from pathlib import Path
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -59,46 +61,165 @@ def _name_priority(name: str) -> int:
     return 0
 
 
-def _extract_arch_metadata(ckpt: dict) -> dict:
+def _match_dataset_by_mean(data_mean: torch.Tensor, project_dir: Path) -> str | None:
+    """Match a checkpoint's data_mean against dataset yaml observation_mean fields.
+
+    data_mean = observation_mean concatenated with action_mean.  Since all current
+    datasets have action_mean=[], data_mean IS the observation_mean vector.
+
+    Scans configurations/dataset/*.yaml inside project_dir and returns the config
+    name (stem) of the first yaml whose observation_mean matches within tolerance.
+    Returns None if no match found or project_dir is unavailable.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return None
+
+    dataset_dir = project_dir / "configurations" / "dataset"
+    if not dataset_dir.is_dir():
+        return None
+
+    dm_np = data_mean.float().numpy()
+    obs_dim = dm_np.shape[0]
+
+    for yaml_path in sorted(dataset_dir.glob("*.yaml")):
+        try:
+            with open(yaml_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            obs_mean = cfg.get("observation_mean")
+            if not obs_mean or len(obs_mean) != obs_dim:
+                continue
+            if np.allclose(dm_np, np.array(obs_mean, dtype=np.float32), atol=1e-3, rtol=1e-4):
+                return yaml_path.stem
+        except Exception:
+            continue
+    return None
+
+
+def _meta_to_flat(nested: dict) -> dict:
+    """Convert nested training_config.yaml-style structure to flat metadata dict."""
+    algo = nested.get("algorithm") or {}
+    ds = nested.get("dataset") or {}
+    arch = (algo.get("diffusion") or {}).get("architecture") or {}
+    return {
+        "obs_dim_indices": algo.get("obs_dim_indices"),
+        "pos_dim_indices": algo.get("pos_dim_indices"),
+        "jump": ds.get("jump") if ds.get("jump") is not None else algo.get("jump"),
+        "dataset": ds.get("config"),
+        "frame_stack": algo.get("frame_stack"),
+        "frame_skip": algo.get("frame_skip"),
+        "causal": algo.get("causal"),
+        "scheduling_matrix": algo.get("scheduling_matrix"),
+        "padding_mode": algo.get("padding_mode"),
+        "context_frames": algo.get("context_frames"),
+        "uncertainty_scale": algo.get("uncertainty_scale"),
+        "external_cond_dim": algo.get("external_cond_dim"),
+        "network_size": arch.get("network_size"),
+        "num_layers": arch.get("num_layers"),
+        "attn_heads": arch.get("attn_heads"),
+        "dim_feedforward": arch.get("dim_feedforward"),
+    }
+
+
+def _cache_entry_to_flat(cached: dict) -> dict:
+    """Extract flat metadata from either old flat or new nested cache entry (backward compat)."""
+    if "algorithm" in cached or "dataset" in cached:
+        return _meta_to_flat(cached)
+    return {k: cached.get(k) for k in ("obs_dim_indices", "jump", "dataset",
+                                        "frame_stack", "network_size",
+                                        "num_layers", "attn_heads")}
+
+
+def _is_meta_complete(flat: dict) -> bool:
+    """True if flat metadata has all required fields with non-unknown values."""
+    return (flat.get("obs_dim_indices") is not None
+            and flat.get("network_size") is not None
+            and flat.get("dataset") not in (None, _UNKNOWN))
+
+
+def _extract_arch_metadata(ckpt: dict, project_dir: Path | None = None) -> dict:
     """Extract arch metadata from a loaded checkpoint dict.
 
-    Returns a dict with keys: obs_dim, jump, dataset, frame_stack,
-    network_size, num_layers, attn_heads.  Missing values are None.
+    Returns a nested dict matching training_config.yaml / ckpt_df_planning.yaml structure:
+      algorithm: { all ckpt-bound params from ckpt_df_planning.yaml }
+      dataset:   { config, episode_len, jump }
+    Missing values are None.  obs_dim_indices is always an explicit list[int].
     """
     sd = ckpt.get("state_dict", {})
     dm = sd.get("data_mean")
-    # obs_dim from data_mean shape (legacy fallback)
+    # Legacy fallback: data_mean shape gives total obs dim when indices unavailable.
     obs_dim_from_mean = int(dm.shape[0]) if dm is not None else None
 
-    result = {
-        "obs_dim": obs_dim_from_mean,
-        "jump": None,
-        "dataset": None,
+    # Initialise with all ckpt_df_planning.yaml keys set to None
+    algo = {
+        "obs_dim_indices": list(range(obs_dim_from_mean)) if obs_dim_from_mean is not None else None,
+        "pos_dim_indices": None,
         "frame_stack": None,
-        "network_size": None,
-        "num_layers": None,
-        "attn_heads": None,
+        "frame_skip": None,
+        "causal": None,
+        "scheduling_matrix": None,
+        "context_frames": None,
+        "padding_mode": None,
+        "uncertainty_scale": None,
+        "external_cond_dim": None,
+        "jump": None,
+        "train_dataset_config": None,
+        "diffusion": {
+            "timesteps": None,
+            "sampling_timesteps": None,
+            "beta_schedule": None,
+            "objective": None,
+            "use_fused_snr": None,
+            "snr_clip": None,
+            "cum_snr_decay": None,
+            "clip_noise": None,
+            "stabilization_level": None,
+            "schedule_fn_kwargs": None,
+            "architecture": {
+                "network_size": None,
+                "num_layers": None,
+                "attn_heads": None,
+                "dim_feedforward": None,
+            },
+        },
     }
+    dataset_meta = {"config": None, "episode_len": None, "jump": None}
 
     hp = ckpt.get("training_hparams")
-    if not isinstance(hp, dict):
-        return result
+    if isinstance(hp, dict):
+        # obs_dim_indices: prefer explicit value, fall back to range-based
+        obs_idx = hp.get("obs_dim_indices")
+        if obs_idx is not None:
+            algo["obs_dim_indices"] = list(obs_idx)
 
-    # obs_dim: prefer len(obs_dim_indices) over data_mean shape
-    obs_idx = hp.get("obs_dim_indices")
-    if obs_idx is not None:
-        result["obs_dim"] = len(obs_idx)
+        for key in ("pos_dim_indices", "frame_stack", "frame_skip", "causal",
+                    "scheduling_matrix", "context_frames", "padding_mode",
+                    "uncertainty_scale", "external_cond_dim", "jump",
+                    "train_dataset_config"):
+            if hp.get(key) is not None:
+                algo[key] = hp[key]
 
-    result["jump"] = hp.get("jump")
-    result["dataset"] = hp.get("dataset_config")
-    result["frame_stack"] = hp.get("frame_stack")
+        dataset_meta["jump"] = hp.get("jump")
+        dataset_meta["config"] = hp.get("dataset_config") or hp.get("dataset")
+        dataset_meta["episode_len"] = hp.get("episode_len")
 
-    arch = hp.get("diffusion", {}).get("architecture", {})
-    result["network_size"] = arch.get("network_size")
-    result["num_layers"] = arch.get("num_layers")
-    result["attn_heads"] = arch.get("attn_heads")
+        hp_diff = hp.get("diffusion") or {}
+        arch = hp_diff.get("architecture") or {}
+        algo["diffusion"]["architecture"].update({
+            k: arch.get(k) for k in ("network_size", "num_layers", "attn_heads", "dim_feedforward")
+        })
+        for key in ("timesteps", "sampling_timesteps", "beta_schedule", "objective",
+                    "use_fused_snr", "snr_clip", "cum_snr_decay", "clip_noise",
+                    "stabilization_level", "schedule_fn_kwargs"):
+            if hp_diff.get(key) is not None:
+                algo["diffusion"][key] = hp_diff[key]
 
-    return result
+    # Fallback: infer dataset from data_mean values when training_hparams lacks it
+    if dataset_meta["config"] is None and dm is not None and project_dir is not None:
+        dataset_meta["config"] = _match_dataset_by_mean(dm, project_dir)
+
+    return {"algorithm": algo, "dataset": dataset_meta}
 
 
 def main():
@@ -112,6 +233,7 @@ def main():
     docker_outputs = sys.argv[1]
     host_mount_dir = sys.argv[2]
     target_dim = int(sys.argv[3]) if len(sys.argv) >= 4 else 0  # 0 = no filter
+    project_dir = Path(sys.argv[4]) if len(sys.argv) >= 5 else None
 
     base       = Path(docker_outputs)
     cache_path = base / "ckpt_scan_cache.json"
@@ -156,26 +278,44 @@ def main():
             real_key  = str(real_path)
             mtime     = int(real_path.stat().st_mtime)
 
+            # Check model_id entry written by train.sh (works for both old- and new-style paths).
+            # Provides richer metadata: pos_dim_indices, causal, dim_feedforward, episode_len, etc.
+            trainsh_meta = None
+            mid_cached = cache.get(model_id)
+            if isinstance(mid_cached, dict) and mid_cached.get("_source") == "train_sh":
+                trainsh_meta = _meta_to_flat(mid_cached)
+
             cached = cache.get(real_key)
-            if cached and cached.get("mtime") == mtime and "network_size" in cached:
-                # Cache hit with full arch metadata
-                meta = {k: cached.get(k) for k in ("obs_dim", "jump", "dataset",
-                                                     "frame_stack", "network_size",
-                                                     "num_layers", "attn_heads")}
+            if cached and cached.get("mtime") == mtime:
+                realpath_flat = _cache_entry_to_flat(cached)
                 epoch = cached["epoch"]
+                # Prefer train.sh metadata when complete (has pos_dim_indices etc.)
+                candidate = trainsh_meta if (trainsh_meta and _is_meta_complete(trainsh_meta)) \
+                            else realpath_flat
+                if _is_meta_complete(candidate):
+                    meta = candidate
+                else:
+                    # Realpath cache stale/incomplete — reload checkpoint for metadata
+                    ckpt = torch.load(str(real_path), map_location="cpu", weights_only=False)
+                    nested = _extract_arch_metadata(ckpt, project_dir)
+                    meta = trainsh_meta if (trainsh_meta and _is_meta_complete(trainsh_meta)) \
+                           else _meta_to_flat(nested)
+                    cache[real_key] = {"mtime": mtime, "epoch": epoch, **nested}
+                    cache_dirty = True
             else:
                 ckpt  = torch.load(str(real_path), map_location="cpu", weights_only=False)
-                meta  = _extract_arch_metadata(ckpt)
+                nested = _extract_arch_metadata(ckpt, project_dir)
                 epoch = int(ckpt.get("epoch", 0))
-                cache[real_key] = {
-                    "mtime": mtime, "epoch": epoch,
-                    **meta,
-                }
+                meta = trainsh_meta if (trainsh_meta and _is_meta_complete(trainsh_meta)) \
+                       else _meta_to_flat(nested)
+                cache[real_key] = {"mtime": mtime, "epoch": epoch, **nested}
                 cache_dirty = True
 
             # ── Optional obs_dim filter ──────────────────────────────────────
-            if target_dim > 0 and meta.get("obs_dim") != target_dim:
-                continue
+            if target_dim > 0:
+                _indices = meta.get("obs_dim_indices")
+                if _indices is None or len(_indices) != target_dim:
+                    continue
 
             # ── Dedup: keep highest-priority name per realpath ───────────────
             if real_key not in best or _name_priority(name) < _name_priority(best[real_key][0]):
@@ -194,14 +334,20 @@ def main():
 
     # ── Emit results ──────────────────────────────────────────────────────────
     def _f(v) -> str:
-        """Format a possibly-None metadata value."""
+        """Format a possibly-None scalar metadata value."""
         return str(v) if v is not None else _UNKNOWN
+
+    def _f_indices(v) -> str:
+        """Format obs_dim_indices list as compact JSON, or 'unknown'."""
+        if v is None:
+            return _UNKNOWN
+        return json.dumps(v, separators=(",", ":"))  # e.g. [0,1] or [0,1,2,...,28]
 
     for name, host_path, mtime, epoch, meta in best.values():
         model_id = name[len("[eval] "):] if name.startswith("[eval] ") else name
         print(
             f"{name}|{model_id}|{host_path}|{mtime}|{epoch}"
-            f"|{_f(meta.get('obs_dim'))}"
+            f"|{_f_indices(meta.get('obs_dim_indices'))}"
             f"|{_f(meta.get('jump'))}"
             f"|{_f(meta.get('dataset'))}"
             f"|{_f(meta.get('frame_stack'))}"

@@ -299,7 +299,7 @@ class PlanVizMixin:
             gpos = xs_gpos = gg = pg = xs_gg = xs_pg = None
 
             if len(tail_vis) > 0:
-                gpos = pu[tail_vis, 0, self.pos_dim_indices].detach().cpu().numpy()
+                gpos = pu[tail_vis][:, 0][:, self.pos_dim_indices].detach().cpu().numpy()
 
                 if step_caps is not None and m < len(step_caps):
                     sc = step_caps[m]
@@ -331,7 +331,7 @@ class PlanVizMixin:
                     pxs_cpu = sc.get('pred_x_start_pos')
                     if pxs_cpu is not None:
                         pxs_world = self._unnormalize_x(pxs_cpu.unsqueeze(1))
-                        xs_gpos = pxs_world[tail_vis, 0, self.pos_dim_indices].detach().cpu().numpy()
+                        xs_gpos = pxs_world[tail_vis][:, 0][:, self.pos_dim_indices].detach().cpu().numpy()
 
                         gg_clean_dict = sc.get('guidance_grads_clean', {})
                         if gg_clean_dict:

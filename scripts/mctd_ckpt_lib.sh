@@ -173,12 +173,32 @@ mctd_check_gpu_availability() {
             --query-compute-apps=pid,process_name,used_gpu_memory \
             --format=csv,noheader 2>/dev/null)" || true
 
+        # Only flag as occupied if total process VRAM exceeds threshold (MiB).
+        # Background/system processes (e.g. desktop compositor, WSL2 services)
+        # typically use < 500 MiB and don't actually block GPU compute.
+        local _GPU_BUSY_THRESHOLD_MIB="${GPU_BUSY_THRESHOLD_MIB:-1000}"
+        local _total_proc_mem=0 _heavy_procs=""
         if [ -n "$_procs" ]; then
+            while IFS= read -r _line; do
+                [ -z "$_line" ] && continue
+                local _pmib
+                _pmib=$(echo "$_line" | cut -d',' -f3 | sed 's/[^0-9]//g')
+                _pmib="${_pmib:-0}"
+                _total_proc_mem=$(( _total_proc_mem + _pmib ))
+            done <<< "$_procs"
+            if [ "$_total_proc_mem" -ge "$_GPU_BUSY_THRESHOLD_MIB" ]; then
+                _heavy_procs="$_procs"
+            fi
+        fi
+
+        if [ -n "$_heavy_procs" ]; then
             _any_occupied=1
-            echo "  ✗ GPU $_gpu is occupied:"
-            echo "$_procs" | while IFS= read -r _line; do
+            echo "  ✗ GPU $_gpu is occupied (${_total_proc_mem} MiB ≥ threshold ${_GPU_BUSY_THRESHOLD_MIB} MiB):"
+            echo "$_heavy_procs" | while IFS= read -r _line; do
                 echo "      $_line"
             done
+        elif [ -n "$_procs" ]; then
+            echo "  ✓ GPU $_gpu is free (${_total_proc_mem} MiB background processes ignored, threshold ${_GPU_BUSY_THRESHOLD_MIB} MiB)"
         else
             echo "  ✓ GPU $_gpu is free"
         fi
@@ -231,13 +251,15 @@ mctd_dim_menu() {
 #   - realpath deduplication (symlinks and originals show as one entry)
 #
 # Fills global MCTD_CKPT_DIRS with 12-field pipe-delimited entries:
-#   name|model_id|host_path|mtime|epoch|obs_dim|jump|dataset|frame_stack|network_size|num_layers|attn_heads
+#   name|model_id|host_path|mtime|epoch|obs_dim_indices|jump|dataset|frame_stack|network_size|num_layers|attn_heads
+#   obs_dim_indices: compact JSON list e.g. [0,1] — never a bare count
 mctd_scan_ckpts() {
     local target_dim="${1:-0}"
     MCTD_CKPT_DIRS=()
 
     local scanner_host="$MCTD_PROJECT_DIR/scripts/ckpt_scanner.py"
     local scanner_docker="/tmp/ckpt_scanner.py"
+    local scanner_project_docker="/tmp/mctd_project"
 
     local -a _raw
     mapfile -t _raw < <(
@@ -245,8 +267,9 @@ mctd_scan_ckpts() {
             --entrypoint python3 \
             -v "$MCTD_OUTPUT_MOUNT_DIR":"$MCTD_DOCKER_OUTPUTS" \
             -v "$scanner_host":"$scanner_docker":ro \
+            -v "$MCTD_PROJECT_DIR":"$scanner_project_docker":ro \
             "$MCTD_DOCKER_IMAGE" \
-            "$scanner_docker" "$MCTD_DOCKER_OUTPUTS" "$MCTD_OUTPUT_MOUNT_DIR" "$target_dim" \
+            "$scanner_docker" "$MCTD_DOCKER_OUTPUTS" "$MCTD_OUTPUT_MOUNT_DIR" "$target_dim" "$scanner_project_docker" \
             2>/dev/null | grep -E '^[^|]+(\|[^|]*){4,}'
     )
 
@@ -261,14 +284,15 @@ mctd_scan_ckpts() {
 #
 # Reads global MCTD_CKPT_DIRS (populated by mctd_scan_ckpts).
 # Each entry has 12 fields:
-#   name|model_id|host_path|mtime|epoch|obs_dim|jump|dataset|frame_stack|network_size|num_layers|attn_heads
+#   name|model_id|host_path|mtime|epoch|obs_dim_indices|jump|dataset|frame_stack|network_size|num_layers|attn_heads
+#   obs_dim_indices: compact JSON list e.g. [0,1] or [0,1,...,28]  (never a bare count)
 #
 # Sets globals:
-#   MCTD_SELECTED_CKPT        host path of selected model.ckpt (empty = fresh)
-#   MCTD_SELECTED_EPOCH       epoch number of selected ckpt
-#   MCTD_SELECTED_MODEL_ID    model_id extracted directly from scanner output
-#   MCTD_SELECTED_DATASET     dataset config of selected ckpt (may be "unknown")
-#   MCTD_SELECTED_OBS_DIM     obs_dim of selected ckpt (may be "unknown")
+#   MCTD_SELECTED_CKPT             host path of selected model.ckpt (empty = fresh)
+#   MCTD_SELECTED_EPOCH            epoch number of selected ckpt
+#   MCTD_SELECTED_MODEL_ID         model_id extracted directly from scanner output
+#   MCTD_SELECTED_DATASET          dataset config of selected ckpt (may be "unknown")
+#   MCTD_SELECTED_OBS_DIM_INDICES  obs_dim_indices JSON of selected ckpt (may be "unknown")
 #
 # --no-fresh: hides "[0] Start from scratch" (use for eval scripts)
 #             returns 1 if user enters invalid index
@@ -279,7 +303,7 @@ mctd_ckpt_menu() {
     MCTD_SELECTED_EPOCH=0
     MCTD_SELECTED_MODEL_ID=""
     MCTD_SELECTED_DATASET=""
-    MCTD_SELECTED_OBS_DIM=""
+    MCTD_SELECTED_OBS_DIM_INDICES=""
 
     if [ ${#MCTD_CKPT_DIRS[@]} -eq 0 ]; then
         echo "No checkpoints found."
@@ -298,20 +322,22 @@ mctd_ckpt_menu() {
 
     local i
     for i in "${!_sorted[@]}"; do
-        local _e _model_id _epoch _obs_dim _jump _dataset _fs _net _layers _heads
+        local _e _model_id _epoch _obs_dim_indices _obs_dim_count _jump _dataset _fs _net _layers _heads
         _e="${_sorted[$i]}"
-        _model_id=$(echo "$_e" | cut -d'|' -f2)
-        _epoch=$(   echo "$_e" | cut -d'|' -f5)
-        _obs_dim=$( echo "$_e" | cut -d'|' -f6)
-        _jump=$(    echo "$_e" | cut -d'|' -f7)
-        _dataset=$( echo "$_e" | cut -d'|' -f8)
-        _fs=$(      echo "$_e" | cut -d'|' -f9)
-        _net=$(     echo "$_e" | cut -d'|' -f10)
-        _layers=$(  echo "$_e" | cut -d'|' -f11)
-        _heads=$(   echo "$_e" | cut -d'|' -f12)
+        _model_id=$(        echo "$_e" | cut -d'|' -f2)
+        _epoch=$(           echo "$_e" | cut -d'|' -f5)
+        _obs_dim_indices=$( echo "$_e" | cut -d'|' -f6)
+        _jump=$(            echo "$_e" | cut -d'|' -f7)
+        _dataset=$(         echo "$_e" | cut -d'|' -f8)
+        _fs=$(              echo "$_e" | cut -d'|' -f9)
+        _net=$(             echo "$_e" | cut -d'|' -f10)
+        _layers=$(          echo "$_e" | cut -d'|' -f11)
+        _heads=$(           echo "$_e" | cut -d'|' -f12)
         _epoch="${_epoch:-0}"
+        # Derive display count from JSON indices list (e.g. [0,1] → 2)
+        _obs_dim_count=$(python3 -c "import sys,json; v='$_obs_dim_indices'; print(len(json.loads(v)) if v!='unknown' else '?')" 2>/dev/null || echo "?")
         printf "  [%d] %-20s  dataset=%-38s obs=%s  jump=%s  fs=%s  net=%sL%sh%s  (epoch %s)\n" \
-            "$((i+1))" "$_model_id" "$_dataset" "$_obs_dim" "$_jump" "$_fs" \
+            "$((i+1))" "$_model_id" "$_dataset" "$_obs_dim_count" "$_jump" "$_fs" \
             "$_net" "$_layers" "$_heads" "$_epoch"
     done
     echo ""
@@ -338,11 +364,11 @@ mctd_ckpt_menu() {
 
     local _idx=$((_sel - 1))
     local _e="${_sorted[$_idx]}"
-    MCTD_SELECTED_MODEL_ID=$(echo "$_e" | cut -d'|' -f2)
-    MCTD_SELECTED_CKPT=$(    echo "$_e" | cut -d'|' -f3)
-    MCTD_SELECTED_EPOCH=$(   echo "$_e" | cut -d'|' -f5)
-    MCTD_SELECTED_OBS_DIM=$( echo "$_e" | cut -d'|' -f6)
-    MCTD_SELECTED_DATASET=$( echo "$_e" | cut -d'|' -f8)
+    MCTD_SELECTED_MODEL_ID=$(         echo "$_e" | cut -d'|' -f2)
+    MCTD_SELECTED_CKPT=$(             echo "$_e" | cut -d'|' -f3)
+    MCTD_SELECTED_EPOCH=$(            echo "$_e" | cut -d'|' -f5)
+    MCTD_SELECTED_OBS_DIM_INDICES=$(  echo "$_e" | cut -d'|' -f6)
+    MCTD_SELECTED_DATASET=$(          echo "$_e" | cut -d'|' -f8)
     MCTD_SELECTED_EPOCH="${MCTD_SELECTED_EPOCH:-0}"
     echo "Selected: $MCTD_SELECTED_CKPT  (epoch $MCTD_SELECTED_EPOCH)"
     echo "Model ID: $MCTD_SELECTED_MODEL_ID"

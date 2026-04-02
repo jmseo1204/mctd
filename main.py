@@ -48,6 +48,11 @@ def run_local(cfg: DictConfig):
         (output_dir.parents[1] / "latest-run").symlink_to(output_dir, target_is_directory=True)
 
     # Set up logging with wandb.
+    assert cfg.wandb.mode in ("online", "disabled"), (
+        f"wandb.mode='{cfg.wandb.mode}' is not allowed. "
+        "Only 'online' or 'disabled' are permitted to prevent local log accumulation. "
+        "Use wandb.mode=online (default) or wandb.mode=disabled to skip logging."
+    )
     if cfg.wandb.mode != "disabled":
         # If resuming, merge into the existing run on wandb.
         resume = cfg.get("resume", None)
@@ -62,6 +67,7 @@ def run_local(cfg: DictConfig):
         logger = logger_cls(
             name=name,
             save_dir=str(output_dir),
+            dir="/tmp",  # wandb local cache → /tmp (container-ephemeral, not persisted)
             offline=offline,
             entity=cfg.wandb.entity,
             group=cfg.wandb.group,
@@ -79,9 +85,9 @@ def run_local(cfg: DictConfig):
     checkpoint_path = None
     load_id = None
     if load and not is_run_id(load):
-        # Check if it's a local model_id in outputs/downloaded (non-WandB checkpoint)
+        # Check if it's a local model_id in the downloaded checkpoints directory
         local_downloaded = (
-            Path("outputs/downloaded")
+            Path(__file__).parent / "outputs" / "downloaded"
             / cfg.wandb.entity
             / cfg.wandb.project
             / load
@@ -100,7 +106,7 @@ def run_local(cfg: DictConfig):
 
     if load_id:
         run_path = f"{cfg.wandb.entity}/{cfg.wandb.project}/{load_id}"
-        checkpoint_path = Path("outputs/downloaded") / run_path / "model.ckpt"
+        checkpoint_path = Path(__file__).parent / "outputs" / "downloaded" / run_path / "model.ckpt"
 
     if checkpoint_path and is_rank_zero:
         print(f"Will load checkpoint from {checkpoint_path}")
@@ -199,7 +205,7 @@ def run(cfg: DictConfig):
 
     if load_id and "_on_compute_node" not in cfg:
         run_path = f"{cfg.wandb.entity}/{cfg.wandb.project}/{load_id}"
-        download_latest_checkpoint(run_path, Path("outputs/downloaded"))
+        download_latest_checkpoint(run_path, Path(__file__).parent / "outputs" / "downloaded")
 
     if "cluster" in cfg and not "_on_compute_node" in cfg:
         print(cyan("Slurm detected, submitting to compute node instead of running locally..."))

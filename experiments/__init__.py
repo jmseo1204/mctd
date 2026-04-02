@@ -8,7 +8,7 @@ from .exp_planning import PlanningExperiment
 
 # each key has to be a yaml file under '[project_root]/configurations/experiment' without .yaml suffix
 exp_registry = dict(
-    exp_planning=PlanningExperiment,
+    base_pytorch=PlanningExperiment,
 )
 
 

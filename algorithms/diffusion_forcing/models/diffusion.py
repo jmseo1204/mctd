@@ -37,7 +37,7 @@ class Diffusion(nn.Module):
         self.use_fused_snr = cfg.use_fused_snr
         self.snr_clip = cfg.snr_clip
         self.cum_snr_decay = cfg.cum_snr_decay
-        self.ddim_sampling_eta = cfg.ddim_sampling_eta
+        self.ddim_sampling_eta = cfg.get('ddim_sampling_eta', 0.1)
         self.clip_noise = cfg.clip_noise
         self.max_guidance_ratio = cfg.get("max_guidance_ratio", float("inf"))
         self.arch = cfg.architecture

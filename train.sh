@@ -40,20 +40,20 @@ mkdir -p "$OUTPUT_MOUNT_DIR"
 mctd_select_gpus
 
 # ────────────────────────────────────────────────────────
-# Read training parameters from train_df_planning.yaml
+# Read training parameters from ckpt_df_planning.yaml
 # (no user prompts for dataset / jump — edit the YAML to change them)
 # ────────────────────────────────────────────────────────
 echo "===================================================="
 echo "  MCTD Training Launcher"
 echo "===================================================="
 
-ALGORITHM_CONFIG="train_df_planning"
+ALGORITHM_CONFIG="train_df_planning"   # Hydra entry point (composes ckpt_df_planning via defaults)
+CKPT_YAML="$PROJECT_DIR/configurations/algorithm/ckpt_df_planning.yaml"
 TRAIN_YAML="$PROJECT_DIR/configurations/algorithm/train_df_planning.yaml"
-DF_YAML="$PROJECT_DIR/configurations/algorithm/df_planning.yaml"
-DF_BASE_YAML="$PROJECT_DIR/configurations/algorithm/df_base.yaml"
 
-# Read training parameters from YAML (inline Python, yaml is stdlib-available)
-eval "$(python3 - "$TRAIN_YAML" "$DF_YAML" "$DF_BASE_YAML" <<'PYEOF'
+# Read training parameters from ckpt_df_planning.yaml (model arch) and
+# train_df_planning.yaml (training loop).  Both are plain YAML — no Hydra interpolation.
+eval "$(python3 - "$CKPT_YAML" "$TRAIN_YAML" <<'PYEOF'
 import sys, yaml, json, shlex, os
 
 def load_yaml(path):
@@ -63,22 +63,12 @@ def load_yaml(path):
     except Exception:
         return {}
 
-def deep_merge(base, override):
-    result = dict(base)
-    for k, v in override.items():
-        if k in ('defaults',):
-            continue
-        if isinstance(v, dict) and isinstance(result.get(k), dict):
-            result[k] = deep_merge(result[k], v)
-        else:
-            result[k] = v
-    return result
-
-train_path, df_path, df_base_path = sys.argv[1], sys.argv[2], sys.argv[3]
-merged = deep_merge(deep_merge(load_yaml(df_base_path), load_yaml(df_path)), load_yaml(train_path))
+ckpt_path, train_path = sys.argv[1], sys.argv[2]
+merged      = load_yaml(ckpt_path)   # model arch params
+train_cfg   = load_yaml(train_path)  # training loop params
 
 dataset_config = str(merged.get('train_dataset_config', 'og_antmaze_giant_stitch'))
-jump           = str(merged.get('train_jump', 5))
+jump           = str(merged.get('jump', 5))
 obs_idx        = merged.get('obs_dim_indices')
 pos_idx        = merged.get('pos_dim_indices', [0, 1])
 obs_dim        = str(len(obs_idx)) if obs_idx else 'unknown'
@@ -90,6 +80,16 @@ network_size = str(arch.get('network_size', 'unknown'))
 num_layers   = str(arch.get('num_layers', 'unknown'))
 attn_heads   = str(arch.get('attn_heads', 'unknown'))
 
+tl = train_cfg.get('training_loop') or {}
+batch_size  = str(tl.get('batch_size', 2048))
+max_steps   = str(tl.get('max_steps', 200005))
+ckpt_every  = str(tl.get('checkpointing_every_n_steps', 2000))
+val_prec    = str(tl.get('validation_precision', 32))
+val_inf     = str(tl.get('validation_inference_mode', 'false')).lower()
+val_step    = tl.get('validation_val_every_n_step')
+val_step_s  = 'null' if val_step is None else str(val_step)
+val_epoch   = str(tl.get('validation_val_every_n_epoch', 5000))
+
 print(f"DATASET_CONFIG={shlex.quote(dataset_config)}")
 print(f"JUMP_VALUE={shlex.quote(jump)}")
 print(f"TARGET_OBS_DIM={shlex.quote(obs_dim)}")
@@ -99,10 +99,17 @@ print(f"TRAIN_FRAME_STACK={shlex.quote(frame_stack)}")
 print(f"TRAIN_NETWORK_SIZE={shlex.quote(network_size)}")
 print(f"TRAIN_NUM_LAYERS={shlex.quote(num_layers)}")
 print(f"TRAIN_ATTN_HEADS={shlex.quote(attn_heads)}")
+print(f"TRAIN_BATCH_SIZE={shlex.quote(batch_size)}")
+print(f"TRAIN_MAX_STEPS={shlex.quote(max_steps)}")
+print(f"TRAIN_CKPT_EVERY={shlex.quote(ckpt_every)}")
+print(f"TRAIN_VAL_PRECISION={shlex.quote(val_prec)}")
+print(f"TRAIN_VAL_INF_MODE={shlex.quote(val_inf)}")
+print(f"TRAIN_VAL_STEP={shlex.quote(val_step_s)}")
+print(f"TRAIN_VAL_EPOCH={shlex.quote(val_epoch)}")
 PYEOF
 )"
 
-echo "Read training config from $TRAIN_YAML:"
+echo "Read training config from $CKPT_YAML:"
 echo "  dataset_config  = $DATASET_CONFIG"
 echo "  jump            = $JUMP_VALUE"
 echo "  obs_dim         = $TARGET_OBS_DIM  (obs_dim_indices=$OBS_DIM_JSON)"
@@ -160,7 +167,7 @@ host_to_docker_path() {
 update_eval_symlink() {
     local model_id="$1"
 
-    # Find latest model.ckpt in raw training outputs only (outputs/ subdir)
+    # Find latest model.ckpt in raw training outputs only (OUTPUT_MOUNT_DIR)
     local latest_ckpt="" latest_time=0
     while IFS= read -r f; do
         local ftime
@@ -316,7 +323,7 @@ echo "[model_id] Using: $MODEL_ID" | tee -a "$LOG_FILE"
 # ────────────────────────────────────────────────────────
 # save_training_config: persist training-dependent architecture params
 #   so that generate_jobs_generalized.py can auto-detect them at eval time.
-#   Reads configurations/algorithm/{algo}.yaml (+ parent df_planning.yaml) and
+#   Reads configurations/algorithm/{algo}.yaml (train_df_planning.yaml, self-contained) and
 #   writes EVAL_BASE/$model_id/training_config.yaml in plain-YAML format that
 #   extract_from_config() already handles (no WandB value-wrapper needed).
 # ────────────────────────────────────────────────────────
@@ -328,17 +335,18 @@ save_training_config() {
     local obs_dim_json="$5"     # JSON list e.g. [0,1]
     local pos_dim_json="$6"     # JSON list e.g. [0,1]
 
-    local base_yaml="$PROJECT_DIR/configurations/algorithm/df_planning.yaml"
     local algo_yaml="$PROJECT_DIR/configurations/algorithm/${algo_config}.yaml"
     local dataset_yaml="$PROJECT_DIR/configurations/dataset/${dataset_config}.yaml"
     local output_dir="$EVAL_BASE/$model_id"
     local output_file="$output_dir/training_config.yaml"
+    local cache_file="$MCTD_OUTPUT_MOUNT_DIR/ckpt_scan_cache.json"
 
     mkdir -p "$output_dir"
 
-    python3 - "$base_yaml" "$algo_yaml" "$dataset_yaml" "$dataset_config" "$jump_value" \
-              "$obs_dim_json" "$pos_dim_json" "$output_file" <<'PYEOF'
-import sys, yaml, json
+    # train_df_planning.yaml is self-contained — no df_planning.yaml merge needed.
+    python3 - "$algo_yaml" "$dataset_yaml" "$dataset_config" "$jump_value" \
+              "$obs_dim_json" "$pos_dim_json" "$output_file" "$model_id" "$cache_file" <<'PYEOF'
+import sys, yaml, json, os
 
 def load_yaml(path):
     try:
@@ -347,61 +355,56 @@ def load_yaml(path):
     except FileNotFoundError:
         return {}
 
-def deep_merge(base, override):
-    result = dict(base)
-    for k, v in override.items():
-        if k == 'defaults':
-            continue
-        if isinstance(v, dict) and isinstance(result.get(k), dict):
-            result[k] = deep_merge(result[k], v)
-        else:
-            result[k] = v
-    return result
+algo_path, dataset_path, dataset_config_name, jump_value, \
+    obs_dim_json, pos_dim_json, out_path, model_id, cache_path = sys.argv[1:]
 
-base_path, algo_path, dataset_path, dataset_config_name, jump_value, \
-    obs_dim_json, pos_dim_json, out_path = sys.argv[1:]
-
-merged_algo  = deep_merge(load_yaml(base_path), load_yaml(algo_path))
+merged_algo  = load_yaml(algo_path)
 dataset_data = load_yaml(dataset_path)
 
-arch = (merged_algo.get('diffusion') or {}).get('architecture', {})
+# Resolve episode_len from dataset config (ckpt_df_planning.yaml does not contain it)
+episode_len = dataset_data.get('episode_len')
 
-# Resolve episode_len: algo yaml may use ${dataset.episode_len} interpolation
-episode_len_raw = merged_algo.get('episode_len')
-if isinstance(episode_len_raw, str) and '${' in episode_len_raw:
-    episode_len = dataset_data.get('episode_len')
-else:
-    episode_len = episode_len_raw or dataset_data.get('episode_len')
+# Strip OmegaConf interpolation strings (not resolvable outside Hydra)
+def strip_interpolations(obj):
+    if isinstance(obj, str) and obj.startswith('${'):
+        return None
+    if isinstance(obj, dict):
+        return {k: strip_interpolations(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [strip_interpolations(v) for v in obj]
+    return obj
 
-obs_dim_indices = json.loads(obs_dim_json) if obs_dim_json != 'null' else None
-pos_dim_indices = json.loads(pos_dim_json) if pos_dim_json not in ('null', '') else [0, 1]
+algo_to_save = strip_interpolations(merged_algo)
+effective_jump = algo_to_save.get('jump', 1)
 
 config_to_save = {
-    'algorithm': {
-        'causal': merged_algo.get('causal'),
-        'scheduling_matrix': merged_algo.get('scheduling_matrix'),
-        'frame_stack': merged_algo.get('frame_stack'),
-        'obs_dim_indices': obs_dim_indices,
-        'pos_dim_indices': pos_dim_indices,
-        'diffusion': {
-            'architecture': {
-                'attn_heads': arch.get('attn_heads'),
-                'network_size': arch.get('network_size'),
-                'dim_feedforward': arch.get('dim_feedforward'),
-                'num_layers': arch.get('num_layers'),
-            }
-        }
-    },
+    'algorithm': algo_to_save,   # full ckpt_df_planning.yaml content
     'dataset': {
         'config': dataset_config_name,
         'episode_len': episode_len,
-        'jump': int(jump_value) if jump_value.isdigit() else dataset_data.get('jump', 1),
+        'jump': effective_jump,
     }
 }
 
+# Write training_config.yaml
 with open(out_path, 'w') as f:
     yaml.dump(config_to_save, f, default_flow_style=False)
 print(f"[config] Saved training config to {out_path}")
+
+# Also update ckpt_scan_cache.json with the same structure under model_id key.
+# The scanner (ckpt_scanner.py) reads this entry to get richer metadata without
+# having to torch.load the checkpoint (see _source == "train_sh" handling there).
+try:
+    cache = {}
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            cache = json.load(f)
+    cache[model_id] = {"_source": "train_sh", **config_to_save}
+    with open(cache_path, 'w') as f:
+        json.dump(cache, f, indent=2)
+    print(f"[config] Updated ckpt_scan_cache.json for {model_id}")
+except Exception as e:
+    print(f"[config] WARNING: Failed to update ckpt_scan_cache.json: {e}")
 PYEOF
 
     local rc=$?
@@ -411,7 +414,8 @@ PYEOF
 }
 
 # Save training-dependent config for later eval job generation
-save_training_config "$MODEL_ID" "$ALGORITHM_CONFIG" "$DATASET_CONFIG" "$JUMP_VALUE" \
+# Read from ckpt_df_planning (the model definition config), not train_df_planning.
+save_training_config "$MODEL_ID" "ckpt_df_planning" "$DATASET_CONFIG" "$JUMP_VALUE" \
     "$OBS_DIM_JSON" "$POS_DIM_JSON"
 
 # ────────────────────────────────────────────────────────
@@ -434,7 +438,14 @@ fi
 
 BASE_CMD="python3 main.py \
     experiment.tasks=[training] \
-    experiment=exp_planning \
+    experiment=base_pytorch \
+    experiment.training.batch_size=$TRAIN_BATCH_SIZE \
+    experiment.training.max_steps=$TRAIN_MAX_STEPS \
+    experiment.training.checkpointing.every_n_train_steps=$TRAIN_CKPT_EVERY \
+    experiment.validation.precision=$TRAIN_VAL_PRECISION \
+    experiment.validation.inference_mode=$TRAIN_VAL_INF_MODE \
+    experiment.validation.val_every_n_step=$TRAIN_VAL_STEP \
+    experiment.validation.val_every_n_epoch=$TRAIN_VAL_EPOCH \
     algorithm=$ALGORITHM_CONFIG \
     dataset=$DATASET_CONFIG \
     dataset.jump=$JUMP_VALUE \

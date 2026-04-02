@@ -23,7 +23,7 @@ configs = [
         "wandb.project": wandb_project,
         "wandb.group": "Reproduction-Maze2D-Medium",
         "+name": "Reproduction-Maze2D-Medium",
-        "experiment": "exp_planning",
+        "experiment": "base_pytorch",
         "algorithm": "df_planning",
         "algorithm.parallel_search_num": 50, # Reduced for quick check
         "algorithm.open_loop_horizon": 500,
@@ -33,6 +33,9 @@ configs = [
         "dataset.episode_len": 500,
         "experiment.tasks": ["validation"],
         "experiment.validation.batch_size": 1,
+        "experiment.validation.precision": 32,
+        "experiment.validation.inference_mode": False,
+        "experiment.validation.limit_batch": 1,
         "load": "ynn5o8cb", # Run ID from the original file
     },
     # AntMaze Medium - The classic stitch dataset
@@ -41,7 +44,7 @@ configs = [
         "wandb.project": wandb_project,
         "wandb.group": "Reproduction-AntMaze-Medium",
         "+name": "Reproduction-AntMaze-Medium",
-        "experiment": "exp_planning",
+        "experiment": "base_pytorch",
         "algorithm": "df_planning",
         "algorithm.open_loop_horizon": 500, # Reduced horizon for quick check? No, keep logic similar.
         "algorithm.val_max_steps": 1000,
@@ -54,6 +57,9 @@ configs = [
         "dataset.episode_len": 500,
         "experiment.tasks": ["validation"],
         "experiment.validation.batch_size": 1,
+        "experiment.validation.precision": 32,
+        "experiment.validation.inference_mode": False,
+        "experiment.validation.limit_batch": 1,
         "load": "8b3xf51l", # Run ID from the original file
     }
 ]
@@ -71,7 +77,7 @@ for i, config in enumerate(configs):
     print(f"Generated job file: {filename}")
 
 print("\nTo run these jobs, you would typically use run_jobs.py.")
-print("However, without the pre-trained models downloaded to outputs/downloaded/..., `main.py` will attempt to download them from W&B.")
+print("However, without the pre-trained models downloaded from W&B, `main.py` will attempt to download them from W&B.")
 print("Since we likely lack W&B credentials for the original project, this might fail or require login.")
 
 # Attempt to run one job to demonstrate the reproduction step

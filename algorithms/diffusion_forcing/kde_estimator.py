@@ -1,20 +1,120 @@
 """kde_estimator.py
 Kernel Density Estimation utilities for trajectory-coverage scoring.
 
-Provides KDEEstimatorMixin — a mixin class whose methods handle:
-  - Loading training (x,y) positions from dataset (_load_kde_data_xy)
-  - Pre-computing a 2D KDE grid and persisting to pkl (_build_or_load_kde_grid)
-  - Fast O(N) bilinear-interpolation KDE score lookup (_get_kde_score_grid)
-  - Raw data accessor (_get_kde_data_xy)
+Provides:
+  build_or_load_kde_grid()  — standalone function (importable from scripts)
+  KDEEstimatorMixin         — mixin class that delegates to the above
 
-Intended to be inherited by DiffusionForcingPlanning alongside DiffusionForcingBase.
-All methods reference `self.*` attributes provided by the base class.
+pkl filename format (all params self-contained):
+  {dataset}_kde_grid_s{sigma}_n{n}_r{res}.pkl
+  e.g. antmaze-large-navigate-v0_kde_grid_s0.2_n100000_r256.pkl
 """
 
 from __future__ import annotations
 
+import os
+import pickle
+
 import numpy as np
 
+
+# ─── Module-level standalone function (reusable from scripts) ─────────────────
+
+def build_or_load_kde_grid(
+    data_xy: np.ndarray,
+    sigma: float,
+    dataset: str,
+    save_dir: str,
+    res: int = 256,
+) -> dict:
+    """Build (or load from cache) a 2-D grid of KDE scores and log-densities.
+
+    Grid covers the data extent + 3σ margin at ``res × res`` resolution.
+    Results are persisted as a pkl whose filename encodes all parameters so
+    stale caches are never reused without manual deletion.
+
+    pkl filename: ``{dataset}_kde_grid_s{sigma}_n{n}_r{res}.pkl``
+
+    Args:
+        data_xy:  (M, 2) float32 training positions, already subsampled.
+        sigma:    KDE bandwidth (world units).
+        dataset:  Dataset name string — used as part of the pkl filename.
+        save_dir: Directory where the pkl is saved/loaded.
+        res:      Grid resolution per axis (default 256).
+
+    Returns:
+        dict with keys:
+            "xs"       — (res,) x grid coordinates
+            "ys"       — (res,) y grid coordinates
+            "scores"   — (res, res, 2) ∇log p score field
+            "log_dens" — (res, res) log-density field  (for heatmap)
+    """
+    from algorithms.diffusion_forcing.guidance import _kde_score_np as _kde_score
+
+    n = len(data_xy)
+    pkl_name = f"{dataset}_kde_grid_s{sigma}_n{n}_r{res}.pkl"
+    pkl_path = os.path.join(save_dir, pkl_name)
+
+    if os.path.exists(pkl_path):
+        with open(pkl_path, "rb") as f:
+            grid = pickle.load(f)
+        # Backward compat: old pkls may lack log_dens — recompute if missing
+        if "log_dens" not in grid:
+            print(f"[KDE] Cache missing log_dens, rebuilding: {pkl_path}", flush=True)
+        else:
+            print(f"[KDE] Loaded grid from cache: {pkl_path}", flush=True)
+            return grid
+
+    # ── Build grid ─────────────────────────────────────────────────────────────
+    margin = sigma * 3.0
+    x_min = float(data_xy[:, 0].min()) - margin
+    x_max = float(data_xy[:, 0].max()) + margin
+    y_min = float(data_xy[:, 1].min()) - margin
+    y_max = float(data_xy[:, 1].max()) + margin
+    xs = np.linspace(x_min, x_max, res, dtype=np.float32)
+    ys = np.linspace(y_min, y_max, res, dtype=np.float32)
+    gx, gy = np.meshgrid(xs, ys, indexing="ij")
+    grid_pts = np.stack([gx.ravel(), gy.ravel()], axis=-1)  # (res*res, 2)
+
+    from tqdm import tqdm
+
+    chunk = 512
+    n_chunks = (len(grid_pts) + chunk - 1) // chunk
+
+    # Score field ∇log p — chunked to keep memory bounded
+    score_parts = []
+    for i in tqdm(range(0, len(grid_pts), chunk), total=n_chunks,
+                  desc="KDE score field", unit="chunk", leave=True):
+        score_parts.append(_kde_score(grid_pts[i:i + chunk], data_xy, sigma))
+    grid_scores = np.concatenate(score_parts, axis=0).reshape(res, res, 2)
+
+    # Log-density field — logsumexp of Gaussian kernels
+    log_dens_parts = []
+    for i in tqdm(range(0, len(grid_pts), chunk), total=n_chunks,
+                  desc="KDE log-density ", unit="chunk", leave=True):
+        q = grid_pts[i:i + chunk]                       # (C, 2)
+        diff = data_xy[None, :, :] - q[:, None, :]      # (C, M, 2)
+        sq   = (diff ** 2).sum(-1)                       # (C, M)
+        logw = -sq / (2.0 * sigma ** 2)
+        lmax = logw.max(-1, keepdims=True)
+        log_dens_parts.append(
+            np.log(np.exp(logw - lmax).sum(-1)) + lmax[:, 0]
+        )
+    grid_log_dens = np.concatenate(log_dens_parts, axis=0).reshape(res, res)
+
+    grid = {"xs": xs, "ys": ys, "scores": grid_scores, "log_dens": grid_log_dens}
+    os.makedirs(save_dir, exist_ok=True)
+    with open(pkl_path, "wb") as f:
+        pickle.dump(grid, f)
+    print(
+        f"[KDE] Grid built and saved: {pkl_path} "
+        f"(res={res}×{res}, chunks={len(score_parts)})",
+        flush=True,
+    )
+    return grid
+
+
+# ─── Mixin (delegates to the standalone function above) ───────────────────────
 
 class KDEEstimatorMixin:
     """Mixin providing kernel-density-estimation helpers."""
@@ -25,7 +125,6 @@ class KDEEstimatorMixin:
         Called once at __init__ time. Uses the entire dataset without subsampling
         so that the density estimate is as accurate as possible.
         """
-        import os
         path = os.path.join(self._kde_save_dir, f"{self.dataset}.npz")
         xy = np.load(path)["observations"][:, :2].astype(np.float32)
         if self.kde_sample_ratio < 1.0:
@@ -37,46 +136,13 @@ class KDEEstimatorMixin:
         self._build_or_load_kde_grid()
 
     def _build_or_load_kde_grid(self) -> None:
-        """Pre-compute a 2-D grid of KDE scores and persist as pkl.
-
-        Grid covers the data extent + 3σ margin at 256×256 resolution.
-        Subsequent runs load the pkl and skip the O(grid_pts × M) computation.
-        The pkl filename encodes sigma and M so stale caches are never reused.
-        """
-        import os, pickle
-        from algorithms.diffusion_forcing.guidance import _kde_score_np as _kde_score
-
-        xy = self._kde_data_xy_cache
-        n = len(xy)
-        pkl_name = f"{self.dataset}_kde_grid_s{self.kde_sigma}_n{n}.pkl"
-        pkl_path = os.path.join(self._kde_save_dir, pkl_name)
-
-        if os.path.exists(pkl_path):
-            with open(pkl_path, "rb") as f:
-                self._kde_grid_cache = pickle.load(f)
-            print(f"[INIT] KDE grid loaded from cache: {pkl_path}", flush=True)
-            return
-
-        # Build grid
-        margin = self.kde_sigma * 3.0
-        x_min, x_max = float(xy[:, 0].min()) - margin, float(xy[:, 0].max()) + margin
-        y_min, y_max = float(xy[:, 1].min()) - margin, float(xy[:, 1].max()) + margin
-        res = 256
-        xs = np.linspace(x_min, x_max, res, dtype=np.float32)
-        ys = np.linspace(y_min, y_max, res, dtype=np.float32)
-        grid_pts = np.stack(np.meshgrid(xs, ys, indexing="ij"), axis=-1).reshape(-1, 2)  # (res*res, 2)
-
-        # Compute in chunks to keep memory bounded (~40 MB per chunk for M=100K)
-        chunk = 512
-        parts = []
-        for i in range(0, len(grid_pts), chunk):
-            parts.append(_kde_score(grid_pts[i:i+chunk], xy, self.kde_sigma))
-        grid_scores = np.concatenate(parts, axis=0).reshape(res, res, 2)  # (res, res, 2)
-
-        self._kde_grid_cache = {"xs": xs, "ys": ys, "scores": grid_scores}
-        with open(pkl_path, "wb") as f:
-            pickle.dump(self._kde_grid_cache, f)
-        print(f"[INIT] KDE grid built and saved: {pkl_path} (res={res}x{res}, chunks={len(parts)})", flush=True)
+        """Delegate to module-level build_or_load_kde_grid()."""
+        self._kde_grid_cache = build_or_load_kde_grid(
+            data_xy=self._kde_data_xy_cache,
+            sigma=self.kde_sigma,
+            dataset=self.dataset,
+            save_dir=self._kde_save_dir,
+        )
 
     def _get_kde_score_grid(self, query_xy: np.ndarray) -> np.ndarray:
         """Fast KDE score via bilinear interpolation on precomputed grid.
@@ -103,12 +169,12 @@ class KDEEstimatorMixin:
         tx = ((qx - xs[ix]) / dx)[:, None]
         ty = ((qy - ys[iy]) / dy)[:, None]
 
-        s00 = scores[ix,   iy  ]  # (N, 2)
-        s10 = scores[ix+1, iy  ]
-        s01 = scores[ix,   iy+1]
-        s11 = scores[ix+1, iy+1]
-        return (s00*(1-tx)*(1-ty) + s10*tx*(1-ty) +
-                s01*(1-tx)*ty     + s11*tx*ty)
+        s00 = scores[ix,     iy    ]  # (N, 2)
+        s10 = scores[ix + 1, iy    ]
+        s01 = scores[ix,     iy + 1]
+        s11 = scores[ix + 1, iy + 1]
+        return (s00 * (1 - tx) * (1 - ty) + s10 * tx * (1 - ty) +
+                s01 * (1 - tx) * ty       + s11 * tx * ty)
 
     def _get_kde_data_xy(self) -> np.ndarray:
         return self._kde_data_xy_cache

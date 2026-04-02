@@ -121,7 +121,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         # Physical qpos[:2] is always world (x,y) in AntMaze/PointMaze — kept separate.
         _pos_idx = cfg.get("pos_dim_indices", None)
         self.pos_dim_indices: list = list(_pos_idx) if _pos_idx is not None else [0, 1]
-        self.pos_dim: int = len(self.pos_dim_indices)
         self.use_reward = cfg.use_reward
         self.unstacked_dim = (
             self.observation_dim + self.action_dim + int(self.use_reward)
@@ -136,7 +135,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         )
         self.n_tokens = self.episode_len // self.frame_stack
 
-        self.gamma = cfg.gamma
         self.reward_mean = cfg.reward_mean
         self.reward_std = cfg.reward_std
         self.observation_mean = np.array(cfg.observation_mean)[self.obs_dim_indices]
@@ -157,7 +155,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.mctd_guidance_scales = cfg.mctd_guidance_scales
         self.mctd_max_search_num = cfg.mctd_max_search_num
         self.mctd_num_denoising_steps = cfg.mctd_num_denoising_steps
-        self.replanning_target_level = cfg.get("replanning_target_level", cfg.diffusion.sampling_timesteps // 3)
+        _rpl = cfg.get("replanning_target_level")
+        self.replanning_target_level = _rpl if _rpl is not None else cfg.diffusion.sampling_timesteps // 3
         self.mctd_skip_level_steps = cfg.mctd_skip_level_steps
         self.jump = cfg.jump
         self.time_limit = cfg.time_limit
@@ -457,7 +456,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         batch_size, n_frames = observations.shape[:2]
 
-        observations = observations[..., : self.observation_dim]
+        observations = observations[..., self.obs_dim_indices]
         actions = actions[..., : self.action_dim]
 
         if (n_frames - 1) % self.frame_stack != 0:
@@ -1397,7 +1396,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             obs = torch.from_numpy(obs).float().to(self.device)
             start = obs.detach()
             obs_normalized = (
-                (obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]
+                (obs[:, self.obs_dim_indices] - obs_mean[None]) / obs_std[None]
             ).detach()
 
             if self.env_id in OGBENCH_ENVS:  # OGBench
@@ -1433,8 +1432,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # alternately within each planning call.
             # ----------------------------------------------------------------
             horizon: int = int(self.episode_len * self.horizon_scale)
-            _bidir_start_np = start.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
-            _bidir_goal_np = goal.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
+            _bidir_start_np = start.cpu().numpy()[:, self.obs_dim_indices]  # (b, obs_dim)
+            _bidir_goal_np = goal.cpu().numpy()[:, self.obs_dim_indices]  # (b, obs_dim)
             # Capture initial physical state (always, regardless of use_rollout)
             initial_sim_state = self._get_sim_state(envs)
             assert initial_sim_state is not None, "Failed to capture initial sim state"
@@ -1564,14 +1563,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                             plan_hist_last, child_depth=parent_node.depth + 1, seg_size=seg_size,
                         )  # (observation_dim,)
 
-                        # Create new sim_state: copy parent's structure and update qpos[:pos_dim] with last valid position
+                        # Create new sim_state: copy parent's structure and update qpos[:2] with last valid position
                         _child.sim_state = {}
                         for k, v in parent_node.sim_state.items():
                             if isinstance(v, np.ndarray):
                                 _child.sim_state[k] = v.copy()
                             else:
                                 _child.sim_state[k] = v
-                        # Update qpos with last valid frame position (pos_dim only)
+                        # Update qpos[:2] with position from pos_dim_indices
                         _child.sim_state['qpos'][:2] = _child.obs_pos[self.pos_dim_indices]
 
 
@@ -1667,7 +1666,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 node_trajectory = self._extract_node_trajectory(best_node)
 
                 # Create forward trajectory image with both plan (red) and node trajectory (blue)
-                #plan_positions = plan_unnormalized[:, :, :self.pos_dim].detach().cpu().numpy()
 
                 # Extract best_node's target_node obs_pos (single green point)
                 best_node_target_pos = None

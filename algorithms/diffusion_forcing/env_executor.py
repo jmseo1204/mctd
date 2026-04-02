@@ -228,7 +228,7 @@ class PlanExecutorMixin:
             if sub_goal_sim_state is not None:
                 rollout_subgoal_positions.append(sub_goal_sim_state["qpos"][:2].copy())  # physical (x,y)
             else:
-                rollout_subgoal_positions.append(np.full((self.pos_dim,), np.nan, dtype=np.float32))
+                rollout_subgoal_positions.append(np.full((len(self.pos_dim_indices),), np.nan, dtype=np.float32))
 
             # Compute action
             _act_t0 = time.time()
@@ -277,7 +277,7 @@ class PlanExecutorMixin:
             first_reach += ~reached
 
             # Collect trajectory
-            obs_torch = torch.from_numpy(obs_numpy[:, :self.observation_dim]).float()
+            obs_torch = torch.from_numpy(obs_numpy[:, self.obs_dim_indices]).float()
             bundle = self.make_bundle(obs_torch, action, reward[..., None])
             trajectory.append(bundle)
 
