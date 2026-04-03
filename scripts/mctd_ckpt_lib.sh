@@ -258,6 +258,12 @@ mctd_scan_ckpts() {
     local target_dim="${1:-0}"
     MCTD_CKPT_DIRS=()
 
+    if [ ! -d "$MCTD_OUTPUT_MOUNT_DIR" ] || [ -z "$(ls -A "$MCTD_OUTPUT_MOUNT_DIR" 2>/dev/null)" ]; then
+        echo "❌ ERROR: Outputs directory not found or empty: $MCTD_OUTPUT_MOUNT_DIR" >&2
+        echo "   Expected: ~/mctd/outputs" >&2
+        return 1
+    fi
+
     local scanner_host="$MCTD_PROJECT_DIR/scripts/ckpt_scanner.py"
     local scanner_docker="/tmp/ckpt_scanner.py"
     local scanner_project_docker="/tmp/mctd_project"

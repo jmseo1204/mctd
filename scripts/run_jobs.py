@@ -50,11 +50,11 @@ hilp_dir = os.path.abspath(os.path.join(project_dir, "..", "HILP"))
 jax_cache_dir = os.path.expanduser("~/.jax_cache")
 os.makedirs(jax_cache_dir, exist_ok=True)
 os.makedirs(os.path.join(jax_cache_dir, "xla_gpu_per_fusion_autotune_cache_dir"), exist_ok=True)
-output_mount_dir = f"/home/{docker_user}/mctd/outputs"
-os.makedirs(output_mount_dir, exist_ok=True)
-os.system(f"chmod 777 {output_mount_dir}")
+output_dir = os.path.join(home_dir, "mctd", "outputs")
+os.makedirs(output_dir, exist_ok=True)
+os.system(f"chmod 777 {output_dir}")
 # Ensure today's date dir is writable by Docker (uid 1020) if already created by host user
-today_dir = os.path.join(output_mount_dir, datetime.datetime.now().strftime("%Y-%m-%d"))
+today_dir = os.path.join(output_dir, datetime.datetime.now().strftime("%Y-%m-%d"))
 os.makedirs(today_dir, exist_ok=True)
 os.system(f"chmod 777 {today_dir}")
 
@@ -180,7 +180,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -e WANDB_PROJECT={wandb_project} \
         -v /usr/lib/wsl:/usr/lib/wsl \
         -v {project_dir}:/home/{docker_user}/mctd \
-        -v {output_mount_dir}:/home/{docker_user}/mctd/outputs \
+        -v {output_dir}:/home/{docker_user}/mctd/outputs \
         -v {home_dir}/.netrc:/home/{docker_user}/.netrc \
         -v {home_dir}/.d4rl:/home/{docker_user}/.d4rl \
         -v {ogbench_data_dir}:/home/{docker_user}/.ogbench/data \
@@ -197,7 +197,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -e HYDRA_FULL_ERROR=1 \
         -e CUDA_VISIBLE_DEVICES=0 \
         -v {project_dir}:/home/{docker_user}/mctd \
-        -v {output_mount_dir}:/home/{docker_user}/mctd/outputs \
+        -v {output_dir}:/home/{docker_user}/mctd/outputs \
         -v {home_dir}/.netrc:/home/{docker_user}/.netrc \
         -v {home_dir}/.d4rl:/home/{docker_user}/.d4rl \
         -v {ogbench_data_dir}:/home/{docker_user}/.ogbench/data \

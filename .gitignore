@@ -16,7 +16,8 @@ logs/
 logs_memory_debug/
 td_models/*.npz
 td_models/*.pkl
-
+outputs/
+symlink_to_outputs/
 
 # agent_config
 .claude/
