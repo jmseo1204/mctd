@@ -50,7 +50,7 @@ hilp_dir = os.path.abspath(os.path.join(project_dir, "..", "HILP"))
 jax_cache_dir = os.path.expanduser("~/.jax_cache")
 os.makedirs(jax_cache_dir, exist_ok=True)
 os.makedirs(os.path.join(jax_cache_dir, "xla_gpu_per_fusion_autotune_cache_dir"), exist_ok=True)
-output_mount_dir = f"/home/{docker_user}/mctd_outputs"
+output_mount_dir = f"/home/{docker_user}/mctd/outputs"
 os.makedirs(output_mount_dir, exist_ok=True)
 os.system(f"chmod 777 {output_mount_dir}")
 # Ensure today's date dir is writable by Docker (uid 1020) if already created by host user

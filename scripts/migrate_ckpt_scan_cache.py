@@ -13,13 +13,13 @@ ckpt_df_planning.yaml defaults (which were fixed across all old checkpoints).
 
 Usage (run inside Docker):
     python3 scripts/migrate_ckpt_scan_cache.py [path/to/ckpt_scan_cache.json]
-    Default path: /home/jmseo1204/mctd_outputs/ckpt_scan_cache.json
+    Default path: /home/jmseo1204/mctd/outputs/ckpt_scan_cache.json
 """
 import json
 import sys
 from pathlib import Path
 
-DEFAULT_CACHE_PATH = "/home/jmseo1204/mctd_outputs/ckpt_scan_cache.json"
+DEFAULT_CACHE_PATH = "/home/jmseo1204/mctd/outputs/ckpt_scan_cache.json"
 
 # Stable defaults from ckpt_df_planning.yaml — valid for all old checkpoints.
 ALGO_DEFAULTS = {

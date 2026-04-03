@@ -14,7 +14,7 @@ MCTD_PROJECT_DIR="$PROJECT_DIR"
 # shellcheck source=scripts/mctd_ckpt_lib.sh
 source "$PROJECT_DIR/scripts/mctd_ckpt_lib.sh"
 
-OUTPUT_DOWNLOADED_DIR="$MCTD_EVAL_BASE"
+OUTPUT_DOWNLOADED_DIR="$MCTD_DOWNLOADED_DIR"
 
 echo "===================================================="
 echo "  MCTD Job Generator"

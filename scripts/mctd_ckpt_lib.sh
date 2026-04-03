@@ -29,8 +29,9 @@ source "$_MCTD_LIB_DIR/project_config.sh"
 MCTD_DOCKER_IMAGE="${MCTD_DOCKER_IMAGE:-$DOCKER_IMAGE}"
 MCTD_DOCKER_USER="${MCTD_DOCKER_USER:-$DOCKER_USER}"
 MCTD_DOCKER_OUTPUTS="/home/$MCTD_DOCKER_USER/mctd/outputs"
-MCTD_OUTPUT_MOUNT_DIR="${MCTD_OUTPUT_MOUNT_DIR:-/home/$DOCKER_USER/mctd_outputs}"
+MCTD_OUTPUT_MOUNT_DIR="${MCTD_OUTPUT_MOUNT_DIR:-/home/$DOCKER_USER/mctd/outputs}"
 MCTD_EVAL_BASE="$MCTD_OUTPUT_MOUNT_DIR"
+MCTD_DOWNLOADED_DIR="$MCTD_OUTPUT_MOUNT_DIR/downloaded/$WANDB_ENTITY/$WANDB_PROJECT"
 
 # ── mctd_select_gpus ──────────────────────────────────────────────────────────
 # Display a table of all detected GPUs (status, VRAM, running processes with
@@ -376,18 +377,27 @@ mctd_ckpt_menu() {
 }
 
 # ── mctd_ensure_eval_symlink <host_ckpt_path> <model_id> ─────────────────────
-# Creates MCTD_EVAL_BASE/<model_id>/model.ckpt → <host_ckpt_path> symlink.
-# Uses a RELATIVE symlink so it resolves correctly both on the host and inside
-# Docker (where MCTD_OUTPUT_MOUNT_DIR is mounted at a different absolute path).
+# Ensures MCTD_DOWNLOADED_DIR/<model_id>/model.ckpt exists.
+# If the checkpoint is already under MCTD_DOWNLOADED_DIR/<model_id>/, nothing
+# is done (downloaded ckpts are already in the right place).
+# For local (non-downloaded) checkpoints, creates a RELATIVE symlink so the
+# path resolves correctly both on the host and inside Docker.
 # Safe to call multiple times (ln -sf is idempotent).
 mctd_ensure_eval_symlink() {
     local host_ckpt="$1"
     local model_id="$2"
-    local real_ckpt eval_dir rel_path
+    local real_ckpt target_dir
     real_ckpt=$(realpath "$host_ckpt" 2>/dev/null || echo "$host_ckpt")
-    eval_dir="$MCTD_EVAL_BASE/$model_id"
-    mkdir -p "$eval_dir"
-    # Compute relative path from eval_dir to the actual checkpoint file
-    rel_path=$(realpath --relative-to="$eval_dir" "$real_ckpt")
-    ln -sf "$rel_path" "$eval_dir/model.ckpt"
+    target_dir="$MCTD_DOWNLOADED_DIR/$model_id"
+
+    # Already in the canonical downloaded location — nothing to do
+    if [ "$(realpath "$target_dir/model.ckpt" 2>/dev/null)" = "$real_ckpt" ]; then
+        return 0
+    fi
+
+    # Local checkpoint: create symlink inside downloaded dir
+    mkdir -p "$target_dir"
+    local rel_path
+    rel_path=$(realpath --relative-to="$target_dir" "$real_ckpt")
+    ln -sf "$rel_path" "$target_dir/model.ckpt"
 }

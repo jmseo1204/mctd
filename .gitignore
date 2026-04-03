@@ -8,7 +8,6 @@ lightning_logs/
 datasets/offline_rl/viz
 jobs/
 dql_jobs/
-outputs/
 dql/backup/
 dql/results/
 test_*.py
@@ -17,7 +16,7 @@ logs/
 logs_memory_debug/
 td_models/*.npz
 td_models/*.pkl
-td_models/*.npz
+
 
 # agent_config
 .claude/

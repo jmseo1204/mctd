@@ -8,7 +8,7 @@ from pathlib import Path
 from project_config import DOCKER_USER as _DOCKER_USER, WANDB_ENTITY as _WANDB_ENTITY, \
     DOCKER_IMAGE as _DOCKER_IMAGE, WANDB_PROJECT as _WANDB_PROJECT
 
-def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir=f"/home/{_DOCKER_USER}/mctd_outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
+def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir=f"/home/{_DOCKER_USER}/mctd/outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
     """
     Infer frame_stack from checkpoint weights.
     init_mlp.0.weight has shape (hidden, x_dim + k_embed_dim + external_cond_dim).
@@ -82,7 +82,7 @@ def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir=f"/h
     return None
 
 
-def detect_network_size_from_ckpt(model_id, downloaded_dir=f"/home/{_DOCKER_USER}/mctd_outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
+def detect_network_size_from_ckpt(model_id, downloaded_dir=f"/home/{_DOCKER_USER}/mctd/outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
     """
     Infer network_size (hidden dimension) from checkpoint weights.
     Checks transformer layer self_attn.in_proj_weight shape[1] for hidden dim.
@@ -193,7 +193,7 @@ def detect_network_size_from_ckpt(model_id, downloaded_dir=f"/home/{_DOCKER_USER
     return None
 
 
-def find_local_training_config(model_id, downloaded_dir=f"/home/{_DOCKER_USER}/mctd_outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
+def find_local_training_config(model_id, downloaded_dir=f"/home/{_DOCKER_USER}/mctd/outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
     """
     Find training_config.yaml saved by train.sh alongside the checkpoint.
     Written in plain-YAML format; extract_from_config() handles it without changes.
@@ -206,7 +206,7 @@ def find_local_training_config(model_id, downloaded_dir=f"/home/{_DOCKER_USER}/m
 
 def find_config_yaml(model_id, outputs_root=None):
     if outputs_root is None:
-        outputs_root = f"/home/{_DOCKER_USER}/mctd_outputs"
+        outputs_root = f"/home/{_DOCKER_USER}/mctd/outputs"
     """
     Search for config.yaml in WANDB run directories matching the model_id.
 
@@ -354,7 +354,7 @@ def load_full_config(dataset_name, algo_name="df_planning"):
         print(f"Error loading configs: {e}")
         return None
 
-def load_training_hparams_from_ckpt(model_id, downloaded_dir=f"/home/{_DOCKER_USER}/mctd_outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
+def load_training_hparams_from_ckpt(model_id, downloaded_dir=f"/home/{_DOCKER_USER}/mctd/outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
     """Load training_hparams saved by df_base.on_save_checkpoint from the checkpoint file.
 
     New checkpoints (trained after the save_hyperparameters refactor) embed all arch
@@ -416,7 +416,7 @@ def main():
     parser.add_argument("--start_task_id", type=int, default=1, help="Starting task index (1-based)")
     parser.add_argument("--horizon_scale", type=float, default=None, help="Override Multiplier")
     parser.add_argument("--episode_len", type=int, default=None, help="Override episode_len (useful for offline/local runs without config.yaml)")
-    parser.add_argument("--outputs_root", default=f"/home/{_DOCKER_USER}/mctd_outputs", help="Root directory of outputs/wandb logs")
+    parser.add_argument("--outputs_root", default=f"/home/{_DOCKER_USER}/mctd/outputs", help="Root directory of outputs/wandb logs")
 
     args = parser.parse_args()
 
