@@ -174,7 +174,7 @@ class BaseLightningExperiment(BaseExperiment):
         """
         if not self.algo:
             # episode_len is not in YAML schema — inject from dataset config before building
-            self._ensure_episode_len_in_algo_cfg()
+            self._ensure_algo_cfg_fallbacks()
             self.algo = self._build_algo()
         if self.cfg.training.compile:
             self.algo = torch.compile(self.algo)
