@@ -30,7 +30,7 @@ class Diffusion(nn.Module):
         self.x_shape = x_shape
         self.external_cond_dim = external_cond_dim
         self.timesteps = cfg.timesteps
-        self.sampling_timesteps = cfg.sampling_timesteps
+        self.sampling_timesteps = cfg.get("sampling_timesteps", cfg.timesteps)
         self.beta_schedule = cfg.beta_schedule
         self.schedule_fn_kwargs = cfg.schedule_fn_kwargs
         self.objective = cfg.objective
