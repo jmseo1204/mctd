@@ -143,7 +143,17 @@ def compute_guidance_grad_np(
         else:
             kde_data_xy = planner._get_kde_data_xy()
             kde_score = _kde_score_np(query_xy, kde_data_xy, sigma=planner.kde_sigma)
-        hilp_combined_np = hilp_grad_normalized + kde_lam * kde_score
+        
+        # Filter: set score to 0 where ||kde_score|| < μ (- k * sigma)
+        kde_score_norm = np.linalg.norm(kde_score, axis=-1)  # (N,)
+        score_mean = float(kde_score_norm.mean())
+        score_std = float(kde_score_norm.std()) + 1e-8
+        threshold = score_mean - 0.3 * score_std
+        mask_below_threshold = kde_score_norm < threshold  # (N,)
+        kde_score_filtered = kde_score.copy()
+        kde_score_filtered[mask_below_threshold] = 0.0
+        
+        hilp_combined_np = hilp_grad_normalized + kde_lam * kde_score_filtered
     else:
         hilp_combined_np = hilp_grad_normalized
 
@@ -224,23 +234,23 @@ def goal_guidance(
             _atail = torch.tensor(active_tail_per_batch, device=pred.device)  # (B,)
             _bidx  = torch.arange(B, device=pred.device)
 
-            obs_dim = planner.observation_dim
+            _obs_idx = planner.obs_bundle_indices  # model-space obs indices (Method A)
             hilp_obs_dim = planner.hilp_obs_dim
             _ref = getattr(planner, '_hilp_ref_obs', None)
 
-            obs_tail_raw = pred[_atail, _bidx, :obs_dim].detach().cpu().numpy().astype(np.float32)  # (B, obs_dim)
+            obs_tail_raw = pred[_atail, _bidx][..., _obs_idx].detach().cpu().numpy().astype(np.float32)  # (B, n_obs)
             if _ref is not None:
                 obs_tail_np = np.tile(_ref, (B, 1)).astype(np.float32)
             else:
                 obs_tail_np = np.zeros((B, hilp_obs_dim), np.float32)
-            obs_tail_np[:, :obs_dim] = obs_tail_raw
+            obs_tail_np[:, _obs_idx] = obs_tail_raw
 
-            target_raw = target[:, :obs_dim].detach().cpu().numpy().astype(np.float32)  # (B, obs_dim)
+            target_raw = target[:, _obs_idx].detach().cpu().numpy().astype(np.float32)  # (B, n_obs)
             if _ref is not None:
                 target_np = np.tile(_ref, (B, 1)).astype(np.float32)
             else:
                 target_np = np.zeros((B, hilp_obs_dim), np.float32)
-            target_np[:, :obs_dim] = target_raw
+            target_np[:, _obs_idx] = target_raw
 
             hilp_fn = getattr(planner, '_hilp_value_fn_instance', None)
             assert hilp_fn is not None and hasattr(hilp_fn, 'compute_grads'), \
@@ -297,26 +307,27 @@ def goal_guidance(
         hilp_fn = getattr(planner, '_hilp_value_fn_instance', None)
 
         if hilp_fn is not None and hasattr(hilp_fn, 'compute_grads'):
-            obs_dim = planner.observation_dim
+            _obs_idx = planner.obs_bundle_indices  # model-space obs indices (Method A)
+            _n_obs = len(_obs_idx)
             hilp_obs_dim = planner.hilp_obs_dim
             _ref = getattr(planner, '_hilp_ref_obs', None)
 
             # Build padded obs at all tail positions (len(tail_pos) * B rows)
-            obs_tail_raw = pred[tail_pos, :, :obs_dim].reshape(-1, obs_dim).detach().cpu().numpy().astype(np.float32)
+            obs_tail_raw = pred[tail_pos][..., _obs_idx].reshape(-1, _n_obs).detach().cpu().numpy().astype(np.float32)
             if _ref is not None:
                 obs_tail_np = np.tile(_ref, (len(obs_tail_raw), 1)).astype(np.float32)
             else:
                 obs_tail_np = np.zeros((len(obs_tail_raw), hilp_obs_dim), np.float32)
-            obs_tail_np[:, :obs_dim] = obs_tail_raw
+            obs_tail_np[:, _obs_idx] = obs_tail_raw
 
             # Build padded target obs for each tail position and batch item
-            target_raw = target[:, :obs_dim].detach().cpu().numpy().astype(np.float32)
-            target_tail_raw = np.repeat(target_raw[None, :, :], len(tail_pos), axis=0).reshape(-1, obs_dim)
+            target_raw = target[:, _obs_idx].detach().cpu().numpy().astype(np.float32)
+            target_tail_raw = np.repeat(target_raw[None, :, :], len(tail_pos), axis=0).reshape(-1, _n_obs)
             if _ref is not None:
                 target_np = np.tile(_ref, (len(target_tail_raw), 1)).astype(np.float32)
             else:
                 target_np = np.zeros((len(target_tail_raw), hilp_obs_dim), np.float32)
-            target_np[:, :obs_dim] = target_tail_raw
+            target_np[:, _obs_idx] = target_tail_raw
 
             _t0 = time.time()
             # Delegate all normalization / KDE / TD-threshold logic to shared helper.
@@ -565,7 +576,8 @@ def combined_guidance(planner, x_start, goal, horizon, guidance_scale,
     Returns:
         guidance_dict: dict of guidance losses
     """
-    anchor_loss = anchor_dist_guidance(planner, x_start, horizon) * planner.anchor_guidance_scale
+    anchor_guidance_scale = guidance_scale * planner.anchor_guidance_scale_ratio
+    anchor_loss = anchor_dist_guidance(planner, x_start, horizon) * anchor_guidance_scale 
     # NOTE: goal_guidance() returns HILP and RMSE components separately so each can be
     # scaled independently: TD_guidance_scale (via guidance_scale arg) for HILP,
     # rmse_guidance_scale for the far-target RMSE direction.

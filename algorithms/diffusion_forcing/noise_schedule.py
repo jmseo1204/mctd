@@ -74,6 +74,7 @@ class NoiseScheduleMixin:
         self,
         start_levels: np.ndarray,
         is_replanning: bool = False,
+        num_denoising_steps_override: Optional[int] = None,
     ) -> np.ndarray:
         """
         Generates the N-step denoising schedule for bidirectional search.
@@ -81,16 +82,16 @@ class NoiseScheduleMixin:
 
         If complete_denoising=True, continues denoising all remaining segments until all
         tokens reach 0 (used for value estimation). Otherwise, denoises one segment only.
+
+        Args:
+            num_denoising_steps_override: If set, overrides self.sampling_timesteps
+                for the reduction_amount computation (used for fast uncertainty sampling).
         """
         # start_levels shape: (B, plan_tokens)  # (b, t)
 
         batch_size = start_levels.shape[0]
         current_levels = start_levels.copy()
         schedule = [current_levels.copy()]
-
-        assert self.sampling_timesteps >= self.mctd_num_denoising_steps, (
-            "sampling_timesteps must be greater than or equal to mctd_num_denoising_steps"
-        )
 
         def _one_segment_pass(levels):
             to_levels_list = []
@@ -99,6 +100,7 @@ class NoiseScheduleMixin:
                     levels[b],
                     self.sequence_dividing_factor,
                     is_replanning=is_replanning,
+                    num_denoising_steps_override=num_denoising_steps_override,
                 )  # (m, t)
                 to_levels_list.append(to_levels_b)
 

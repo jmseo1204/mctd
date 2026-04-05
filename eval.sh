@@ -130,9 +130,9 @@ echo ""
 # ─────────────────────────────────────────────────────
 # 3. Fixed parameters
 # ─────────────────────────────────────────────────────
-NUM_TASKS=1
+NUM_TASKS=5
 NUM_SEEDS=1
-START_TASK_IDX=4
+START_TASK_IDX=2
 
 echo "Configuration summary:"
 echo "  Dataset    : $SELECTED_DATASET (obs_dim=${STATE_DIM})"

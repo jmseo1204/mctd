@@ -559,6 +559,11 @@ class BaseLightningExperiment(BaseExperiment):
             OmegaConf.update(self.root_cfg, "dataset.episode_len", ep_len, merge=True)
             OmegaConf.update(self.root_cfg, "algorithm.episode_len", ep_len, merge=True)
 
+        # sampling_timesteps is an eval-time param (DDIM step count) — NOT a model
+        # architecture param. Old checkpoints may have it saved; skip to preserve the
+        # value set in df_planning.yaml.
+        EVAL_ONLY_DIFFUSION_KEYS = {'sampling_timesteps'}
+
         # All other params: declared in df_planning.yaml schema → standard update
         updates = {}
         for k, v in hparams.items():
@@ -566,6 +571,8 @@ class BaseLightningExperiment(BaseExperiment):
                 continue  # handled above
             if k == 'diffusion' and isinstance(v, dict):
                 for dk, dv in v.items():
+                    if dk in EVAL_ONLY_DIFFUSION_KEYS:
+                        continue  # eval-only: do not restore from ckpt
                     if dk == 'architecture' and isinstance(dv, dict):
                         for ak, av in dv.items():
                             updates[f"algorithm.diffusion.architecture.{ak}"] = av

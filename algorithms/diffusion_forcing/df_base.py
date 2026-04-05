@@ -92,7 +92,8 @@ class DiffusionForcingBase(BasePytorchAlgo):
                 'beta_schedule': str(self.cfg.diffusion.beta_schedule),
                 'objective': str(self.cfg.diffusion.objective),
                 'timesteps': int(self.cfg.diffusion.timesteps),
-                'sampling_timesteps': int(self.cfg.diffusion.sampling_timesteps),
+                # sampling_timesteps intentionally NOT saved: it is an eval-time param
+                # (DDIM step count), not a model architecture param. Set it in df_planning.yaml.
                 'architecture': arch,
                 # Diffusion behavior params — saved here so eval config can be null
                 # (restored before model build via _apply_ckpt_hparams_to_cfg).
@@ -124,7 +125,7 @@ class DiffusionForcingBase(BasePytorchAlgo):
         if _context_frames is not None:
             hparams['context_frames'] = int(_context_frames)
         # Dataset normalization stats — required to build the model at eval time
-        # (observation_dim = len(observation_mean), etc.) without a dataset config.
+        # (obs_dim_indices length determines obs_dim, etc.) without a dataset config.
         for _key in ('observation_mean', 'observation_std', 'action_mean', 'action_std',
                      'reward_mean', 'reward_std', 'env_id', 'dataset'):
             _val = self.cfg.get(_key, None)

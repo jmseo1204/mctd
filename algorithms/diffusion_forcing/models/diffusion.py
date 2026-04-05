@@ -38,6 +38,7 @@ class Diffusion(nn.Module):
         self.snr_clip = cfg.snr_clip
         self.cum_snr_decay = cfg.cum_snr_decay
         self.ddim_sampling_eta = cfg.get('ddim_sampling_eta', 0.1)
+        self.sampling_way = cfg.get('sampling_way', 'linear')
         self.clip_noise = cfg.clip_noise
         self.max_guidance_ratio = cfg.get("max_guidance_ratio", float("inf"))
         self.arch = cfg.architecture
@@ -332,7 +333,27 @@ class Diffusion(nn.Module):
         next_noise_level: torch.Tensor,
         guidance_fn: Optional[Callable] = None,
     ):
-        real_steps = torch.linspace(-1, self.timesteps - 1, steps=self.sampling_timesteps + 1, device=x.device).long()
+        # Generate timestep schedule based on sampling_way
+        if self.sampling_way == 'quadratic':
+            # Quadratic spacing: dense near x_0 (low timesteps, end of denoising)
+            # t ∈ [0, 1]: linear progression
+            # mapped_t = t^2: quadratic mapping (dense at start = low timesteps)
+            # This makes timesteps dense near t=0, which corresponds to low noise levels (x_0)
+            t = torch.linspace(0, 1, steps=self.sampling_timesteps + 1, device=x.device)
+            t_mapped = t ** 2
+            # Map to timestep range: -1 to (timesteps - 1)
+            raw = (t_mapped * self.timesteps - 1).long()
+            # Cascade deduplication: if raw[i] == raw[i-1], shift to raw[i-1]+1.
+            # Vectorized via cummax trick:
+            #   a[i] = raw[i] - i  →  cummax(a)[i] + i gives the cascaded result.
+            # Proof: result[i] = max(raw[i], result[i-1]+1)
+            #        ⟺ result[i]-i = max(raw[i]-i, result[i-1]-(i-1)) = cummax(a)[i]
+            idx = torch.arange(self.sampling_timesteps + 1, device=x.device)
+            a = raw - idx
+            real_steps = torch.cummax(a, dim=0).values + idx
+        else:  # 'linear' (default)
+            # Linear spacing: uniform stride across timesteps
+            real_steps = torch.linspace(-1, self.timesteps - 1, steps=self.sampling_timesteps + 1, device=x.device).long()
 
         # convert noise levels (0 ~ sampling_timesteps) to real noise levels (-1 ~ timesteps - 1)
         curr_noise_level = real_steps[curr_noise_level]

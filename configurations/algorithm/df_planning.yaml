@@ -15,7 +15,6 @@ mctd_skip_level_steps: 10
 time_limit: null
 virtual_visit_weight: 1.0
 parallel_multiple_visits: False
-mctd_num_denoising_steps: 20
 leaf_parallelization: True
 mctd_max_search_num: 40
 max_child_resets: 3
@@ -23,7 +22,7 @@ DEBUG: True
 debug_memory_profile: True
 noise_level_building_way: others # smooth, causal, or others
 num_tries_for_bad_plans: 5
-open_loop_horizon: 1000 #fixme -> best: episode_len*horizon_scale
+open_loop_horizon: 1300 #fixme -> best: episode_len*horizon_scale
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
 sub_goal_interval: 1
 horizon_scale: 0.45 # horizon = episode_len * horizon_scale
@@ -38,9 +37,9 @@ episode_len: 200 # 1000(giant) // 5(jump)
 #   If no sidecar exists, inner_prod is used (matches training default).
 # For legacy .pt checkpoints: hilp_obs_dim / hilp_skill_dim are still needed.
 hilp_checkpoint_path: "td_models/params_1000000_20260324_002241.pkl"
-mctd_guidance_scales: [0.3, 0.1] # HILP gradient scale for near-target positions (TD_thres or above)
+mctd_guidance_scales: [0.4, 0.1] # HILP gradient scale for near-target positions (TD_thres or above)
 rmse_guidance_scale: 0.4 # RMSE direction scale for far-target positions (below TD_thres)
-anchor_guidance_scale: 0.4 # 0.4
+anchor_guidance_scale_ratio: 1.3 # 0.4
 rdf_guidance_scale: 0.0
 particle_guidance_scale: 0.1 # sibling repulsion during denoising (0 = disabled)
 
@@ -53,13 +52,14 @@ plan_feasibility_delta: 99999.0 # max per-frame movement (world units) to count 
 meeting_delta: 1.5
 
 # [wandb visualization]
-viz_agent_rollout: true # set True to upload *_interaction/sample_*_video to wandb (slow)
+viz_agent_rollout: false # set True to upload *_interaction/sample_*_video to wandb (slow)
 viz_final_plans: True
 viz_compare_expanded_to_value: false
-viz_mujoco_renderer: true
-viz_subplan_denoising: true # set True to upload plan/plan_at_* to wandb (slow)
+viz_mujoco_renderer: false
+viz_subplan_denoising: True # set True to upload plan/plan_at_* to wandb (slow)
+viz_uncertain_next_subplan_last_obs: true
 profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
-frame_sampling_way: "quadratic" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
+frame_sampling_way: "linear" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
 
 # HILP memoization: precompute phi(s) on a 2D grid and use bilinear interpolation
 use_hilp_memoization: true # set true to enable
@@ -70,13 +70,18 @@ use_score_func_with_TD: true # if true: HILP grad + KDE score grad; if false: HI
 TD_thres_for_far_target: -200.0 # HILP value threshold: V < threshold → use RMSE guidance
 # KDE-weighted guidance: unit_grad = ∇V/|∇V| + kde_lam·∇log p
 kde_sigma: 0.2 # KDE bandwidth (world units)
-kde_lam: 0.07 # scale for ∇log p term
+kde_lam: 0.15 # scale for ∇log p term
 kde_sample_ratio: 0.1 # fraction of dataset to use for KDE (1.0 = full dataset)
 kde_save_dir: "~/.ogbench/data" # dataset npz directory for KDE positions
 
-# SIMULATION (REPLANNING)
-mcts_use_sim: true
-replanning_target_level: 10 # noise level to add when replanning already-denoised prefix
+# REPLANNING
+mcts_use_replan: true
+replanning_target_level: 11 # noise level to add when replanning already-denoised prefix
+
+# UNCERTAINTY CHECK
+use_uncertainty_as_value: true
+fast_sampling_multiple: 5 # number of fast samples per candidate
+fast_sampling_steps: 20 # denoising steps for fast uncertainty sampling (< sampling_timesteps)
 
 # [MPC-style agent control]
 use_rollout: false
@@ -124,9 +129,13 @@ diffusion:
   # Eval-specific diffusion params
   ddim_sampling_eta: 0.1 # used during MCTS DDIM sampling; absent in train config
   max_guidance_ratio: 1.5 # soft norm clip for guidance (inf = disabled); eval only
+  # sampling_timesteps: eval-time DDIM steps; NOT restored from ckpt.
+  # Controls both denoising granularity and step count (must satisfy: sampling_timesteps <= timesteps).
+  # For fast uncertainty sampling, use fast_sampling_steps < sampling_timesteps.
+  sampling_timesteps: 60
+  sampling_way: "quadratic" # 'linear': uniform stride; 'quadratic': dense near x_0 (low timesteps)
   # Schema stubs restored from ckpt training_hparams (actual values come from ckpt)
   timesteps: null
-  sampling_timesteps: null
   beta_schedule: null
   objective: null
   architecture:

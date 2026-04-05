@@ -63,7 +63,6 @@ class MCTSTreeState:
     ]  # always None; bidirectional dynamic schedule used
     children_node_guidance_scales: list
     max_search_num: int
-    num_denoising_steps: int
     skip_level_steps: int
     tag: str
     is_tree1: bool = True  # True for start-rooted tree, False for goal-rooted tree
@@ -79,13 +78,13 @@ class MCTSTreeState:
     # --- Timing lists ---
     selection_time: List = field(default_factory=list)
     expansion_time: List = field(default_factory=list)
-    simulation_time: List = field(default_factory=list)
+    replanning_time: List = field(default_factory=list)
     backprop_time: List = field(default_factory=list)
     early_termination_time: List = field(default_factory=list)
-    simul_noiselevel_zero_padding_time: List = field(default_factory=list)
-    simul_value_estimation_time: List = field(default_factory=list)
-    simul_value_calculation_time: List = field(default_factory=list)
-    simul_node_allocation_time: List = field(default_factory=list)
+    replan_noiselevel_zero_padding_time: List = field(default_factory=list)
+    replan_diffusion_time: List = field(default_factory=list)
+    replan_value_calculation_time: List = field(default_factory=list)
+    replan_node_allocation_time: List = field(default_factory=list)
 
     def get_all_nodes(self) -> List["TreeNode"]:
         """Return every node in the tree (BFS traversal), including the root."""
@@ -116,15 +115,18 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             list(_obs_idx) if _obs_idx is not None
             else list(range(len(cfg.observation_mean)))
         )
-        self.observation_dim: int = len(self.obs_dim_indices)
+        # obs_bundle_indices: indices of obs dims within the model-space bundle [obs|action|reward].
+        # Model obs is always laid out at positions 0..n_obs-1 in the bundle (Method A).
+        self.obs_bundle_indices: list = list(range(len(self.obs_dim_indices)))
         # pos_dim_indices: which obs vector indices are spatial (x,y) position.
         # Physical qpos[:2] is always world (x,y) in AntMaze/PointMaze — kept separate.
         _pos_idx = cfg.get("pos_dim_indices", None)
         self.pos_dim_indices: list = list(_pos_idx) if _pos_idx is not None else [0, 1]
         self.use_reward = cfg.use_reward
-        self.unstacked_dim = (
-            self.observation_dim + self.action_dim + int(self.use_reward)
-        )
+        _n_obs = len(self.obs_dim_indices)
+        self.unstacked_dim = _n_obs + self.action_dim + int(self.use_reward)
+        # non_obs_bundle_indices: action and reward positions within the bundle (for zeroing).
+        self.non_obs_bundle_indices: list = list(range(_n_obs, self.unstacked_dim))
         cfg.x_shape = (self.unstacked_dim,)
         self.episode_len = cfg.episode_len
 
@@ -154,7 +156,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.val_max_loops = cfg.val_max_loops
         self.mctd_guidance_scales = cfg.mctd_guidance_scales
         self.mctd_max_search_num = cfg.mctd_max_search_num
-        self.mctd_num_denoising_steps = cfg.mctd_num_denoising_steps
         _rpl = cfg.get("replanning_target_level")
         self.replanning_target_level = _rpl if _rpl is not None else cfg.diffusion.sampling_timesteps // 3
         self.mctd_skip_level_steps = cfg.mctd_skip_level_steps
@@ -201,7 +202,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.hilp_skill_dim = cfg.get("hilp_skill_dim", 256)  # used only for legacy .pt checkpoints
         # HILP value function instance will be loaded lazily and stored in _hilp_value_fn_instance
         # We don't initialize it here to prevent PyTorch from registering it as a submodule
-        self.anchor_guidance_scale = cfg.get("anchor_guidance_scale", 40.0)
+        self.anchor_guidance_scale_ratio = cfg.get("anchor_guidance_scale_ratio", 1.0)
         self.rdf_guidance_scale = cfg.get("rdf_guidance_scale", 2.0)
         self.rmse_guidance_scale = cfg.get("rmse_guidance_scale", 1.0)
         self.use_score_func_with_TD = cfg.get("use_score_func_with_TD", True)
@@ -210,7 +211,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.kde_lam = cfg.get("kde_lam", 2.0)
         self.kde_sample_ratio = cfg.get("kde_sample_ratio", 0.1)
         self._kde_save_dir = os.path.expanduser(cfg.get("kde_save_dir", "~/.ogbench/data"))
-        self.mcts_use_sim = cfg.get("mcts_use_sim", False)
+        self.mcts_use_replan = cfg.get("mcts_use_replan", False)
+        self.use_uncertainty_as_value: bool = cfg.get("use_uncertainty_as_value", False)
+        self.viz_uncertain_next_subplan_last_obs: bool = cfg.get("viz_uncertain_next_subplan_last_obs", False)
+        self.fast_sampling_multiple: int = cfg.get("fast_sampling_multiple", 5)
+        self.fast_sampling_steps: int = cfg.get("fast_sampling_steps", 10)
         self.use_rollout: bool = cfg.get("use_rollout", False)
         self.use_dynamic_obs_padding: bool = cfg.get("use_dynamic_obs_padding", True)
 
@@ -441,6 +446,33 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         v = self._compute_hilp_values(obs_a_np, obs_b_np)  # (N,) tensor, negative values
         return (-v).cpu().numpy().astype(np.float32) / 7
 
+    def _compute_distance(
+        self,
+        obs1: np.ndarray,  # (N, obs_dim) — observations for TD metric
+        obs2: np.ndarray,  # (N, obs_dim) — observations for TD metric
+        pos1: np.ndarray,  # (N, pos_dim) — positions for Euclidean distance
+        pos2: np.ndarray,  # (N, pos_dim) — positions for Euclidean distance
+    ) -> np.ndarray:       # (N,) — distance array
+        """Unified distance computation based on use_TD_metric_as_dist flag.
+        
+        Encapsulates the choice between TD metric and Euclidean distance.
+        Caller does not need to check use_TD_metric_as_dist — this function
+        handles the branching internally.
+        
+        Args:
+            obs1: First observation array (N, obs_dim) — used if use_TD_metric_as_dist=True
+            obs2: Second observation array (N, obs_dim) — used if use_TD_metric_as_dist=True
+            pos1: First position array (N, pos_dim) — used if use_TD_metric_as_dist=False
+            pos2: Second position array (N, pos_dim) — used if use_TD_metric_as_dist=False
+            
+        Returns:
+            distances: (N,) array of distances
+        """
+        if self.use_TD_metric_as_dist:
+            return self._compute_state_temporal_dist_np(obs1, obs2)
+        else:
+            return np.linalg.norm(pos1 - pos2, axis=1)
+
     def _build_model(self):
         mean = list(self.observation_mean) + list(self.action_mean)
         std = list(self.observation_std) + list(self.action_std)
@@ -484,7 +516,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             self.make_bundle(observations, actions, rewards)
         )  # (b t c)
         init_bundle = self._normalize_x(self.make_bundle(init_obs[:, 0]))  # (b c)
-        init_bundle[:, self.observation_dim :] = (
+        init_bundle[:, self.non_obs_bundle_indices] = (
             0  # zero out actions and rewards after normalization
         )
         init_bundle = self.pad_init(init_bundle, batch_first=True)  # (b, fs, c)
@@ -501,7 +533,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         return bundles, conditions, masks
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
-        """Override observation_dim from checkpoint if it conflicts with config."""
+        """Override obs_dim_indices from checkpoint if its length conflicts with config."""
         parent = super()
         if hasattr(parent, "on_load_checkpoint"):
             parent.on_load_checkpoint(checkpoint)
@@ -509,14 +541,17 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         dm = sd.get("data_mean")
         if dm is not None:
             ckpt_obs_dim = int(dm.shape[0]) - self.action_dim - int(self.use_reward)
-            if ckpt_obs_dim != self.observation_dim:
+            if ckpt_obs_dim != len(self.obs_bundle_indices):
                 import warnings
                 warnings.warn(
-                    f"[DFPlanning] Config observation_dim={self.observation_dim} does not match "
-                    f"checkpoint ({ckpt_obs_dim}). Overriding with checkpoint value.",
+                    f"[DFPlanning] Config obs_dim_indices length ({len(self.obs_bundle_indices)}) does not match "
+                    f"checkpoint obs_dim ({ckpt_obs_dim}). Overriding obs_dim_indices with range({ckpt_obs_dim}).",
                     stacklevel=2,
                 )
-                self.observation_dim = ckpt_obs_dim
+                self.obs_dim_indices = list(range(ckpt_obs_dim))
+                self.obs_bundle_indices = list(range(ckpt_obs_dim))
+                self.non_obs_bundle_indices = list(range(ckpt_obs_dim, ckpt_obs_dim + self.action_dim + int(self.use_reward)))
+                self.unstacked_dim = ckpt_obs_dim + self.action_dim + int(self.use_reward)
 
     def training_step(self, batch, batch_idx):
         _step = self.trainer.global_step if self.trainer else 0
@@ -636,11 +671,25 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             self.interact(batch_size, conditions, task_ns)
 
     
+    @staticmethod
+    def _linspace_schedule(start: int, end: int, n_steps: int) -> np.ndarray:
+        """Interpolate from start to end in n_steps, rounded and deduplicated.
+
+        Mirrors the linspace subsampling used in diffusion.sample_step
+        (timesteps → sampling_timesteps), applied here to map
+        sampling_timesteps → _num_denoising_steps.
+        Returns an array of length ≤ n_steps+1 with strictly monotone values.
+        """
+        raw = np.round(np.linspace(start, end, n_steps + 1)).astype(int)
+        mask = np.concatenate([[True], np.diff(raw) != 0])
+        return raw[mask]
+
     def process_segment_noise_levels(
         self,
         level_array: np.ndarray,
         sequence_dividing_factor: int,
-        is_replanning = False
+        is_replanning = False,
+        num_denoising_steps_override: Optional[int] = None,
     ) -> np.ndarray:
         plan_tokens = len(level_array)  # T
         assert plan_tokens % sequence_dividing_factor == 0, (
@@ -648,7 +697,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         )
         segment_size = plan_tokens // sequence_dividing_factor
 
-        reduction_amount = self.sampling_timesteps // self.mctd_num_denoising_steps
+        _num_denoising_steps = num_denoising_steps_override if num_denoising_steps_override is not None else self.sampling_timesteps
 
         # Work with a copy
         steps = [level_array.copy()]
@@ -667,21 +716,21 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         if is_replanning:
             # Replan the already-denoised prefix [:start_idx]:
-            # 1) increase noise uniformly from 0 -> target_level
-            # 2) decrease noise uniformly back to 0
+            # 1) increase noise uniformly from 0 -> target_level  (up phase)
+            # 2) decrease noise uniformly back to 0               (down phase)
+            # Each phase uses half of _num_denoising_steps, mirroring how
+            # sample_step subsamples timesteps → sampling_timesteps via linspace.
             target_level = self.replanning_target_level
             assert target_level <= self.sampling_timesteps, "replanning_target_level must be less than or equal to sampling_timesteps"
-                
-            #FIXME: test
-            reduction_amount = max(2*target_level // self.mctd_num_denoising_steps , 1)
-            current_level = 0
-            while current_level < target_level:
-                current_level = min(current_level + reduction_amount, target_level)
-                work_array[:start_idx] = current_level
+
+            half_n = max(_num_denoising_steps // 2, 1)
+            up_schedule = self._linspace_schedule(0, target_level, half_n)
+            down_schedule = self._linspace_schedule(target_level, 0, half_n)
+            for level in up_schedule[1:]:
+                work_array[:start_idx] = level
                 steps.append(work_array.copy())
-            while current_level > 0:
-                current_level = max(current_level - reduction_amount, 0)
-                work_array[:start_idx] = current_level
+            for level in down_schedule[1:]:
+                work_array[:start_idx] = level
                 steps.append(work_array.copy())
 
         elif self.noise_level_building_way == 'causal':
@@ -691,21 +740,18 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             initial_levels = steps[0][start_idx:end_idx]
             base_val = initial_levels[0]
             indices = np.arange(local_horizon)
+            # Total reduction needed to drive the noisiest token (rightmost) to 0
+            max_level = int(base_val + (local_horizon - 1) * uncertainty_scale)
 
-            while np.any(work_array[start_idx:end_idx] > 0):
-                current_step_count = len(steps)
-
-                target_levels = (
-                    base_val
-                    + indices * uncertainty_scale
-                    - current_step_count * reduction_amount
-                )
-                target_levels = np.maximum(0, target_levels).astype(work_array.dtype)
-
+            # Linspace over cumulative reductions: 0 → max_level in _num_denoising_steps
+            reduction_schedule = self._linspace_schedule(0, max_level, _num_denoising_steps)
+            for r in reduction_schedule[1:]:
+                target_levels = np.maximum(
+                    0, base_val + indices * uncertainty_scale - r
+                ).astype(work_array.dtype)
                 work_array[start_idx:end_idx] = np.minimum(
                     work_array[start_idx:end_idx], target_levels
                 )
-
                 steps.append(work_array.copy())
 
         elif self.noise_level_building_way == 'smooth' and start_idx > 0:
@@ -745,20 +791,34 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 if work_array[B] - work_array[B - 1] <= 1:
                     break
 
-            # Phase 2: uniform subtraction over extended window
-            while np.any(work_array[start_idx:end_idx] > 0):
-                work_array[window_start:window_end] = np.maximum(
-                    0, work_array[window_start:window_end] - reduction_amount
-                )
-                steps.append(work_array.copy())
+            # Phase 2: linspace-based uniform subtraction over extended window.
+            # Use delta steps so tokens with different post-Phase-1 levels all
+            # reach 0 proportionally (same approach as sample_step subsampling).
+            remaining_level = int(work_array[window_start:window_end].max())
+            if remaining_level > 0:
+                phase2_schedule = self._linspace_schedule(remaining_level, 0, _num_denoising_steps)
+                prev = remaining_level
+                for target in phase2_schedule[1:]:
+                    delta = prev - target
+                    work_array[window_start:window_end] = np.maximum(
+                        0, work_array[window_start:window_end] - delta
+                    )
+                    steps.append(work_array.copy())
+                    prev = target
 
-        else: 
-            # Normal uniform denoising (also handles 'smooth' at start_idx==0)
-            while np.any(work_array[start_idx:end_idx] > 0):
+        else:
+            # Normal uniform denoising (also handles 'smooth' at start_idx==0).
+            # Use delta steps to preserve relative differences across tokens.
+            start_val = int(work_array[start_idx:end_idx].max())
+            schedule = self._linspace_schedule(start_val, 0, _num_denoising_steps)
+            prev = start_val
+            for target in schedule[1:]:
+                delta = prev - target
                 work_array[start_idx:end_idx] = np.maximum(
-                    0, work_array[start_idx:end_idx] - reduction_amount
+                    0, work_array[start_idx:end_idx] - delta
                 )
                 steps.append(work_array.copy())
+                prev = target
 
         return np.stack(steps, axis=0)  # (M, T)
 
@@ -774,6 +834,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         prefix_len_list: Optional[list] = None,
         particle_guidance_scale: float = 0.0,
         group_ids: Optional[list] = None,
+        call_type: str = "expansion",
     ) -> torch.Tensor:
         """
         Parallel denoising planning with diffusion guidance.
@@ -1176,6 +1237,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             _total_gpu_ms = sum(_gpu_step_times) * 1000
             _mean_gpu_ms = _total_gpu_ms / _n
             self._tlog("timing.gpu_sample_step", {
+                "call_type": call_type,
                 "batch_size": batch_size,
                 "n_denoising_steps": _n,
                 "total_gpu_ms": round(_total_gpu_ms, 1),
@@ -1380,8 +1442,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # [ENV CACHING END] Environment setup complete (cached or new)
 
             terminate = False
-            obs_mean = self.data_mean[: self.observation_dim]
-            obs_std = self.data_std[: self.observation_dim]
+            # Method B: use stored observation_mean/std directly (no data_mean slicing)
+            obs_mean = torch.tensor(self.observation_mean, dtype=torch.float32, device=self.device)
+            obs_std = torch.tensor(self.observation_std, dtype=torch.float32, device=self.device)
             obs = envs.reset()
             # Randomize the goal for each environment
             if (
@@ -1407,7 +1470,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 goal = np.concatenate([[env.env._target] for env in envs.envs])
             goal = torch.Tensor(goal).float().to(self.device)
             goal = torch.cat([goal, torch.zeros_like(goal)], -1)
-            goal = goal[:, : self.observation_dim]
+            goal = goal[:, self.obs_dim_indices]  # select obs dims from raw env goal
             goal_normalized = ((goal - obs_mean[None]) / obs_std[None]).detach()
 
             steps = 0
@@ -1501,8 +1564,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 # ------------------------------------------------------------------
                 # Bidirectional alternating MCTS planning
                 # ------------------------------------------------------------------
-                _start_np = start.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
-                _goal_np = goal.cpu().numpy()[:, : self.observation_dim]  # (b, obs_dim)
+                _start_np = start.cpu().numpy()[:, self.obs_dim_indices]  # (b, n_obs) — select from raw env obs
+                _goal_np = goal.cpu().numpy()  # (b, n_obs) — already indexed by obs_dim_indices
 
                 # Initialize infos dicts so {**infos1, **infos2} is safe even on the first step
 
@@ -1517,7 +1580,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     single_step=True,
                 )
                 
-                # Per-leaf MPC rollout: update obs_pos and sim_state for newly expanded leaves
+                # Per-leaf MPC rollout: update obs and sim_state for newly expanded leaves
 
                 if self.use_rollout:
                     for info in expanded_node_infos.values():
@@ -1547,10 +1610,10 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         )
                         assert _new_sim_state is not None, "_new_sim_state is None"
                         _child.sim_state = _new_sim_state
-                        _child.obs_pos = np.concatenate([_new_sim_state["qpos"], _new_sim_state["qvel"]])[self.obs_dim_indices]
+                        _child.obs = np.concatenate([_new_sim_state["qpos"], _new_sim_state["qvel"]])[self.obs_dim_indices]
                 
                 else:
-                    # Derive obs_pos from plan_history without physical simulation
+                    # Derive obs from plan_history without physical simulation
                     seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
                     for info in expanded_node_infos.values():
                         parent_node: "TreeNode" = info["parent_node"]
@@ -1559,7 +1622,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                             continue
 
                         plan_hist_last: torch.Tensor = info["plan_history"][-1][-1]  # (t*fs, c)
-                        _child.obs_pos = self._extract_plan_endpoint_obs_pos(
+                        _child.obs = self._extract_plan_endpoint_obs(
                             plan_hist_last, child_depth=parent_node.depth + 1, seg_size=seg_size,
                         )  # (observation_dim,)
 
@@ -1571,7 +1634,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                             else:
                                 _child.sim_state[k] = v
                         # Update qpos[:2] with position from pos_dim_indices
-                        _child.sim_state['qpos'][:2] = _child.obs_pos[self.pos_dim_indices]
+                        _child.sim_state['qpos'][:2] = _child.obs[self.pos_dim_indices]
 
 
                 # --- Per-expansion denoising video logging ---
@@ -1580,7 +1643,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 _v_start_np = start.cpu().numpy()[:, self.pos_dim_indices]
                 _v_goal_np = goal.cpu().numpy()[:, self.pos_dim_indices]
                 _v_goal_pos2d = goal.cpu().numpy()[0, self.pos_dim_indices]            # world coords
-                _v_goal_obs = goal.cpu().numpy()[0, :self.observation_dim].astype(np.float32)  # for HILP
+                _v_goal_obs = goal.cpu().numpy()[0].astype(np.float32)  # for HILP — goal already indexed by obs_dim_indices
                 _v_gscale = self.mctd_guidance_scales[0] if self.mctd_guidance_scales else 0.0
                 _v_hilp_fn = getattr(self, '_hilp_value_fn_instance', None)
                 _v_hilp_ref = getattr(self, '_hilp_ref_obs', None)
@@ -1597,8 +1660,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     else np.array(self.data_std)
                 )[self.pos_dim_indices]
 
+                _viz_subplan_expand_ms = 0.0
+                _viz_subplan_replan_ms = 0.0
+                _viz_subplan_unc_ms = 0.0
+                _viz_subplan_n = 0
                 for _vname, _vinfo in (expanded_node_infos.items() if self.viz_subplan_denoising else []):
+                    _viz_subplan_n += 1
                     # Always log expanded stage denoising
+                    _viz_t0 = time.time()
                     self._log_candidate_plan_video(
                         _vname, _vinfo, active_tree,
                         _v_start_np, _v_goal_np,
@@ -1610,8 +1679,10 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         log_prefix="expanded",
                         plan_hist_override=_vinfo.get("expanded_plan_hist_frame"),
                     )
-                    # Additionally log simulation stage denoising if mcts_use_sim is enabled
-                    if self.mcts_use_sim and _vinfo.get("sim_plan_hist_frame") is not None:
+                    _viz_subplan_expand_ms += (time.time() - _viz_t0) * 1000
+                    # Additionally log replanned stage denoising if mcts_use_replan is enabled
+                    if self.mcts_use_replan and _vinfo.get("replanned_plan_hist_frame") is not None:
+                        _viz_t0 = time.time()
                         self._log_candidate_plan_video(
                             _vname, _vinfo, active_tree,
                             _v_start_np, _v_goal_np,
@@ -1620,9 +1691,40 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                             _v_sc_by_name,
                             _v_obs_std_np,
                             loops,
-                            log_prefix="simulation",
-                            plan_hist_override=_vinfo.get("sim_plan_hist_frame"),
+                            log_prefix="replanned",
+                            plan_hist_override=_vinfo.get("replanned_plan_hist_frame"),
                         )
+                        _viz_subplan_replan_ms += (time.time() - _viz_t0) * 1000
+                    # Log uncertainty estimate video: K*G fast-sampled sub_plans overlaid,
+                    # each rendered as red gradient with alpha-scaled green endpoint dots.
+                    # Skip if node is at terminal_depth (no further sub-plan denoising possible).
+                    if (
+                        self.viz_uncertain_next_subplan_last_obs
+                        and _vinfo.get("uncertainty_plan_hist_frame") is not None
+                        and _vinfo.get("depth", 0) < active_tree.terminal_depth
+                    ):
+                        _viz_t0 = time.time()
+                        self._log_candidate_plan_video(
+                            _vname, _vinfo, active_tree,
+                            _v_start_np, _v_goal_np,
+                            _v_hilp_fn,
+                            _v_tgt_vis_cache,
+                            _v_sc_by_name,
+                            _v_obs_std_np,
+                            loops,
+                            log_prefix="uncertainty_estimate",
+                            plan_hist_override=_vinfo["uncertainty_plan_hist_frame"],
+                            is_uncertainty_viz=True,
+                        )
+                        _viz_subplan_unc_ms += (time.time() - _viz_t0) * 1000
+                if _viz_subplan_n > 0 or self.viz_subplan_denoising:
+                    self._tlog("timing.viz_subplan_denoising", {
+                        "n_candidates": _viz_subplan_n,
+                        "expand_ms": round(_viz_subplan_expand_ms, 1),
+                        "replan_ms": round(_viz_subplan_replan_ms, 1),
+                        "uncertainty_ms": round(_viz_subplan_unc_ms, 1),
+                        "total_ms": round(_viz_subplan_expand_ms + _viz_subplan_replan_ms + _viz_subplan_unc_ms, 1),
+                    }, depth=1)
 
                 # Extract plan by selecting best leaf and combining plans
                 best_info: dict = self._select_best_leaf(expanded_node_infos)
@@ -1667,14 +1769,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
                 # Create forward trajectory image with both plan (red) and node trajectory (blue)
 
-                # Extract best_node's target_node obs_pos (single green point)
+                # Extract best_node's target_node obs (single green point)
                 best_node_target_pos = None
                 if best_node.target_node is None:
                     pass
-                elif best_node.target_node.obs_pos is None:
+                elif best_node.target_node.obs is None:
                     pass
                 else:
-                    best_node_target_pos = best_node.target_node.obs_pos  # (obs_dim,) world coords
+                    best_node_target_pos = best_node.target_node.obs  # (obs_dim,) world coords
 
                 # Compute HILP value heatmap if model is already loaded
                 hilp_heatmap = None
@@ -1785,6 +1887,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             bidir_tree2.pbar.close()
             print(f"[MCTD] Episode done | loops={loops} | steps={steps} | reached={bool(reached.any())} | reward={float(episode_reward.mean()):.3f}", flush=True)
 
+            self.log(f"{namespace}/task_id", float(self.task_id))
             self.log(f"{namespace}/planning_time", np.sum(planning_time))
             self.log(f"{namespace}/episode_reward", episode_reward.mean())
             self.log(f"{namespace}/episode_reward_if_stay", episode_reward_if_stay.mean())
@@ -1793,6 +1896,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
             # Visualization
             _post_exec_t0 = time.time()
+            _post_exec_traj_image_ms = 0.0
+            _post_exec_rollout_video_ms = 0.0
+            _post_exec_mujoco_video_ms = 0.0
             if len(trajectory) > 0:
                 samples = 1 # min(32, batch_size)
                 trajectory = torch.stack(trajectory)
@@ -1800,17 +1906,20 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 goal = goal[:, self.pos_dim_indices].cpu().numpy().tolist()
                 rollout_agent_history = validation_rollout_agent_history
                 rollout_subgoal_history = validation_rollout_subgoal_history
+
+                _timg_t0 = time.time()
                 images = make_trajectory_images(
                     self.env_id, trajectory[:, -samples:], samples, start, goal, self.plot_end_points
                 )
-
                 for i, img in enumerate(images):
                     self.log_image(
                         f"{namespace}_interaction/sample_{i}",
                         Image.fromarray(img),
                     )
+                _post_exec_traj_image_ms = (time.time() - _timg_t0) * 1000
 
                 if rollout_agent_history and self.viz_agent_rollout:
+                    _rvid_t0 = time.time()
                     rollout_agent_np = np.concatenate(rollout_agent_history, axis=0)[:, None, :]
                     rollout_subgoal_np = np.concatenate(rollout_subgoal_history, axis=0)[:, None, :]
                     pp_plan_per_frame = validation_pp_plan_history if validation_pp_plan_history else None
@@ -1842,6 +1951,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                                 fps=self.validation_video_fps,
                                 step=_video_step,
                             )
+                    _post_exec_rollout_video_ms = (time.time() - _rvid_t0) * 1000
 
                 # [MUJOCO RENDER VIDEO] Log overhead MuJoCo render video
                 if (
@@ -1849,6 +1959,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     and self.viz_mujoco_renderer
                     and validation_mujoco_frame_history
                 ):
+                    _mj_t0 = time.time()
                     _mj_all = np.concatenate(validation_mujoco_frame_history, axis=0)  # (T, H, W, 3)
                     _mj_n = _mj_all.shape[0]
                     _mj_indices = _sample_frame_indices(_mj_n, self.validation_video_max_frames)
@@ -1867,11 +1978,15 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         fps=self.validation_video_fps,
                         step=_mj_step,
                     )
+                    _post_exec_mujoco_video_ms = (time.time() - _mj_t0) * 1000
 
             _post_exec_ms = (time.time() - _post_exec_t0) * 1000
             self._tlog("timing.post_exec", {
                 "total_ms": round(_post_exec_ms, 1),
                 "n_steps": steps,
+                "traj_image_ms": round(_post_exec_traj_image_ms, 1),
+                "rollout_video_ms": round(_post_exec_rollout_video_ms, 1),
+                "mujoco_video_ms": round(_post_exec_mujoco_video_ms, 1),
             }, depth=0)
 
             _interact_elapsed = time.time() - _interact_t0
@@ -1908,30 +2023,26 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         Handles both token-format obs (stacked with frame_stack) and non-stacked obs.
         Automatically detects which format based on bundle size.
         """
-        # Determine obs dimension: either self.observation_dim or self.x_stacked_shape[0]
+        # Determine obs split size by checking bundle format.
         bundle_size = bundle.shape[-1]
+        _n_obs = len(self.obs_bundle_indices)
 
         # Check if bundle contains frame-stacked obs (larger dimension)
         if bundle_size == self.x_stacked_shape[0] + self.action_dim + (1 if self.use_reward else 0):
-            # Frame-stacked obs format: (batch, x_stacked_shape[0] + action_dim + reward?)
-            obs_dim = self.x_stacked_shape[0]
-        elif bundle_size == self.observation_dim + self.action_dim + (1 if self.use_reward else 0):
-            # Non-stacked obs format: (batch, observation_dim + action_dim + reward?)
-            obs_dim = self.observation_dim
+            # Frame-stacked obs format
+            obs_split = self.x_stacked_shape[0]
+        elif bundle_size == _n_obs + self.action_dim + (1 if self.use_reward else 0):
+            # Non-stacked obs format
+            obs_split = _n_obs
         else:
-            # Fallback: try to infer from bundle_size
-            # Assume: bundle_size = obs_dim + action_dim + (1 if reward else 0)
+            # Fallback: infer from bundle_size
             remainder = bundle_size - self.action_dim - (1 if self.use_reward else 0)
-            if remainder > 0:
-                obs_dim = remainder
-            else:
-                # Last resort: use x_stacked_shape[0]
-                obs_dim = self.x_stacked_shape[0]
+            obs_split = remainder if remainder > 0 else self.x_stacked_shape[0]
 
         if self.use_reward:
-            return torch.split(bundle, [obs_dim, self.action_dim, 1], -1)
+            return torch.split(bundle, [obs_split, self.action_dim, 1], -1)
         else:
-            o, a = torch.split(bundle, [obs_dim, self.action_dim], -1)
+            o, a = torch.split(bundle, [obs_split, self.action_dim], -1)
             return o, a, None
 
     def make_bundle(
@@ -1952,7 +2063,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         batch_shape = valid_value.shape[:-1]
 
         if obs is None:
-            obs = torch.zeros(batch_shape + (self.observation_dim,)).to(valid_value)
+            obs = torch.zeros(batch_shape + (len(self.obs_bundle_indices),)).to(valid_value)
         if action is None:
             action = torch.zeros(batch_shape + (self.action_dim,)).to(valid_value)
         if reward is None:
@@ -2016,7 +2127,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
     def visualize_expanded_vs_value_plans(self, is_achieved_plan, names, expanded_plans, value_plans, starts, goals):
         # expanded_plans: (t fs) b c  — plans from expanded_node_plan_hists[-1]
-        # value_plans:    (t fs) b c  — plans from value_estimation_plan_hists[-1]
+        # value_plans:    (t fs) b c  — plans from replanned_plan_hists[-1]
         batch_size = expanded_plans.shape[1]
 
         if starts.ndim == 1:
@@ -2147,12 +2258,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
             # --- Delegate Warp/Achieved detection to calculate_values --- #
             # start = parent_node's physical position, goal = target_node's last valid frame from plan_hist
-            start_np: np.ndarray = parent_node.obs_pos[
-                None, : self.observation_dim
-            ]  # (1, obs_dim)
-            goal_np: np.ndarray = target_node.obs_pos[
-                None, : self.observation_dim
-            ]  # (1, obs_dim) — unnormalized world coords, same space as calculate_values' obs
+            start_np: np.ndarray = parent_node.obs[None]  # (1, n_obs) — obs already indexed by obs_dim_indices
+            goal_np: np.ndarray = target_node.obs[None]   # (1, n_obs) — unnormalized world coords
              # Always evaluate as forward (plan_A is forward, plan_B already flipped)
             _vals, _achieved_infos, _achieved_ts = self.calculate_values(
                 plan_a_sliced, start_np, goal_np
@@ -2184,7 +2291,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             horizon: Planning horizon (must be divisible by frame_stack)
             tag: Tag string for tqdm progress bar labeling
             root_obs: Unnormalized root observation, shape (obs_dim,).
-                      Stored in root_node.obs_pos and tree.tree_root_obs.
+                      Stored in root_node.obs and tree.tree_root_obs.
 
         Returns:
             MCTSTreeState: Fully initialized tree state ready for _run_mcts_search
@@ -2192,7 +2299,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         plan_tokens: int = horizon // self.frame_stack  # t
         children_node_guidance_scales: list = self.mctd_guidance_scales
         max_search_num: int = self.mctd_max_search_num
-        num_denoising_steps: int = self.mctd_num_denoising_steps
         skip_level_steps: int = self.mctd_skip_level_steps
 
         assert plan_tokens <= self.n_tokens - 1, (
@@ -2215,7 +2321,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             terminal_depth=terminal_depth,
             virtual_visit_weight=self.virtual_visit_weight,
             current_levels=root_current_levels,
-            obs_pos=root_obs,
+            obs=root_obs,
             sim_state=root_sim_state,
         )
         root_node.set_value(0)  # Initialize the value of the root node
@@ -2234,7 +2340,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             noise_level=noise_level,
             children_node_guidance_scales=children_node_guidance_scales,
             max_search_num=max_search_num,
-            num_denoising_steps=num_denoising_steps,
             skip_level_steps=skip_level_steps,
             tag=tag,
             is_tree1=is_tree1,
@@ -2289,7 +2394,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         # Unpack frequently used tree fields for readability
         root_node = tree.root_node
         children_node_guidance_scales = tree.children_node_guidance_scales
-        num_denoising_steps = tree.num_denoising_steps
         skip_level_steps = tree.skip_level_steps
         terminal_depth = tree.terminal_depth
 
@@ -2457,14 +2561,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # ------------------------------------------------------------------
             # Dynamic Start & Goal Selection for each expansion candidate
             # ------------------------------------------------------------------
-            # Filter out nodes with uninitialized obs_pos
+            # Filter out nodes with uninitialized obs
             valid_candidates = []
             for info in expanded_node_candidates:
-                if info["parent_node"].obs_pos is not None:
+                if info["parent_node"].obs is not None:
                     valid_candidates.append(info)
 
 
-            # If no valid candidates (all had None obs_pos), skip diffusion and continue
+            # If no valid candidates (all had None obs), skip diffusion and continue
             if not valid_candidates:
                 break  # Exit search loop
 
@@ -2478,15 +2582,15 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
             for info in valid_candidates:
                 parent_node = info["parent_node"]
-                parent_obs_pos = parent_node.obs_pos
+                parent_obs = parent_node.obs
 
                 # Start: Normalized parent position for planning context
-                eff_start_np_list.append(parent_obs_pos[None, : self.observation_dim])
-                obs_mean_np = self.data_mean[: self.observation_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[: self.observation_dim])
-                obs_std_np = self.data_std[: self.observation_dim].cpu().numpy() if isinstance(self.data_std, torch.Tensor) else np.array(self.data_std[: self.observation_dim])
+                # obs is already indexed by obs_dim_indices; Method B for normalization stats
+                obs_mean_np = np.array(self.observation_mean)
+                obs_std_np = np.array(self.observation_std)
+                eff_start_np_list.append(parent_obs[None])
                 p_norm = torch.tensor(
-                    (parent_obs_pos[: self.observation_dim] - obs_mean_np)
-                    / obs_std_np,
+                    (parent_obs - obs_mean_np) / obs_std_np,
                     dtype=torch.float32,
                     device=self.device,
                 ).unsqueeze(0)
@@ -2496,19 +2600,17 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 all_opposite_nodes = opposite_tree.get_all_nodes()
                 assert len(all_opposite_nodes) > 0, "opposite_tree has no nodes"
                 target_node = self._select_dynamic_goal(
-                    current_leaf_obs=parent_obs_pos,
+                    current_leaf_obs=parent_obs,
                     opposite_tree_all_nodes=all_opposite_nodes,
                 )
                 info["target_node"] = (
                     target_node  # Will be propagated to child TreeNode via expand()
                 )
-                target_pos = target_node.obs_pos
+                target_pos = target_node.obs
 
-                eff_goal_np_list.append(target_pos[None, : self.observation_dim])
-                obs_mean_np = self.data_mean[: self.observation_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[: self.observation_dim])
-                obs_std_np = self.data_std[: self.observation_dim].cpu().numpy() if isinstance(self.data_std, torch.Tensor) else np.array(self.data_std[: self.observation_dim])
+                eff_goal_np_list.append(target_pos[None])
                 g_norm = torch.tensor(
-                    (target_pos[: self.observation_dim] - obs_mean_np) / obs_std_np,
+                    (target_pos - obs_mean_np) / obs_std_np,
                     dtype=torch.float32,
                     device=self.device,
                 ).unsqueeze(0)
@@ -2522,9 +2624,12 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             filtered_expanded_node_plan_hists = [None] * len(
                 valid_candidates
             )  # the elements can be left as None is every states are at the same point
-            filtered_value_estimation_plan_hists = [None] * len(
+            filtered_replanned_plan_hists = [None] * len(
                 valid_candidates
             )
+            # Per-candidate uncertainty plan hists: populated by NODE UNCERTAINTY CHECK block.
+            # Each entry is (fast_steps+1, plan_tokens*fs, K, c) or None.
+            uncertainty_plan_hists_per_candidate: list = [None] * len(valid_candidates)
 
             for _ in range(
                 self.num_tries_for_bad_plans
@@ -2610,6 +2715,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     prefix_len_list=prefix_len_list,                # list of B ints
                     particle_guidance_scale=self.particle_guidance_scale,
                     group_ids=_group_ids,
+                    call_type="expansion",
                 )  # (m+1, plan_tokens*fs, B, c)
 
                 # Build per-candidate step captures for video visualization.
@@ -2695,9 +2801,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 tree.expansion_time.append(expansion_end_time - expansion_start_time)
 
                 ###############################
-                # Simulation
-                #  It includes the noise level zero-padding, finding the max denoising steps, simulation, value calculation and node allocation
-                simulation_start_time = time.time()
+                # Replanning
+                #  It includes the noise level zero-padding, finding the max denoising steps, replanning, value calculation and node allocation
+                replanning_start_time = time.time()
 
                 def is_feasible_and_not_short_plan_hists(plan_hists): # plan_hists: (m, plan_tokens*fs, b, c)
                     plans = (
@@ -2705,7 +2811,18 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         .detach()
                         .cpu()
                         .numpy()
-                    )  # (t fs) b c
+                    )  # (t*fs-1, b, c)
+
+                    # Prepend each candidate's parent obs as frame 0 so that the
+                    # parent→first_plan_token continuity is also checked.
+                    parent_obs_list = [
+                        expanded_node_candidates[i]["parent_node"].obs
+                        for i in range(plans.shape[1])
+                    ]
+                    if all(p is not None for p in parent_obs_list):
+                        parent_obs_np = np.stack(parent_obs_list, axis=0)[np.newaxis]  # (1, b, c)
+                        plans = np.concatenate([parent_obs_np, plans], axis=0)  # (t*fs, b, c)
+
                     diffs = np.linalg.norm(
                         plans[1:] - plans[:-1], axis=-1
                     )  # (plan_len-1, b)
@@ -2722,8 +2839,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         for i in range(diffs.shape[1]):
                             if is_feasible[i]:
                                 parent_node = expanded_node_candidates[i]["parent_node"]
-                                if parent_node.obs_pos is not None:
-                                    start_xy = parent_node.obs_pos[:2]
+                                if parent_node.obs is not None:
+                                    start_xy = parent_node.obs[:2]
                                     end_xy = plans[-1, i, :2]
                                     progress = float(np.linalg.norm(end_xy - start_xy))
                                     if progress < self.min_progress_threshold:
@@ -2731,8 +2848,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
                     return is_feasible
 
-                if not self.mcts_use_sim:
-                    # Skip simulation: use HILP value directly for expansion results
+
+                if not self.mcts_use_replan:
+                    # Skip replanning: use expansion results directly for value.
                     assert prefix_len_list is not None
                     batch_size = expanded_node_plan_hists.shape[2]
                     plans_tokens = rearrange(expanded_node_plan_hists, "m (t fs) b c -> m t fs b c", fs=self.frame_stack)
@@ -2750,21 +2868,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     processed_hists = rearrange(sliced_hists, "m t fs b c -> m (t fs) b c")
 
                     is_feasible = is_feasible_and_not_short_plan_hists(processed_hists)
+                    # val_plan_hists: plan used for value / filtering (no replan → same as expansion)
+                    val_plan_hists = expanded_node_plan_hists
 
-                    for i in range(len(expanded_node_candidates)):
-                        if is_feasible[i] and filtered_expanded_node_plan_hists[i] is None:
-                            filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[
-                                :, :, i
-                            ]
-                            # Create dummy value_estimation_plan_hists using expanded_node_plan_hists
-                            filtered_value_estimation_plan_hists[i] = (
-                                expanded_node_plan_hists[:, :, i]
-                            )
-
-                else: # simulation means REPLANNING to get more feasible trajectory
+                else: # REPLANNING to get more feasible trajectory
                     # Pad the noise levels - Sequential
-                    simul_noiselevel_zero_padding_start = time.time()
-                    value_estimation_plans, value_estimation_noise_levels = [], []
+                    replan_noiselevel_zero_padding_start = time.time()
+                    replan_init_plans = []
                     max_denoising_steps = 0
                     for i in range(
                         len(expanded_node_candidates)
@@ -2782,83 +2892,161 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         _sim_plan, _ = self._build_plan_from_leaf(
                             _parent_node, _plan_tokens_val, seg_size, expanded_plan=_plan_rearranged
                         )  # (n_tokens, 1, fs*c)
-                        value_estimation_plans.append(_sim_plan)
+                        replan_init_plans.append(_sim_plan)
 
-                    simul_noiselevel_zero_padding_end = time.time()
-                    tree.simul_noiselevel_zero_padding_time.append(
-                        simul_noiselevel_zero_padding_end
-                        - simul_noiselevel_zero_padding_start
+                    replan_noiselevel_zero_padding_end = time.time()
+                    tree.replan_noiselevel_zero_padding_time.append(
+                        replan_noiselevel_zero_padding_end
+                        - replan_noiselevel_zero_padding_start
                     )
 
-                    # Simulation - Value Estimation
-                    simul_value_estimation_start = time.time()
+                    # Replanning - Diffusion
+                    replan_diffusion_start = time.time()
 
-                    # Prepare expanded node's denoising state for simulation
-                    simulation_initial_levels_list = []
+                    # Prepare expanded node's denoising state for replanning
+                    replan_initial_levels_list = []
                     for i in range(len(expanded_node_candidates)):
                         if expanded_node_updated_levels is not None:
-                            simulation_initial_levels_list.append(
+                            replan_initial_levels_list.append(
                                 expanded_node_updated_levels[i : i + 1]
                             )
                         else:
-                            simulation_initial_levels_list.append(None)
+                            replan_initial_levels_list.append(None)
 
                     assert expanded_node_updated_levels is not None, (
                         "expanded_node_updated_levels must be set"
                     )
-                    simulation_initial_levels = np.concatenate(
-                        simulation_initial_levels_list, axis=0
+                    replan_initial_levels = np.concatenate(
+                        replan_initial_levels_list, axis=0
                     )  # (b, plan_tokens)
-                    # Generate Schedule for Simulation (Complete Denoising)
-                    value_estimation_noise_levels = (
+                    # Generate Schedule for Replanning (Complete Denoising)
+                    replan_noise_levels = (
                         self._generate_bidirectional_schedule(
-                            simulation_initial_levels,
+                            replan_initial_levels,
                             is_replanning = True
                         )
                     )  # (b, m, plan_tokens)
 
                     # input plans: list of (n_tokens, 1, fs*c)
                     # output plan_hists: (m+1, plan_tokens*fs, b, c)
-                    value_estimation_plan_hists = self.parallel_plan(
+                    replanned_plan_hists = self.parallel_plan(
                         effective_obs_normalized,
                         effective_goal_normalized,
                         horizon,
                         conditions,
                         guidance_scale=None,
-                        noise_level=value_estimation_noise_levels,
-                        plans=value_estimation_plans,
+                        noise_level=replan_noise_levels,
+                        plans=replan_init_plans,
                         prefix_len_list=prefix_len_list,
+                        call_type="replan",
                     )
 
-                    # Validate value_estimation_plan_hists shape: (m, plan_tokens*fs, B, c)
-                    assert value_estimation_plan_hists.ndim == 4, (
-                        f"value_estimation_plan_hists.ndim={value_estimation_plan_hists.ndim}, expected 4"
+                    # Validate replanned_plan_hists shape: (m, plan_tokens*fs, B, c)
+                    assert replanned_plan_hists.ndim == 4, (
+                        f"replanned_plan_hists.ndim={replanned_plan_hists.ndim}, expected 4"
                     )
-                    assert value_estimation_plan_hists.shape[2] == len(
+                    assert replanned_plan_hists.shape[2] == len(
                         expanded_node_candidates
                     ), (
-                        f"value_estimation_plan_hists.shape[2]={value_estimation_plan_hists.shape[2]}, expected {len(expanded_node_candidates)}"
+                        f"replanned_plan_hists.shape[2]={replanned_plan_hists.shape[2]}, expected {len(expanded_node_candidates)}"
                     )
 
-                    simul_value_estimation_end = time.time()
+                    replan_diffusion_end = time.time()
 
-                    # check if any plan is good
-                    is_feasible = is_feasible_and_not_short_plan_hists(value_estimation_plan_hists)
-                    
-                    for i in range(len(expanded_node_candidates)): # b
+                    is_feasible = is_feasible_and_not_short_plan_hists(replanned_plan_hists)
+                    # val_plan_hists: plan used for value / filtering (replan → replanned)
+                    val_plan_hists = replanned_plan_hists
+
+                ##### NODE UNCERTAINTY CHECK #####
+
+                # uncertainty_plan_hists_per_candidate is initialized before the retry loop.
+                # Here we populate it for each candidate when use_uncertainty_as_value=True.
+                # Input: val_plan_hists (replanned if mcts_use_replan, else expanded).
+                if self.use_uncertainty_as_value:
+                    B_cands = len(expanded_node_candidates)
+                    K = self.fast_sampling_multiple
+
+                    # Build unc_init_plans from val_plan_hists (the final plan after replan/expand).
+                    # This wraps each candidate's last denoised frame into (n_tokens, 1, fs*c)
+                    # via _build_plan_from_leaf so parallel_plan can accept it.
+                    unc_init_plans = []
+                    for _i in range(B_cands):
+                        _plan_t_fs = val_plan_hists[-1, :, _i].unsqueeze(1)  # (plan_tokens*fs, 1, c)
+                        _plan_tokens_val = horizon // self.frame_stack
+                        _plan_rearranged = rearrange(
+                            _plan_t_fs, "(t fs) b c -> t b (fs c)", fs=self.frame_stack
+                        )  # (plan_tokens, 1, fs*c)
+                        _parent_node = expanded_node_candidates[_i]["parent_node"]
+                        _unc_plan, _ = self._build_plan_from_leaf(
+                            _parent_node, _plan_tokens_val, seg_size, expanded_plan=_plan_rearranged
+                        )  # (n_tokens, 1, fs*c)
+                        unc_init_plans.append(_unc_plan)
+
+                    # Build fast noise schedule using fast_sampling_steps.
+                    # Same starting levels as replanning (expanded_node_updated_levels).
+                    assert expanded_node_updated_levels is not None, (
+                        "expanded_node_updated_levels must be set for uncertainty sampling"
+                    )
+                    unc_noise_levels = self._generate_bidirectional_schedule(
+                        expanded_node_updated_levels,
+                        num_denoising_steps_override=self.fast_sampling_steps,
+                    )  # (B_cands, fast_steps+1, plan_tokens)
+
+                    # Replicate each candidate K*G times (K copies per guidance scale G).
+                    # Batch order within each candidate: [g0*K, g1*K, ..., g_{G-1}*K]
+                    G = len(self.mctd_guidance_scales)
+                    unc_noise_levels_rep = np.repeat(unc_noise_levels, K * G, axis=0)  # (B*G*K, fast_steps+1, plan_tokens)
+                    unc_init_plans_rep = []
+                    unc_guidance_scale_vals = []  # per-sample guidance scale (length B*G*K)
+                    for _i in range(B_cands):
+                        for g_scale in self.mctd_guidance_scales:
+                            for _ in range(K):
+                                unc_init_plans_rep.append(unc_init_plans[_i])
+                                unc_guidance_scale_vals.append(g_scale)
+                    unc_guidance_scale_tensor = torch.tensor(
+                        unc_guidance_scale_vals, dtype=torch.float32, device=self.device
+                    )  # (B*G*K,)
+
+                    # Run parallel_plan for fast uncertainty sampling.
+                    # Replicate obs/goal/prefix_len to match B*G*K batch size.
+                    unc_obs = effective_obs_normalized.repeat_interleave(G * K, dim=0)   # (B*G*K, D)
+                    unc_goal = effective_goal_normalized.repeat_interleave(G * K, dim=0)  # (B*G*K, D)
+                    unc_prefix_len_list = [pl for pl in prefix_len_list for _ in range(G * K)]
+                    unc_batch_plan_hists = self.parallel_plan(
+                        unc_obs,
+                        unc_goal,
+                        horizon,
+                        conditions,
+                        guidance_scale=unc_guidance_scale_tensor,
+                        noise_level=unc_noise_levels_rep,
+                        plans=unc_init_plans_rep,
+                        prefix_len_list=unc_prefix_len_list,
+                        call_type="uncertainty",
+                    )  # (fast_steps+1, plan_tokens*fs, B*G*K, c)
+
+                    # Reshape into per-candidate tensors: (fast_steps+1, plan_tokens*fs, G*K, c).
+                    for _i in range(B_cands):
+                        start_idx_k = _i * G * K
+                        end_idx_k = start_idx_k + G * K
+                        uncertainty_plan_hists_per_candidate[_i] = unc_batch_plan_hists[:, :, start_idx_k:end_idx_k, :]
+
+
+                for i in range(len(is_feasible)):
                         if is_feasible[i] and filtered_expanded_node_plan_hists[i] is None:
-                            filtered_expanded_node_plan_hists[i] = (
-                                expanded_node_plan_hists[:, :, i]
-                            )  # m (t fs) b c -> m (t fs) c
-                            filtered_value_estimation_plan_hists[i] = (
-                                value_estimation_plan_hists[:, :, i]
-                            )
-                    
+                            filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[:, :, i]
+                            filtered_replanned_plan_hists[i] = val_plan_hists[:, :, i]
+
+                # Kill uncertainty plans for candidates that didn't pass the feasibility filter.
+                # Alive plans (filtered_expanded_node_plan_hists[i] is not None) keep their
+                # uncertainty plans; dead plans discard theirs.
+                for _i in range(len(expanded_node_candidates)):
+                    if filtered_expanded_node_plan_hists[_i] is None:
+                        uncertainty_plan_hists_per_candidate[_i] = None
 
                 if None in filtered_expanded_node_plan_hists:
-                    simulation_end_time = time.time()
-                    tree.simulation_time.append(
-                        simulation_end_time - simulation_start_time
+                    replanning_end_time = time.time()
+                    tree.replanning_time.append(
+                        replanning_end_time - replanning_start_time
                     )
                     continue
                 else:
@@ -2875,20 +3063,20 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[
                         :, :, i
                     ]
-                    filtered_value_estimation_plan_hists[i] = (
-                        value_estimation_plan_hists[:, :, i] if self.mcts_use_sim else expanded_node_plan_hists[:, :, i]
+                    filtered_replanned_plan_hists[i] = (
+                        replanned_plan_hists[:, :, i] if self.mcts_use_replan else expanded_node_plan_hists[:, :, i]
                     )
             expanded_node_plan_hists = torch.stack(
                 filtered_expanded_node_plan_hists, dim=2
             )  # m (t fs) 'B' c
-            value_estimation_plan_hists = torch.stack(
-                filtered_value_estimation_plan_hists, dim=2
+            replanned_plan_hists = torch.stack(
+                filtered_replanned_plan_hists, dim=2
             )  # m (t fs) 'B' c
 
             # Value Calculation
-            simul_value_calculation_start = time.time()
+            replan_value_calculation_start = time.time()
             achieved_indices = []
-            final_best_plans = value_estimation_plan_hists[-1] # (plan_tokens*fs, b, c)
+            final_best_plans = replanned_plan_hists[-1] # (plan_tokens*fs, b, c)
 
             values, achieved_infos, achieved_ts = self.calculate_values_bidir(
                 expanded_node_candidates, final_best_plans, tree
@@ -2900,24 +3088,24 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     tree.achieved = True
                     achieved_indices.append(i)
 
-            simul_value_calculation_end = time.time()
+            replan_value_calculation_end = time.time()
 
-            # Endpoint Deduplication: extract obs_pos per candidate, then kill duplicates
-            candidate_obs_poses = []  # list of np.ndarray (observation_dim,), len B
+            # Endpoint Deduplication: extract obs per candidate, then kill duplicates
+            candidate_obses = []  # list of np.ndarray (observation_dim,), len B
             for i in range(len(expanded_node_candidates)):
                 child_depth = expanded_node_candidates[i]["depth"]
                 plan_hists_last_i = expanded_node_plan_hists[-1, :, i]  # (plan_tokens*fs, c)
-                obs_pos_i = self._extract_plan_endpoint_obs_pos(
+                obs_i = self._extract_plan_endpoint_obs(
                     plan_hists_last_i, child_depth=child_depth, seg_size=seg_size,
                 )  # (observation_dim,)
-                candidate_obs_poses.append(obs_pos_i)
+                candidate_obses.append(obs_i)
 
             is_kept = self._deduplicate_by_endpoint(
-                expanded_node_candidates, candidate_obs_poses, final_is_feasible,
+                expanded_node_candidates, candidate_obses, final_is_feasible,
             )  # list of bool, len B
 
             # Node Allocation (skip deduplicated/infeasible candidates)
-            simul_node_allocation_start = time.time()
+            replan_node_allocation_start = time.time()
             # Dedup-killed slots are permanently dead: never attempt to expand them again.
             # Kept slots that weren't expanded also release their virtually_visited lock.
             for i in range(len(expanded_node_candidates)):
@@ -2941,10 +3129,10 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     expanded_node_infos[name]["plan_history"].append([])
                     # Note: is_tree1 is a property of MCTSTreeState (tree), not individual nodes
                 value = values[i]
-                plan_hist = expanded_node_plan_hists[:, :, i] if not self.mcts_use_sim else value_estimation_plan_hists[:, :, i] # m (t fs) c
+                plan_hist = expanded_node_plan_hists[:, :, i] if not self.mcts_use_replan else replanned_plan_hists[:, :, i] # m (t fs) c
                 expanded_plan_hist_i = expanded_node_plan_hists[:, :, i]  # always expanded stage
-                sim_plan_hist_i = value_estimation_plan_hists[:, :, i] if self.mcts_use_sim else None  # sim stage if available
-                value_estimation_plan = value_estimation_plan_hists[-1, :, i]
+                replanned_plan_hist_i = replanned_plan_hists[:, :, i] if self.mcts_use_replan else None  # replanning stage if available
+                replanned_plan = replanned_plan_hists[-1, :, i]
 
                 # Store updated denoising state for child node
                 if expanded_node_updated_levels is not None:
@@ -2956,42 +3144,44 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
                 if expanded_node_infos[name]["value"] is None:
                     expanded_node_infos[name]["value"] = value
-                    expanded_node_infos[name]["value_estimation_plan"] = (
-                        value_estimation_plan
+                    expanded_node_infos[name]["replanned_plan"] = (
+                        replanned_plan
                     )
                     expanded_node_infos[name]["plan_history"][-1] = (
                         plan_hist  # d m (t fs) c
                     )
                     expanded_node_infos[name]["expanded_plan_hist_frame"] = expanded_plan_hist_i
-                    expanded_node_infos[name]["sim_plan_hist_frame"] = sim_plan_hist_i
+                    expanded_node_infos[name]["replanned_plan_hist_frame"] = replanned_plan_hist_i
+                    expanded_node_infos[name]["uncertainty_plan_hist_frame"] = uncertainty_plan_hists_per_candidate[i]
                     expanded_node_infos[name]["current_levels"] = updated_level
                 else:
                     if value > expanded_node_infos[name]["value"]:
                         expanded_node_infos[name]["value"] = value
-                        expanded_node_infos[name]["value_estimation_plan"] = (
-                            value_estimation_plan
+                        expanded_node_infos[name]["replanned_plan"] = (
+                            replanned_plan
                         )
                         expanded_node_infos[name]["plan_history"][-1] = plan_hist
                         expanded_node_infos[name]["expanded_plan_hist_frame"] = expanded_plan_hist_i
-                        expanded_node_infos[name]["sim_plan_hist_frame"] = sim_plan_hist_i
+                        expanded_node_infos[name]["replanned_plan_hist_frame"] = replanned_plan_hist_i
+                        expanded_node_infos[name]["uncertainty_plan_hist_frame"] = uncertainty_plan_hists_per_candidate[i]
                         expanded_node_infos[name]["current_levels"] = updated_level
 
             for name in selected_nodes_for_expansion:
                 parent_node_for_expand = selected_nodes_for_expansion[name]
                 expand_kwargs = {k: v for k, v in expanded_node_infos[name].items()
-                                 if k not in ("expanded_plan_hist_frame", "sim_plan_hist_frame")}
+                                 if k not in ("expanded_plan_hist_frame", "replanned_plan_hist_frame", "uncertainty_plan_hist_frame")}
                 child_node = parent_node_for_expand.expand(
                     **expand_kwargs
                 )
                 expanded_node_infos[name]["node"] = child_node
 
-            simul_node_allocation_end = time.time()
-            tree.simul_node_allocation_time.append(
-                simul_node_allocation_end - simul_node_allocation_start
+            replan_node_allocation_end = time.time()
+            tree.replan_node_allocation_time.append(
+                replan_node_allocation_end - replan_node_allocation_start
             )
 
-            simulation_end_time = time.time()
-            tree.simulation_time.append(simulation_end_time - simulation_start_time)
+            replanning_end_time = time.time()
+            tree.replanning_time.append(replanning_end_time - replanning_start_time)
 
             ######################
             # Backpropagation
@@ -3022,6 +3212,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
             is_early_termination = tree.achieved
 
+            _viz_fp_t0 = time.time()
+            _viz_fp_node_ms = 0.0
+            _viz_fp_compare_ms = 0.0
             if self.viz_final_plans:
                 depths = [info["depth"] for info in expanded_node_candidates]
                 terminal_depth_indices = [
@@ -3059,6 +3252,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     if "from_goal" in tree.tag:
                         terminal_expanded_plans = torch.flip(terminal_expanded_plans, [0])
 
+                    _viz_node_t0 = time.time()
                     self.visualize_node_value_plans(
                         is_achieved_plan,
                         tree.search_num,
@@ -3070,9 +3264,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         tag=tree.tag,
                         denoised_lens=visualize_denoised_lens,
                     )
+                    _viz_fp_node_ms = (time.time() - _viz_node_t0) * 1000
 
                     if self.viz_compare_expanded_to_value:
-                        terminal_value_plans = value_estimation_plan_hists[
+                        _viz_cmp_t0 = time.time()
+                        terminal_value_plans = replanned_plan_hists[
                             -1, :, visualize_indices
                         ]  # (t fs) b c
                         if "from_goal" in tree.tag:
@@ -3085,6 +3281,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                             start,
                             goal,
                         )
+                        _viz_fp_compare_ms = (time.time() - _viz_cmp_t0) * 1000
+            _viz_fp_total_ms = (time.time() - _viz_fp_t0) * 1000
+            self._tlog("timing.viz_final_plans", {
+                "node_value_ms": round(_viz_fp_node_ms, 1),
+                "compare_ms": round(_viz_fp_compare_ms, 1),
+                "total_ms": round(_viz_fp_total_ms, 1),
+            }, depth=1)
 
             early_termination_end_time = time.time()
             tree.early_termination_time.append(
@@ -3107,7 +3310,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         "expansion_idx": tree.search_num,
                         "expansion_ms": round(tree.expansion_time[-1] * 1000, 1),
                         "selection_ms": round(tree.selection_time[-1] * 1000, 1) if tree.selection_time else 0.0,
-                        "simulation_ms": round(tree.simulation_time[-1] * 1000, 1) if tree.simulation_time else 0.0,
+                        "replanning_ms": round(tree.replanning_time[-1] * 1000, 1) if tree.replanning_time else 0.0,
                         "backprop_ms": round(tree.backprop_time[-1] * 1000, 1) if tree.backprop_time else 0.0,
                         "early_term_ms": round(tree.early_termination_time[-1] * 1000, 1) if tree.early_termination_time else 0.0,
                     }, depth=0)
@@ -3132,14 +3335,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         def _ms_mean(lst): return round((sum(lst) / len(lst)) * 1000, 1) if lst else 0.0
         sel_ms   = _ms(tree.selection_time)
         exp_ms   = _ms(tree.expansion_time)
-        sim_ms   = _ms(tree.simulation_time)
+        replan_ms = _ms(tree.replanning_time)
         bp_ms    = _ms(tree.backprop_time)
         et_ms    = _ms(tree.early_termination_time)
-        nzp_ms   = _ms(tree.simul_noiselevel_zero_padding_time)
-        val_ms   = _ms(tree.simul_value_estimation_time)
-        calc_ms  = _ms(tree.simul_value_calculation_time)
-        alloc_ms = _ms(tree.simul_node_allocation_time)
-        total_ms = sel_ms + exp_ms + sim_ms + bp_ms + et_ms
+        nzp_ms   = _ms(tree.replan_noiselevel_zero_padding_time)
+        val_ms   = _ms(tree.replan_diffusion_time)
+        calc_ms  = _ms(tree.replan_value_calculation_time)
+        alloc_ms = _ms(tree.replan_node_allocation_time)
+        total_ms = sel_ms + exp_ms + replan_ms + bp_ms + et_ms
         self._tlog("timing.phase_breakdown", {
             "tree_tag": tree.tag,
             "n_iters": tree.search_num,
@@ -3148,19 +3351,19 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             "total_ms": total_ms,
             "selection_ms": sel_ms,
             "expansion_ms": exp_ms,
-            "simulation_ms": sim_ms,
+            "replanning_ms": replan_ms,
             "backprop_ms": bp_ms,
             "early_term_ms": et_ms,
-            "sim_noise_zeropad_ms": nzp_ms,
-            "sim_value_estimation_ms": val_ms,
-            "sim_value_calculation_ms": calc_ms,
-            "sim_node_allocation_ms": alloc_ms,
+            "replan_noise_zeropad_ms": nzp_ms,
+            "replan_diffusion_ms": val_ms,
+            "replan_value_calculation_ms": calc_ms,
+            "replan_node_allocation_ms": alloc_ms,
             "mean_selection_ms": _ms_mean(tree.selection_time),
             "mean_expansion_ms": _ms_mean(tree.expansion_time),
-            "mean_simulation_ms": _ms_mean(tree.simulation_time),
+            "mean_replanning_ms": _ms_mean(tree.replanning_time),
             "mean_backprop_ms": _ms_mean(tree.backprop_time),
             "expansion_ratio": round(exp_ms / total_ms, 3) if total_ms > 0 else 0,
-            "simulation_ratio": round(sim_ms / total_ms, 3) if total_ms > 0 else 0,
+            "replanning_ratio": round(replan_ms / total_ms, 3) if total_ms > 0 else 0,
             "selection_ratio": round(sel_ms / total_ms, 3) if total_ms > 0 else 0,
         }, depth=0)
 
@@ -3183,11 +3386,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             while padding_node._parent_node is not None:
                 padding_node = padding_node._parent_node
 
-        parent_obs_pos = padding_node.obs_pos  # Raw (unnormalized) world coordinate
+        parent_obs = padding_node.obs  # Raw (unnormalized) world coordinate
 
-        obs_mean_np = self.data_mean[: self.observation_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[: self.observation_dim])
-        obs_std_np = self.data_std[: self.observation_dim].cpu().numpy() if isinstance(self.data_std, torch.Tensor) else np.array(self.data_std[: self.observation_dim])
-        parent_obs_normalized = (parent_obs_pos[: self.observation_dim] - obs_mean_np) / obs_std_np
+        # Method B: use stored observation_mean/std directly (no data_mean slicing)
+        # obs is already indexed by obs_dim_indices, no further slicing needed
+        obs_mean_np = np.array(self.observation_mean)
+        obs_std_np = np.array(self.observation_std)
+        parent_obs_normalized = (parent_obs - obs_mean_np) / obs_std_np
 
         parent_obs_tensor = torch.tensor(
             parent_obs_normalized, dtype=torch.float32, device=self.device
@@ -3215,7 +3420,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         When denoised_prefix is empty (root depth=0):
             [obs_parent_token(1) | noisy_chunk | padding]
 
-        When expanded_plan (plan_tokens, 1, fs*c) is provided (simulation/value-estimation),
+        When expanded_plan (plan_tokens, 1, fs*c) is provided (replanning),
         the full assembly flow is identical — only noisy_parts is replaced with
         expanded_plan[prefix_len:] instead of random noise. use_dynamic_obs_padding
         branching and padding are applied unchanged.
@@ -3281,7 +3486,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             )
 
         # Assemble plan_tokens-length chunk: [prefix | obs_parent | noisy]
-        # obs_parent token is inserted only when using dynamic padding (parent's obs_pos varies by depth)
+        # obs_parent token is inserted only when using dynamic padding (parent's obs varies by depth)
         if denoised_prefix is not None and self.use_dynamic_obs_padding:
             plan_chunk_with_parent_obs = torch.cat(
                 [denoised_prefix, obs_parent_token, noisy_parts],
@@ -3334,7 +3539,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
     ) -> "TreeNode":
         """Select the best goal from the opposite tree's nodes using HILP value.
 
-        Computes V(current_leaf_obs, candidate.obs_pos) for each candidate in
+        Computes V(current_leaf_obs, candidate.obs) for each candidate in
         `opposite_tree_all_nodes` and returns the node with the highest value
         (i.e., temporally closest to `current_leaf_obs`).
 
@@ -3347,9 +3552,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         Returns:
             best_node: The TreeNode from opposite_tree_all_nodes with the highest HILP value.
         """
-        assert all(n.obs_pos is not None for n in opposite_tree_all_nodes), \
-            "All opposite_tree_all_nodes must have obs_pos set before goal selection"
-        targets = np.stack([n.obs_pos for n in opposite_tree_all_nodes])  # (N, D) — unnormalized world coords
+        assert all(n.obs is not None for n in opposite_tree_all_nodes), \
+            "All opposite_tree_all_nodes must have obs set before goal selection"
+        targets = np.stack([n.obs for n in opposite_tree_all_nodes])  # (N, D) — unnormalized world coords
         obs_expanded = np.tile(current_leaf_obs, (targets.shape[0], 1))  # (N, D)
         values = self._compute_hilp_values(obs_expanded, targets, use_no_grad=True)
 

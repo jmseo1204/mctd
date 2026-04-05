@@ -8,10 +8,15 @@ Main file for the project. This will create and run new experiments and load che
 Borrowed part of the code from David Charatan and wandb.
 """
 
+import os
 import sys
 import subprocess
 import time
 from pathlib import Path
+
+# MCTD_OUTPUT_DIR is set by Docker to the mounted outputs path (e.g. ~/mctd/mctd_outputs).
+# Falls back to ./outputs for local runs outside Docker.
+_outputs_root = Path(os.environ.get("MCTD_OUTPUT_DIR", str(Path(__file__).parent / "outputs")))
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -87,7 +92,7 @@ def run_local(cfg: DictConfig):
     if load and not is_run_id(load):
         # Check if it's a local model_id in the downloaded checkpoints directory
         local_downloaded = (
-            Path(__file__).parent / "outputs" / "downloaded"
+            _outputs_root / "downloaded"
             / cfg.wandb.entity
             / cfg.wandb.project
             / load
@@ -106,7 +111,7 @@ def run_local(cfg: DictConfig):
 
     if load_id:
         run_path = f"{cfg.wandb.entity}/{cfg.wandb.project}/{load_id}"
-        checkpoint_path = Path(__file__).parent / "outputs" / "downloaded" / run_path / "model.ckpt"
+        checkpoint_path = _outputs_root / "downloaded" / run_path / "model.ckpt"
 
     if checkpoint_path and is_rank_zero:
         print(f"Will load checkpoint from {checkpoint_path}")
@@ -205,7 +210,7 @@ def run(cfg: DictConfig):
 
     if load_id and "_on_compute_node" not in cfg:
         run_path = f"{cfg.wandb.entity}/{cfg.wandb.project}/{load_id}"
-        download_latest_checkpoint(run_path, Path(__file__).parent / "outputs" / "downloaded")
+        download_latest_checkpoint(run_path, _outputs_root / "downloaded")
 
     if "cluster" in cfg and not "_on_compute_node" in cfg:
         print(cyan("Slurm detected, submitting to compute node instead of running locally..."))

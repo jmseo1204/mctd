@@ -31,7 +31,6 @@ external_cond_dim: 0
 # ── Diffusion ─────────────────────────────────────────────────────────────────
 diffusion:
   timesteps: 1000
-  sampling_timesteps: 100
   beta_schedule: linear
   schedule_fn_kwargs: {}
   objective: pred_x0

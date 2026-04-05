@@ -52,7 +52,7 @@ This file contains reminders and guidelines for Claude Code when working on this
 ### Common Mistakes
 - ❌ **Padding mode inconsistency** — If you change `padding_mode`, validate with `test_padding_consistency.py`
 - ❌ **Bidirectional search misalignment** — `is_unknown_final_token` and `sequence_dividing_factor` must be consistent
-- ❌ **Value computation without bounds** — `calculate_values()` is expensive; respect `mctd_num_denoising_steps` limits
+- ❌ **Value computation without bounds** — `calculate_values()` is expensive; respect `sampling_timesteps` limits
 - ❌ **Memory bloat with parallel_search_num** — Each instance holds its own MCTSTreeState
 
 ## df_planning.py Specific Guidelines
@@ -75,7 +75,7 @@ This file contains reminders and guidelines for Claude Code when working on this
    - Run on small `mctd_max_search_num` and `parallel_search_num` first
 
 ### Parameter Tuning
-- **Search quality vs speed**: `mctd_num_denoising_steps` and `mctd_max_search_num`
+- **Search quality vs speed**: `sampling_timesteps` and `mctd_max_search_num`
 - **Parallelization**: `parallel_search_num` and `leaf_parallelization`
 - **Guidance strength**: `mctd_guidance_scales` (list of scales for exploration)
 - **Tree convergence**: `meeting_delta` and `early_stopping_condition`
@@ -88,7 +88,7 @@ This file contains reminders and guidelines for Claude Code when working on this
 python main.py +name=test_run algorithm=df_planning dataset=pointmaze experiment=validation
 
 # Override specific parameters
-python main.py +name=test algorithm=df_planning mctd_num_denoising_steps=50 parallel_search_num=4
+python main.py +name=test algorithm=df_planning diffusion.sampling_timesteps=50 parallel_search_num=4
 
 # Offline mode (no W&B)
 python main.py +name=test algorithm=df_planning wandb.mode=offline

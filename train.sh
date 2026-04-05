@@ -472,6 +472,7 @@ FULL_CMD="docker run --rm --gpus all ${_CUDA_VIS_FLAG} --name mctd_training --sh
     -e HYDRA_FULL_ERROR=1 \
     -e WANDB_ENTITY=$WANDB_ENTITY \
     -e WANDB_PROJECT=$WANDB_PROJECT \
+    -e MCTD_OUTPUT_DIR=$DOCKER_OUTPUTS \
     -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/$DOCKER_USER/.mujoco/mujoco210/bin \
     -v /usr/lib/wsl:/usr/lib/wsl \
     -v $PROJECT_DIR:$DOCKER_PROJECT \

@@ -180,7 +180,8 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -e WANDB_PROJECT={wandb_project} \
         -v /usr/lib/wsl:/usr/lib/wsl \
         -v {project_dir}:/home/{docker_user}/mctd \
-        -v {output_dir}:/home/{docker_user}/mctd/outputs \
+        -v {output_dir}:/home/{docker_user}/mctd_outputs \
+        -e MCTD_OUTPUT_DIR=/home/{docker_user}/mctd_outputs \
         -v {home_dir}/.netrc:/home/{docker_user}/.netrc \
         -v {home_dir}/.d4rl:/home/{docker_user}/.d4rl \
         -v {ogbench_data_dir}:/home/{docker_user}/.ogbench/data \
@@ -197,7 +198,8 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -e HYDRA_FULL_ERROR=1 \
         -e CUDA_VISIBLE_DEVICES=0 \
         -v {project_dir}:/home/{docker_user}/mctd \
-        -v {output_dir}:/home/{docker_user}/mctd/outputs \
+        -v {output_dir}:/home/{docker_user}/mctd_outputs \
+        -e MCTD_OUTPUT_DIR=/home/{docker_user}/mctd_outputs \
         -v {home_dir}/.netrc:/home/{docker_user}/.netrc \
         -v {home_dir}/.d4rl:/home/{docker_user}/.d4rl \
         -v {ogbench_data_dir}:/home/{docker_user}/.ogbench/data \

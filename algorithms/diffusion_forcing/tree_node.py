@@ -8,9 +8,9 @@ class TreeNode():
     def __init__(self, name: str, depth: int, parent_node: Optional['TreeNode'], 
                  children_node_guidance_scales: list, plan_history: list, 
                  guidance_scale: Optional[float] = None, terminal_depth: Optional[int] = None, 
-                 value: Optional[float] = None, value_estimation_plan: Optional[torch.Tensor] = None, 
+                 value: Optional[float] = None, replanned_plan: Optional[torch.Tensor] = None,
                  virtual_visit_weight: float = 0.0, current_levels: Optional[np.ndarray] = None,
-                 obs_pos: Optional[np.ndarray] = None,
+                 obs: Optional[np.ndarray] = None,
                  sim_state: Optional[dict] = None,
                  target_node: Optional['TreeNode'] = None):
         self.name = name
@@ -29,7 +29,7 @@ class TreeNode():
         ]
 
         self.value = value
-        self.value_estimation_plan = value_estimation_plan
+        self.replanned_plan = replanned_plan
         self.visit_count = 0
         
         # Store denoising state for incremental segment-wise denoising in MCTD
@@ -38,7 +38,7 @@ class TreeNode():
         # Agent's actual last reached position after MPC rollout from this node's plan.
         # Root node: set to start (tree1) or goal (tree2) coords.
         # Child nodes: set after _rollout_leaf_plan() in the interact loop.
-        self.obs_pos: Optional[np.ndarray] = obs_pos
+        self.obs: Optional[np.ndarray] = obs
         self.sim_state: Optional[dict] = sim_state
         # The opposite tree's leaf node that this node targets during bidirectional search.
         # Set by _select_dynamic_goal() in _run_mcts_search().
@@ -113,8 +113,8 @@ class TreeNode():
     def set_plan_history(self, plan_history):
         self.plan_history.append(plan_history)
     
-    def set_value_estimation_plan(self, value_estimation_plan):
-        self.value_estimation_plan = value_estimation_plan
+    def set_replanned_plan(self, replanned_plan):
+        self.replanned_plan = replanned_plan
 
     # Following UCT(Upper Confidence Boundary of Tree)
     def select(self, exp_weight=math.sqrt(2), leaf_parallelization=False, max_child_resets: int = 3):
@@ -195,11 +195,11 @@ class TreeNode():
             'plan_history': self.plan_history.copy(),
             'guidance_scale': self._children_nodes[selected_index]['guidance_scale'],
             'value': None,
-            'value_estimation_plan': None,
+            'replanned_plan': None,
             'virtual_visit_weight': self.virtual_visit_weight,
             'terminal_depth': self.terminal_depth,
             'current_levels': self.current_levels,  # Inherit parent's denoising state
-            'obs_pos': None,  # Will be set by _rollout_leaf_plan() after MPC rollout
+            'obs': None,  # Will be set by _rollout_leaf_plan() after MPC rollout
             'sim_state': None,
             'target_node': None,  # Will be set by _select_dynamic_goal() in _run_mcts_search()
         }

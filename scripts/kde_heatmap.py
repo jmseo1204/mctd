@@ -207,13 +207,35 @@ def main():
     # Gradient magnitude
     mag = np.sqrt(sx**2 + sy**2) + 1e-8   # (quiver_res, quiver_res)
 
-    # Z-score normalize: (mag - mean) / std, then shift so center = 1.0
+    # Normalize by mean & std to get standardized gradient lengths
     mag_mean = float(mag.mean())
     mag_std  = float(mag.std()) + 1e-8
-    mag_norm = (mag - mag_mean) / mag_std       # z-score
-    mag_vis  = np.clip(mag_norm + 2.0, 0.05, None)  # shift & floor so arrows stay visible
+    mag_normalized = (mag - mag_mean) / mag_std  # z-score: mean=0, std=1
+    
+    # Filter: set magnitude to 0 where mag < μ
+    threshold = mag_mean
+    mask_below_threshold = mag < threshold
+    mag_filtered = mag.copy()
+    mag_filtered[mask_below_threshold] = 0.0
+    
+    # Count filtered gradients
+    n_filtered = mask_below_threshold.sum()
+    n_total = mask_below_threshold.size
+    print(f"[INFO] Filtered {n_filtered:,} / {n_total:,} gradients "
+          f"({100*n_filtered/n_total:.1f}%) below threshold μ = {threshold:.4f}")
+    
+    # Scale to [0.1, 3.0] range for better visibility
+    # Using percentile-based clipping to handle outliers
+    mag_p05 = np.percentile(mag_normalized, 5)
+    mag_p95 = np.percentile(mag_normalized, 95)
+    mag_vis = np.clip(mag_normalized, mag_p05, mag_p95)
+    # Linearly rescale to [0.1, 3.0]
+    mag_vis = 0.1 + 2.9 * (mag_vis - mag_vis.min()) / (mag_vis.max() - mag_vis.min() + 1e-8)
+    
+    # Apply filter mask to visualization magnitude
+    mag_vis[mask_below_threshold] = 0.0
 
-    # Arrow vectors: unit direction × normalized length (shows relative magnitude)
+    # Arrow vectors: unit direction × normalized length
     U = (sx / mag) * mag_vis
     V = (sy / mag) * mag_vis
 
@@ -233,7 +255,8 @@ def main():
     ax2.set_ylabel("y (world)")
     ax2.set_title(
         f"λ·∇log p  —  KDE score field  (λ={lam})\n"
-        f"arrow length ∝ (|∇log p| − {mag_mean:.3f}) / {mag_std:.3f}  [z-score + 2]"
+        f"arrow length: z-score normalized (μ={mag_mean:.3f}, σ={mag_std:.3f}), scaled to [0.1, 3.0]\n"
+        f"filtered: {n_filtered:,}/{n_total:,} ({100*n_filtered/n_total:.1f}%) gradients < μ-0.5σ"
     )
 
     plt.tight_layout()

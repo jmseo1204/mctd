@@ -153,27 +153,48 @@ def report_phase_breakdown(records: List[Dict]):
 
 
 def report_gpu_sample(records: List[Dict]):
-    """timing.gpu_sample_step: GPU denoising cost per parallel_plan() call."""
+    """timing.gpu_sample_step: GPU denoising cost per parallel_plan() call, broken down by call_type."""
     recs = get_tag(records, "timing.gpu_sample_step")
     if not recs:
         print("  [timing.gpu_sample_step] No records — add logging in parallel_plan()")
         return
 
     data = [r.get("data", {}) for r in recs]
+
+    # Overall aggregate
     total_gpu = [d.get("total_gpu_ms", 0) for d in data]
     per_step = [d.get("mean_per_step_ms", 0) for d in data]
-    n_steps = data[0].get("n_denoising_steps", "?") if data else "?"
+    n_steps_val = data[0].get("n_denoising_steps", "?") if data else "?"
 
     section("GPU Denoising  (timing.gpu_sample_step)")
     table(
         [
-            ("n calls",           len(recs),                    ""),
-            ("n_denoising_steps", n_steps,                      ""),
+            ("n calls (total)",   len(recs),                    ""),
+            ("n_denoising_steps", n_steps_val,                  ""),
             ("avg total GPU",     f"{avg(total_gpu):.0f} ms",   f"max {max(total_gpu):.0f} ms"),
             ("avg ms / step",     f"{avg(per_step):.1f} ms",    f"max {max(per_step):.1f} ms"),
         ],
         ["Metric", "Mean", "Peak"],
     )
+
+    # Per call_type breakdown
+    by_type: Dict[str, list] = defaultdict(list)
+    for d in data:
+        by_type[d.get("call_type", "unknown")].append(d)
+
+    if len(by_type) > 1 or (len(by_type) == 1 and "unknown" not in by_type):
+        print("\n  Per call_type breakdown:")
+        rows = []
+        for ct in ["expansion", "replan", "uncertainty", "unknown"]:
+            entries = by_type.get(ct, [])
+            if not entries:
+                continue
+            ct_total = [e.get("total_gpu_ms", 0) for e in entries]
+            ct_steps = [e.get("mean_per_step_ms", 0) for e in entries]
+            ct_n_steps = entries[0].get("n_denoising_steps", "?")
+            rows.append((ct, len(entries), f"{avg(ct_total):.0f} ms", f"max {max(ct_total):.0f} ms",
+                         f"{avg(ct_steps):.1f} ms/step", str(ct_n_steps)))
+        table(rows, ["call_type", "n", "avg GPU", "peak GPU", "avg/step", "n_steps"])
 
 
 def report_guidance_overhead(records: List[Dict]):
@@ -240,6 +261,57 @@ def report_guidance_breakdown(records: List[Dict]):
                               f"{mean_v:.1f} ms", f"{max(value_vals):.1f} ms",
                               f"{mean_v/mean_hilp*100:.1f}%"))
             table(rows, ["Sub-component", "Mean", "Peak", "% of hilp"])
+
+
+def report_viz_subplan_denoising(records: List[Dict]):
+    """timing.viz_subplan_denoising: per-expansion denoising video upload cost."""
+    recs = get_tag(records, "timing.viz_subplan_denoising")
+    if not recs:
+        print("  [timing.viz_subplan_denoising] No records — add logging around viz_subplan_denoising block")
+        return
+    data = [r.get("data", {}) for r in recs]
+    n_cands = [d.get("n_candidates", 0) for d in data]
+    expand_ms = [d.get("expand_ms", 0) for d in data]
+    replan_ms = [d.get("replan_ms", 0) for d in data]
+    unc_ms    = [d.get("uncertainty_ms", 0) for d in data]
+    total_ms  = [d.get("total_ms", 0) for d in data]
+    section("Subplan Denoising Viz  (timing.viz_subplan_denoising)")
+    table(
+        [
+            ("n expansion calls",     len(recs),                       ""),
+            ("avg n_candidates",      f"{avg(n_cands):.1f}",           ""),
+            ("avg expand video",      f"{avg(expand_ms):.0f} ms",      f"max {max(expand_ms):.0f} ms"),
+            ("avg replan video",      f"{avg(replan_ms):.0f} ms",      f"max {max(replan_ms):.0f} ms"),
+            ("avg uncertainty video", f"{avg(unc_ms):.0f} ms",         f"max {max(unc_ms):.0f} ms"),
+            ("avg total",             f"{avg(total_ms):.0f} ms",       f"max {max(total_ms):.0f} ms"),
+        ],
+        ["Metric", "Mean", "Peak"],
+    )
+
+
+def report_viz_final_plans(records: List[Dict]):
+    """timing.viz_final_plans: node-value plan image upload cost per MCTS expansion."""
+    recs = get_tag(records, "timing.viz_final_plans")
+    if not recs:
+        print("  [timing.viz_final_plans] No records — add logging around viz_final_plans block")
+        return
+    data = [r.get("data", {}) for r in recs]
+    node_ms    = [d.get("node_value_ms", 0) for d in data]
+    compare_ms = [d.get("compare_ms", 0) for d in data]
+    total_ms   = [d.get("total_ms", 0) for d in data]
+    section("Final Plans Viz  (timing.viz_final_plans)")
+    table(
+        [
+            ("n expansion calls",    len(recs),                        ""),
+            ("avg node_value render", f"{avg(node_ms):.0f} ms",        f"max {max(node_ms):.0f} ms"),
+            ("avg compare render",   f"{avg(compare_ms):.0f} ms",      f"max {max(compare_ms):.0f} ms"),
+            ("avg total",            f"{avg(total_ms):.0f} ms",        f"max {max(total_ms):.0f} ms"),
+        ],
+        ["Metric", "Mean", "Peak"],
+    )
+    if any(v > 0 for v in total_ms):
+        total_viz_budget = sum(total_ms)
+        print(f"\n  Cumulative viz_final_plans cost across all expansions: {total_viz_budget:.0f} ms")
 
 
 def report_execute_plan(records: List[Dict]):
@@ -466,6 +538,24 @@ def report_post_exec(records: List[Dict]):
         ["Metric", "Mean", "Peak"],
     )
 
+    # Sub-breakdown (traj image / rollout video / mujoco video)
+    timg_ms  = [d.get("traj_image_ms",    0) for d in data]
+    rvid_ms  = [d.get("rollout_video_ms", 0) for d in data]
+    mjvid_ms = [d.get("mujoco_video_ms",  0) for d in data]
+    if any(v > 0 for v in timg_ms + rvid_ms + mjvid_ms):
+        print()
+        sub_rows = []
+        if any(v > 0 for v in timg_ms):
+            sub_rows.append(("traj image (make+upload)",
+                             f"{avg(timg_ms):.0f} ms", f"max {max(timg_ms):.0f} ms"))
+        if any(v > 0 for v in rvid_ms):
+            sub_rows.append(("rollout video (make+upload)",
+                             f"{avg(rvid_ms):.0f} ms", f"max {max(rvid_ms):.0f} ms"))
+        if any(v > 0 for v in mjvid_ms):
+            sub_rows.append(("mujoco render video (upload)",
+                             f"{avg(mjvid_ms):.0f} ms", f"max {max(mjvid_ms):.0f} ms"))
+        table(sub_rows, ["Sub-component", "Mean", "Peak"])
+
 
 def report_summary(records: List[Dict]):
     """Quick tag count overview to see what timing data is available."""
@@ -510,6 +600,8 @@ def main():
     report_hilp_viz(records)
     report_plan_postproc(records)
     report_post_exec(records)
+    report_viz_subplan_denoising(records)
+    report_viz_final_plans(records)
 
 
 if __name__ == "__main__":

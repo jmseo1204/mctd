@@ -3,7 +3,7 @@ Plan post-processing utilities for MCTD trajectory extraction and deduplication.
 
 Provides PlanPostprocMixin — a mixin class whose methods handle:
   - Depth-based prefix length calculation (_get_prefix_len_frames_from_depth)
-  - Plan endpoint extraction (_extract_plan_endpoint_obs_pos)
+  - Plan endpoint extraction (_extract_plan_endpoint_obs)
   - Endpoint-based plan deduplication (_deduplicate_by_endpoint)
   - Greedy proximity reordering of combined FWD+BWD plans (_reorder_plan_by_proximity)
   - FWD-BWD gap computation (_compute_plan_gap)
@@ -31,13 +31,13 @@ class PlanPostprocMixin:
     def _get_prefix_len_frames_from_depth(self, depth: int, seg_size: int) -> int:
         return depth * seg_size * self.frame_stack
 
-    def _extract_plan_endpoint_obs_pos(
+    def _extract_plan_endpoint_obs(
         self,
         plan_hists_last: torch.Tensor,  # (t*fs, c) — last denoising step for one candidate
         child_depth: int,
         seg_size: int,
     ) -> np.ndarray:
-        """Extract the obs_pos at the child node's denoised boundary from a plan tensor.
+        """Extract the obs at the child node's denoised boundary from a plan tensor.
 
         Args:
             plan_hists_last: Plan tensor for one candidate, shape (plan_tokens*fs, c).
@@ -45,13 +45,13 @@ class PlanPostprocMixin:
             seg_size: plan_tokens // sequence_dividing_factor.
 
         Returns:
-            obs_pos: np.ndarray of shape (observation_dim,).
+            obs: np.ndarray of shape (observation_dim,).
         """
         plan_unnormalized = self._unnormalize_x(
             plan_hists_last.unsqueeze(1)
         )  # (t*fs, 1, c)
         new_denoised_end: int = self._get_prefix_len_frames_from_depth(child_depth, seg_size)
-        return plan_unnormalized[new_denoised_end - 1, 0, :self.observation_dim].cpu().numpy()
+        return plan_unnormalized[new_denoised_end - 1, 0, self.obs_bundle_indices].cpu().numpy()
 
     # ------------------------------------------------------------------
     # Deduplication
@@ -60,7 +60,7 @@ class PlanPostprocMixin:
     def _deduplicate_by_endpoint(
         self,
         expanded_node_candidates: list,  # list of candidate dicts, len B
-        candidate_obs_poses: list,  # list of np.ndarray (observation_dim,), len B
+        candidate_obses: list,  # list of np.ndarray (observation_dim,), len B
         is_feasible: list,  # list of bool, len B
     ) -> list:
         """Among feasible plans from the same parent, kill duplicates whose endpoints
@@ -69,7 +69,7 @@ class PlanPostprocMixin:
 
         Args:
             expanded_node_candidates: Candidate dicts (each has 'parent_node', 'target_node').
-            candidate_obs_poses: Predicted endpoint obs_pos per candidate.
+            candidate_obses: Predicted endpoint obs per candidate.
             is_feasible: Feasibility flags per candidate.
 
         Returns:
@@ -90,14 +90,14 @@ class PlanPostprocMixin:
         for parent_name, indices in parent_groups.items():
             # All siblings in the same group share the same target_node (set by _select_dynamic_goal)
             target_node = expanded_node_candidates[indices[0]].get("target_node")
-            if target_node is not None and target_node.obs_pos is not None:
+            if target_node is not None and target_node.obs is not None:
                 # Stack endpoints for this group → compute V(endpoint_i, target) in one batch
-                group_obs = np.stack([candidate_obs_poses[i] for i in indices])  # (G, obs_dim)
+                group_obs = np.stack([candidate_obses[i] for i in indices])  # (G, n_obs)
                 target_tiled = np.tile(
-                    target_node.obs_pos[: self.observation_dim], (len(indices), 1)
-                )  # (G, obs_dim)
+                    target_node.obs, (len(indices), 1)
+                )  # (G, n_obs) — obs already indexed by obs_dim_indices
                 hilp_vals = self._compute_hilp_values(
-                    group_obs[:, : self.observation_dim],
+                    group_obs,
                     target_tiled,
                     use_no_grad=True,
                 ).cpu().numpy()  # (G,)
@@ -115,14 +115,11 @@ class PlanPostprocMixin:
                     j = feasible_indices[b_idx]
                     if not is_kept[j]:
                         continue
-                    if self.use_TD_metric_as_dist:
-                        _obs_i = candidate_obs_poses[i].reshape(1, -1).astype(np.float32)
-                        _obs_j = candidate_obs_poses[j].reshape(1, -1).astype(np.float32)
-                        dist = float(self._compute_state_temporal_dist_np(_obs_i, _obs_j)[0])
-                    else:
-                        dist = np.linalg.norm(
-                            candidate_obs_poses[i][self.pos_dim_indices] - candidate_obs_poses[j][self.pos_dim_indices]
-                        )
+                    _obs_i = candidate_obses[i].reshape(1, -1).astype(np.float32)
+                    _obs_j = candidate_obses[j].reshape(1, -1).astype(np.float32)
+                    _pos_i = candidate_obses[i][self.pos_dim_indices].reshape(1, -1).astype(np.float32)
+                    _pos_j = candidate_obses[j][self.pos_dim_indices].reshape(1, -1).astype(np.float32)
+                    dist = float(self._compute_distance(_obs_i, _obs_j, _pos_i, _pos_j)[0])
                     if dist < self.diverge_threshold:
                         # Duplicate: kill the one with lower HILP value (farther from target)
                         if group_values[i] >= group_values[j]:
@@ -159,24 +156,18 @@ class PlanPostprocMixin:
             return plan_unnormalized
 
         threshold = self.meeting_delta
-        if self.use_TD_metric_as_dist:
-            obs_frames = plan_unnormalized[:, 0, :self.observation_dim].detach().cpu().numpy()  # (N, obs_dim)
-        else:
-            # (N, pos_dim) — positions in maze coordinates
-            positions = plan_unnormalized[:, 0, self.pos_dim_indices].detach().cpu().numpy()
+        obs_frames = plan_unnormalized[:, 0, self.obs_bundle_indices].detach().cpu().numpy()  # (N, n_obs)
+        positions = plan_unnormalized[:, 0, self.pos_dim_indices].detach().cpu().numpy()  # (N, pos_dim)
 
         result_indices = [0]
         current_idx = 0
 
         while current_idx < n_frames - 1:
             remaining_start = current_idx + 1
-            if self.use_TD_metric_as_dist:
-                M = n_frames - remaining_start
-                _cur_rep = np.broadcast_to(obs_frames[current_idx:current_idx + 1], (M, obs_frames.shape[1])).copy()
-                dists = self._compute_state_temporal_dist_np(obs_frames[remaining_start:], _cur_rep)
-            else:
-                remaining_pos = positions[remaining_start:]  # (M, pos_dim)
-                dists = np.linalg.norm(remaining_pos - positions[current_idx], axis=1)  # (M,)
+            M = n_frames - remaining_start
+            _cur_obs_rep = np.broadcast_to(obs_frames[current_idx:current_idx + 1], (M, obs_frames.shape[1])).copy()
+            _cur_pos_rep = np.broadcast_to(positions[current_idx:current_idx + 1], (M, positions.shape[1])).copy()
+            dists = self._compute_distance(obs_frames[remaining_start:], _cur_obs_rep, positions[remaining_start:], _cur_pos_rep)
 
             within = np.where(dists <= threshold)[0]            # local indices, ascending
             if len(within) > 0:
@@ -238,22 +229,27 @@ class PlanPostprocMixin:
         if a_len == 0 or b_len == 0:
             return None
 
-        if self.use_TD_metric_as_dist:
-            _std_np = self.data_std[:self.observation_dim].cpu().numpy() if isinstance(self.data_std, torch.Tensor) else np.array(self.data_std[:self.observation_dim])
-            _mean_np = self.data_mean[:self.observation_dim].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean[:self.observation_dim])
-            _seg_a_unnorm = t1_segments[:, :self.observation_dim].detach().cpu().numpy() * _std_np + _mean_np
-            _seg_b_unnorm = t2_flipped[:, :self.observation_dim].detach().cpu().numpy() * _std_np + _mean_np
-            A, B = _seg_a_unnorm.shape[0], _seg_b_unnorm.shape[0]
-            _obs_ab = np.repeat(_seg_a_unnorm, B, axis=0)
-            _goal_ab = np.tile(_seg_b_unnorm, (A, 1))
-            return float(self._compute_state_temporal_dist_np(_obs_ab, _goal_ab).min())
-        else:
-            _std_np = self.data_std[self.pos_dim_indices].cpu().numpy() if isinstance(self.data_std, torch.Tensor) else np.array(self.data_std)[self.pos_dim_indices]
-            _mean_np = self.data_mean[self.pos_dim_indices].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean)[self.pos_dim_indices]
-            _seg_a_unnorm = t1_segments[:, self.pos_dim_indices].detach().cpu().numpy() * _std_np + _mean_np
-            _seg_b_unnorm = t2_flipped[:, self.pos_dim_indices].detach().cpu().numpy() * _std_np + _mean_np
-            _diffs = _seg_a_unnorm[:, None, :] - _seg_b_unnorm[None, :, :]  # (A, B, pos_dim)
-            return float(np.linalg.norm(_diffs, axis=2).min())
+        # Prepare observation data
+        _obs_std_np = np.array(self.observation_std)
+        _obs_mean_np = np.array(self.observation_mean)
+        _seg_a_obs = t1_segments[:, self.obs_bundle_indices].detach().cpu().numpy() * _obs_std_np + _obs_mean_np
+        _seg_b_obs = t2_flipped[:, self.obs_bundle_indices].detach().cpu().numpy() * _obs_std_np + _obs_mean_np
+        
+        # Prepare position data
+        _pos_std_np = self.data_std[self.pos_dim_indices].cpu().numpy() if isinstance(self.data_std, torch.Tensor) else np.array(self.data_std)[self.pos_dim_indices]
+        _pos_mean_np = self.data_mean[self.pos_dim_indices].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean)[self.pos_dim_indices]
+        _seg_a_pos = t1_segments[:, self.pos_dim_indices].detach().cpu().numpy() * _pos_std_np + _pos_mean_np
+        _seg_b_pos = t2_flipped[:, self.pos_dim_indices].detach().cpu().numpy() * _pos_std_np + _pos_mean_np
+        
+        # Compute pairwise distances
+        A, B = _seg_a_obs.shape[0], _seg_b_obs.shape[0]
+        _obs_ab = np.repeat(_seg_a_obs, B, axis=0)
+        _goal_ab = np.tile(_seg_b_obs, (A, 1))
+        _pos_ab = np.repeat(_seg_a_pos, B, axis=0)
+        _pos_goal_ab = np.tile(_seg_b_pos, (A, 1))
+        
+        dists = self._compute_distance(_obs_ab, _goal_ab, _pos_ab, _pos_goal_ab)
+        return float(dists.min())
 
     # ------------------------------------------------------------------
     # Output plan construction
@@ -321,8 +317,8 @@ class PlanPostprocMixin:
             c = combined.shape[-1]
             n_goal_pad = 1
             goal_frame = torch.zeros(n_goal_pad, c, dtype=combined.dtype, device=combined.device)
-            goal_obs = goal_normalized[0, : self.observation_dim]  # (obs_dim,)
-            goal_frame[:, : self.observation_dim] = goal_obs.unsqueeze(0).expand(n_goal_pad, -1)
+            goal_obs = goal_normalized[0]  # (n_obs,) — goal_normalized is already obs-only
+            goal_frame[:, self.obs_bundle_indices] = goal_obs.unsqueeze(0).expand(n_goal_pad, -1)
             combined = torch.cat([combined, goal_frame], dim=0)  # (A_len+B_len+n_goal_pad, c)
 
         output = combined.unsqueeze(1)  # (T, 1, c)

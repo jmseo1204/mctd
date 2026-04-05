@@ -188,8 +188,8 @@ class PlanVizMixin:
             if current_node.sim_state is not None:
                 pos = current_node.sim_state["qpos"][:2]  # physical: qpos[:2] = world (x,y)
                 trajectory.append(pos)
-            elif current_node.obs_pos is not None:
-                trajectory.append(current_node.obs_pos)
+            elif current_node.obs is not None:
+                trajectory.append(current_node.obs)
 
             # Move to parent
             current_node = current_node._parent_node
@@ -220,6 +220,7 @@ class PlanVizMixin:
         loops: int,
         log_prefix: str = "plan",
         plan_hist_override=None,
+        is_uncertainty_viz: bool = False,
     ) -> None:
         """Build and log a per-candidate denoising video to WandB.
 
@@ -237,8 +238,14 @@ class PlanVizMixin:
             tgt_vis_cache: Mutable cache dict mapping target-node name →
                 ``(heatmap, grad_field)``.  Updated in-place.
             sc_by_name: Per-candidate denoising-step captures keyed by name.
-            obs_std_np: Observation std in world coordinates ``(pos_dim,)``.
+            obs_std_np: Observation std in world coordinates ``(obs_dim,)``.
             loops: Current MPC loop index (used for WandB step alignment).
+            plan_hist_override: If provided, used instead of vnode.plan_history[-1].
+                In normal mode: (fast_steps+1, plan_tokens*fs, c).
+                In uncertainty mode: (fast_steps+1, plan_tokens*fs, G*K, c).
+            is_uncertainty_viz: If True, plan_hist_override carries G*K fast-sampled
+                trajectories. Each is rendered as a red-gradient scatter; green endpoint
+                dots with alpha proportional to relative guidance-scale intensity.
         """
         vnode = vinfo.get("node")
         if vnode is None or not vnode.plan_history:
@@ -247,8 +254,38 @@ class PlanVizMixin:
         seg_size = active_tree.plan_tokens // self.sequence_dividing_factor
         alen = self._get_prefix_len_frames_from_depth(vnode.depth, seg_size)
 
-        # Single guidance-target index: end of the currently denoised segment.
-        tail_vis = np.array([alen - 1]) if alen > 0 else np.array([], dtype=int)
+        if is_uncertainty_viz and plan_hist_override is not None:
+            # In uncertainty mode the endpoint is the NEXT segment boundary.
+            unc_alen = min(
+                self._get_prefix_len_frames_from_depth(vnode.depth + 1, seg_size),
+                plan_hist_override.shape[1],
+            )
+            tail_vis = np.array([unc_alen - 1]) if unc_alen > 0 else np.array([], dtype=int)
+
+            # Precompute per-sample alpha based on relative guidance-scale intensity.
+            # Batch ordering within each candidate: for g in G_scales: for k in K_copies.
+            K = self.fast_sampling_multiple
+            gk_total = plan_hist_override.shape[2]  # should equal G*K
+            scales = self.mctd_guidance_scales
+            s_min, s_max = min(scales), max(scales)
+            scale_range = s_max - s_min if s_max > s_min else 1.0
+            # For sample index j: g_idx = j // K, scale = scales[g_idx]
+            # Alpha range [0.5, 1.0] — less extreme than [0.2, 1.0] so faint dots stay visible.
+            unc_scale_alphas = np.array([
+                0.5 + 0.5 * (scales[j // K] - s_min) / scale_range
+                for j in range(gk_total)
+            ], dtype=np.float32)
+            # Legend entries: one per unique guidance scale (G total).
+            unc_guidance_legend = [
+                (f"gs={s:.3g}", float(0.5 + 0.5 * (s - s_min) / scale_range))
+                for s in scales
+            ]
+        else:
+            unc_alen = None
+            unc_scale_alphas = None
+            unc_guidance_legend = None
+            # Single guidance-target index: end of the currently denoised segment.
+            tail_vis = np.array([alen - 1]) if alen > 0 else np.array([], dtype=int)
 
         node_traj = self._extract_node_trajectory(vnode)
         is_fwd = active_tree.is_tree1
@@ -258,8 +295,8 @@ class PlanVizMixin:
             else None
         )
         tgt_pos = (
-            vnode.target_node.obs_pos
-            if vnode.target_node is not None and getattr(vnode.target_node, 'obs_pos', None) is not None
+            vnode.target_node.obs
+            if vnode.target_node is not None and getattr(vnode.target_node, 'obs', None) is not None
             else None
         )
 
@@ -273,7 +310,7 @@ class PlanVizMixin:
             else:
                 try:
                     cand_heatmap = self._compute_hilp_heatmap(
-                        tgt_pos[:self.observation_dim].astype(np.float32)
+                        tgt_pos.astype(np.float32)  # tgt_pos already indexed by obs_dim_indices
                     )
                 except Exception:
                     pass
@@ -286,62 +323,87 @@ class PlanVizMixin:
                 if tgt_name is not None:
                     tgt_vis_cache[tgt_name] = (cand_heatmap, cand_grad_field)
 
-        hist = plan_hist_override if plan_hist_override is not None else vnode.plan_history[-1]  # (K, plan_tokens*fs, c)
+        hist = plan_hist_override if plan_hist_override is not None else vnode.plan_history[-1]  # (steps, plan_tokens*fs, [G*K,] c)
         frames = []
         step_caps = sc_by_name.get(vname)
         _dn_step_indices = getattr(self, '_parallel_plan_step_indices', None)
         _dn_step_total = getattr(self, '_parallel_plan_step_total', None)
 
         for m in range(hist.shape[0]):
-            pu = self._unnormalize_x(hist[m].unsqueeze(1))  # (plan_tokens*fs, 1, c)
-            plan = pu[:alen, :, self.pos_dim_indices].detach().cpu().numpy() if alen > 0 else None
+            if is_uncertainty_viz:
+                # hist[m]: (plan_tokens*fs, G*K, c) — unnormalize all samples at once
+                pu_all = self._unnormalize_x(hist[m])  # (plan_tokens*fs, G*K, c)
+                gk_total = pu_all.shape[1]
+                plan = None  # main plan slot unused in uncertainty mode
+                gpos = xs_gpos = gg = pg = xs_gg = xs_pg = None
 
-            gpos = xs_gpos = gg = pg = xs_gg = xs_pg = None
+                # Build G*K trajectories and their endpoints for this denoising step.
+                unc_plans_list = []
+                unc_guidance_targets = []
+                for j in range(gk_total):
+                    traj_j = (
+                        pu_all[:unc_alen, j, self.pos_dim_indices].detach().cpu().numpy()
+                        if unc_alen > 0
+                        else np.zeros((0, len(self.pos_dim_indices)))
+                    )  # (unc_alen, pos_dim)
+                    unc_plans_list.append(traj_j)
+                    if len(traj_j) > 0:
+                        unc_guidance_targets.append(traj_j[-1])  # (pos_dim,)
+                    else:
+                        unc_guidance_targets.append(np.zeros(len(self.pos_dim_indices)))
+                unc_guidance_targets = np.stack(unc_guidance_targets, axis=0)  # (G*K, pos_dim)
+                unc_guidance_alphas = unc_scale_alphas  # (G*K,) precomputed
+            else:
+                pu = self._unnormalize_x(hist[m].unsqueeze(1))  # (plan_tokens*fs, 1, c)
+                plan = pu[:alen, :, self.pos_dim_indices].detach().cpu().numpy() if alen > 0 else None
+                unc_plans_list = unc_guidance_targets = unc_guidance_alphas = None
 
-            if len(tail_vis) > 0:
-                gpos = pu[tail_vis][:, 0][:, self.pos_dim_indices].detach().cpu().numpy()
+                gpos = xs_gpos = gg = pg = xs_gg = xs_pg = None
 
-                if step_caps is not None and m < len(step_caps):
-                    sc = step_caps[m]
-                    pn = sc.get('prior_pred_noise')
-                    gg_dict = sc.get('guidance_grads', {})
+                if len(tail_vis) > 0:
+                    gpos = pu[tail_vis][:, 0][:, self.pos_dim_indices].detach().cpu().numpy()
 
-                    # DPS-theory-correct scales:
-                    # sigma_t = sqrt(1-α_t); prior_scale = sqrt(α_t).
-                    sigma_t = 1.0
-                    prior_scale = 0.0
-                    nl_data = sc.get('noise_level')
-                    if nl_data is not None:
-                        tail_tok = min(int(tail_vis[0]) // self.frame_stack, len(nl_data) - 1)
-                        sigma_t = float(nl_data[tail_tok].clamp(0.0, 1.0).item())
-                        prior_scale = float((1.0 - sigma_t ** 2) ** 0.5)
+                    if step_caps is not None and m < len(step_caps):
+                        sc = step_caps[m]
+                        pn = sc.get('prior_pred_noise')
+                        gg_dict = sc.get('guidance_grads', {})
 
-                    # Prior: -ε_θ × sqrt(α_t) — grows as denoising progresses
-                    if pn is not None:
-                        pg = -pn[tail_vis][:, self.pos_dim_indices].numpy() * obs_std_np * prior_scale
+                        # DPS-theory-correct scales:
+                        # sigma_t = sqrt(1-α_t); prior_scale = sqrt(α_t).
+                        sigma_t = 1.0
+                        prior_scale = 0.0
+                        nl_data = sc.get('noise_level')
+                        if nl_data is not None:
+                            tail_tok = min(int(tail_vis[0]) // self.frame_stack, len(nl_data) - 1)
+                            sigma_t = float(nl_data[tail_tok].clamp(0.0, 1.0).item())
+                            prior_scale = float((1.0 - sigma_t ** 2) ** 0.5)
 
-                    # Guidance: +grad × σ_t — x̂_0 moves toward goal
-                    if gg_dict:
-                        gg = (
-                            sum(v[tail_vis][:, self.pos_dim_indices].numpy() for v in gg_dict.values())
-                            * obs_std_np
-                        ) * sigma_t
+                        # Prior: -ε_θ × sqrt(α_t) — grows as denoising progresses
+                        if pn is not None:
+                            pg = -pn[tail_vis][:, self.pos_dim_indices].numpy() * obs_std_np * prior_scale
 
-                    # pred_x_start (x̂_0) visualization
-                    pxs_cpu = sc.get('pred_x_start_pos')
-                    if pxs_cpu is not None:
-                        pxs_world = self._unnormalize_x(pxs_cpu.unsqueeze(1))
-                        xs_gpos = pxs_world[tail_vis][:, 0][:, self.pos_dim_indices].detach().cpu().numpy()
-
-                        gg_clean_dict = sc.get('guidance_grads_clean', {})
-                        if gg_clean_dict:
-                            xs_gg = (
-                                sum(v[tail_vis][:, self.pos_dim_indices].numpy() for v in gg_clean_dict.values())
+                        # Guidance: +grad × σ_t — x̂_0 moves toward goal
+                        if gg_dict:
+                            gg = (
+                                sum(v[tail_vis][:, self.pos_dim_indices].numpy() for v in gg_dict.values())
                                 * obs_std_np
                             ) * sigma_t
 
-                        if pn is not None:
-                            xs_pg = -pn[tail_vis][:, self.pos_dim_indices].numpy() * obs_std_np * prior_scale
+                        # pred_x_start (x̂_0) visualization
+                        pxs_cpu = sc.get('pred_x_start_pos')
+                        if pxs_cpu is not None:
+                            pxs_world = self._unnormalize_x(pxs_cpu.unsqueeze(1))
+                            xs_gpos = pxs_world[tail_vis][:, 0][:, self.pos_dim_indices].detach().cpu().numpy()
+
+                            gg_clean_dict = sc.get('guidance_grads_clean', {})
+                            if gg_clean_dict:
+                                xs_gg = (
+                                    sum(v[tail_vis][:, self.pos_dim_indices].numpy() for v in gg_clean_dict.values())
+                                    * obs_std_np
+                                ) * sigma_t
+
+                            if pn is not None:
+                                xs_pg = -pn[tail_vis][:, self.pos_dim_indices].numpy() * obs_std_np * prior_scale
 
             td = {
                 'plan': plan,
@@ -357,6 +419,10 @@ class PlanVizMixin:
                 'pred_x_start_prior_grad': xs_pg,
                 'hilp_heatmap': cand_heatmap,
                 'hilp_grad_field': cand_grad_field,
+                'unc_plans_list': unc_plans_list,
+                'unc_guidance_targets': unc_guidance_targets,
+                'unc_guidance_alphas': unc_guidance_alphas,
+                'unc_guidance_legend': unc_guidance_legend,
             }
             img = make_trajectory_images(
                 self.env_id, td, 1, start_np, goal_np, self.plot_end_points
@@ -373,6 +439,8 @@ class PlanVizMixin:
                 frame_rgb = np.array(_pil_img)
             frames.append(frame_rgb)
 
+        if len(frames) <= 1:
+            return  # skip single-frame (zero-length) video upload
         video = np.stack(frames, axis=0).transpose(0, 3, 1, 2)  # (K, 3, H, W)
         label = self._node_path_label(vnode, active_tree.is_tree1, vnode.target_node)
         video_step = self.get_safe_wandb_step(min_step=loops)

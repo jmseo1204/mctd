@@ -27,6 +27,7 @@ dataset instance (OGBench environments) with DictConfig
 This is the primary file (~2600 lines). **Treat it as authoritative — it overrides `df_base.py` behavior.**
 
 Key entry points and call chain:
+
 ```
 interact() → p_mctd_plan() → _run_mcts_search() → _extract_output_plan()
                                                  → _execute_plan_in_env()
@@ -38,6 +39,7 @@ interact() → p_mctd_plan() → _run_mcts_search() → _extract_output_plan()
 - `_extract_output_plan()`: Extracts trajectory segment based on tree depth and `sequence_dividing_factor`
 
 **Plan segment extraction:**
+
 ```
 seg_size = plan_tokens // sequence_dividing_factor
 used_len = depth * seg_size * frame_stack
@@ -47,6 +49,7 @@ plan_a_full[used_len:] = unused (contains undenoised noise)
 ### Key Tensor Dimensions
 
 Always verify when modifying `_construct_sequence()` or value computation:
+
 - Observations: `(batch, n_tokens, obs_dim)` after frame stacking
 - Actions: `(batch, n_tokens-1, action_dim)` — **one fewer token than observations**
 - Noise levels: `(batch, n_tokens)` aligned with diffusion timesteps
@@ -64,6 +67,7 @@ Physical state dict with keys `qpos` (joint positions) and `qvel` (joint velocit
 ### Configuration System (Hydra)
 
 Root config: `configurations/config.yaml`. Defaults point to:
+
 - `algorithm/df_planning.yaml` → extends `df_base.yaml`
 - `dataset/og_antmaze_giant_stitch.yaml` (or similar)
 - `experiment/exp_planning.yaml`
@@ -73,32 +77,38 @@ Root config: `configurations/config.yaml`. Defaults point to:
 ## Common Development Commands
 
 **Interactive training (Docker):**
+
 ```bash
 bash train.sh   # menu: select state dim (2D/15D/29D), jump value, resume checkpoint
 ```
 
 **Direct execution:**
+
 ```bash
 python main.py experiment.tasks=[training] experiment=exp_planning algorithm=df_planning dataset=og_antmaze_giant_stitch +name=MyRun wandb.mode=offline
 ```
 
 **Resume / load checkpoint:**
+
 ```bash
 python main.py resume=<wandb_run_id> experiment.tasks=[training]
 python main.py load=<wandb_run_id> experiment.tasks=[validation]
 ```
 
 **Full eval pipeline:**
+
 ```bash
 bash eval.sh   # selects state dim → checkpoint → generates jobs → runs via Docker
 ```
 
 **Debugging (reduced scope):**
+
 ```bash
 python main.py +name=test algorithm=df_planning mctd_max_search_num=10 parallel_search_num=1 wandb.mode=offline
 ```
 
 **Test scripts (root directory):**
+
 ```bash
 python test_padding_consistency.py   # validate padding mode changes
 python test_gradient_flow.py
@@ -106,6 +116,7 @@ python test_trajectory_diagnostics.py
 ```
 
 **Analysis:**
+
 ```bash
 bash latency_analysis.sh                            # timing & job time breakdown
 bash guidance_analysis.sh                            # guidance quality & MCTS debug
@@ -115,40 +126,44 @@ python scripts/run_jobs.py                          # execute job specs
 
 ## Key Parameters (df_planning.yaml)
 
-| Parameter | Purpose |
-|-----------|---------|
-| `mctd_num_denoising_steps` | Denoising iterations per generation (≤ `sampling_timesteps` in df_base.yaml) |
-| `mctd_max_search_num` | Max MCTS tree expansions |
-| `parallel_search_num` | Parallel search instances (each holds own MCTSTreeState — watch memory) |
-| `mctd_guidance_scales` | List of guidance scales for exploration |
-| `sequence_dividing_factor` | Segments per planning level (must match `is_unknown_final_token`) |
-| `horizon_scale` | `horizon = episode_len * horizon_scale` |
-| `open_loop_horizon` | Steps executed per plan |
-| `val_max_loops` | Max rollout loops per validation episode |
-| `meeting_delta` | Bidirectional tree convergence threshold |
-| `padding_mode` | `"same"` or `"zero"` — changing this requires `test_padding_consistency.py` |
-| `use_rollout` | If `false`, derive `obs_pos` from plan_history (skip physical sim) |
-| `leaf_parallelization` | Parallelize leaf node evaluation |
+| Parameter                  | Purpose                                                                      |
+| -------------------------- | ---------------------------------------------------------------------------- |
+| `sampling_timesteps`       | DDIM steps per generation — directly controls denoising iterations (≤ `timesteps` from ckpt) |
+| `mctd_max_search_num`      | Max MCTS tree expansions                                                     |
+| `parallel_search_num`      | Parallel search instances (each holds own MCTSTreeState — watch memory)      |
+| `mctd_guidance_scales`     | List of guidance scales for exploration                                      |
+| `sequence_dividing_factor` | Segments per planning level (must match `is_unknown_final_token`)            |
+| `horizon_scale`            | `horizon = episode_len * horizon_scale`                                      |
+| `open_loop_horizon`        | Steps executed per plan                                                      |
+| `val_max_loops`            | Max rollout loops per validation episode                                     |
+| `meeting_delta`            | Bidirectional tree convergence threshold                                     |
+| `padding_mode`             | `"same"` or `"zero"` — changing this requires `test_padding_consistency.py`  |
+| `use_rollout`              | If `false`, derive `obs` from plan_history (skip physical sim)               |
+| `leaf_parallelization`     | Parallelize leaf node evaluation                                             |
 
 ## Code Conventions
 
 ### Algorithm Implementation
+
 - All algorithms inherit from `BaseAlgo` or `BasePyTorchAlgo` (in `df_base.py`)
 - Must implement `run()` and accept `DictConfig cfg` in `__init__`
 - **Do not modify `df_base.py`** unless absolutely necessary — it's infrastructure
 
 ### Environment Management
+
 - Use `env_manager.EnvManager` for vectorized environments
 - State management via `_get_sim_state()` / `_set_sim_state()` for MCTS rollouts
 - AntMaze: state = `[qpos + qvel]` (29D), goal = `sub_goal_pos[:2]`
 - PointMaze: PID controller from prev_sim_state to current_sim_state
 
 ### Configuration
+
 - Never hardcode parameters — always use Hydra config via `self.cfg`
 - Use `+` prefix for new config keys on CLI: `+new_key=value`
 - Set `WANDB_ENTITY` before running experiments with online logging
 
 ### What to Avoid
+
 - Changing tensor shapes without validating throughout the pipeline
 - Skipping padding validation when modifying sequence logic
 - Overriding Hydra defaults in code (use config files)
@@ -156,18 +171,18 @@ python scripts/run_jobs.py                          # execute job specs
 
 ## File Organization
 
-| File | Purpose |
-|------|---------|
-| `main.py` | Hydra entry point |
+| File                                          | Purpose                                     |
+| --------------------------------------------- | ------------------------------------------- |
+| `main.py`                                     | Hydra entry point                           |
 | `algorithms/diffusion_forcing/df_planning.py` | Core MCTS+diffusion algorithm (~2600 lines) |
-| `algorithms/diffusion_forcing/tree_node.py` | TreeNode for MCTS |
-| `algorithms/diffusion_forcing/df_base.py` | Base class infrastructure |
-| `algorithms/diffusion_forcing/guidance.py` | Plan guidance (goal, HILP, RDF) |
-| `algorithms/diffusion_forcing/env_manager.py` | Vectorized env management |
-| `algorithms/diffusion_forcing/models/` | Neural network architectures |
-| `experiments/exp_planning.py` | Training/validation experiment tasks |
-| `configurations/config.yaml` | Root Hydra config |
-| `configurations/algorithm/df_planning.yaml` | Algorithm hyperparameters |
+| `algorithms/diffusion_forcing/tree_node.py`   | TreeNode for MCTS                           |
+| `algorithms/diffusion_forcing/df_base.py`     | Base class infrastructure                   |
+| `algorithms/diffusion_forcing/guidance.py`    | Plan guidance (goal, HILP, RDF)             |
+| `algorithms/diffusion_forcing/env_manager.py` | Vectorized env management                   |
+| `algorithms/diffusion_forcing/models/`        | Neural network architectures                |
+| `experiments/exp_planning.py`                 | Training/validation experiment tasks        |
+| `configurations/config.yaml`                  | Root Hydra config                           |
+| `configurations/algorithm/df_planning.yaml`   | Algorithm hyperparameters                   |
 
 - `debug/` for unit tests and debug scripts; `scripts/` for non-experiment scripts
 - Do not run files in `algorithms/` directly — use `main.py`
@@ -187,4 +202,5 @@ python scripts/run_jobs.py                          # execute job specs
 ## Known Issues
 
 ### Undenoised Tokens in Later Plan Segments (partially mitigated)
+
 Only the first `used_len` tokens are fully denoised; remaining tokens carry noise artifacts. Current mitigation: use `sequence_dividing_factor=5` and `horizon_scale=0.5`. If noise artifacts persist, consider increasing `sequence_dividing_factor` further or implementing explicit denoising masking.

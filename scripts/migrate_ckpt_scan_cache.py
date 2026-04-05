@@ -31,7 +31,7 @@ ALGO_DEFAULTS = {
 }
 DIFFUSION_DEFAULTS = {
     "timesteps": 1000,
-    "sampling_timesteps": 100,
+    # sampling_timesteps removed: eval-time param, not ckpt-bound
     "beta_schedule": "linear",
     "objective": "pred_x0",
     "use_fused_snr": False,

@@ -341,6 +341,10 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
     rollout_current_agent = plot_data.get("rollout_current_agent")
     rollout_current_subgoal = plot_data.get("rollout_current_subgoal")
     postprocessed_plan = plot_data.get("postprocessed_plan")
+    unc_plans_list = plot_data.get("unc_plans_list")          # list of (T, pos_dim) arrays or None
+    unc_guidance_targets = plot_data.get("unc_guidance_targets")  # (G*K, pos_dim) or None
+    unc_guidance_alphas = plot_data.get("unc_guidance_alphas")    # (G*K,) floats or None
+    unc_guidance_legend = plot_data.get("unc_guidance_legend")    # list of (label, alpha) per scale or None
 
     if is_grid_env(env_id):
         maze_grid = get_maze_grid(env_id)
@@ -377,6 +381,40 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
         ax.plot(node_xy[:, 0], node_xy[:, 1], "b-", linewidth=2, alpha=0.6, label="Expanding Path")
         ax.scatter(node_xy[:, 0], node_xy[:, 1], c="blue", marker="o", s=100, alpha=0.7,
                    edgecolors="darkblue", linewidth=2, zorder=5)
+
+    if unc_plans_list is not None and len(unc_plans_list) > 0:
+        # unc_plans_list: list of G*K arrays (T, pos_dim) — uncertainty fast-sampled trajectories.
+        # Each is rendered as a red-gradient scatter (same style as the main plan).
+        # unc_guidance_targets: (G*K, pos_dim) — endpoint positions.
+        # unc_guidance_alphas: (G*K,) — green dot alpha scaled by relative guidance intensity.
+        for j, traj_j in enumerate(unc_plans_list):
+            if traj_j is None or len(traj_j) == 0:
+                continue
+            traj_xy = _to_plot_coords(env_id, traj_j[:, :2])
+            ax.scatter(traj_xy[:, 0], traj_xy[:, 1], c=np.arange(len(traj_xy)), cmap="Reds",
+                       alpha=0.5, s=20, zorder=4)
+
+        if unc_guidance_targets is not None and len(unc_guidance_targets) > 0:
+            alphas = unc_guidance_alphas if unc_guidance_alphas is not None else np.ones(len(unc_guidance_targets))
+            for j, ep in enumerate(unc_guidance_targets):
+                ep_xy = _to_plot_coords(env_id, np.asarray(ep)[:2])
+                alpha_j = float(np.clip(alphas[j], 0.0, 1.0)) if j < len(alphas) else 1.0
+                ax.scatter(ep_xy[0], ep_xy[1], c="lime", marker="o", s=80, zorder=9,
+                           edgecolors="green", linewidth=1.2, alpha=alpha_j,
+                           label="_nolegend_")
+
+            # Add one proxy legend entry per unique guidance scale.
+            if unc_guidance_legend is not None:
+                import matplotlib.lines as mlines
+                proxy_handles = []
+                for label, leg_alpha in unc_guidance_legend:
+                    proxy = mlines.Line2D([], [], color="lime", marker="o", linestyle="None",
+                                         markersize=7, markeredgecolor="green",
+                                         markeredgewidth=1.2, alpha=leg_alpha, label=label)
+                    proxy_handles.append(proxy)
+                unc_leg = ax.legend(handles=proxy_handles, loc="lower right", framealpha=0.6,
+                                    fontsize=7, title="unc gs", title_fontsize=7)
+                ax.add_artist(unc_leg)  # pin so the main ax.legend() call below doesn't overwrite it
 
     if target_node_trajectory is not None and len(target_node_trajectory) > 0:
         tgt_xy = _to_plot_coords(env_id, target_node_trajectory[:, :2])
