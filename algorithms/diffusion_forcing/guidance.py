@@ -148,7 +148,7 @@ def compute_guidance_grad_np(
         kde_score_norm = np.linalg.norm(kde_score, axis=-1)  # (N,)
         score_mean = float(kde_score_norm.mean())
         score_std = float(kde_score_norm.std()) + 1e-8
-        threshold = score_mean - 0.3 * score_std
+        threshold = score_mean + planner.kde_grad_thres_sigma_coeff * score_std
         mask_below_threshold = kde_score_norm < threshold  # (N,)
         kde_score_filtered = kde_score.copy()
         kde_score_filtered[mask_below_threshold] = 0.0
@@ -156,6 +156,11 @@ def compute_guidance_grad_np(
         hilp_combined_np = hilp_grad_normalized + kde_lam * kde_score_filtered
     else:
         hilp_combined_np = hilp_grad_normalized
+
+    # 3b. Optionally re-normalize the combined vector to unit length
+    if getattr(planner, 'regularize_goal_guidance', False):
+        combined_mag = np.linalg.norm(hilp_combined_np, axis=-1, keepdims=True).clip(min=1e-8)
+        hilp_combined_np = hilp_combined_np / combined_mag
 
     # 4. HILP values V(obs, target) for threshold-based switching
     # Use planner._compute_hilp_values for consistency with heatmap (same pessimistic

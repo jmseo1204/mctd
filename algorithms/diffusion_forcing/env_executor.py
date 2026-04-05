@@ -186,6 +186,8 @@ class PlanExecutorMixin:
         prev_sim_state = None
         loop_cnt = 0
         _reached_last_subgoal = False
+        prev_sub_goal_sim_state = None   # sub_goal before last switch (for action blending)
+        sub_goal_transition_remaining = 0  # steps left in blend window
         rollout_agent_positions = []
         rollout_subgoal_positions = []
         mujoco_frames = []
@@ -214,12 +216,13 @@ class PlanExecutorMixin:
                 _dist_ms.append((time.time() - _dist_t0) * 1000)
 
                 if dist_to_sg < self.meeting_delta:
-                    if sub_goal_step < plan_frame_format.shape[0] - self.sub_goal_interval:
-                        sub_goal_step += self.sub_goal_interval
-                        sub_goal_sim_state["qpos"][:2] = plan_slice_np[sub_goal_step, self.pos_dim_indices]
-                    # else:
-                        # Reached last sub_goal — take one final step to collect reward, then exit
-                        # _reached_last_subgoal = True
+                    prev_sub_goal_sim_state = {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in sub_goal_sim_state.items()}
+                    sub_goal_step = min(sub_goal_step + self.sub_goal_interval, plan_frame_format.shape[0]-1)
+                    sub_goal_sim_state["qpos"][:2] = plan_slice_np[sub_goal_step, self.pos_dim_indices]
+                    sub_goal_transition_remaining = self.sub_goal_blend_steps
+
+                    # Reached last sub_goal — take one final step to collect reward, then exit
+                    # _reached_last_subgoal = True
 
             rollout_agent_positions.append(current_sim_state["qpos"][:2].copy())  # physical (x,y)
             if sub_goal_sim_state is not None:
@@ -232,6 +235,26 @@ class PlanExecutorMixin:
             if use_diffused_action:
                 plan_frame = plan_frame_format[min(loop_cnt, plan_frame_format.shape[0] - 1)]
                 _, action, _ = self.split_bundle(plan_frame)
+            elif "antmaze" in self.env_id and sub_goal_transition_remaining > 0 and prev_sub_goal_sim_state is not None:
+                # Sub-goal just switched: blend old and new actions to avoid sudden jerk.
+                # alpha_new ramps linearly from 1/(N+1) to N/(N+1) over N blend steps.
+                _blend_steps = self.sub_goal_blend_steps
+                _step_idx = _blend_steps - sub_goal_transition_remaining + 1  # 1 → N
+                alpha_new = _step_idx / (_blend_steps + 1)
+                action_new = self._compute_action_from_plan(
+                    agent=agent,
+                    sub_goal_sim_state=sub_goal_sim_state,
+                    current_sim_state=current_sim_state,
+                    prev_sim_state=prev_sim_state,
+                )
+                action_old = self._compute_action_from_plan(
+                    agent=agent,
+                    sub_goal_sim_state=prev_sub_goal_sim_state,
+                    current_sim_state=current_sim_state,
+                    prev_sim_state=prev_sim_state,
+                )
+                action = (1.0 - alpha_new) * action_old + alpha_new * action_new
+                sub_goal_transition_remaining -= 1
             else:
                 action = self._compute_action_from_plan(
                     agent=agent,

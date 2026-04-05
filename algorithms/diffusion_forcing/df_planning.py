@@ -176,6 +176,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.parallel_multiple_visits = cfg.parallel_multiple_visits
         self.num_tries_for_bad_plans = cfg.num_tries_for_bad_plans
         self.sub_goal_interval = cfg.sub_goal_interval
+        self.sub_goal_blend_steps = cfg.get("sub_goal_blend_steps", 1)
         self.viz_final_plans = cfg.viz_final_plans
         self.meeting_delta = cfg.get("meeting_delta", 0.5)
         self.plan_feasibility_delta = cfg.get("plan_feasibility_delta", 100.0)
@@ -208,7 +209,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.use_score_func_with_TD = cfg.get("use_score_func_with_TD", True)
         self.TD_thres_for_far_target = cfg.get("TD_thres_for_far_target", None)
         self.kde_sigma = cfg.get("kde_sigma", 0.3)
+        self.kde_grad_thres_sigma_coeff = cfg.get("kde_grad_thres_sigma_coeff", 0.3)
         self.kde_lam = cfg.get("kde_lam", 2.0)
+        self.regularize_goal_guidance = cfg.get("regularize_goal_guidance", False)
         self.kde_sample_ratio = cfg.get("kde_sample_ratio", 0.1)
         self._kde_save_dir = os.path.expanduser(cfg.get("kde_save_dir", "~/.ogbench/data"))
         self.mcts_use_replan = cfg.get("mcts_use_replan", False)
@@ -346,6 +349,32 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         return object.__getattribute__(self, '_hilp_value_fn_instance')
 
+    def _pad_obs_to_hilp_dim(self, obs_np: np.ndarray) -> np.ndarray:
+        """Pad or crop observations to self.hilp_obs_dim.
+
+        Non-position dims are filled from _hilp_ref_obs (a real env joint-state reference)
+        so HILP receives in-distribution inputs rather than zeros.
+
+        Args:
+            obs_np: (N, D) float32 array.
+
+        Returns:
+            (N, hilp_obs_dim) float32 array.
+        """
+        obs_np = np.atleast_2d(obs_np).astype(np.float32)
+        D = obs_np.shape[-1]
+        if D == self.hilp_obs_dim:
+            return obs_np
+        _hilp_ref = getattr(self, '_hilp_ref_obs', None)
+        if D < self.hilp_obs_dim:
+            if _hilp_ref is not None:
+                out = np.broadcast_to(_hilp_ref[None], (obs_np.shape[0], self.hilp_obs_dim)).copy()
+                out[:, :D] = obs_np
+                return out
+            pad = np.zeros((obs_np.shape[0], self.hilp_obs_dim - D), dtype=np.float32)
+            return np.concatenate([obs_np, pad], axis=-1)
+        return obs_np[:, : self.hilp_obs_dim]
+
     def _compute_hilp_values(
         self,
         obs: Union[np.ndarray, torch.Tensor],
@@ -391,26 +420,10 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             f"[HILP Shape Error] Expected 2D tensors (N, D), got {obs_t.shape}"
         )
 
-        # 4. Padding/Cropping to self.hilp_obs_dim.
-        # Use real joint-state reference (qpos+qvel from env) for non-position dims
-        # instead of zeros, so HILP receives in-distribution inputs.
-        _hilp_ref = getattr(self, '_hilp_ref_obs', None)
-
-        def _pad(x):
-            if x.shape[-1] < self.hilp_obs_dim:
-                if _hilp_ref is not None:
-                    ref_t = torch.from_numpy(_hilp_ref).to(x.device)  # (hilp_obs_dim,)
-                    out = ref_t.unsqueeze(0).expand(x.shape[0], -1).clone()
-                    out[:, : x.shape[-1]] = x
-                    return out
-                padding = torch.zeros(
-                    (*x.shape[:-1], self.hilp_obs_dim - x.shape[-1]), device=x.device
-                )
-                return torch.cat([x, padding], dim=-1)
-            return x[..., : self.hilp_obs_dim]
-
-        obs_t = _pad(obs_t)
-        goal_t = _pad(goal_t)
+        # 4. Padding/Cropping to self.hilp_obs_dim via shared helper.
+        dev = obs_t.device
+        obs_t  = torch.from_numpy(self._pad_obs_to_hilp_dim(obs_t.cpu().numpy())).to(dev)
+        goal_t = torch.from_numpy(self._pad_obs_to_hilp_dim(goal_t.cpu().numpy())).to(dev)
 
         # 5. Compute values
         has_value_attr = hasattr(hilp_value_fn, "value")
@@ -1622,9 +1635,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                             continue
 
                         plan_hist_last: torch.Tensor = info["plan_history"][-1][-1]  # (t*fs, c)
-                        _child.obs = self._extract_plan_endpoint_obs(
-                            plan_hist_last, child_depth=parent_node.depth + 1, seg_size=seg_size,
-                        )  # (observation_dim,)
+                        _child.obs = self._extract_obs_at_boundary(
+                            plan_hist_last.unsqueeze(1),  # (t*fs, 1, c)
+                            depth=parent_node.depth + 1,
+                            seg_size=seg_size,
+                        )[0]  # (observation_dim,)
 
                         # Create new sim_state: copy parent's structure and update qpos[:2] with last valid position
                         _child.sim_state = {}
@@ -1642,11 +1657,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 # episode terminates after this loop's plan execution.
                 _v_start_np = start.cpu().numpy()[:, self.pos_dim_indices]
                 _v_goal_np = goal.cpu().numpy()[:, self.pos_dim_indices]
-                _v_goal_pos2d = goal.cpu().numpy()[0, self.pos_dim_indices]            # world coords
-                _v_goal_obs = goal.cpu().numpy()[0].astype(np.float32)  # for HILP — goal already indexed by obs_dim_indices
-                _v_gscale = self.mctd_guidance_scales[0] if self.mctd_guidance_scales else 0.0
                 _v_hilp_fn = getattr(self, '_hilp_value_fn_instance', None)
-                _v_hilp_ref = getattr(self, '_hilp_ref_obs', None)
 
                 # Heatmap & grad-field are computed per-candidate based on the target (green star),
                 # not the episode goal.  Cache by target_node name to avoid redundant computation.
@@ -2276,6 +2287,174 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         return values, achieved_infos, achieved_ts
 
+    def _check_achieved_bidir(
+        self,
+        expanded_node_candidates: List[dict],
+        final_best_plans: torch.Tensor,  # (plan_tokens*fs, B, c)
+        tree: "MCTSTreeState",
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Lightweight Achieved detection without Warp check.
+
+        Used exclusively when use_uncertainty_as_value=True so that value is determined
+        solely by uncertainty while goal-reaching is still recorded separately.
+
+        Checks whether any frame in the candidate's active segment falls within
+        meeting_delta of the target node (same slice logic as calculate_values_bidir).
+
+        Returns:
+            achieved_infos: np.ndarray shape (B,), values 'Achieved' or 'NotReached'
+            achieved_ts: np.ndarray shape (B,), frame index of first goal touch or -1
+        """
+        seg_size: int = tree.plan_tokens // self.sequence_dividing_factor
+        B: int = len(expanded_node_candidates)
+        achieved_infos: np.ndarray = np.array(["NotReached"] * B)
+        achieved_ts: np.ndarray = np.full(B, -1, dtype=object)
+
+        plan_unnorm = self._unnormalize_x(final_best_plans)  # (T*fs, B, c)
+        obs_raw, _, _ = self.split_bundle(plan_unnorm)       # (T*fs, B, obs_dim)
+        obs_np = obs_raw.detach().cpu().numpy()              # (T*fs, B, obs_dim)
+
+        for i, candidate in enumerate(expanded_node_candidates):
+            parent_node: "TreeNode" = candidate["parent_node"]
+            target_node: Optional["TreeNode"] = candidate["target_node"]
+            if target_node is None:
+                continue
+            goal_np: np.ndarray = target_node.obs  # (obs_dim,)
+
+            parent_seq_len: int = self._get_prefix_len_frames_from_depth(parent_node.depth, seg_size)
+            candid_seq_len: int = self._get_prefix_len_frames_from_depth(parent_node.depth + 1, seg_size)
+            max_seq_len: int = min(final_best_plans.shape[0], candid_seq_len)
+
+            for t in range(parent_seq_len, max_seq_len):
+                if np.linalg.norm(obs_np[t, i] - goal_np) < self.meeting_delta:
+                    achieved_infos[i] = "Achieved"
+                    achieved_ts[i] = t
+                    break
+
+        return achieved_infos, achieved_ts
+
+    def _compute_node_uncertainty(
+        self,
+        parent_node: "TreeNode",
+        target_node: "TreeNode",
+        tail_obs: np.ndarray,  # (G*K, obs_dim) — unnormalized tail observations
+        gamma: float = 0.995,
+        eps: float = 1e-8,
+        eps_progress: float = 0.01,
+    ) -> dict:
+        """Compute uncertainty of a tree node from the spread of fast-sampled tail states.
+
+        Theory: HILP converges to V(s,g) = -||phi(s)-phi(g)|| = -(1-γ^{d*})/(1-γ)
+        where d*(s,g) is the true temporal distance and γ is the discount factor.
+
+        Therefore the true temporal distance is recovered as:
+            emb_dist = ||phi(s) - phi(g)||
+            d*(s,g)  = log(1 - emb_dist*(1-γ)) / log(γ)
+
+        Sigma and g_hat are computed in HILP embedding space (not temporal-distance space).
+        T_curr, T_tail, and Delta_bar are in temporal-distance space (converted from emb_dist).
+
+        NOTE: Requires hilp_fn to expose get_phi(torch.Tensor) → torch.Tensor.
+        Currently only HILPJax and HILPMemoizedWrapper implement this interface.
+        HILP (PyTorch) uses a different get_phi signature and is NOT supported.
+
+        Args:
+            parent_node: Current tree node (source of curr_obs).
+            target_node: Goal tree node (source of goal_obs).
+            tail_obs: (G*K, obs_dim) unnormalized observations at the tail of each unc sample.
+            gamma: Discount factor used during HILP training (default 0.995).
+            eps: Small float for numerical stability.
+            eps_progress: Minimum Delta_bar as a fraction of T_curr (prevents M_rem blow-up).
+
+        Returns:
+            dict with keys: U, ln_K, sigma_parallel, sigma_perp,
+                            T_curr, T_tail, Delta_bar, M_rem
+        """
+        import math
+
+        hilp_fn = self._get_hilp_value_fn()
+        curr_obs: np.ndarray = parent_node.obs  # (obs_dim,)
+        goal_obs: np.ndarray = target_node.obs  # (obs_dim,)
+        K: int = tail_obs.shape[0]
+
+        all_obs = np.concatenate(
+            [curr_obs[None], goal_obs[None], tail_obs], axis=0
+        )  # (2+K, obs_dim)
+        all_obs_padded = self._pad_obs_to_hilp_dim(all_obs)
+
+        obs_t = torch.from_numpy(all_obs_padded).float().to(self.device)
+        with torch.no_grad():
+            Z_all = hilp_fn.get_phi(obs_t).cpu().numpy()  # (2+K, D)
+
+        z_curr = Z_all[0]   # (D,)
+        z_goal = Z_all[1]   # (D,)
+        Z      = Z_all[2:]  # (K, D)
+
+        # --- Degenerate: already at goal in embedding space ---
+        emb_dist_curr = float(np.linalg.norm(z_goal - z_curr))
+        if emb_dist_curr < eps:
+            return {
+                'U': 0.0, 'ln_K': 0.0,
+                'sigma_parallel': 0.0, 'sigma_perp': 0.0,
+                'T_curr': 0.0, 'T_tail': 0.0, 'Delta_bar': 0.0, 'M_rem': 0.0,
+            }
+
+        # --- Embedding-distance → temporal distance conversion ---
+        # HILP converges to ||phi(s)-phi(g)|| = (1-γ^{d*})/(1-γ)
+        # → d*(s,g) = log(1 - emb_dist*(1-γ)) / log(γ)
+        def _emb_to_td(emb_d: np.ndarray) -> np.ndarray:
+            val = 1.0 - np.asarray(emb_d, dtype=np.float64) * (1.0 - gamma)
+            val = np.clip(val, eps, 1.0 - eps)
+            return (np.log(val) / np.log(gamma)).astype(np.float64)
+
+        # --- Sigma in embedding space (step 2-4 from spec §3.2) ---
+        z_bar = Z.mean(axis=0)                    # (D,)
+        dZ    = Z - z_bar                          # (K, D)
+        N_cov = max(K - 1, 1)                      # unbiased when K > 1
+        Sigma = (dZ.T @ dZ) / N_cov               # (D, D)
+
+        g_hat = (z_goal - z_curr) / emb_dist_curr  # (D,) unit vector in embedding space
+
+        sigma_parallel_sq = float(g_hat @ Sigma @ g_hat)
+        sigma_parallel_sq = max(sigma_parallel_sq, eps)
+        sigma_perp_sq     = max(float(np.trace(Sigma)) - sigma_parallel_sq, eps)
+
+        # --- Per-step entropy ln_K (spec §2.3) ---
+        ln_K = (
+            math.log(2.0 * math.pi * math.e)
+            + 0.5 * math.log(sigma_parallel_sq)
+            + 0.5 * math.log(sigma_perp_sq)
+        )
+
+        # --- Temporal distances (converted from embedding L2) ---
+        T_curr = float(_emb_to_td(emb_dist_curr))
+
+        emb_dists_tail = np.linalg.norm(z_goal[None] - Z, axis=-1)  # (K,)
+        T_i    = _emb_to_td(emb_dists_tail)                          # (K,)
+        T_tail = float(T_i.mean())
+
+        Delta_bar = T_curr - T_tail
+        Delta_bar = max(Delta_bar, T_curr * eps_progress)  # floor at eps_progress fraction
+
+        M_rem = T_tail / Delta_bar
+        # Cap M_rem: when Delta_bar hits the eps_progress floor (T_tail ≈ T_curr → near-zero
+        # progress), M_rem blows up to ~1/eps_progress (~100).  Hard-cap at 20 for display
+        # sanity; the eps_progress floor already handles the U floor implicitly.
+        M_rem = min(M_rem, 20.0)
+        # U     = ln_K * (1.0 + M_rem)
+        U     = ln_K * T_curr
+
+        return {
+            'U':               U,
+            'ln_K':            ln_K,
+            'sigma_parallel':  math.sqrt(sigma_parallel_sq),
+            'sigma_perp':      math.sqrt(sigma_perp_sq),
+            'T_curr':          T_curr,
+            'T_tail':          T_tail,
+            'Delta_bar':       Delta_bar,
+            'M_rem':           M_rem,
+        }
+
     def _init_mcts_tree(
         self,
         horizon: int,
@@ -2630,6 +2809,10 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # Per-candidate uncertainty plan hists: populated by NODE UNCERTAINTY CHECK block.
             # Each entry is (fast_steps+1, plan_tokens*fs, K, c) or None.
             uncertainty_plan_hists_per_candidate: list = [None] * len(valid_candidates)
+            # Fallback buffer: always stores the last generated unc plan regardless of feasibility.
+            # Used to fill uncertainty_plan_hists_per_candidate[i] when a candidate's plan
+            # remains infeasible across all retries (mirrors the plan fallback at line ~3061).
+            _fallback_unc_plan_hists: list = [None] * len(valid_candidates)
 
             for _ in range(
                 self.num_tries_for_bad_plans
@@ -2966,22 +3149,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     B_cands = len(expanded_node_candidates)
                     K = self.fast_sampling_multiple
 
-                    # Build unc_init_plans from val_plan_hists (the final plan after replan/expand).
-                    # This wraps each candidate's last denoised frame into (n_tokens, 1, fs*c)
-                    # via _build_plan_from_leaf so parallel_plan can accept it.
-                    unc_init_plans = []
-                    for _i in range(B_cands):
-                        _plan_t_fs = val_plan_hists[-1, :, _i].unsqueeze(1)  # (plan_tokens*fs, 1, c)
-                        _plan_tokens_val = horizon // self.frame_stack
-                        _plan_rearranged = rearrange(
-                            _plan_t_fs, "(t fs) b c -> t b (fs c)", fs=self.frame_stack
-                        )  # (plan_tokens, 1, fs*c)
-                        _parent_node = expanded_node_candidates[_i]["parent_node"]
-                        _unc_plan, _ = self._build_plan_from_leaf(
-                            _parent_node, _plan_tokens_val, seg_size, expanded_plan=_plan_rearranged
-                        )  # (n_tokens, 1, fs*c)
-                        unc_init_plans.append(_unc_plan)
-
                     # Build fast noise schedule using fast_sampling_steps.
                     # Same starting levels as replanning (expanded_node_updated_levels).
                     assert expanded_node_updated_levels is not None, (
@@ -2992,16 +3159,42 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         num_denoising_steps_override=self.fast_sampling_steps,
                     )  # (B_cands, fast_steps+1, plan_tokens)
 
-                    # Replicate each candidate K*G times (K copies per guidance scale G).
-                    # Batch order within each candidate: [g0*K, g1*K, ..., g_{G-1}*K]
+                    # Build G*K independent init plans per candidate.
+                    # Batch order: [cand0·g0·k0, cand0·g0·k1, …, cand0·g1·k0, …, cand_{B-1}·g_{G-1}·k_{K-1}]
+                    # Strategy: build ONE base plan per candidate from val_plan_hists (the replanned/
+                    # expanded plan), preserving the denoised prefix + obs_parent + first replanned
+                    # segment.  For each K copy, clone base and replace only the future undenoised
+                    # tokens [child_depth*seg_size+1 : plan_tokens+1] with fresh randn.  This keeps
+                    # the already-denoised trajectory intact while giving K independently diverse
+                    # future trajectories.
                     G = len(self.mctd_guidance_scales)
+                    _plan_tokens_val = horizon // self.frame_stack
                     unc_noise_levels_rep = np.repeat(unc_noise_levels, K * G, axis=0)  # (B*G*K, fast_steps+1, plan_tokens)
                     unc_init_plans_rep = []
                     unc_guidance_scale_vals = []  # per-sample guidance scale (length B*G*K)
                     for _i in range(B_cands):
+                        _parent_node = expanded_node_candidates[_i]["parent_node"]
+                        # Build base plan from val_plan_hists (replanned or expanded plan)
+                        _plan_t_fs = val_plan_hists[-1, :, _i].unsqueeze(1)  # (plan_tokens*fs, 1, c)
+                        _plan_rearranged_unc = rearrange(
+                            _plan_t_fs, "(t fs) b c -> t b (fs c)", fs=self.frame_stack
+                        )  # (plan_tokens, 1, fs*c)
+                        _base_plan, _ = self._build_plan_from_leaf(
+                            _parent_node, _plan_tokens_val, seg_size,
+                            expanded_plan=_plan_rearranged_unc,
+                        )  # (n_tokens, 1, fs*c)
+                        # Future undenoised tokens: child_depth*seg_size+1 onward (token-space index)
+                        _child_depth = _parent_node.depth + 1
+                        _future_start = _child_depth * seg_size + 1
+                        _n_future = _plan_tokens_val + 1 - _future_start
                         for g_scale in self.mctd_guidance_scales:
                             for _ in range(K):
-                                unc_init_plans_rep.append(unc_init_plans[_i])
+                                _unc_plan = _base_plan.clone()
+                                if _n_future > 0:
+                                    _unc_plan[_future_start : _plan_tokens_val + 1] = (
+                                        self._sample_clamped_noise(_n_future)
+                                    )
+                                unc_init_plans_rep.append(_unc_plan)
                                 unc_guidance_scale_vals.append(g_scale)
                     unc_guidance_scale_tensor = torch.tensor(
                         unc_guidance_scale_vals, dtype=torch.float32, device=self.device
@@ -3028,7 +3221,12 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     for _i in range(B_cands):
                         start_idx_k = _i * G * K
                         end_idx_k = start_idx_k + G * K
-                        uncertainty_plan_hists_per_candidate[_i] = unc_batch_plan_hists[:, :, start_idx_k:end_idx_k, :]
+                        unc_plan = unc_batch_plan_hists[:, :, start_idx_k:end_idx_k, :]
+                        # Always save the latest generated plan as fallback (regardless of feasibility).
+                        # This ensures uncertainty_plan_hists_per_candidate[i] is never None after
+                        # the retry loop, even if the expansion plan was infeasible across all retries.
+                        _fallback_unc_plan_hists[_i] = unc_plan
+                        uncertainty_plan_hists_per_candidate[_i] = unc_plan
 
 
                 for i in range(len(is_feasible)):
@@ -3066,6 +3264,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     filtered_replanned_plan_hists[i] = (
                         replanned_plan_hists[:, :, i] if self.mcts_use_replan else expanded_node_plan_hists[:, :, i]
                     )
+                    # [A4] Inject fallback uncertainty plan for infeasible candidates.
+                    # uncertainty_plan_hists_per_candidate[i] is killed (set to None) after each
+                    # failed retry; _fallback_unc_plan_hists[i] always holds the last generated one.
+                    if self.use_uncertainty_as_value and uncertainty_plan_hists_per_candidate[i] is None:
+                        uncertainty_plan_hists_per_candidate[i] = _fallback_unc_plan_hists[i]
             expanded_node_plan_hists = torch.stack(
                 filtered_expanded_node_plan_hists, dim=2
             )  # m (t fs) 'B' c
@@ -3076,17 +3279,54 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # Value Calculation
             replan_value_calculation_start = time.time()
             achieved_indices = []
-            final_best_plans = replanned_plan_hists[-1] # (plan_tokens*fs, b, c)
+            final_best_plans = replanned_plan_hists[-1]  # (plan_tokens*fs, b, c)
 
-            values, achieved_infos, achieved_ts = self.calculate_values_bidir(
-                expanded_node_candidates, final_best_plans, tree
-            )
-            for i in range(len(achieved_infos)):  # B
-                achieved_info = achieved_infos[i]
-                achieved_t = achieved_ts[i]
-                if achieved_info == "Achieved":
-                    tree.achieved = True
-                    achieved_indices.append(i)
+            unc_results: dict = {}  # candidate index → _compute_node_uncertainty result dict
+
+            if self.use_uncertainty_as_value:
+                # [A5] Achieved detection without Warp: value is decided solely by uncertainty.
+                # Warp is not checked — only goal proximity matters for recording Achieved.
+                achieved_infos, achieved_ts = self._check_achieved_bidir(
+                    expanded_node_candidates, final_best_plans, tree
+                )
+                for i in range(len(achieved_infos)):
+                    if achieved_infos[i] == "Achieved":
+                        tree.achieved = True
+                        achieved_indices.append(i)
+
+                # Compute -uncertainty as value for each candidate.
+                values = np.zeros(len(expanded_node_candidates))
+                for i, candidate in enumerate(expanded_node_candidates):
+                    parent_node_i = candidate["parent_node"]
+                    target_node_i = candidate["target_node"]
+                    child_depth_i = candidate["depth"]
+                    unc_hists_i   = uncertainty_plan_hists_per_candidate[i]
+                    assert unc_hists_i is not None, (
+                        f"[Uncertainty] uncertainty_plan_hists_per_candidate[{i}] is None "
+                        "after fallback injection — this should not happen."
+                    )
+                    # Each K copy was built with fresh noise (expanded_plan=None) → G*K
+                    # samples are independent.  Use all G*K for sigma estimation.
+                    tail_obs_i = self._extract_obs_at_boundary(
+                        unc_hists_i[-1],           # (plan_tokens*fs, G*K, c)
+                        depth=child_depth_i + 1,   # next segment boundary (undenoised region)
+                        seg_size=seg_size,
+                    )  # (G*K, obs_dim)
+                    unc_result = self._compute_node_uncertainty(
+                        parent_node=parent_node_i,
+                        target_node=target_node_i,
+                        tail_obs=tail_obs_i,
+                    )
+                    values[i] = -unc_result['U']
+                    unc_results[i] = unc_result  # store for visualization
+            else:
+                values, achieved_infos, achieved_ts = self.calculate_values_bidir(
+                    expanded_node_candidates, final_best_plans, tree
+                )
+                for i in range(len(achieved_infos)):
+                    if achieved_infos[i] == "Achieved":
+                        tree.achieved = True
+                        achieved_indices.append(i)
 
             replan_value_calculation_end = time.time()
 
@@ -3095,9 +3335,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             for i in range(len(expanded_node_candidates)):
                 child_depth = expanded_node_candidates[i]["depth"]
                 plan_hists_last_i = expanded_node_plan_hists[-1, :, i]  # (plan_tokens*fs, c)
-                obs_i = self._extract_plan_endpoint_obs(
-                    plan_hists_last_i, child_depth=child_depth, seg_size=seg_size,
-                )  # (observation_dim,)
+                obs_i = self._extract_obs_at_boundary(
+                    plan_hists_last_i.unsqueeze(1),  # (plan_tokens*fs, 1, c)
+                    depth=child_depth,
+                    seg_size=seg_size,
+                )[0]  # (observation_dim,)
                 candidate_obses.append(obs_i)
 
             is_kept = self._deduplicate_by_endpoint(
@@ -3153,6 +3395,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     expanded_node_infos[name]["expanded_plan_hist_frame"] = expanded_plan_hist_i
                     expanded_node_infos[name]["replanned_plan_hist_frame"] = replanned_plan_hist_i
                     expanded_node_infos[name]["uncertainty_plan_hist_frame"] = uncertainty_plan_hists_per_candidate[i]
+                    expanded_node_infos[name]["unc_diagnostics"] = unc_results.get(i)
                     expanded_node_infos[name]["current_levels"] = updated_level
                 else:
                     if value > expanded_node_infos[name]["value"]:
@@ -3164,12 +3407,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         expanded_node_infos[name]["expanded_plan_hist_frame"] = expanded_plan_hist_i
                         expanded_node_infos[name]["replanned_plan_hist_frame"] = replanned_plan_hist_i
                         expanded_node_infos[name]["uncertainty_plan_hist_frame"] = uncertainty_plan_hists_per_candidate[i]
+                        expanded_node_infos[name]["unc_diagnostics"] = unc_results.get(i)
                         expanded_node_infos[name]["current_levels"] = updated_level
 
             for name in selected_nodes_for_expansion:
                 parent_node_for_expand = selected_nodes_for_expansion[name]
                 expand_kwargs = {k: v for k, v in expanded_node_infos[name].items()
-                                 if k not in ("expanded_plan_hist_frame", "replanned_plan_hist_frame", "uncertainty_plan_hist_frame")}
+                                 if k not in ("expanded_plan_hist_frame", "replanned_plan_hist_frame", "uncertainty_plan_hist_frame", "unc_diagnostics")}
                 child_node = parent_node_for_expand.expand(
                     **expand_kwargs
                 )
@@ -3373,6 +3617,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
     # Helper functions for bidirectional alternating MCTS
     # =========================================================================
 
+    def _sample_clamped_noise(self, n_tokens: int, batch_size: int = 1) -> torch.Tensor:
+        """Sample (n_tokens, batch_size, *x_stacked_shape) randn clamped to clip_noise."""
+        noise = torch.randn((n_tokens, batch_size, *self.x_stacked_shape), device=self.device)
+        return torch.clamp(noise, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise)
+
     def _build_obs_parent_token(self, parent_node: "TreeNode") -> torch.Tensor:
         """Build the obs_parent_token (position 0 anchor) for a plan tensor.
 
@@ -3477,13 +3726,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             )
             noisy_parts = expanded_plan[prefix_len:]  # (noisy_total, 1, fs*c)
         else:
-            noisy_parts = torch.randn(
-                (noisy_total, batch_size, *self.x_stacked_shape),
-                device=self.device,
-            )
-            noisy_parts = torch.clamp(
-                noisy_parts, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise
-            )
+            noisy_parts = self._sample_clamped_noise(noisy_total, batch_size)
 
         # Assemble plan_tokens-length chunk: [prefix | obs_parent | noisy]
         # obs_parent token is inserted only when using dynamic padding (parent's obs varies by depth)

@@ -24,7 +24,8 @@ noise_level_building_way: others # smooth, causal, or others
 num_tries_for_bad_plans: 5
 open_loop_horizon: 1300 #fixme -> best: episode_len*horizon_scale
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
-sub_goal_interval: 1
+sub_goal_interval: 3
+sub_goal_blend_steps: 1 # steps to blend old/new sub_goal actions after a sub_goal switch (antmaze only)
 horizon_scale: 0.45 # horizon = episode_len * horizon_scale
 sequence_dividing_factor: 3
 parallel_search_node: 3 # parallel_search_num = parallel_search_node * len(mctd_guidance_scales)
@@ -49,17 +50,17 @@ warp_threshold: 3.0
 diverge_threshold: 4.0 # min endpoint distance to count as distinct path (below → deduplicate)
 min_progress_threshold: 1.5 # min distance (x,y) between sub_plan start and end
 plan_feasibility_delta: 99999.0 # max per-frame movement (world units) to count a plan as feasible
-meeting_delta: 1.5
+meeting_delta: 1.2
 
 # [wandb visualization]
 viz_agent_rollout: false # set True to upload *_interaction/sample_*_video to wandb (slow)
-viz_final_plans: True
+viz_final_plans: true
 viz_compare_expanded_to_value: false
 viz_mujoco_renderer: false
-viz_subplan_denoising: True # set True to upload plan/plan_at_* to wandb (slow)
+viz_subplan_denoising: true # set True to upload plan/plan_at_* to wandb (slow)
 viz_uncertain_next_subplan_last_obs: true
 profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
-frame_sampling_way: "linear" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
+frame_sampling_way: "quadratic" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
 
 # HILP memoization: precompute phi(s) on a 2D grid and use bilinear interpolation
 use_hilp_memoization: true # set true to enable
@@ -69,14 +70,16 @@ hilp_memoization_grid_size: 360 # grid resolution per axis
 use_score_func_with_TD: true # if true: HILP grad + KDE score grad; if false: HILP grad only
 TD_thres_for_far_target: -200.0 # HILP value threshold: V < threshold → use RMSE guidance
 # KDE-weighted guidance: unit_grad = ∇V/|∇V| + kde_lam·∇log p
-kde_sigma: 0.2 # KDE bandwidth (world units)
+kde_sigma: 0.3 # KDE bandwidth (world units)
+kde_grad_thres_sigma_coeff: 0.3 # threshold = mean + coeff * std for KDE gradient filtering
 kde_lam: 0.15 # scale for ∇log p term
+regularize_goal_guidance: true # if true: re-normalize (unit_hilp + kde_lam·kde_score) to unit vector before applying guidance_scale
 kde_sample_ratio: 0.1 # fraction of dataset to use for KDE (1.0 = full dataset)
 kde_save_dir: "~/.ogbench/data" # dataset npz directory for KDE positions
 
 # REPLANNING
 mcts_use_replan: true
-replanning_target_level: 11 # noise level to add when replanning already-denoised prefix
+replanning_target_level: 20 # 11 for linear, noise level to add when replanning already-denoised prefix
 
 # UNCERTAINTY CHECK
 use_uncertainty_as_value: true
@@ -133,7 +136,7 @@ diffusion:
   # Controls both denoising granularity and step count (must satisfy: sampling_timesteps <= timesteps).
   # For fast uncertainty sampling, use fast_sampling_steps < sampling_timesteps.
   sampling_timesteps: 60
-  sampling_way: "quadratic" # 'linear': uniform stride; 'quadratic': dense near x_0 (low timesteps)
+  sampling_way: "linear" # 'linear': uniform stride; 'quadratic': dense near x_0 (low timesteps)
   # Schema stubs restored from ckpt training_hparams (actual values come from ckpt)
   timesteps: null
   beta_schedule: null

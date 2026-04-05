@@ -102,6 +102,26 @@ class HILPMemoizedWrapper:
     # ------------------------------------------------------------------
     # Public interface (matching HILP / HILPJax)
     # ------------------------------------------------------------------
+
+    def get_phi(self, obs):
+        """Return psi(obs) embedding — matches HILPJax.get_phi interface.
+
+        NOTE: This interface is based on HILPJax.get_phi (torch.Tensor in → torch.Tensor out).
+        HILP (PyTorch) uses a different get_phi signature (np.ndarray in → np.ndarray out)
+        and is NOT supported here. If you switch to a PyTorch-based ckpt, update this method.
+
+        Args:
+            obs: (N, obs_dim) torch.Tensor — observations (only x,y dims used for grid lookup)
+
+        Returns:
+            psi: (N, D) torch.Tensor — psi embedding from ensemble member 0
+        """
+        import torch
+        obs_np = obs.detach().cpu().numpy().astype(np.float32)
+        xi, yi = self._xy_to_fidx(obs_np)
+        psi = self._bilinear(self._psi_grids[0], xi, yi)  # (N, D)
+        return torch.from_numpy(psi).float().to(self.device)
+
     def value(self, obs_t, goal_t):
         """value(obs, goal) → (v1, v2) — matches HILP/HILPJax interface."""
         import torch

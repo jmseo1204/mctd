@@ -33,6 +33,7 @@ EVAL_BASE="$MCTD_EVAL_BASE"
 
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$OUTPUT_MOUNT_DIR"
+chmod 777 "$OUTPUT_MOUNT_DIR"
 
 # ────────────────────────────────────────────────────────
 # GPU selection (before interactive menus)

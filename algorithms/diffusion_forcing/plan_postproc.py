@@ -3,7 +3,7 @@ Plan post-processing utilities for MCTD trajectory extraction and deduplication.
 
 Provides PlanPostprocMixin — a mixin class whose methods handle:
   - Depth-based prefix length calculation (_get_prefix_len_frames_from_depth)
-  - Plan endpoint extraction (_extract_plan_endpoint_obs)
+  - Plan obs extraction at a segment boundary (_extract_obs_at_boundary)
   - Endpoint-based plan deduplication (_deduplicate_by_endpoint)
   - Greedy proximity reordering of combined FWD+BWD plans (_reorder_plan_by_proximity)
   - FWD-BWD gap computation (_compute_plan_gap)
@@ -31,27 +31,39 @@ class PlanPostprocMixin:
     def _get_prefix_len_frames_from_depth(self, depth: int, seg_size: int) -> int:
         return depth * seg_size * self.frame_stack
 
-    def _extract_plan_endpoint_obs(
+    def _extract_obs_at_boundary(
         self,
-        plan_hists_last: torch.Tensor,  # (t*fs, c) — last denoising step for one candidate
-        child_depth: int,
+        plan: torch.Tensor,  # (T, N, c) — last denoising step already selected by caller
+        depth: int,
         seg_size: int,
     ) -> np.ndarray:
-        """Extract the obs at the child node's denoised boundary from a plan tensor.
+        """Extract unnormalized observations at frame index `depth * seg_size * fs - 1`.
+
+        Unified replacement for the former _extract_plan_endpoint_obs /
+        _extract_unc_tail_obs pair.  The caller controls which boundary to look at by
+        choosing `depth`, and which samples to include by choosing N (1 for a single
+        candidate plan, G*K for the uncertainty batch).
 
         Args:
-            plan_hists_last: Plan tensor for one candidate, shape (plan_tokens*fs, c).
-            child_depth: Depth of the child node (parent.depth + 1).
+            plan: (T, N, c) tensor — the relevant denoising step.
+                  For a single-candidate plan: pass plan_tensor.unsqueeze(1) so N=1.
+                  For the uncertainty batch:   pass unc_plan_hists[-1] so N=G*K.
+            depth: Boundary index.  Frame extracted = depth * seg_size * fs - 1.
+                   • For endpoint deduplication (current boundary):  pass child_depth.
+                   • For uncertainty sigma (next undenoised boundary): pass child_depth + 1.
             seg_size: plan_tokens // sequence_dividing_factor.
 
         Returns:
-            obs: np.ndarray of shape (observation_dim,).
+            (N, obs_dim) numpy array of unnormalized world-coordinate observations.
+            For N=1 callers that need a 1-D result, index with [0].
         """
-        plan_unnormalized = self._unnormalize_x(
-            plan_hists_last.unsqueeze(1)
-        )  # (t*fs, 1, c)
-        new_denoised_end: int = self._get_prefix_len_frames_from_depth(child_depth, seg_size)
-        return plan_unnormalized[new_denoised_end - 1, 0, self.obs_bundle_indices].cpu().numpy()
+        idx = min(
+            self._get_prefix_len_frames_from_depth(depth, seg_size) - 1,
+            plan.shape[0] - 1,
+        )
+        frame = plan[idx]  # (N, c)
+        unnorm = self._unnormalize_x(frame.unsqueeze(0))  # (1, N, c)
+        return unnorm[0, :, self.obs_bundle_indices].cpu().numpy()  # (N, obs_dim)
 
     # ------------------------------------------------------------------
     # Deduplication

@@ -13,6 +13,8 @@ All methods reference `self.*` attributes/methods provided by the base class or 
 
 from __future__ import annotations
 
+import math
+import re
 from typing import Optional
 
 import numpy as np
@@ -20,6 +22,19 @@ from PIL import Image, ImageDraw
 
 from utils.logging_utils import get_maze_grid, is_grid_env, make_trajectory_images
 from . import guidance
+
+
+def _fmt_sci(v: float) -> str:
+    """Format float as compact scientific notation: 1.23e2, -4.56e-3.
+
+    Strips leading zeros from exponent and the '+' sign:
+        1.23e+02  →  1.23e2
+       -4.56e-03  → -4.56e-3
+    """
+    s = f"{v:.2e}"
+    s = re.sub(r'e\+0*(\d+)', r'e\1', s)
+    s = re.sub(r'e-0*(\d+)', r'e-\1', s)
+    return s
 
 
 class PlanVizMixin:
@@ -323,6 +338,36 @@ class PlanVizMixin:
                 if tgt_name is not None:
                     tgt_vis_cache[tgt_name] = (cand_heatmap, cand_grad_field)
 
+        # ------------------------------------------------------------------
+        # Prepare per-frame text labels
+        # ------------------------------------------------------------------
+        # Value label: shown above vnode.obs for ALL viz types (expand/replan/uncertainty).
+        _raw_value = vinfo.get("value")
+        node_value_label = _fmt_sci(float(_raw_value)) if _raw_value is not None else None
+
+        # Uncertainty diagnostics label: shown below vnode.obs only for uncertainty viz.
+        node_unc_label = None
+        if is_uncertainty_viz:
+            unc_diag = vinfo.get("unc_diagnostics")
+            if unc_diag is not None:
+                sp = unc_diag.get('sigma_parallel', 0.0)
+                sv = unc_diag.get('sigma_perp', 0.0)
+                # m_rem = unc_diag.get('M_rem', 0.0)
+                T_curr = unc_diag.get('T_curr', 0.0)
+                ln_sp = math.log(sp) if sp > 0 else float('-inf')
+                ln_sv = math.log(sv) if sv > 0 else float('-inf')
+                node_unc_label = (
+                    f"ln\u03c3\u2225={_fmt_sci(ln_sp)}\n"
+                    f"ln\u03c3\u22a5={_fmt_sci(ln_sv)}\n"
+                    f"T_curr={_fmt_sci(T_curr)}"
+                )
+
+        # Expanded node position (world coords) used as anchor for labels.
+        expanded_node_pos = (
+            vnode.obs[:2].copy() if vnode is not None and getattr(vnode, 'obs', None) is not None
+            else None
+        )
+
         hist = plan_hist_override if plan_hist_override is not None else vnode.plan_history[-1]  # (steps, plan_tokens*fs, [G*K,] c)
         frames = []
         step_caps = sc_by_name.get(vname)
@@ -423,6 +468,10 @@ class PlanVizMixin:
                 'unc_guidance_targets': unc_guidance_targets,
                 'unc_guidance_alphas': unc_guidance_alphas,
                 'unc_guidance_legend': unc_guidance_legend,
+                # Value & uncertainty labels (same for every denoising-step frame)
+                'expanded_node_pos': expanded_node_pos,
+                'node_value_label': node_value_label,
+                'node_unc_label': node_unc_label,
             }
             img = make_trajectory_images(
                 self.env_id, td, 1, start_np, goal_np, self.plot_end_points

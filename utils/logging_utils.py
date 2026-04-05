@@ -311,6 +311,7 @@ def _parse_trajectory_plot_inputs(trajectory):
         "rollout_current_agent",
         "rollout_current_subgoal",
         "postprocessed_plan",
+        "expanded_node_pos",
     ]:
         if key in plot_data and plot_data[key] is not None:
             plot_data[key] = np.asarray(plot_data[key])
@@ -413,7 +414,7 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
                                          markeredgewidth=1.2, alpha=leg_alpha, label=label)
                     proxy_handles.append(proxy)
                 unc_leg = ax.legend(handles=proxy_handles, loc="lower right", framealpha=0.6,
-                                    fontsize=7, title="unc gs", title_fontsize=7)
+                                    fontsize=9, title="unc gs", title_fontsize=9)
                 ax.add_artist(unc_leg)  # pin so the main ax.legend() call below doesn't overwrite it
 
     if target_node_trajectory is not None and len(target_node_trajectory) > 0:
@@ -580,6 +581,46 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
         ax.scatter(subgoal_xy[0], subgoal_xy[1], c="lime", marker="o", s=180, zorder=14,
                    edgecolors="darkgreen", linewidth=1.5, label="Sub-goal")
 
+    # --- Expanded-node value & uncertainty text labels ---
+    # expanded_node_pos: (2,) world coords of the newly expanded node (vnode.obs[:2])
+    # node_value_label: compact scientific string shown ABOVE the node position (all viz types)
+    # node_unc_label:   multi-line string shown BELOW the node position (uncertainty viz only)
+    expanded_node_pos = plot_data.get("expanded_node_pos")
+    node_value_label  = plot_data.get("node_value_label")
+    node_unc_label    = plot_data.get("node_unc_label")
+
+    if expanded_node_pos is not None:
+        epos = np.asarray(expanded_node_pos).flatten()[:2]
+        epos_p = _to_plot_coords(env_id, epos)  # (2,) plot coords
+
+        if node_value_label is not None:
+            ax.annotate(
+                node_value_label,
+                xy=(epos_p[0], epos_p[1]),
+                xytext=(0, +12),
+                textcoords="offset points",
+                fontsize=8,
+                color="yellow",
+                ha="center",
+                va="bottom",
+                zorder=20,
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="black", alpha=0.65, edgecolor="none"),
+            )
+
+        if node_unc_label is not None:
+            ax.annotate(
+                node_unc_label,
+                xy=(epos_p[0], epos_p[1]),
+                xytext=(0, -14),
+                textcoords="offset points",
+                fontsize=7,
+                color="cyan",
+                ha="center",
+                va="top",
+                zorder=20,
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="black", alpha=0.65, edgecolor="none"),
+            )
+
     if ((node_trajectory is not None and len(node_trajectory) > 0)
             or (target_node_trajectory is not None and len(target_node_trajectory) > 0)
             or best_node_target is not None
@@ -594,7 +635,7 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
             or rollout_current_agent is not None
             or rollout_current_subgoal is not None
             or postprocessed_plan is not None):
-        ax.legend(loc="upper right", fontsize=8)
+        ax.legend(loc="upper right", fontsize=10)
 
 
 def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end_points=True):
