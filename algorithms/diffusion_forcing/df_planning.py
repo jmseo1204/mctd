@@ -158,7 +158,10 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.mctd_guidance_scales = list(_scales) if _scales is not None else [0.0]
         self.mctd_max_search_num = cfg.get("mctd_max_search_num", None)
         _rpl = cfg.get("replanning_target_level")
-        _sampling_ts = OmegaConf.select(cfg, "diffusion.sampling_timesteps")
+        try:
+            _sampling_ts = cfg.diffusion.sampling_timesteps
+        except Exception:
+            _sampling_ts = None
         self.replanning_target_level = _rpl if _rpl is not None else ((_sampling_ts // 3) if _sampling_ts is not None else 0)
         self.mctd_skip_level_steps = cfg.get("mctd_skip_level_steps", None)
         self.jump = cfg.jump
