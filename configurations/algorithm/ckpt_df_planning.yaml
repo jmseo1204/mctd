@@ -14,6 +14,7 @@ jump: 5
 
 # ── Dimension indices ────────────────────────────────────────────────────────
 # obs_dim_indices: which indices of the dataset observation to use.
+use_reward: False
 obs_dim_indices: [0, 1]
 # pos_dim_indices: which obs indices are spatial (x,y) position.
 pos_dim_indices: [0, 1]
