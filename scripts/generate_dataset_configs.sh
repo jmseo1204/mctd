@@ -21,14 +21,15 @@ DATASET_DIR="$(dirname "$PROJECT_DIR")/ogbench_data"
 CONFIG_DIR="$PROJECT_DIR/configurations/dataset"
 
 # Parse flags
-DRY_RUN=true
+DRY_RUN=false
 for arg in "$@"; do
     case "$arg" in
         --write) DRY_RUN=false ;;
         --dry-run) DRY_RUN=true ;;
+        --no-write) DRY_RUN=true ;;
         *)
             echo "Unknown flag: $arg" >&2
-            echo "Usage: $0 [--write | --dry-run]" >&2
+            echo "Usage: $0 [--dry-run | --no-write]" >&2
             exit 1
             ;;
     esac

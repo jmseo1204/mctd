@@ -581,7 +581,7 @@ def combined_guidance(planner, x_start, goal, horizon, guidance_scale,
     Returns:
         guidance_dict: dict of guidance losses
     """
-    anchor_guidance_scale = guidance_scale * planner.anchor_guidance_scale_ratio
+    anchor_guidance_scale = guidance_scale * planner.anchor_guidance_scale_ratio + 0.1
     anchor_loss = anchor_dist_guidance(planner, x_start, horizon) * anchor_guidance_scale 
     # NOTE: goal_guidance() returns HILP and RMSE components separately so each can be
     # scaled independently: TD_guidance_scale (via guidance_scale arg) for HILP,

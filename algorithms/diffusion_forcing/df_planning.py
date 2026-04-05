@@ -3117,7 +3117,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         effective_goal_normalized,
                         horizon,
                         conditions,
-                        guidance_scale=None,
+                        guidance_scale=torch.zeros_like(expanded_node_guidance_scales), # None,
                         noise_level=replan_noise_levels,
                         plans=replan_init_plans,
                         prefix_len_list=prefix_len_list,

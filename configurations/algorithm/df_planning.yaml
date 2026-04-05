@@ -40,7 +40,7 @@ episode_len: 200 # 1000(giant) // 5(jump)
 hilp_checkpoint_path: "td_models/params_1000000_20260324_002241.pkl"
 mctd_guidance_scales: [0.4, 0.1] # HILP gradient scale for near-target positions (TD_thres or above)
 rmse_guidance_scale: 0.4 # RMSE direction scale for far-target positions (below TD_thres)
-anchor_guidance_scale_ratio: 1.3 # 0.4
+anchor_guidance_scale_ratio: 1.0 # 0.4
 rdf_guidance_scale: 0.0
 particle_guidance_scale: 0.1 # sibling repulsion during denoising (0 = disabled)
 
@@ -57,10 +57,10 @@ viz_agent_rollout: false # set True to upload *_interaction/sample_*_video to wa
 viz_final_plans: true
 viz_compare_expanded_to_value: false
 viz_mujoco_renderer: false
-viz_subplan_denoising: true # set True to upload plan/plan_at_* to wandb (slow)
-viz_uncertain_next_subplan_last_obs: true
+viz_subplan_denoising: false # set True to upload plan/plan_at_* to wandb (slow)
+viz_uncertain_next_subplan_last_obs: false
 profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
-frame_sampling_way: "quadratic" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
+frame_sampling_way: "linear" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
 
 # HILP memoization: precompute phi(s) on a 2D grid and use bilinear interpolation
 use_hilp_memoization: true # set true to enable
@@ -84,7 +84,7 @@ replanning_target_level: 20 # 11 for linear, noise level to add when replanning 
 # UNCERTAINTY CHECK
 use_uncertainty_as_value: true
 fast_sampling_multiple: 5 # number of fast samples per candidate
-fast_sampling_steps: 20 # denoising steps for fast uncertainty sampling (< sampling_timesteps)
+fast_sampling_steps: 17 # denoising steps for fast uncertainty sampling (< sampling_timesteps)
 
 # [MPC-style agent control]
 use_rollout: false
@@ -136,7 +136,7 @@ diffusion:
   # Controls both denoising granularity and step count (must satisfy: sampling_timesteps <= timesteps).
   # For fast uncertainty sampling, use fast_sampling_steps < sampling_timesteps.
   sampling_timesteps: 60
-  sampling_way: "linear" # 'linear': uniform stride; 'quadratic': dense near x_0 (low timesteps)
+  sampling_way: "quadratic" # 'linear': uniform stride; 'quadratic': dense near x_0 (low timesteps)
   # Schema stubs restored from ckpt training_hparams (actual values come from ckpt)
   timesteps: null
   beta_schedule: null
