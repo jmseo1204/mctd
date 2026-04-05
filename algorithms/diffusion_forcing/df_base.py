@@ -60,7 +60,7 @@ class DiffusionForcingBase(BasePytorchAlgo):
 
         self.uncertainty_scale = cfg.uncertainty_scale
         self.timesteps = cfg.diffusion.timesteps
-        self.sampling_timesteps = cfg.diffusion.sampling_timesteps
+        self.sampling_timesteps = cfg.diffusion.get("sampling_timesteps", cfg.diffusion.timesteps)
         self.clip_noise = cfg.diffusion.clip_noise
 
         self._cum_snr_decay_raw = float(self.cfg.diffusion.cum_snr_decay)  # original value before frame_stack power
