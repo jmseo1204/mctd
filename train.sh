@@ -32,8 +32,10 @@ OUTPUT_MOUNT_DIR="$MCTD_OUTPUT_MOUNT_DIR"
 EVAL_BASE="$MCTD_EVAL_BASE"
 
 mkdir -p "$PROJECT_DIR/logs"
-mkdir -p "$OUTPUT_MOUNT_DIR"
-chmod 777 "$OUTPUT_MOUNT_DIR"
+mkdir -p "$OUTPUT_MOUNT_DIR" 2>/dev/null || true
+# Fix permissions inside Docker (runs as root) so host user can write to the mounted dir
+docker run --rm -v "$OUTPUT_MOUNT_DIR":"$MCTD_DOCKER_OUTPUTS" "$DOCKER_IMAGE" \
+    chmod 777 "$MCTD_DOCKER_OUTPUTS"
 
 # ────────────────────────────────────────────────────────
 # GPU selection (before interactive menus)
