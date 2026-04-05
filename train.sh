@@ -34,7 +34,7 @@ EVAL_BASE="$MCTD_EVAL_BASE"
 mkdir -p "$PROJECT_DIR/logs"
 mkdir -p "$OUTPUT_MOUNT_DIR" 2>/dev/null || true
 # Fix permissions inside Docker (runs as root) so host user can write to the mounted dir
-docker run --rm -v "$OUTPUT_MOUNT_DIR":"$MCTD_DOCKER_OUTPUTS" "$DOCKER_IMAGE" \
+docker run --rm --user root -v "$OUTPUT_MOUNT_DIR":"$MCTD_DOCKER_OUTPUTS" "$DOCKER_IMAGE" \
     chmod 777 "$MCTD_DOCKER_OUTPUTS"
 
 # ────────────────────────────────────────────────────────
