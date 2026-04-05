@@ -20,7 +20,7 @@ action_mean: ${dataset.action_mean}
 action_std: ${dataset.action_std}
 env_id: ${dataset.env_id}
 dataset: ${dataset.dataset}
-x_shape: null           # computed at runtime in DiffusionForcingPlanning.__init__
+x_shape: null # computed at runtime in DiffusionForcingPlanning.__init__
 data_mean: ${dataset.data_mean}
 data_std: ${dataset.data_std}
 
@@ -28,7 +28,7 @@ data_std: ${dataset.data_std}
 weight_decay: 1e-4
 lr_min_ratio: 0.1
 optimizer_beta: [0.9, 0.999]
-warmup_steps: 10000   # overrides df_base default (2000)
+warmup_steps: 10000 # overrides df_base default (2000)
 noise_level: random_all
 
 # ── Training loop (read by train.sh → passed as experiment.* CLI overrides) ──
@@ -39,5 +39,5 @@ training_loop:
   checkpointing_every_n_steps: 2000
   validation_precision: 32
   validation_inference_mode: false
-  validation_val_every_n_step: null   # null = use val_every_n_epoch instead
+  validation_val_every_n_step: null # null = use val_every_n_epoch instead
   validation_val_every_n_epoch: 5000

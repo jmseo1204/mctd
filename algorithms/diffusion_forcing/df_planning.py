@@ -1,6 +1,6 @@
 from typing import Optional, Any, List, Tuple, Union
 from dataclasses import dataclass, field
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 import time
 import numpy as np
@@ -143,29 +143,31 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.observation_std = np.array(cfg.observation_std)[self.obs_dim_indices]
         self.action_mean = np.array(cfg.action_mean[: self.action_dim])
         self.action_std = np.array(cfg.action_std[: self.action_dim])
-        self.open_loop_horizon = cfg.open_loop_horizon
+        self.open_loop_horizon = cfg.get("open_loop_horizon", None)
         self.padding_mode = cfg.padding_mode
-        self.interaction_seed = cfg.interaction_seed
-        self.use_random_goals_for_interaction = cfg.use_random_goals_for_interaction
-        self.task_id = cfg.task_id
+        self.interaction_seed = cfg.get("interaction_seed", None)
+        self.use_random_goals_for_interaction = cfg.get("use_random_goals_for_interaction", False)
+        self.task_id = cfg.get("task_id", None)
         # task_ids: list of task IDs to evaluate sequentially in one process.
         # Set by run_jobs.py when multiple same-config jobs are batched together.
         raw_ids = cfg.get("task_ids", None)
         self.task_ids = list(raw_ids) if raw_ids is not None else None  # Optional[List[int]]
-        self.dql_model = cfg.dql_model
-        self.val_max_loops = cfg.val_max_loops
-        self.mctd_guidance_scales = cfg.mctd_guidance_scales
-        self.mctd_max_search_num = cfg.mctd_max_search_num
+        self.dql_model = cfg.get("dql_model", None)
+        self.val_max_loops = cfg.get("val_max_loops", None)
+        _scales = cfg.get("mctd_guidance_scales", [0.0])
+        self.mctd_guidance_scales = list(_scales) if _scales is not None else [0.0]
+        self.mctd_max_search_num = cfg.get("mctd_max_search_num", None)
         _rpl = cfg.get("replanning_target_level")
-        self.replanning_target_level = _rpl if _rpl is not None else cfg.diffusion.sampling_timesteps // 3
-        self.mctd_skip_level_steps = cfg.mctd_skip_level_steps
+        _sampling_ts = OmegaConf.select(cfg, "diffusion.sampling_timesteps")
+        self.replanning_target_level = _rpl if _rpl is not None else ((_sampling_ts // 3) if _sampling_ts is not None else 0)
+        self.mctd_skip_level_steps = cfg.get("mctd_skip_level_steps", None)
         self.jump = cfg.jump
-        self.time_limit = cfg.time_limit
-        self.parallel_search_node = cfg.parallel_search_node
-        self.parallel_search_num = self.parallel_search_node * len(cfg.mctd_guidance_scales)
-        self.virtual_visit_weight = cfg.virtual_visit_weight
-        self.warp_threshold = cfg.warp_threshold * self.jump
-        self.leaf_parallelization = cfg.leaf_parallelization
+        self.time_limit = cfg.get("time_limit", None)
+        self.parallel_search_node = cfg.get("parallel_search_node", 1)
+        self.parallel_search_num = self.parallel_search_node * len(self.mctd_guidance_scales)
+        self.virtual_visit_weight = cfg.get("virtual_visit_weight", 1.0)
+        self.warp_threshold = cfg.get("warp_threshold", 3.0) * self.jump
+        self.leaf_parallelization = cfg.get("leaf_parallelization", False)
         if self.leaf_parallelization:
             _N = len(self.mctd_guidance_scales)
             assert self.parallel_search_num % _N == 0, (
@@ -173,11 +175,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 f"({self.parallel_search_num}) must be a multiple of "
                 f"len(mctd_guidance_scales) ({_N})."
             )
-        self.parallel_multiple_visits = cfg.parallel_multiple_visits
-        self.num_tries_for_bad_plans = cfg.num_tries_for_bad_plans
-        self.sub_goal_interval = cfg.sub_goal_interval
+        self.parallel_multiple_visits = cfg.get("parallel_multiple_visits", False)
+        self.num_tries_for_bad_plans = cfg.get("num_tries_for_bad_plans", None)
+        self.sub_goal_interval = cfg.get("sub_goal_interval", None)
         self.sub_goal_blend_steps = cfg.get("sub_goal_blend_steps", 1)
-        self.viz_final_plans = cfg.viz_final_plans
+        self.viz_final_plans = cfg.get("viz_final_plans", False)
         self.meeting_delta = cfg.get("meeting_delta", 0.5)
         self.plan_feasibility_delta = cfg.get("plan_feasibility_delta", 100.0)
         self.diverge_threshold = cfg.get("diverge_threshold", 2.0)
@@ -187,8 +189,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.use_TD_metric_as_dist = cfg.get("use_TD_metric_as_dist", False)
         self.debug_memory_profile = cfg.get("debug_memory_profile", False)
         self.profiler_snapshot_frames = cfg.get("profiler_snapshot_frames", cfg.get("max_plan_hist_keep", 20))  # Number of denoising frames kept for video
-        self.sequence_dividing_factor = cfg.sequence_dividing_factor
-        self.horizon_scale = cfg.horizon_scale
+        self.sequence_dividing_factor = cfg.get("sequence_dividing_factor", None)
+        self.horizon_scale = cfg.get("horizon_scale", None)
         self.noise_level_building_way = cfg.get("noise_level_building_way", "pyramid")
 
         # HILP value function guidance
@@ -223,7 +225,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.use_dynamic_obs_padding: bool = cfg.get("use_dynamic_obs_padding", True)
 
         super().__init__(cfg)
-        self.plot_end_points = cfg.plot_start_goal
+        self.plot_end_points = cfg.get("plot_start_goal", False)
         
         self.frame_sampling_way: str = cfg.get("frame_sampling_way", "linear")
         self.validation_video_max_frames: int = int(cfg.get("validation_video_max_frames", 200))
