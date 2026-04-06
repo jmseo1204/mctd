@@ -137,8 +137,7 @@ echo "  valid_episode_len_multiple  = $VALID_EPISODE_LEN_MULTIPLE"
 echo ""
 
 # Derived display values
-DATASET_KEYWORDS=$(echo "$DATASET_CONFIG" \
-    | sed 's/^og_//' \
+DATASET_KEYWORDS=$(mctd_normalize_dataset_name "$DATASET_CONFIG" \
     | sed 's/_\(2d\|15d\|29d\|fullstate\)$//')
 MODEL_ID_PREFIX="train_${TARGET_OBS_DIM}d"
 LOG_FILE="$PROJECT_DIR/logs/train_${TARGET_OBS_DIM}d.log"
@@ -298,8 +297,9 @@ for _entry in "${MCTD_CKPT_DIRS[@]:-}"; do
     _match=1
     [[ "$_c_obs"    != "unknown" && "$_c_obs"    != "$OBS_DIM_JSON"       ]] && _match=0
     [[ "$_c_jump"   != "unknown" && "$_c_jump"   != "$JUMP_VALUE"         ]] && _match=0
-    _c_ds_norm="${_c_ds#og_}"  # strip deprecated og_ prefix for comparison
-    [[ "$_c_ds_norm" != "unknown" && "$_c_ds_norm" != "${DATASET_CONFIG#og_}" ]] && _match=0
+    _c_ds_norm="$(mctd_normalize_dataset_name "$_c_ds")"
+    _ds_config_norm="$(mctd_normalize_dataset_name "$DATASET_CONFIG")"
+    [[ "$_c_ds_norm" != "unknown" && "$_c_ds_norm" != "$_ds_config_norm" ]] && _match=0
     [[ "$_c_fs"     != "unknown" && "$_c_fs"     != "$TRAIN_FRAME_STACK"  ]] && _match=0
     [[ "$_c_net"    != "unknown" && "$_c_net"    != "$TRAIN_NETWORK_SIZE" ]] && _match=0
     [[ "$_c_layers" != "unknown" && "$_c_layers" != "$TRAIN_NUM_LAYERS"   ]] && _match=0

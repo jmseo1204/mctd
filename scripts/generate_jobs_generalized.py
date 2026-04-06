@@ -336,6 +336,14 @@ def load_full_config(dataset_name, algo_name="df_planning"):
     try:
         import yaml
         dataset_path = Path(f"configurations/dataset/{dataset_name}.yaml")
+        # Fallback: strip legacy 'og_' prefix if file not found
+        if not dataset_path.exists() and dataset_name.startswith("og_"):
+            stripped = dataset_name[3:]
+            fallback_path = Path(f"configurations/dataset/{stripped}.yaml")
+            if fallback_path.exists():
+                print(f"  [load_full_config] Remapped legacy dataset name: {dataset_name} → {stripped}")
+                dataset_name = stripped
+                dataset_path = fallback_path
         algo_path = Path(f"configurations/algorithm/{algo_name}.yaml")
         
         with open(dataset_path, "r") as f:
@@ -485,6 +493,12 @@ def main():
 
         # If training config names a different dataset, reload with that dataset
         detected_dataset_config = model_metadata.get('dataset_config')
+        # Normalize legacy 'og_' prefix so comparison is stable
+        if detected_dataset_config and detected_dataset_config.startswith("og_"):
+            _stripped = detected_dataset_config[3:]
+            if Path(f"configurations/dataset/{_stripped}.yaml").exists():
+                print(f"  [config detect] Remapped legacy dataset name: {detected_dataset_config} → {_stripped}")
+                detected_dataset_config = _stripped
         if detected_dataset_config and detected_dataset_config != args.dataset:
             print(f"  [config detect] Training dataset '{detected_dataset_config}' differs from arg '{args.dataset}'. "
                   f"Reloading config with training dataset.")

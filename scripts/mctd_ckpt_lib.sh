@@ -33,6 +33,30 @@ MCTD_OUTPUT_MOUNT_DIR="${MCTD_OUTPUT_MOUNT_DIR:-/home/$DOCKER_USER/mctd/outputs}
 MCTD_EVAL_BASE="$MCTD_OUTPUT_MOUNT_DIR"
 MCTD_DOWNLOADED_DIR="$MCTD_OUTPUT_MOUNT_DIR/downloaded/$WANDB_ENTITY/$WANDB_PROJECT"
 
+# ── mctd_normalize_dataset_name <name> [config_dataset_dir] ──────────────────
+# Strip legacy 'og_' prefix from a dataset config name.
+#
+# Usage:
+#   mctd_normalize_dataset_name <name>              — always strips 'og_' prefix
+#   mctd_normalize_dataset_name <name> <config_dir> — strips only if un-prefixed
+#                                                     .yaml exists in config_dir
+# Echoes the resolved name. Prints a notice to stderr when remapping occurs.
+mctd_normalize_dataset_name() {
+    local _ds="$1"
+    local _dir="${2:-}"
+    if [[ "$_ds" != og_* ]]; then
+        echo "$_ds"
+        return 0
+    fi
+    local _stripped="${_ds#og_}"
+    if [ -z "$_dir" ] || [ -f "$_dir/${_stripped}.yaml" ]; then
+        [ -n "$_dir" ] && echo "  [dataset] Remapped legacy name: $_ds → $_stripped" >&2
+        echo "$_stripped"
+    else
+        echo "$_ds"
+    fi
+}
+
 # ── mctd_select_gpus ──────────────────────────────────────────────────────────
 # Display a table of all detected GPUs (status, VRAM, running processes with
 # user / PID / uptime), prompt the user to pick GPU index(es), then override

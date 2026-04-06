@@ -120,6 +120,7 @@ if [ "$SELECTED_DATASET" = "unknown" ] || [ -z "$SELECTED_DATASET" ]; then
     exit 1
 fi
 
+SELECTED_DATASET="$(mctd_normalize_dataset_name "$SELECTED_DATASET" "$CONFIG_DATASET_DIR")"
 DATASET_YAML="${CONFIG_DATASET_DIR}/${SELECTED_DATASET}.yaml"
 if [ ! -f "$DATASET_YAML" ]; then
     echo "❌ ERROR: Dataset config not found: ${DATASET_YAML}"
