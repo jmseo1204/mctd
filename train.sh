@@ -10,6 +10,19 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ── SSH resilience: relaunch inside tmux so disconnecting won't kill training ──
+if [ -z "${TMUX:-}" ] && command -v tmux &>/dev/null; then
+    SESSION="mctd_train"
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    echo "========================================================"
+    echo "  tmux 세션 '$SESSION' 에서 실행합니다."
+    echo "  SSH를 끊어도 학습이 계속됩니다."
+    echo "  재접속:  tmux attach -t $SESSION"
+    echo "  분리:    Ctrl+B, D"
+    echo "========================================================"
+    exec tmux new-session -s "$SESSION" "bash '${BASH_SOURCE[0]}'"
+fi
+
 # Load central user config (DOCKER_USER) before anything else
 # shellcheck source=scripts/project_config.sh
 source "$PROJECT_DIR/scripts/project_config.sh"
