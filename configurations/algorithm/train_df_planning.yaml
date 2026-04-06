@@ -35,8 +35,8 @@ noise_level: random_all
 # Edit these to change training behavior without touching train.sh.
 training_loop:
   batch_size: 2048
-  max_steps: 200005
-  checkpointing_every_n_steps: 2000
+  max_steps: 400010
+  checkpointing_every_n_steps: 4000
   validation_precision: 32
   validation_inference_mode: false
   validation_val_every_n_step: null # null = use val_every_n_epoch instead

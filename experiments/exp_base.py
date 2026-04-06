@@ -300,22 +300,37 @@ class BaseLightningExperiment(BaseExperiment):
 
             callbacks.append(_KeepLatestCheckpoint())
 
+            _model_id = self.cfg.get("name", None)
+
             class _RenameLastCheckpoint(pl.callbacks.Callback):
-                """Rename last.ckpt → model.ckpt after each save (atomic, no copy)."""
-                def _rename(self):
+                """Rename last.ckpt → model.ckpt after each save, then update eval symlink."""
+                def _rename(self, trainer):
+                    if not trainer.is_global_zero:
+                        return
                     last = _ckpt_dir / "last.ckpt"
                     model = _ckpt_dir / "model.ckpt"
                     if last.exists():
                         last.replace(model)
+                    # Keep <MCTD_OUTPUT_DIR>/<model_id>/model.ckpt symlink up-to-date
+                    # so it survives even if the host train.sh process dies before training ends.
+                    output_base = os.environ.get("MCTD_OUTPUT_DIR")
+                    if output_base and _model_id and model.exists():
+                        eval_dir = pathlib.Path(output_base) / _model_id
+                        eval_dir.mkdir(parents=True, exist_ok=True)
+                        real_ckpt = model.resolve()
+                        rel = os.path.relpath(real_ckpt, eval_dir)
+                        tmp = eval_dir / ".model.ckpt.tmp"
+                        tmp.symlink_to(rel)
+                        tmp.replace(eval_dir / "model.ckpt")  # atomic replace
 
                 def on_train_start(self, trainer, pl_module):
-                    self._rename()  # handle any pre-existing last.ckpt on resume
+                    self._rename(trainer)  # handle any pre-existing last.ckpt on resume
 
                 def on_train_epoch_end(self, trainer, pl_module):
-                    self._rename()
+                    self._rename(trainer)
 
                 def on_train_end(self, trainer, pl_module):
-                    self._rename()
+                    self._rename(trainer)
 
             callbacks.append(_RenameLastCheckpoint())
 
