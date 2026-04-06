@@ -409,7 +409,7 @@ def load_training_hparams_from_ckpt(model_id, downloaded_dir=f"/home/{_DOCKER_US
 
 def main():
     parser = argparse.ArgumentParser(description="Generate evaluation jobs JSON files.")
-    parser.add_argument("--dataset", required=True, help="Dataset config name (e.g., og_antmaze_giant_stitch)")
+    parser.add_argument("--dataset", required=True, help="Dataset config name (e.g., antmaze_giant_stitch)")
     parser.add_argument("--model_id", required=True, help="WandB model ID (e.g., en1ddvu7)")
     parser.add_argument("--num_tasks", type=int, default=5, help="Number of tasks to generate")
     parser.add_argument("--num_seeds", type=int, default=3, help="Number of seeds per task")

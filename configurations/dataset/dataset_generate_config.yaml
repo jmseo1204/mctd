@@ -1,0 +1,5 @@
+# This will be passed as the cfg to Dataset.__init__(cfg) of your dataset class
+
+debug: ${debug} # inherited from configurations/config.yaml
+jump: ${jump} # inherited from configurations/config.yaml
+extract_episode_ratio_from_sample: 0.5 # episode_len = sample_length * this ratio (sample_length determined at runtime from dataset)

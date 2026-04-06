@@ -1,0 +1,31 @@
+defaults:
+  - dataset_generate_config
+
+# ── [Group A: Dataset Loader] ─────────────────────────────────────────────
+# Read directly by dataset.__init__() and env creation.
+# Required at both train and eval time.
+env_id: "cube-single-v0"
+dataset: "cube-single-play-v0"
+save_dir: ~/.ogbench/data
+num_tasks: 5
+# sample_length: frames per raw episode in the npz (auto-extracted at config generation time).
+# episode_len = int(sample_length * extract_episode_ratio_from_sample)
+# Change sliding-window size via: dataset.extract_episode_ratio_from_sample=<ratio>
+sample_length: 1001
+episode_len: 500  # = int(1001 * 0.5), recomputed at dataset load time
+
+# ── [Group B: Normalization Stats] ────────────────────────────────────────
+# train time: interpolated into algorithm cfg via train_df_planning.yaml
+#             (${dataset.observation_mean} etc.) and saved to ckpt training_hparams.
+# eval time:  restored from ckpt training_hparams; yaml value is NOT used.
+# Computed from cube-single-play-v0 training data
+# (1001000 samples, obs_dim=28).
+observation_mean: [-1.874768, -1.5490059, 2.0911441, -2.1050403, -1.5851192, -0.32152754, 5.7365203e-05, 0.0033162395, 0.0070936261, -0.010955717, -2.6004162e-05, -0.00052766153, -0.016903365, 0.023832215, 1.2545078, 0.22641957, 0.0024870925, 0.94185382, 0.43858045, -0.0015744471, 0.018456049, 0.73072189, -0.0027022841, 0.0026158118, 0.0016928284, 0.53272116, 0.018587932, 0.014634829]
+observation_std:  [0.36499926, 0.21692242, 0.21938419, 0.25965926, 0.014293727, 1.7062747, 0.33552051, 0.39872631, 0.39362475, 0.50601774, 0.0043530962, 0.53037632, 0.70267707, 1.6119003, 0.84833598, 0.64188969, 0.73250461, 0.75784969, 0.47707367, 0.71464956, 1.6774826, 0.84207088, 0.70997614, 0.07165359, 0.062837921, 0.45072767, 0.7074393, 0.70631695]
+# action_mean/std: empty → action_dim=0.
+# The diffusion model generates observations only; actions are computed at
+# runtime by DQL (antmaze) or PID (pointmaze) controller.
+action_mean: []
+action_std:  []
+reward_mean: 0.000999001  # = n_terminals/n_samples (synthetic terminal reward)
+reward_std:  0.0315912

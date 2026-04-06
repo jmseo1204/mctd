@@ -1,0 +1,31 @@
+defaults:
+  - dataset_generate_config
+
+# ── [Group A: Dataset Loader] ─────────────────────────────────────────────
+# Read directly by dataset.__init__() and env creation.
+# Required at both train and eval time.
+env_id: "pointmaze-medium-v0"
+dataset: "pointmaze-medium-stitch-v0"
+save_dir: ~/.ogbench/data
+num_tasks: 5
+# sample_length: frames per raw episode in the npz (auto-extracted at config generation time).
+# episode_len = int(sample_length * extract_episode_ratio_from_sample)
+# Change sliding-window size via: dataset.extract_episode_ratio_from_sample=<ratio>
+sample_length: 201
+episode_len: 100  # = int(201 * 0.5), recomputed at dataset load time
+
+# ── [Group B: Normalization Stats] ────────────────────────────────────────
+# train time: interpolated into algorithm cfg via train_df_planning.yaml
+#             (${dataset.observation_mean} etc.) and saved to ckpt training_hparams.
+# eval time:  restored from ckpt training_hparams; yaml value is NOT used.
+# Computed from pointmaze-medium-stitch-v0 training data
+# (1005000 samples, obs_dim=2).
+observation_mean: [9.5560627, 10.342426]
+observation_std:  [5.7912898, 5.0556569]
+# action_mean/std: empty → action_dim=0.
+# The diffusion model generates observations only; actions are computed at
+# runtime by DQL (antmaze) or PID (pointmaze) controller.
+action_mean: []
+action_std:  []
+reward_mean: 0.00497512  # = n_terminals/n_samples (synthetic terminal reward)
+reward_std:  0.0703589

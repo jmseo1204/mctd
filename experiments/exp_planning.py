@@ -25,12 +25,21 @@ class PlanningExperiment(BaseLightningExperiment):
         og_maze2d_large_navigate=OGMaze2dOfflineRLDataset,
         og_maze2d_giant_navigate=OGMaze2dOfflineRLDataset,
 
-        og_antmaze_medium_navigate=OGAntMazeOfflineRLDataset,
-        og_antmaze_large_navigate=OGAntMazeOfflineRLDataset,
-        og_antmaze_giant_navigate=OGAntMazeOfflineRLDataset,
-        og_antmaze_giant_navigate_fullstate=OGAntMazeOfflineRLDataset,
-        og_antmaze_giant_navigate_15d=OGAntMazeOfflineRLDataset,
-        og_antmaze_teleport_navigate=OGAntMazeOfflineRLDataset,
-        
-        og_antmaze_giant_stitch=OGAntMazeOfflineRLDataset,
+        antmaze_medium_navigate=OGAntMazeOfflineRLDataset,
+        antmaze_large_navigate=OGAntMazeOfflineRLDataset,
+        antmaze_giant_navigate=OGAntMazeOfflineRLDataset,
+        antmaze_giant_navigate_fullstate=OGAntMazeOfflineRLDataset,
+        antmaze_giant_navigate_15d=OGAntMazeOfflineRLDataset,
+        antmaze_teleport_navigate=OGAntMazeOfflineRLDataset,
+
+        antmaze_giant_stitch=OGAntMazeOfflineRLDataset,
+        antmaze_large_stitch=OGAntMazeOfflineRLDataset,
+        antmaze_medium_stitch=OGAntMazeOfflineRLDataset,
+
+        cube_single_play=OGAntMazeOfflineRLDataset,
+        cube_double_play=OGAntMazeOfflineRLDataset,
+
+        pointmaze_giant_stitch=OGAntMazeOfflineRLDataset,
+        pointmaze_large_stitch=OGAntMazeOfflineRLDataset,
+        pointmaze_medium_stitch=OGAntMazeOfflineRLDataset,
     )

@@ -1,0 +1,31 @@
+defaults:
+  - dataset_generate_config
+
+# ── [Group A: Dataset Loader] ─────────────────────────────────────────────
+# Read directly by dataset.__init__() and env creation.
+# Required at both train and eval time.
+env_id: "antmaze-giant-v0"
+dataset: "antmaze-giant-stitch-v0"
+save_dir: ~/.ogbench/data
+num_tasks: 5
+# sample_length: frames per raw episode in the npz (auto-extracted at config generation time).
+# episode_len = int(sample_length * extract_episode_ratio_from_sample)
+# Change sliding-window size via: dataset.extract_episode_ratio_from_sample=<ratio>
+sample_length: 201
+episode_len: 100  # = int(201 * 0.5), recomputed at dataset load time
+
+# ── [Group B: Normalization Stats] ────────────────────────────────────────
+# train time: interpolated into algorithm cfg via train_df_planning.yaml
+#             (${dataset.observation_mean} etc.) and saved to ckpt training_hparams.
+# eval time:  restored from ckpt training_hparams; yaml value is NOT used.
+# Computed from antmaze-giant-stitch-v0 training data
+# (1005000 samples, obs_dim=29).
+observation_mean: [25.435719, 17.564924, 0.55406803, 0.85091823, 0.006099225, -0.011156108, -0.38917276, 0.056416374, 0.73632681, -0.010099308, -0.764341, 0.10026661, -0.6866442, -0.067342974, 0.66359407, -0.014885324, -0.029437266, -0.0089642424, 0.0080661858, -0.011783523, -0.039711006, -0.00035339998, 0.032113954, -0.0057278806, -0.037487876, 0.0036002183, -0.029149279, -0.004309251, 0.036922481]
+observation_std:  [16.767639, 11.864943, 0.089462042, 0.17033982, 0.12798266, 0.11924684, 0.2570127, 0.43116707, 0.28006008, 0.42140439, 0.27303517, 0.41847324, 0.25654259, 0.41748717, 0.23847951, 1.0889628, 0.99703604, 0.75430673, 1.1348261, 1.0818559, 1.0832849, 2.4646423, 2.126611, 3.2804294, 1.9357569, 2.9843283, 1.8496423, 3.106739, 1.6011289]
+# action_mean/std: empty → action_dim=0.
+# The diffusion model generates observations only; actions are computed at
+# runtime by DQL (antmaze) or PID (pointmaze) controller.
+action_mean: []
+action_std:  []
+reward_mean: 0.00497512  # = n_terminals/n_samples (synthetic terminal reward)
+reward_std:  0.0703589
