@@ -30,7 +30,11 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
         term_indices = np.where(self.dataset["terminals"])[0]
         if len(term_indices) == 0:
             raise ValueError(f"No terminal transitions found in dataset '{self.dataset_name}'.")
+        # ogbench compact_dataset places consecutive terminal markers at episode boundaries
+        # (e.g. indices 199 & 200, 400 & 401, ...).  Use the last in the first run.
         sample_length = int(term_indices[0]) + 1
+        if len(term_indices) > 1 and term_indices[1] == term_indices[0] + 1:
+            sample_length = int(term_indices[1]) + 1
 
         # Compute episode_len as a fraction of sample_length (sliding-window slice size).
         ratio = float(getattr(cfg, "extract_episode_ratio_from_sample", 0.5))

@@ -263,9 +263,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             for _ov_ti in list(_hc_ti.overrides.task):
                 _kv_ti = _ov_ti.lstrip("+~")
                 if _kv_ti.startswith("load="):
-                    _ti_model_id = _kv_ti.split("=", 1)[1]
+                    _raw_id = _kv_ti.split("=", 1)[1]
+                    _ti_model_id = _Path_ti(_raw_id).parent.name if "/" in _raw_id else _raw_id
                 elif _kv_ti.startswith("resume=") and _ti_model_id == "unknown":
-                    _ti_model_id = _kv_ti.split("=", 1)[1]
+                    _raw_id = _kv_ti.split("=", 1)[1]
+                    _ti_model_id = _Path_ti(_raw_id).parent.name if "/" in _raw_id else _raw_id
                 elif _kv_ti.startswith("name="):
                     _ti_job_name = _kv_ti.split("=", 1)[1]
         except Exception:

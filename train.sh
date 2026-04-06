@@ -88,7 +88,7 @@ jump           = str(merged.get('jump', 5))
 obs_idx        = merged.get('obs_dim_indices')
 pos_idx        = merged.get('pos_dim_indices', [0, 1])
 obs_dim        = str(len(obs_idx)) if obs_idx else 'unknown'
-obs_dim_json   = json.dumps(obs_idx) if obs_idx else 'null'
+obs_dim_json   = json.dumps(obs_idx, separators=(',', ':')) if obs_idx else 'null'
 pos_dim_json   = json.dumps(list(pos_idx)) if pos_idx else '[0,1]'
 frame_stack    = str(merged.get('frame_stack', 'unknown'))
 arch = (merged.get('diffusion') or {}).get('architecture', {})
@@ -292,9 +292,10 @@ for _entry in "${MCTD_CKPT_DIRS[@]:-}"; do
     _c_heads=$( echo "$_entry" | cut -d'|' -f12)
     # For each field: skip only if both are known AND they differ
     _match=1
-    [[ "$_c_obs"    != "unknown" && "$_c_obs"    != "$TARGET_OBS_DIM"     ]] && _match=0
+    [[ "$_c_obs"    != "unknown" && "$_c_obs"    != "$OBS_DIM_JSON"       ]] && _match=0
     [[ "$_c_jump"   != "unknown" && "$_c_jump"   != "$JUMP_VALUE"         ]] && _match=0
-    [[ "$_c_ds"     != "unknown" && "$_c_ds"     != "$DATASET_CONFIG"     ]] && _match=0
+    _c_ds_norm="${_c_ds#og_}"  # strip deprecated og_ prefix for comparison
+    [[ "$_c_ds_norm" != "unknown" && "$_c_ds_norm" != "${DATASET_CONFIG#og_}" ]] && _match=0
     [[ "$_c_fs"     != "unknown" && "$_c_fs"     != "$TRAIN_FRAME_STACK"  ]] && _match=0
     [[ "$_c_net"    != "unknown" && "$_c_net"    != "$TRAIN_NETWORK_SIZE" ]] && _match=0
     [[ "$_c_layers" != "unknown" && "$_c_layers" != "$TRAIN_NUM_LAYERS"   ]] && _match=0
