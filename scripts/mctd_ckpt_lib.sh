@@ -225,17 +225,17 @@ mctd_check_gpu_availability() {
 # Sets globals: MCTD_TARGET_OBS_DIM  MCTD_DATASET_CONFIG
 mctd_dim_menu() {
     echo "Select dataset:"
-    echo "  1) 2D  navigate (x,y only)      [og_antmaze_giant_navigate]"
-    echo "  2) 15D navigate (qpos only)     [og_antmaze_giant_navigate_15d]"
-    echo "  3) 29D navigate (qpos+qvel)     [og_antmaze_giant_navigate_fullstate]"
-    echo "  4) 2D  stitch   (x,y only)      [og_antmaze_giant_stitch]"
+    echo "  1) 2D  navigate (x,y only)      [antmaze_giant_navigate]"
+    echo "  2) 15D navigate (qpos only)     [antmaze_giant_navigate_15d]"
+    echo "  3) 29D navigate (qpos+qvel)     [antmaze_giant_navigate_fullstate]"
+    echo "  4) 2D  stitch   (x,y only)      [antmaze_giant_stitch]"
     echo ""
     read -rp "Enter [1-4]: " _mctd_dim_sel
     case "$_mctd_dim_sel" in
-        1) MCTD_TARGET_OBS_DIM=2;  MCTD_DATASET_CONFIG="og_antmaze_giant_navigate"            ;;
-        2) MCTD_TARGET_OBS_DIM=15; MCTD_DATASET_CONFIG="og_antmaze_giant_navigate_15d"       ;;
-        3) MCTD_TARGET_OBS_DIM=29; MCTD_DATASET_CONFIG="og_antmaze_giant_navigate_fullstate" ;;
-        4) MCTD_TARGET_OBS_DIM=2;  MCTD_DATASET_CONFIG="og_antmaze_giant_stitch"             ;;
+        1) MCTD_TARGET_OBS_DIM=2;  MCTD_DATASET_CONFIG="antmaze_giant_navigate"            ;;
+        2) MCTD_TARGET_OBS_DIM=15; MCTD_DATASET_CONFIG="antmaze_giant_navigate_15d"       ;;
+        3) MCTD_TARGET_OBS_DIM=29; MCTD_DATASET_CONFIG="antmaze_giant_navigate_fullstate" ;;
+        4) MCTD_TARGET_OBS_DIM=2;  MCTD_DATASET_CONFIG="antmaze_giant_stitch"             ;;
         *) echo "Invalid selection '$_mctd_dim_sel'. Exiting." >&2; return 1 ;;
     esac
     echo "Obs dim: $MCTD_TARGET_OBS_DIM"

@@ -18,7 +18,6 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
         self.save_dir = cfg.save_dir # Using default save_dir, "~/.ogbench/data"
         self.env_id = cfg.env_id
         self.dataset_name = cfg.dataset
-        self.n_frames = cfg.episode_len + 1
         self.split = split
         if self.split != "training":
             self.jump = 1
@@ -26,23 +25,18 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
             self.jump = cfg.jump
         Path(self.save_dir).mkdir(parents=True, exist_ok=True)
         self.dataset = self.get_dataset()
-        # Dataset already provides 29D observations (qpos+qvel) via compact_dataset=True
-        # No concatenation needed; observations key is present directly
-        if "navigate" in self.dataset_name:
-            if "giant" in self.dataset_name:
-                sample_length = 2001
-            else:
-                sample_length = 1001
-        elif "stitch" in self.dataset_name:
-            sample_length = 201
-        elif "explore" in self.dataset_name:
-            sample_length = 501
-        else:
-            raise ValueError(f"Invalid Dataset {self.dataset}")
 
-        if self.n_frames > sample_length:
-            self.n_frames = sample_length
-        #assert self.n_frames <= sample_length, f"Episode length {self.n_frames} is greater than sample length {sample_length}"
+        # Infer sample_length from the first terminal index (all episodes equal length).
+        term_indices = np.where(self.dataset["terminals"])[0]
+        if len(term_indices) == 0:
+            raise ValueError(f"No terminal transitions found in dataset '{self.dataset_name}'.")
+        sample_length = int(term_indices[0]) + 1
+
+        # Compute episode_len as a fraction of sample_length (sliding-window slice size).
+        ratio = float(getattr(cfg, "extract_episode_ratio_from_sample", 0.5))
+        episode_len = int(sample_length * ratio)
+        cfg.episode_len = episode_len  # expose to downstream (df_base, df_planning)
+        self.n_frames = episode_len + 1
 
         # Dataset Statistics
         print(f"Dataset: {self.dataset_name}")

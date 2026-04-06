@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # scripts/generate_dataset_configs.sh
 #
-# Auto-generates configurations/dataset/og_*.yaml for every OGBench dataset
+# Auto-generates configurations/dataset/*.yaml for every OGBench dataset
 # found in DATASET_DIR.  Run once after downloading new datasets.
 #
 # Output:
-#   configurations/dataset/og_{name}.yaml   (e.g. og_antmaze_giant_navigate.yaml)
+#   configurations/dataset/{name}.yaml   (e.g. antmaze_giant_navigate.yaml)
 #   One file per train-split *.npz (val splits and *.tmp files are skipped).
 #
 # Usage:
@@ -17,6 +17,7 @@ set -euo pipefail
 # ── Hardcoded dataset directory (edit here to change) ─────────────────────────
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATASET_DIR="$(dirname "$PROJECT_DIR")/ogbench_data"
+OGBENCH_SRC="$(dirname "$PROJECT_DIR")/ogbench"   # path to ogbench source (for gymnasium registry)
 # ─────────────────────────────────────────────────────────────────────────────
 CONFIG_DIR="$PROJECT_DIR/configurations/dataset"
 
@@ -43,47 +44,34 @@ echo "Dataset dir : $DATASET_DIR"
 echo "Config dir  : $CONFIG_DIR"
 echo ""
 
-python3 - "$DATASET_DIR" "$CONFIG_DIR" "$DRY_RUN" <<'PYEOF'
+python3 - "$DATASET_DIR" "$CONFIG_DIR" "$DRY_RUN" "$OGBENCH_SRC" <<'PYEOF'
 import numpy as np
 import os
 import sys
 from pathlib import Path
 
-DATASET_DIR = Path(sys.argv[1])
-CONFIG_DIR  = Path(sys.argv[2])
-DRY_RUN     = sys.argv[3].lower() == "true"
+DATASET_DIR  = Path(sys.argv[1])
+CONFIG_DIR   = Path(sys.argv[2])
+DRY_RUN      = sys.argv[3].lower() == "true"
+OGBENCH_SRC  = sys.argv[4] if len(sys.argv) > 4 else None
 
-# ── Hardcoded metadata tables ─────────────────────────────────────────────────
-# episode_len: the cfg value read by OGAntMazeOfflineRLDataset (raw, before /jump).
-# Equals the intended max trajectory length.  The npz stores up to 2*episode_len+1
-# frames per trajectory for navigate (sliding-window format).
-EPISODE_LEN_TABLE = {
-    ("antmaze", "giant",    "navigate"): 1000,
-    ("antmaze", "large",    "navigate"):  500,
-    ("antmaze", "medium",   "navigate"):  500,
-    ("antmaze", "teleport", "navigate"):  500,
-    ("antmaze", "giant",    "stitch"):    100,
-    ("antmaze", "large",    "stitch"):    100,
-    ("antmaze", "medium",   "stitch"):    100,
-    ("antmaze", "teleport", "stitch"):    100,
-    ("antmaze", "giant",    "explore"):   250,
-    ("antmaze", "large",    "explore"):   250,
-    ("antmaze", "medium",   "explore"):   250,
-    ("antmaze", "teleport", "explore"):   250,
-}
-# num_tasks: all OGBench antmaze variants use 5 tasks.
-NUM_TASKS = 5
-# gamma: always 1.0 (sparse terminal reward; effectively dead parameter in algo).
-GAMMA = 1.0
+# Ensure ogbench is importable for gymnasium registry lookups.
+if OGBENCH_SRC and OGBENCH_SRC not in sys.path:
+    sys.path.insert(0, OGBENCH_SRC)
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+# extract_episode_ratio_from_sample: default sliding-window ratio written to yaml.
+# episode_len = int(sample_length * extract_episode_ratio_from_sample).
+EXTRACT_EPISODE_RATIO = 0.5
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def parse_dataset_name(name):
     """
-    'antmaze-giant-navigate-v0'
-      → maze_type='antmaze', size='giant', task_type='navigate'
+    'antmaze-giant-navigate-v0' → ('antmaze', 'giant',  'navigate')
+    'cube-single-play-v0'       → ('cube',    'single', 'play')
     Returns (maze_type, size, task_type) or None if pattern not recognised.
     """
-    TYPE_WORDS = {"navigate", "stitch", "explore"}
+    TYPE_WORDS = {"navigate", "stitch", "explore", "play"}
     parts = name.rstrip("-v0").rstrip("-").split("-")
     # strip version suffix robustly
     if parts and parts[-1].startswith("v") and parts[-1][1:].isdigit():
@@ -98,18 +86,43 @@ def parse_dataset_name(name):
     return maze_type, size, task_type
 
 def env_id_from_name(name):
-    """'antmaze-giant-navigate-v0' → 'antmaze-giant-v0'"""
-    TYPE_WORDS = {"navigate", "stitch", "explore"}
+    """
+    'antmaze-giant-navigate-v0' → 'antmaze-giant-v0'
+    'cube-single-play-v0'       → 'cube-single-v0'
+    """
+    TYPE_WORDS = {"navigate", "stitch", "explore", "play"}
     parts = name.split("-")
     kept = [p for p in parts if p not in TYPE_WORDS]
     return "-".join(kept)
 
 def config_stem_from_name(name):
-    """'antmaze-giant-navigate-v0' → 'og_antmaze_giant_navigate'"""
+    """'antmaze-giant-navigate-v0' → 'antmaze_giant_navigate'"""
     # Remove -v0 (or -v1 etc.) suffix, then replace hyphens with underscores
     import re
     cleaned = re.sub(r"-v\d+$", "", name)
-    return "og_" + cleaned.replace("-", "_")
+    return cleaned.replace("-", "_")
+
+def get_num_tasks(env_id):
+    """Read num_tasks from the ogbench gymnasium registry.
+    Counts how many singletask-task{N} variants are registered for the base env_id.
+    e.g. 'antmaze-giant-v0' → checks 'antmaze-giant-singletask-task1-v0', etc.
+    Falls back to None if ogbench/gymnasium are unavailable.
+    """
+    try:
+        import re as _re
+        import gymnasium as _gym
+        import ogbench as _ogbench  # ensure env registrations are loaded
+        base = _re.sub(r'-v\d+$', '', env_id)
+        count = 0
+        for i in range(1, 50):
+            try:
+                _gym.spec(f'{base}-singletask-task{i}-v0')
+                count += 1
+            except Exception:
+                break
+        return count if count > 0 else None
+    except Exception:
+        return None
 
 # ── Scan npz files ─────────────────────────────────────────────────────────
 npz_files = sorted(DATASET_DIR.glob("*.npz"))
@@ -141,24 +154,22 @@ for npz_path in npz_files:
     config_stem = config_stem_from_name(stem)
     config_path = CONFIG_DIR / f"{config_stem}.yaml"
 
-    # episode_len lookup
-    key = (maze_type, size.replace("_", "-") if "_" in size else size, task_type)
-    # normalise size key: "giant" not "giant-v0"
-    episode_len = EPISODE_LEN_TABLE.get(key)
-    if episode_len is None:
-        print(f"[warn] {npz_path.name}: no episode_len rule for {key}, defaulting to 500")
-        episode_len = 500
-
     print(f"Processing: {npz_path.name}")
-    print(f"  → {config_path.name}  (episode_len={episode_len})")
+    print(f"  → {config_path.name}")
 
     try:
         data = np.load(str(npz_path), allow_pickle=False)
-        obs       = data["observations"]   # (N, obs_dim) — always 29D for antmaze
-        terminals = data["terminals"]      # (N,) bool
+        obs       = data["observations"]
+        terminals = data["terminals"]
 
         n_samples = len(obs)
         obs_dim   = obs.shape[1]
+
+        # Infer sample_length from the first terminal index (all episodes are equal length).
+        term_indices = np.where(terminals)[0]
+        if len(term_indices) == 0:
+            raise ValueError("No terminal transitions found; cannot infer sample_length.")
+        sample_length = int(term_indices[0]) + 1
 
         # Observation normalization stats (over all training samples)
         obs_mean = np.mean(obs, axis=0).tolist()
@@ -173,29 +184,39 @@ for npz_path in npz_files:
 
         env_id = env_id_from_name(stem)
 
+        # num_tasks: read from gymnasium registry (counts singletask-task{N} variants).
+        num_tasks = get_num_tasks(env_id)
+        num_tasks_str = str(num_tasks) if num_tasks is not None else "??  # could not detect; set manually"
+
         # ── Format output ──────────────────────────────────────────────────
         def fmt_list(vals, precision=8):
             return "[" + ", ".join(f"{v:.{precision}g}" for v in vals) + "]"
 
+        episode_len = int(sample_length * EXTRACT_EPISODE_RATIO)
+
         lines = [
             f"defaults:",
-            f"  - base_dataset",
+            f"  - dataset_generate_config",
             f"",
             f"# ── [Group A: Dataset Loader] ─────────────────────────────────────────────",
-            f"# Read directly by OGAntMazeOfflineRLDataset.__init__() and env creation.",
+            f"# Read directly by dataset.__init__() and env creation.",
             f"# Required at both train and eval time.",
             f'env_id: "{env_id}"',
             f'dataset: "{stem}"',
             f"save_dir: ~/.ogbench/data",
-            f"episode_len: {episode_len}",
-            f"num_tasks: {NUM_TASKS}",
+            f"num_tasks: {num_tasks_str}",
+            f"# sample_length: frames per raw episode in the npz (auto-extracted at config generation time).",
+            f"# episode_len = int(sample_length * extract_episode_ratio_from_sample)",
+            f"# Change sliding-window size via: dataset.extract_episode_ratio_from_sample=<ratio>",
+            f"sample_length: {sample_length}",
+            f"episode_len: {episode_len}  # = int({sample_length} * {EXTRACT_EPISODE_RATIO}), recomputed at dataset load time",
             f"",
             f"# ── [Group B: Normalization Stats] ────────────────────────────────────────",
             f"# train time: interpolated into algorithm cfg via train_df_planning.yaml",
             f"#             (${'{'}dataset.observation_mean{'}'} etc.) and saved to ckpt training_hparams.",
             f"# eval time:  restored from ckpt training_hparams; yaml value is NOT used.",
             f"# Computed from {stem} training data",
-            f"# ({n_samples} samples, obs_dim={obs_dim} = qpos[15] + qvel[14]).",
+            f"# ({n_samples} samples, obs_dim={obs_dim}).",
             f"observation_mean: {fmt_list(obs_mean)}",
             f"observation_std:  {fmt_list(obs_std)}",
             f"# action_mean/std: empty → action_dim=0.",
@@ -218,7 +239,7 @@ for npz_path in npz_files:
             generated.append(str(config_path))
             print(f"  [written] {config_path}")
 
-        print(f"  obs_dim={obs_dim}, n_samples={n_samples}, "
+        print(f"  obs_dim={obs_dim}, sample_length={sample_length}, n_samples={n_samples}, "
               f"n_episodes={n_terminals}, reward_mean={reward_mean:.5f}")
 
     except Exception as e:

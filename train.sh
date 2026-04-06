@@ -83,7 +83,7 @@ ckpt_path, train_path = sys.argv[1], sys.argv[2]
 merged      = load_yaml(ckpt_path)   # model arch params
 train_cfg   = load_yaml(train_path)  # training loop params
 
-dataset_config = str(merged.get('train_dataset_config', 'og_antmaze_giant_stitch'))
+dataset_config = str(merged.get('train_dataset_config', 'antmaze_giant_stitch'))
 jump           = str(merged.get('jump', 5))
 obs_idx        = merged.get('obs_dim_indices')
 pos_idx        = merged.get('pos_dim_indices', [0, 1])
@@ -346,7 +346,7 @@ echo "[model_id] Using: $MODEL_ID" | tee -a "$LOG_FILE"
 save_training_config() {
     local model_id="$1"
     local algo_config="$2"
-    local dataset_config="$3"   # e.g. og_antmaze_giant_stitch
+    local dataset_config="$3"   # e.g. antmaze_giant_stitch
     local jump_value="$4"       # e.g. 5
     local obs_dim_json="$5"     # JSON list e.g. [0,1]
     local pos_dim_json="$6"     # JSON list e.g. [0,1]
