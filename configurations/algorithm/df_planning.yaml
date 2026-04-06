@@ -57,7 +57,8 @@ viz_agent_rollout: false # set True to upload *_interaction/sample_*_video to wa
 viz_final_plans: true
 viz_compare_expanded_to_value: false
 viz_mujoco_renderer: false
-viz_subplan_denoising: false # set True to upload plan/plan_at_* to wandb (slow)
+viz_subplan_denoising: true # set True to upload plan/plan_at_* to wandb (slow)
+viz_replanning: false # set True to also log replanned stage denoising video (requires mcts_use_replan)
 viz_uncertain_next_subplan_last_obs: false
 profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
 frame_sampling_way: "linear" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising

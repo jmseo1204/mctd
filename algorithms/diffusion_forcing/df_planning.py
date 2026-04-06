@@ -221,6 +221,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.kde_sample_ratio = cfg.get("kde_sample_ratio", 0.1)
         self._kde_save_dir = os.path.expanduser(cfg.get("kde_save_dir", "~/.ogbench/data"))
         self.mcts_use_replan = cfg.get("mcts_use_replan", False)
+        self.viz_replanning: bool = cfg.get("viz_replanning", True)
         self.use_uncertainty_as_value: bool = cfg.get("use_uncertainty_as_value", False)
         self.viz_uncertain_next_subplan_last_obs: bool = cfg.get("viz_uncertain_next_subplan_last_obs", False)
         self.fast_sampling_multiple: int = cfg.get("fast_sampling_multiple", 5)
@@ -1721,7 +1722,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     )
                     _viz_subplan_expand_ms += (time.time() - _viz_t0) * 1000
                     # Additionally log replanned stage denoising if mcts_use_replan is enabled
-                    if self.mcts_use_replan and _vinfo.get("replanned_plan_hist_frame") is not None:
+                    if self.mcts_use_replan and self.viz_replanning and _vinfo.get("replanned_plan_hist_frame") is not None:
                         _viz_t0 = time.time()
                         self._log_candidate_plan_video(
                             _vname, _vinfo, active_tree,
