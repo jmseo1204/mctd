@@ -136,6 +136,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             "Episode length must be divisible by frame stack size"
         )
         self.n_tokens = self.episode_len // self.frame_stack
+        self.valid_episode_len_multiple = cfg.get("valid_episode_len_multiple", 1)
 
         self.reward_mean = cfg.reward_mean
         self.reward_std = cfg.reward_std
@@ -650,12 +651,33 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         xs = self._unstack_and_unnormalize(xs)[self.frame_stack - 1 :]
         xs_pred = self._unstack_and_unnormalize(xs_pred)[self.frame_stack - 1 :]
 
-        # Visualization, including masked out entries
+        # Visualization: generate a fresh plan of valid_episode_len tokens via DDIM
+        # (valid_episode_len = episode_len * valid_episode_len_multiple)
         if self.global_step % 10000 == 0:
-            o, a, r = self.split_bundle(xs_pred)
-            trajectory = (
-                o.detach().cpu().numpy()[:-1, :8]
-            )  # last observation is dummy, sample 8
+            valid_n_tokens = int(self.n_tokens * self.valid_episode_len_multiple)
+            _viz_batch = 8
+            _n_viz_steps = 20
+            with torch.no_grad():
+                _x_t = torch.randn(
+                    valid_n_tokens, _viz_batch, *self.x_stacked_shape, device=self.device
+                )
+                _x_t = torch.clamp(_x_t, -self.clip_noise, self.clip_noise)
+                _sched = np.round(
+                    np.linspace(self.sampling_timesteps, 0, _n_viz_steps + 1)
+                ).astype(np.int64)
+                for _m in range(_n_viz_steps):
+                    _from_nl = torch.full(
+                        (valid_n_tokens, _viz_batch), int(_sched[_m]),
+                        dtype=torch.long, device=self.device,
+                    )
+                    _to_nl = torch.full(
+                        (valid_n_tokens, _viz_batch), int(_sched[_m + 1]),
+                        dtype=torch.long, device=self.device,
+                    )
+                    _x_t = self.diffusion_model.sample_step(_x_t, None, _from_nl, _to_nl)
+            _xs_viz = self._unstack_and_unnormalize(_x_t)[self.frame_stack - 1:]
+            _o_viz, _, _ = self.split_bundle(_xs_viz)
+            trajectory = _o_viz.detach().cpu().numpy()[:-1]  # remove dummy last obs
             images = make_trajectory_images(
                 self.env_id, trajectory, trajectory.shape[1], None, None, False
             )

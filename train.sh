@@ -105,6 +105,7 @@ val_inf     = str(tl.get('validation_inference_mode', 'false')).lower()
 val_step    = tl.get('validation_val_every_n_step')
 val_step_s  = 'null' if val_step is None else str(val_step)
 val_epoch   = str(tl.get('validation_val_every_n_epoch', 5000))
+valid_epi_mult = str(train_cfg.get('valid_episode_len_multiple', 1))
 
 print(f"DATASET_CONFIG={shlex.quote(dataset_config)}")
 print(f"JUMP_VALUE={shlex.quote(jump)}")
@@ -122,15 +123,17 @@ print(f"TRAIN_VAL_PRECISION={shlex.quote(val_prec)}")
 print(f"TRAIN_VAL_INF_MODE={shlex.quote(val_inf)}")
 print(f"TRAIN_VAL_STEP={shlex.quote(val_step_s)}")
 print(f"TRAIN_VAL_EPOCH={shlex.quote(val_epoch)}")
+print(f"VALID_EPISODE_LEN_MULTIPLE={shlex.quote(valid_epi_mult)}")
 PYEOF
 )"
 
 echo "Read training config from $CKPT_YAML:"
-echo "  dataset_config  = $DATASET_CONFIG"
-echo "  jump            = $JUMP_VALUE"
-echo "  obs_dim         = $TARGET_OBS_DIM  (obs_dim_indices=$OBS_DIM_JSON)"
-echo "  frame_stack     = $TRAIN_FRAME_STACK"
-echo "  network         = size=$TRAIN_NETWORK_SIZE  layers=$TRAIN_NUM_LAYERS  heads=$TRAIN_ATTN_HEADS"
+echo "  dataset_config              = $DATASET_CONFIG"
+echo "  jump                        = $JUMP_VALUE"
+echo "  obs_dim                     = $TARGET_OBS_DIM  (obs_dim_indices=$OBS_DIM_JSON)"
+echo "  frame_stack                 = $TRAIN_FRAME_STACK"
+echo "  network                     = size=$TRAIN_NETWORK_SIZE  layers=$TRAIN_NUM_LAYERS  heads=$TRAIN_ATTN_HEADS"
+echo "  valid_episode_len_multiple  = $VALID_EPISODE_LEN_MULTIPLE"
 echo ""
 
 # Derived display values
@@ -246,23 +249,24 @@ update_eval_symlink() {
 }
 
 # ────────────────────────────────────────────────────────
-# Kill existing training processes
+# Unique container name per run (allows multiple simultaneous train.sh instances)
+# Use --kill-existing to stop all running mctd_training_* containers first.
 # ────────────────────────────────────────────────────────
-echo "========================================"
-echo "[$(date)] Checking for existing training processes..."
+CONTAINER_NAME="mctd_training_$$"
 
-EXISTING_PIDS=$(ps aux | grep -E "docker.*mctd_training|python.*main.py.*$RUN_NAME" | grep -v grep | awk '{print $2}' | grep -v $$ || true)
+KILL_EXISTING=0
+for _arg in "$@"; do
+    [ "$_arg" = "--kill-existing" ] && KILL_EXISTING=1
+done
 
-if [ -n "$EXISTING_PIDS" ]; then
-    echo "Found existing training processes: $EXISTING_PIDS"
-    echo "Killing existing processes..."
-    echo "$EXISTING_PIDS" | xargs -r kill -9 2>/dev/null || true
-    docker rm -f mctd_training 2>/dev/null || true
+if [ "$KILL_EXISTING" -eq 1 ]; then
+    echo "========================================"
+    echo "[$(date)] --kill-existing: stopping all running mctd_training_* containers..."
+    docker ps --filter "name=mctd_training_" --format "{{.Names}}" | xargs -r docker rm -f 2>/dev/null || true
+    EXISTING_PIDS=$(ps aux | grep -E "docker.*mctd_training_" | grep -v grep | awk '{print $2}' | grep -v $$ || true)
+    [ -n "$EXISTING_PIDS" ] && echo "$EXISTING_PIDS" | xargs -r kill -9 2>/dev/null || true
     sleep 2
-    echo "Existing processes killed."
-else
-    echo "No existing training processes found."
-    docker rm -f mctd_training 2>/dev/null || true
+    echo "Done."
 fi
 
 # ────────────────────────────────────────────────────────
@@ -484,7 +488,7 @@ _gpu_ids=$(echo "$AVAILABLE_GPUS" | tr ',' '\n' | grep '^localhost:' | sed 's/lo
 _CUDA_VIS_FLAG=""
 [ -n "$_gpu_ids" ] && _CUDA_VIS_FLAG="-e CUDA_VISIBLE_DEVICES=${_gpu_ids}"
 
-FULL_CMD="docker run --rm --gpus all ${_CUDA_VIS_FLAG} --name mctd_training --shm-size=8g \
+FULL_CMD="docker run --rm --gpus all ${_CUDA_VIS_FLAG} --name ${CONTAINER_NAME} --shm-size=8g \
     -e MUJOCO_GL=osmesa \
     -e HYDRA_FULL_ERROR=1 \
     -e WANDB_ENTITY=$WANDB_ENTITY \
