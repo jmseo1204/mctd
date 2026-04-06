@@ -18,6 +18,7 @@ td_models/*.npz
 td_models/*.pkl
 outputs/
 symlink_to_outputs/
+.gitattributes
 
 # agent_config
 .claude/
