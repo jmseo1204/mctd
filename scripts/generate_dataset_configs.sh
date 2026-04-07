@@ -124,24 +124,45 @@ def config_stem_from_name(name):
     return cleaned.replace("-", "_")
 
 def get_num_tasks(env_id):
-    """Read num_tasks from the ogbench gymnasium registry.
-    Counts how many singletask-task{N} variants are registered for the base env_id.
-    e.g. 'antmaze-giant-v0' → checks 'antmaze-giant-singletask-task1-v0', etc.
-    Falls back to None if ogbench/gymnasium are unavailable.
+    """Read num_tasks by counting task_infos entries in the ogbench environment.
+    Tries direct import first; falls back to Docker (mctd:0.1) if unavailable.
     """
-    try:
-        import re as _re
+    def _count_via_import():
         import gymnasium as _gym
         import ogbench as _ogbench  # ensure env registrations are loaded
-        base = _re.sub(r'-v\d+$', '', env_id)
-        count = 0
-        for i in range(1, 50):
-            try:
-                _gym.spec(f'{base}-singletask-task{i}-v0')
-                count += 1
-            except Exception:
-                break
+        env = _gym.make(env_id)
+        uw = env.unwrapped
+        ti = uw.task_infos if hasattr(uw, 'task_infos') else env.task_infos
+        count = len(ti)
+        env.close()
         return count if count > 0 else None
+
+    def _count_via_docker():
+        import subprocess
+        py_cmd = (
+            "import gymnasium, ogbench\n"
+            f"env = gymnasium.make('{env_id}')\n"
+            "uw = env.unwrapped\n"
+            "ti = uw.task_infos if hasattr(uw, 'task_infos') else env.task_infos\n"
+            "print(len(ti))\n"
+            "env.close()\n"
+        )
+        result = subprocess.run(
+            ["docker", "run", "--rm", "mctd:0.1", "python3", "-c", py_cmd],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0:
+            val = result.stdout.strip().split()[-1]  # last token (skip Docker header lines)
+            if val.isdigit():
+                return int(val) if int(val) > 0 else None
+        return None
+
+    try:
+        return _count_via_import()
+    except Exception:
+        pass
+    try:
+        return _count_via_docker()
     except Exception:
         return None
 

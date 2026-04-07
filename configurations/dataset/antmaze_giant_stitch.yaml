@@ -7,7 +7,7 @@ defaults:
 env_id: "antmaze-giant-v0"
 dataset: "antmaze-giant-stitch-v0"
 save_dir: ~/.ogbench/data
-num_tasks: ??  # could not detect; set manually
+num_tasks: 5
 # sample_length: frames per raw episode in the npz (auto-extracted at config generation time).
 # episode_len = floor(int(sample_length * ratio) / snap_unit) * snap_unit
 #   where snap_unit = jump * frame_stack (from ckpt_df_planning.yaml).
