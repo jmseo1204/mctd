@@ -623,6 +623,8 @@ def main():
         os.makedirs(jobs_folder)
 
     total_tasks_num = full_cfg['dataset'].get('num_tasks')
+    if total_tasks_num is not None:
+        total_tasks_num = int(total_tasks_num)
     start_task_id = args.start_task_id
     count = 0
     for i in range(args.num_tasks):

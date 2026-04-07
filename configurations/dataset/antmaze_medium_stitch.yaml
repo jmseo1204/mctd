@@ -9,10 +9,11 @@ dataset: "antmaze-medium-stitch-v0"
 save_dir: ~/.ogbench/data
 num_tasks: 5
 # sample_length: frames per raw episode in the npz (auto-extracted at config generation time).
-# episode_len = int(sample_length * extract_episode_ratio_from_sample)
+# episode_len = floor(int(sample_length * ratio) / snap_unit) * snap_unit
+#   where snap_unit = jump * frame_stack (from ckpt_df_planning.yaml).
 # Change sliding-window size via: dataset.extract_episode_ratio_from_sample=<ratio>
 sample_length: 201
-episode_len: 100  # = int(201 * 0.5), recomputed at dataset load time
+episode_len: 200  # ratio=1.0, snap_unit=50
 
 # ── [Group B: Normalization Stats] ────────────────────────────────────────
 # train time: interpolated into algorithm cfg via train_df_planning.yaml

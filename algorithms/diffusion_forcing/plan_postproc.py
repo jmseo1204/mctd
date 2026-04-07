@@ -129,9 +129,7 @@ class PlanPostprocMixin:
                         continue
                     _obs_i = candidate_obses[i].reshape(1, -1).astype(np.float32)
                     _obs_j = candidate_obses[j].reshape(1, -1).astype(np.float32)
-                    _pos_i = candidate_obses[i][self.pos_dim_indices].reshape(1, -1).astype(np.float32)
-                    _pos_j = candidate_obses[j][self.pos_dim_indices].reshape(1, -1).astype(np.float32)
-                    dist = float(self._compute_distance(_obs_i, _obs_j, _pos_i, _pos_j)[0])
+                    dist = float(self._compute_distance(_obs_i, _obs_j)[0])
                     if dist < self.diverge_threshold:
                         # Duplicate: kill the one with lower HILP value (farther from target)
                         if group_values[i] >= group_values[j]:
@@ -169,7 +167,6 @@ class PlanPostprocMixin:
 
         threshold = self.meeting_delta
         obs_frames = plan_unnormalized[:, 0, self.obs_bundle_indices].detach().cpu().numpy()  # (N, n_obs)
-        positions = plan_unnormalized[:, 0, self.pos_dim_indices].detach().cpu().numpy()  # (N, pos_dim)
 
         result_indices = [0]
         current_idx = 0
@@ -178,8 +175,7 @@ class PlanPostprocMixin:
             remaining_start = current_idx + 1
             M = n_frames - remaining_start
             _cur_obs_rep = np.broadcast_to(obs_frames[current_idx:current_idx + 1], (M, obs_frames.shape[1])).copy()
-            _cur_pos_rep = np.broadcast_to(positions[current_idx:current_idx + 1], (M, positions.shape[1])).copy()
-            dists = self._compute_distance(obs_frames[remaining_start:], _cur_obs_rep, positions[remaining_start:], _cur_pos_rep)
+            dists = self._compute_distance(obs_frames[remaining_start:], _cur_obs_rep)
 
             within = np.where(dists <= threshold)[0]            # local indices, ascending
             if len(within) > 0:
@@ -246,21 +242,13 @@ class PlanPostprocMixin:
         _obs_mean_np = np.array(self.observation_mean)
         _seg_a_obs = t1_segments[:, self.obs_bundle_indices].detach().cpu().numpy() * _obs_std_np + _obs_mean_np
         _seg_b_obs = t2_flipped[:, self.obs_bundle_indices].detach().cpu().numpy() * _obs_std_np + _obs_mean_np
-        
-        # Prepare position data
-        _pos_std_np = self.data_std[self.pos_dim_indices].cpu().numpy() if isinstance(self.data_std, torch.Tensor) else np.array(self.data_std)[self.pos_dim_indices]
-        _pos_mean_np = self.data_mean[self.pos_dim_indices].cpu().numpy() if isinstance(self.data_mean, torch.Tensor) else np.array(self.data_mean)[self.pos_dim_indices]
-        _seg_a_pos = t1_segments[:, self.pos_dim_indices].detach().cpu().numpy() * _pos_std_np + _pos_mean_np
-        _seg_b_pos = t2_flipped[:, self.pos_dim_indices].detach().cpu().numpy() * _pos_std_np + _pos_mean_np
-        
+
         # Compute pairwise distances
         A, B = _seg_a_obs.shape[0], _seg_b_obs.shape[0]
-        _obs_ab = np.repeat(_seg_a_obs, B, axis=0)
-        _goal_ab = np.tile(_seg_b_obs, (A, 1))
-        _pos_ab = np.repeat(_seg_a_pos, B, axis=0)
-        _pos_goal_ab = np.tile(_seg_b_pos, (A, 1))
-        
-        dists = self._compute_distance(_obs_ab, _goal_ab, _pos_ab, _pos_goal_ab)
+        dists = self._compute_distance(
+            np.repeat(_seg_a_obs, B, axis=0),
+            np.tile(_seg_b_obs, (A, 1)),
+        )
         return float(dists.min())
 
     # ------------------------------------------------------------------

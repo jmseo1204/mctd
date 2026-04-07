@@ -486,34 +486,42 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         temporally closer states (mirrors the meaning of small L2 distance).
         """
         v = self._compute_hilp_values(obs_a_np, obs_b_np)  # (N,) tensor, negative values
-        return (-v).cpu().numpy().astype(np.float32) / 7
+        temporal_dist = self.emb_dist_to_temporal_dist((-v).cpu().numpy(), gamma=0.995)
+        td_to_real_metric_ratio = 0.2
+        return temporal_dist * td_to_real_metric_ratio 
 
     def _compute_distance(
         self,
-        obs1: np.ndarray,  # (N, obs_dim) — observations for TD metric
-        obs2: np.ndarray,  # (N, obs_dim) — observations for TD metric
-        pos1: np.ndarray,  # (N, pos_dim) — positions for Euclidean distance
-        pos2: np.ndarray,  # (N, pos_dim) — positions for Euclidean distance
-    ) -> np.ndarray:       # (N,) — distance array
+        state1: np.ndarray,  # (N, d) — full obs (d==obs_dim) or position-only (d==pos_dim)
+        state2: np.ndarray,  # (N, d) — same
+    ) -> np.ndarray:          # (N,) — distance array
         """Unified distance computation based on use_TD_metric_as_dist flag.
-        
-        Encapsulates the choice between TD metric and Euclidean distance.
-        Caller does not need to check use_TD_metric_as_dist — this function
-        handles the branching internally.
-        
-        Args:
-            obs1: First observation array (N, obs_dim) — used if use_TD_metric_as_dist=True
-            obs2: Second observation array (N, obs_dim) — used if use_TD_metric_as_dist=True
-            pos1: First position array (N, pos_dim) — used if use_TD_metric_as_dist=False
-            pos2: Second position array (N, pos_dim) — used if use_TD_metric_as_dist=False
-            
-        Returns:
-            distances: (N,) array of distances
+
+        Accepts states with full obs dimension (len(obs_dim_indices)) or any
+        partial dimension. When use_TD_metric_as_dist=True, partial inputs are
+        zero-padded at missing obs_dim_indices positions before the TD metric
+        is applied. When False, pos_dim_indices are extracted for Euclidean
+        distance (or the input is used directly if already at pos_dim size).
         """
+        obs_len = len(self.obs_dim_indices)
+        pos_len = len(self.pos_dim_indices)
+        d = state1.shape[-1]
+
         if self.use_TD_metric_as_dist:
-            return self._compute_state_temporal_dist_np(obs1, obs2)
+            if d < obs_len:
+                # Partial input — zero-pad to full obs dim at pos_dim_indices positions
+                shape = state1.shape[:-1] + (obs_len,)
+                full1 = np.zeros(shape, dtype=state1.dtype)
+                full2 = np.zeros(shape, dtype=state2.dtype)
+                full1[..., self.pos_dim_indices] = state1
+                full2[..., self.pos_dim_indices] = state2
+                state1, state2 = full1, full2
+            return self._compute_state_temporal_dist_np(state1, state2)
         else:
-            return np.linalg.norm(pos1 - pos2, axis=1)
+            if d > pos_len:
+                state1 = state1[..., self.pos_dim_indices]
+                state2 = state2[..., self.pos_dim_indices]
+            return np.linalg.norm(state1 - state2, axis=-1)
 
     def _build_model(self):
         mean = list(self.observation_mean) + list(self.action_mean)
@@ -2383,6 +2391,16 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         return achieved_infos, achieved_ts
 
+
+    # --- Embedding-distance → temporal distance conversion ---
+    # HILP converges to ||phi(s)-phi(g)|| = (1-γ^{d*})/(1-γ)
+    # → d*(s,g) = log(1 - emb_dist*(1-γ)) / log(γ)
+    def emb_dist_to_temporal_dist(self, emb_d: np.ndarray, gamma = 0.995) -> np.ndarray:
+        EPS = 1e-8
+        val = 1.0 - np.asarray(emb_d, dtype=np.float64) * (1.0 - gamma)
+        val = np.clip(val, EPS, 1.0 - EPS)
+        return (np.log(val) / np.log(gamma)).astype(np.float64)
+
     def _compute_node_uncertainty(
         self,
         curr_obs: np.ndarray,  # (obs_dim,) — unnormalized current observation
@@ -2448,13 +2466,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 'T_curr': 0.0, 'T_tail': 0.0, 'Delta_bar': 0.0, 'M_rem': 0.0,
             }
 
-        # --- Embedding-distance → temporal distance conversion ---
-        # HILP converges to ||phi(s)-phi(g)|| = (1-γ^{d*})/(1-γ)
-        # → d*(s,g) = log(1 - emb_dist*(1-γ)) / log(γ)
-        def _emb_to_td(emb_d: np.ndarray) -> np.ndarray:
-            val = 1.0 - np.asarray(emb_d, dtype=np.float64) * (1.0 - gamma)
-            val = np.clip(val, eps, 1.0 - eps)
-            return (np.log(val) / np.log(gamma)).astype(np.float64)
+        
 
         # --- Sigma in embedding space (step 2-4 from spec §3.2) ---
         z_bar = Z.mean(axis=0)                    # (D,)
@@ -2476,10 +2488,10 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         )
 
         # --- Temporal distances (converted from embedding L2) ---
-        T_curr = float(_emb_to_td(emb_dist_curr))
+        T_curr = float(self.emb_dist_to_temporal_dist(emb_dist_curr, gamma))
 
         emb_dists_tail = np.linalg.norm(z_goal[None] - Z, axis=-1)  # (K,)
-        T_i    = _emb_to_td(emb_dists_tail)                          # (K,)
+        T_i    = self.emb_dist_to_temporal_dist(emb_dists_tail, gamma)                          # (K,)
         T_tail = float(T_i.mean())
 
         Delta_bar = T_curr - T_tail
@@ -3037,7 +3049,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 #  It includes the noise level zero-padding, finding the max denoising steps, replanning, value calculation and node allocation
                 replanning_start_time = time.time()
 
-                def is_feasible_and_not_short_plan_hists(plan_hists): # plan_hists: (m, plan_tokens*fs, b, c)
+                def check_feasibility(plan_hists): # plan_hists: (m, plan_tokens*fs, b, c)
                     plans = (
                         self._unnormalize_x(plan_hists[-1])[:-1]
                         .detach()
@@ -3045,63 +3057,74 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         .numpy()
                     )  # (t*fs-1, b, c)
 
+                    def get_root_obs(node):
+                        padding_node = node
+                        while padding_node._parent_node is not None:
+                            padding_node = padding_node._parent_node
+                        return padding_node.obs
+
                     # Prepend each candidate's parent obs as frame 0 so that the
                     # parent→first_plan_token continuity is also checked.
-                    parent_obs_list = [
-                        expanded_node_candidates[i]["parent_node"].obs
-                        for i in range(plans.shape[1])
+
+                    parent_node_list = [expanded_node_candidates[i]["parent_node"] for i in range(plans.shape[1])]
+                    root_obs_list = [
+                        get_root_obs(i)
+                        for i in parent_node_list
                     ]
-                    if all(p is not None for p in parent_obs_list):
-                        parent_obs_np = np.stack(parent_obs_list, axis=0)[np.newaxis]  # (1, b, c)
-                        plans = np.concatenate([parent_obs_np, plans], axis=0)  # (t*fs, b, c)
+                    if all(p is not None for p in root_obs_list):
+                        root_obs_np = np.stack(root_obs_list, axis=0)[np.newaxis]  # (1, b, c)
+                        plans = np.concatenate([root_obs_np, plans], axis=0)  # (t*fs, b, c)
 
-                    diffs = np.linalg.norm(
-                        plans[1:] - plans[:-1], axis=-1
-                    )  # (plan_len-1, b)
 
-                    # FIX: is_feasible size should match diffs.shape[1] (number of plans), not expanded_node_candidates
-                    is_feasible = [False] * diffs.shape[1]
-                    for i in range(diffs.shape[1]):
-                        is_feasible[i] = np.all(
+                    _pl, _b, _c = plans[:-1].shape
+                    diffs = self._compute_distance(
+                        plans[:-1].reshape(_pl * _b, _c),
+                        plans[1:].reshape(_pl * _b, _c),
+                    ).reshape(_pl, _b)  # (plan_len-1, b)
+
+
+                    batch_size = diffs.shape[1]
+                    # FIX: is_feasible size should match batch_size (number of plans), not expanded_node_candidates
+                    is_proximal = [False] * batch_size
+                    for i in range(batch_size):
+                        is_proximal[i] = np.all(
                             diffs[:, i] < self.plan_feasibility_delta
                         )
 
+                    is_not_stagnant = [False] * batch_size
                     # Progress filter: kill plans whose sub_plan start-end distance is too small
                     if self.min_progress_threshold > 0.0:
-                        for i in range(diffs.shape[1]):
-                            if is_feasible[i]:
-                                parent_node = expanded_node_candidates[i]["parent_node"]
-                                if parent_node.obs is not None:
-                                    start_xy = parent_node.obs[:2]
-                                    end_xy = plans[-1, i, :2]
-                                    progress = float(np.linalg.norm(end_xy - start_xy))
-                                    if progress < self.min_progress_threshold:
-                                        is_feasible[i] = False
+                        for i, parent_node in enumerate(parent_node_list):
+                            if parent_node.obs is not None:
+                                progress = float(self._compute_distance(
+                                    parent_node.obs[np.newaxis],
+                                    plans[-1, i][np.newaxis],
+                                )[0])
+                                if progress > self.min_progress_threshold:
+                                    is_not_stagnant[i] = True
+
+
+                    is_feasible = [is_proximal[i] and is_not_stagnant[i] for i in range(batch_size)]
 
                     return is_feasible
 
 
                 if not self.mcts_use_replan:
                     # Skip replanning: use expansion results directly for value.
-                    assert prefix_len_list is not None
-                    batch_size = expanded_node_plan_hists.shape[2]
-                    plans_tokens = rearrange(expanded_node_plan_hists, "m (t fs) b c -> m t fs b c", fs=self.frame_stack)
-                    num_tokens_to_check = seg_size
-
-                    # All candidates in a batch come from parents at the same depth, so prefix_len
-                    # is uniform across the batch. Use a simple slice to avoid PyTorch non-adjacent
-                    # advanced indexing, which swaps the indexed dimensions to the front and produces
-                    # shape (T_check, B, m, fs, c) instead of the expected (m, T_check, fs, B, c).
-                    assert len(set(prefix_len_list)) == 1, \
-                        f"Expected uniform prefix_len across batch, got {prefix_len_list}"
-                    plen = prefix_len_list[0]
-                    t_end = min(plen + num_tokens_to_check, plans_tokens.shape[1])
-                    sliced_hists = plans_tokens[:, plen:t_end, :, :, :]  # (m, T_check, fs, B, c)
-                    processed_hists = rearrange(sliced_hists, "m t fs b c -> m (t fs) b c")
-
-                    is_feasible = is_feasible_and_not_short_plan_hists(processed_hists)
                     # val_plan_hists: plan used for value / filtering (no replan → same as expansion)
                     val_plan_hists = expanded_node_plan_hists
+
+                    # assert prefix_len_list is not None
+                    # batch_size = expanded_node_plan_hists.shape[2]
+                    # plans_tokens = rearrange(expanded_node_plan_hists, "m (t fs) b c -> m t fs b c", fs=self.frame_stack)
+                    # num_tokens_to_check = seg_size
+                    # assert len(set(prefix_len_list)) == 1, \
+                    #     f"Expected uniform prefix_len across batch, got {prefix_len_list}"
+                    # plen = prefix_len_list[0]
+                    # t_end = min(plen + num_tokens_to_check, plans_tokens.shape[1])
+                    # sliced_hists = plans_tokens[:, plen:t_end, :, :, :]  # (m, T_check, fs, B, c)
+                    # processed_hists = rearrange(sliced_hists, "m t fs b c -> m (t fs) b c")
+                    # is_feasible = check_feasibility(processed_hists)
 
                 else: # REPLANNING to get more feasible trajectory
                     # Pad the noise levels - Sequential
@@ -3185,10 +3208,12 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
                     replan_diffusion_end = time.time()
 
-                    is_feasible = is_feasible_and_not_short_plan_hists(replanned_plan_hists)
                     # val_plan_hists: plan used for value / filtering (replan → replanned)
                     val_plan_hists = replanned_plan_hists
 
+                ##### NODE FEASIBILITY CHECK #####
+                is_feasible = check_feasibility(val_plan_hists)
+                
                 ##### NODE UNCERTAINTY CHECK #####
 
                 # uncertainty_plan_hists_per_candidate is initialized before the retry loop.

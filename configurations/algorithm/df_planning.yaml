@@ -26,9 +26,9 @@ open_loop_horizon: 1300 #fixme -> best: int(eval_episode_len * horizon_scale) //
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
 sub_goal_interval: 3
 sub_goal_blend_steps: 1 # steps to blend old/new sub_goal actions after a sub_goal switch (antmaze only)
-horizon_scale: 0.45 # horizon = int(eval_episode_len * horizon_scale) // jump
 sequence_dividing_factor: 3
 parallel_search_node: 3 # parallel_search_num = parallel_search_node * len(mctd_guidance_scales)
+horizon_scale: 0.45 # horizon = int(eval_episode_len * horizon_scale) // jump
 eval_episode_len: 1000 # raw episode length (pre-jump); n_tokens = (eval_episode_len // jump) // frame_stack + 1
 
 # HILP value function guidance
@@ -38,9 +38,9 @@ eval_episode_len: 1000 # raw episode length (pre-jump); n_tokens = (eval_episode
 #   If no sidecar exists, inner_prod is used (matches training default).
 # For legacy .pt checkpoints: hilp_obs_dim / hilp_skill_dim are still needed.
 hilp_checkpoint_path: "td_models/params_1000000_20260324_002241.pkl"
-mctd_guidance_scales: [0.4, 0.1] # HILP gradient scale for near-target positions (TD_thres or above)
+mctd_guidance_scales: [0.4, 0.0] # HILP gradient scale for near-target positions (TD_thres or above)
 rmse_guidance_scale: 0.4 # RMSE direction scale for far-target positions (below TD_thres)
-anchor_guidance_scale_ratio: 1.0 # 0.4
+anchor_guidance_scale_ratio: 0.9 # 0.4
 rdf_guidance_scale: 0.0
 particle_guidance_scale: 0.1 # sibling repulsion during denoising (0 = disabled)
 
@@ -48,7 +48,7 @@ particle_guidance_scale: 0.1 # sibling repulsion during denoising (0 = disabled)
 use_TD_metric_as_dist: true # If true, use HILP temporal distance (-V(s,g)) instead of L2(x,y)
 warp_threshold: 3.0
 diverge_threshold: 4.0 # min endpoint distance to count as distinct path (below → deduplicate)
-min_progress_threshold: 1.5 # min distance (x,y) between sub_plan start and end
+min_progress_threshold: 4.0 # min distance (x,y) between sub_plan start and end
 plan_feasibility_delta: 99999.0 # max per-frame movement (world units) to count a plan as feasible
 meeting_delta: 1.2
 

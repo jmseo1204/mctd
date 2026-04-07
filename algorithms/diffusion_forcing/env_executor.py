@@ -167,13 +167,9 @@ class PlanExecutorMixin:
             # is an accumulated FWD+BWD plan that starts from the episode origin (52, 28),
             # while the agent has already advanced deep into the maze.
             _n_frames = plan_slice_np.shape[0]
-            _cur_obs = obs_flat.reshape(1, -1)  # (1, obs_dim)
-            _cur_rep = np.broadcast_to(_cur_obs, (_n_frames, _cur_obs.shape[1])).copy()
             _plan_obs = plan_slice_np[:, self.obs_bundle_indices]  # (T*fs, n_obs)
-            current_pos = current_sim_state["qpos"][:2]  # physical (x,y) always at qpos[:2]
-            plan_positions = plan_slice_np[:, self.pos_dim_indices]  # (T*fs, pos_dim)
-            _cur_pos_rep_2d = np.broadcast_to(current_pos.reshape(1, -1), (_n_frames, len(self.pos_dim_indices))).copy()
-            dists_to_plan = self._compute_distance(_plan_obs, _cur_rep, plan_positions, _cur_pos_rep_2d)
+            _cur_rep = np.broadcast_to(obs_flat.reshape(1, -1), (_n_frames, _plan_obs.shape[1])).copy()
+            dists_to_plan = self._compute_distance(_plan_obs, _cur_rep)
             nearest_frame = int(np.argmin(dists_to_plan))
             sub_goal_idx = min(nearest_frame + self.sub_goal_interval, plan_frame_format.shape[0] - 1)
             sub_goal_pos = plan_slice_np[sub_goal_idx, self.pos_dim_indices]
@@ -210,9 +206,7 @@ class PlanExecutorMixin:
                 _dist_t0 = time.time()
                 _cur_obs = np.concatenate([current_sim_state["qpos"], current_sim_state["qvel"]])[self.obs_dim_indices].reshape(1, -1)
                 _sg_obs = np.concatenate([sub_goal_sim_state["qpos"], sub_goal_sim_state["qvel"]])[self.obs_dim_indices].reshape(1, -1)
-                _cur_pos = current_sim_state["qpos"][:2].reshape(1, -1)  # physical
-                _sg_pos = sub_goal_sim_state["qpos"][:2].reshape(1, -1)  # physical
-                dist_to_sg = float(self._compute_distance(_cur_obs, _sg_obs, _cur_pos, _sg_pos)[0])
+                dist_to_sg = float(self._compute_distance(_cur_obs, _sg_obs)[0])
                 _dist_ms.append((time.time() - _dist_t0) * 1000)
 
                 if dist_to_sg < self.meeting_delta:
