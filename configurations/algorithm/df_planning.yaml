@@ -22,14 +22,14 @@ DEBUG: True
 debug_memory_profile: True
 noise_level_building_way: others # smooth, causal, or others
 num_tries_for_bad_plans: 5
-open_loop_horizon: 1300 #fixme -> best: episode_len*horizon_scale
+open_loop_horizon: 1300 #fixme -> best: int(eval_episode_len * horizon_scale) // jump
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
 sub_goal_interval: 3
 sub_goal_blend_steps: 1 # steps to blend old/new sub_goal actions after a sub_goal switch (antmaze only)
-horizon_scale: 0.45 # horizon = episode_len * horizon_scale
+horizon_scale: 0.45 # horizon = int(eval_episode_len * horizon_scale) // jump
 sequence_dividing_factor: 3
 parallel_search_node: 3 # parallel_search_num = parallel_search_node * len(mctd_guidance_scales)
-episode_len: 200 # 1000(giant) // 5(jump)
+eval_episode_len: 1000 # raw episode length (pre-jump); n_tokens = (eval_episode_len // jump) // frame_stack + 1
 
 # HILP value function guidance
 # For .pkl checkpoints (JAX/Flax): all hyper-params are auto-detected from the file.

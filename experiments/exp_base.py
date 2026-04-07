@@ -185,10 +185,10 @@ class BaseLightningExperiment(BaseExperiment):
         
         effective_max_steps = self.cfg.training.max_steps
         if effective_max_steps > 0:
-            # effective_max_steps counts optimizer steps; num_batches counts micro-batches.
-            # Multiply by accumulate_grad_batches so total_epochs reflects the true budget.
-            accum = self.cfg.training.optim.accumulate_grad_batches
-            total_epochs = (effective_max_steps * accum + num_batches - 1) // num_batches
+            # Let max_steps be the sole stopping criterion to avoid epoch-count
+            # conflicts when resuming from a checkpoint that already exceeded a
+            # previously-computed max_epochs value.
+            total_epochs = -1
         else:
             total_epochs = self.cfg.training.max_epochs
 
@@ -300,7 +300,7 @@ class BaseLightningExperiment(BaseExperiment):
 
             callbacks.append(_KeepLatestCheckpoint())
 
-            _model_id = self.cfg.get("name", None)
+            _model_id = self.root_cfg.get("name", None)
 
             class _RenameLastCheckpoint(pl.callbacks.Callback):
                 """Rename last.ckpt → model.ckpt after each save, then update eval symlink."""
@@ -446,15 +446,25 @@ class BaseLightningExperiment(BaseExperiment):
             max_epochs=total_epochs,
             max_steps=effective_max_steps,
             max_time=self.cfg.training.max_time,
-            enable_progress_bar=False, # Disable default batch-level bar
+            enable_progress_bar=True,
         )
 
-        trainer.fit(
-            self.algo,
-            train_dataloaders=train_loader,
-            val_dataloaders=self._build_validation_loader(),
-            ckpt_path=self.ckpt_path,
-        )
+        try:
+            trainer.fit(
+                self.algo,
+                train_dataloaders=train_loader,
+                val_dataloaders=self._build_validation_loader(),
+                ckpt_path=self.ckpt_path,
+            )
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"\n[OOM] CUDA Out of Memory — step={trainer.global_step}, epoch={trainer.current_epoch}", flush=True)
+                if torch.cuda.is_available():
+                    for _i in range(torch.cuda.device_count()):
+                        _alloc = torch.cuda.memory_allocated(_i) / 1024**3
+                        _reserved = torch.cuda.memory_reserved(_i) / 1024**3
+                        print(f"[OOM] GPU {_i}: allocated={_alloc:.2f} GB, reserved={_reserved:.2f} GB", flush=True)
+            raise
 
     def validation(self) -> None:
         """
@@ -567,12 +577,12 @@ class BaseLightningExperiment(BaseExperiment):
         if not hparams:
             return
 
-        # episode_len: now declared in df_planning.yaml as ${dataset.episode_len}.
-        # Update dataset.episode_len first; algorithm.episode_len interpolates from it.
+        # episode_len: restore dataset.episode_len from ckpt for dataset loading.
+        # algorithm.episode_len is NOT restored — train uses ${dataset.episode_len}
+        # interpolation; eval uses eval_episode_len from df_planning.yaml (override).
         if 'episode_len' in hparams:
             ep_len = int(hparams['episode_len'])
             OmegaConf.update(self.root_cfg, "dataset.episode_len", ep_len, merge=True)
-            OmegaConf.update(self.root_cfg, "algorithm.episode_len", ep_len, merge=True)
 
         # sampling_timesteps is an eval-time param (DDIM step count) — NOT a model
         # architecture param. Old checkpoints may have it saved; skip to preserve the
@@ -610,11 +620,9 @@ class BaseLightningExperiment(BaseExperiment):
         2. New checkpoint missing a specific key (e.g. jump added after the ckpt was saved).
         In both cases df_planning.yaml schema stubs stay null and would crash __init__.
         """
-        # episode_len: injected from dataset config (also called at train time since
-        # episode_len is not a static YAML value but derived from dataset).
-        if OmegaConf.select(self.root_cfg, "algorithm.episode_len") is None:
-            with open_dict(self.root_cfg.algorithm):
-                self.root_cfg.algorithm.episode_len = int(self.root_cfg.dataset.episode_len)
+        # episode_len: train_df_planning.yaml provides `episode_len: ${dataset.episode_len}`
+        # (raw, pre-jump) via Hydra interpolation — no fallback needed here.
+        # eval_episode_len (df_planning.yaml) is eval-only and must not be set here.
 
         # jump: fall back to root config value (set via CLI e.g. jump=5, default=1).
         if OmegaConf.select(self.root_cfg, "algorithm.jump") is None:
@@ -749,29 +757,13 @@ class BaseLightningExperiment(BaseExperiment):
 
     def _build_dataset(self, split: str) -> Optional[torch.utils.data.Dataset]:
         if split in ["training", "test", "validation"]:
-            # FIXME: changed the meaning of episode_len 
-            
             # Decouple the dataset config from the root config to avoid side effects via interpolation
             dataset_cfg_dict = OmegaConf.to_container(self.root_cfg.dataset, resolve=True)
             dataset_cfg = OmegaConf.create(dataset_cfg_dict)
             
-            # If the algorithm uses frame_stack, adjust the dataset's episode_len 
-            # so that it provides exactly (orig_ep_len - fs + 1) frames.
-            # This ensures that n_tokens = (frames - 1) // fs + 1 matches the original definition.
-            if hasattr(self.root_cfg, "algorithm") and hasattr(self.root_cfg.algorithm, "frame_stack"):
-                fs = self.root_cfg.algorithm.frame_stack
-                # Use the original episode_len from the algorithm config
-                orig_ep_len = self.root_cfg.algorithm.episode_len
-                jump = getattr(dataset_cfg, 'jump', 1)
-                if jump <= 1:
-                    # jump=1: need (episode_len) divisible by frame_stack
-                    dataset_cfg.episode_len = orig_ep_len - fs
-                else:
-                    # jump>1: need (episode_len // jump) divisible by frame_stack
-                    # i.e., episode_len must be a multiple of (jump * frame_stack)
-                    unit = jump * fs
-                    dataset_cfg.episode_len = (orig_ep_len // unit) * unit
-                
+            # dataset_cfg.episode_len is raw (pre-jump); the dataset's __getitem__ slices
+            # every `jump` frames automatically, yielding:
+            #   n_tokens = episode_len // (jump * frame_stack) + 1  (including init token)
             return self.compatible_datasets[dataset_cfg._name](dataset_cfg, split=split)
         else:
             raise NotImplementedError(f"split '{split}' is not implemented")

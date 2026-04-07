@@ -60,9 +60,30 @@ if OGBENCH_SRC and OGBENCH_SRC not in sys.path:
     sys.path.insert(0, OGBENCH_SRC)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-# extract_episode_ratio_from_sample: default sliding-window ratio written to yaml.
-# episode_len = int(sample_length * extract_episode_ratio_from_sample).
-EXTRACT_EPISODE_RATIO = 0.5
+# extract_episode_ratio_from_sample: read from dataset_generate_config.yaml.
+# episode_len = int(sample_length * extract_episode_ratio_from_sample),
+#   then snapped DOWN to nearest SNAP_UNIT (= jump * frame_stack from
+#   ckpt_df_planning.yaml) and clamped to < sample_length.
+# Set snap_unit = 0 in ckpt_df_planning.yaml context to disable snapping.
+import re as _re_yaml
+
+def _read_yaml_scalar(path, key, cast=str):
+    """Read a top-level scalar value from a YAML file without a YAML parser."""
+    try:
+        text = Path(path).read_text()
+        m = _re_yaml.search(rf"^\s*{_re_yaml.escape(key)}\s*:\s*(\S+)", text, _re_yaml.MULTILINE)
+        return cast(m.group(1)) if m else None
+    except Exception:
+        return None
+
+_dataset_cfg_path = Path(sys.argv[2]) / "dataset_generate_config.yaml"
+_ckpt_cfg_path    = Path(sys.argv[2]).parent / "algorithm" / "ckpt_df_planning.yaml"
+
+EXTRACT_EPISODE_RATIO = _read_yaml_scalar(_dataset_cfg_path, "extract_episode_ratio_from_sample", float) or 0.5
+
+_jump        = _read_yaml_scalar(_ckpt_cfg_path, "jump",        int)
+_frame_stack = _read_yaml_scalar(_ckpt_cfg_path, "frame_stack", int)
+SNAP_UNIT = (_jump * _frame_stack) if (_jump and _frame_stack) else 0
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def parse_dataset_name(name):
@@ -192,7 +213,8 @@ for npz_path in npz_files:
         def fmt_list(vals, precision=8):
             return "[" + ", ".join(f"{v:.{precision}g}" for v in vals) + "]"
 
-        episode_len = int(sample_length * EXTRACT_EPISODE_RATIO)
+        raw_len = min(int(sample_length * EXTRACT_EPISODE_RATIO), sample_length - 1)
+        episode_len = (raw_len // SNAP_UNIT) * SNAP_UNIT if SNAP_UNIT > 0 else raw_len
 
         lines = [
             f"defaults:",
@@ -206,10 +228,11 @@ for npz_path in npz_files:
             f"save_dir: ~/.ogbench/data",
             f"num_tasks: {num_tasks_str}",
             f"# sample_length: frames per raw episode in the npz (auto-extracted at config generation time).",
-            f"# episode_len = int(sample_length * extract_episode_ratio_from_sample)",
+            f"# episode_len = floor(int(sample_length * ratio) / snap_unit) * snap_unit",
+            f"#   where snap_unit = jump * frame_stack (from ckpt_df_planning.yaml).",
             f"# Change sliding-window size via: dataset.extract_episode_ratio_from_sample=<ratio>",
             f"sample_length: {sample_length}",
-            f"episode_len: {episode_len}  # = int({sample_length} * {EXTRACT_EPISODE_RATIO}), recomputed at dataset load time",
+            f"episode_len: {episode_len}  # ratio={EXTRACT_EPISODE_RATIO}, snap_unit={SNAP_UNIT}",
             f"",
             f"# ── [Group B: Normalization Stats] ────────────────────────────────────────",
             f"# train time: interpolated into algorithm cfg via train_df_planning.yaml",

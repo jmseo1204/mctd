@@ -35,12 +35,16 @@ noise_level: random_all
 # valid_episode_len = episode_len * valid_episode_len_multiple tokens are generated
 # via DDIM and logged to training_visualization/sample_* in WandB.
 valid_episode_len_multiple: 1
+# episode_len: raw sliding-window length from dataset (pre-jump).
+# Used only for training visualization (valid_n_tokens = episode_len * valid_episode_len_multiple // (jump * frame_stack) + 1).
+# eval_episode_len (df_planning.yaml) is completely separate and must NOT be used during training.
+episode_len: ${dataset.episode_len}
 
 # ── Training loop (read by train.sh → passed as experiment.* CLI overrides) ──
 # Edit these to change training behavior without touching train.sh.
 training_loop:
   batch_size: 2048
-  max_steps: 400010
+  max_steps: 600015
   checkpointing_every_n_steps: 4000
   validation_precision: 32
   validation_inference_mode: false

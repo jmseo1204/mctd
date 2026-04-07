@@ -36,9 +36,12 @@ class OGAntMazeOfflineRLDataset(torch.utils.data.Dataset):
         if len(term_indices) > 1 and term_indices[1] == term_indices[0] + 1:
             sample_length = int(term_indices[1]) + 1
 
-        # Compute episode_len as a fraction of sample_length (sliding-window slice size).
-        ratio = float(getattr(cfg, "extract_episode_ratio_from_sample", 0.5))
-        episode_len = int(sample_length * ratio)
+        # Use cfg.episode_len (set by generate_dataset_configs.sh + exp_base._build_dataset,
+        # already snapped to jump*frame_stack and clamped to < sample_length).
+        # Do NOT recompute from extract_episode_ratio_from_sample here: the ratio is only
+        # used at yaml-generation time; runtime re-computation bypasses snapping and can
+        # produce 0 sliding windows when ratio >= 1.0.
+        episode_len = int(cfg.episode_len)
         cfg.episode_len = episode_len  # expose to downstream (df_base, df_planning)
         self.n_frames = episode_len + 1
 
