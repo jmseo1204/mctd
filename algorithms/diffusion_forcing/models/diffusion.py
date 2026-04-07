@@ -332,6 +332,7 @@ class Diffusion(nn.Module):
         curr_noise_level: torch.Tensor,
         next_noise_level: torch.Tensor,
         guidance_fn: Optional[Callable] = None,
+        force_ddim: bool = False,
     ):
         # Generate timestep schedule based on sampling_way
         if self.sampling_way == 'quadratic':
@@ -359,7 +360,7 @@ class Diffusion(nn.Module):
         curr_noise_level = real_steps[curr_noise_level]
         next_noise_level = real_steps[next_noise_level]
 
-        if self.is_ddim_sampling:
+        if self.is_ddim_sampling or force_ddim:
             return self.ddim_sample_step(
                 x=x,
                 external_cond=external_cond,

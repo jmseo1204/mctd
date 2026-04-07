@@ -35,12 +35,13 @@ noise_level: random_all
 # valid_episode_len = episode_len * valid_episode_len_multiple tokens are generated
 # via DDIM and logged to training_visualization/sample_* in WandB.
 valid_episode_len_multiple: 1.0
+episode_len: ${dataset.episode_len}
 
 # ── Training loop (read by train.sh → passed as experiment.* CLI overrides) ──
 # Edit these to change training behavior without touching train.sh.
 training_loop:
   batch_size: 2048
-  max_steps: 400010
+  max_steps: 600015
   checkpointing_every_n_steps: 4000
   validation_precision: 32
   validation_inference_mode: false

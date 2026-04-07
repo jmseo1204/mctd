@@ -10,18 +10,6 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── SSH resilience: relaunch inside tmux so disconnecting won't kill training ──
-if [ -z "${TMUX:-}" ] && command -v tmux &>/dev/null; then
-    SESSION="mctd_train"
-    tmux kill-session -t "$SESSION" 2>/dev/null || true
-    echo "========================================================"
-    echo "  tmux 세션 '$SESSION' 에서 실행합니다."
-    echo "  SSH를 끊어도 학습이 계속됩니다."
-    echo "  재접속:  tmux attach -t $SESSION"
-    echo "  분리:    Ctrl+B, D"
-    echo "========================================================"
-    exec tmux new-session -s "$SESSION" "bash '${BASH_SOURCE[0]}'"
-fi
 
 # Load central user config (DOCKER_USER) before anything else
 # shellcheck source=scripts/project_config.sh
@@ -488,7 +476,11 @@ _gpu_ids=$(echo "$AVAILABLE_GPUS" | tr ',' '\n' | grep '^localhost:' | sed 's/lo
 _CUDA_VIS_FLAG=""
 [ -n "$_gpu_ids" ] && _CUDA_VIS_FLAG="-e CUDA_VISIBLE_DEVICES=${_gpu_ids}"
 
-FULL_CMD="docker run --rm --gpus all ${_CUDA_VIS_FLAG} --name ${CONTAINER_NAME} --shm-size=8g \
+# Memory monitor log: written inside Docker to the project logs/ dir (host-mounted)
+MEM_LOG_DOCKER="$DOCKER_PROJECT/logs/mem_monitor_$(date +%Y%m%d_%H%M%S).log"
+echo "[$(date)] Memory monitor log: $PROJECT_DIR/logs/$(basename "$MEM_LOG_DOCKER")" | tee -a "$LOG_FILE"
+
+FULL_CMD="docker run -d --gpus all ${_CUDA_VIS_FLAG} --name ${CONTAINER_NAME} --shm-size=8g \
     -e MUJOCO_GL=osmesa \
     -e HYDRA_FULL_ERROR=1 \
     -e WANDB_ENTITY=$WANDB_ENTITY \
@@ -502,18 +494,55 @@ FULL_CMD="docker run --rm --gpus all ${_CUDA_VIS_FLAG} --name ${CONTAINER_NAME} 
     -v $HOME_DIR/.netrc:/home/$DOCKER_USER/.netrc \
     -v $HOME_DIR/.d4rl:/home/$DOCKER_USER/.d4rl \
     $DOCKER_IMAGE /bin/bash \
-    -c 'cd $DOCKER_PROJECT && git config --global --add safe.directory $DOCKER_PROJECT 2>/dev/null; $INNER_CMD'"
+    -c 'cd $DOCKER_PROJECT && git config --global --add safe.directory $DOCKER_PROJECT 2>/dev/null; \
+        mkdir -p $DOCKER_PROJECT/logs; \
+        printf \"[MEM_MONITOR] Log: $MEM_LOG_DOCKER\n\" >&2; \
+        (while true; do \
+            printf \"=== \$(date --iso-8601=seconds) ===\n\"; \
+            nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu \
+                --format=csv,noheader,nounits 2>/dev/null \
+                | awk -F, \"{printf \\\"GPU%s: used=%sMiB total=%sMiB util=%s%%\n\\\", \\\$1,\\\$2,\\\$3,\\\$4}\"; \
+            grep -E \"MemTotal|MemAvailable\" /proc/meminfo; \
+            printf \"\n\"; \
+            sleep 30; \
+        done >> $MEM_LOG_DOCKER) & \
+        _MON_PID=\$!; \
+        $INNER_CMD; _RC=\$?; \
+        kill \$_MON_PID 2>/dev/null; wait \$_MON_PID 2>/dev/null || true; \
+        exit \$_RC'"
 
 echo "[$(date)] Docker command: $FULL_CMD" | tee -a "$LOG_FILE"
 
+# Start container detached — survives SSH disconnect
 set +e
-eval "$FULL_CMD" 2>&1 | tee -a "$LOG_FILE"
-EXIT_CODE=${PIPESTATUS[0]}
+CONTAINER_ID=$(eval "$FULL_CMD" 2>&1)
+RUN_RC=$?
 set -e
+
+if [ $RUN_RC -ne 0 ]; then
+    echo "[$(date)] Failed to start container: $CONTAINER_ID" | tee -a "$LOG_FILE"
+    exit 1
+fi
+echo "[$(date)] Container started: $CONTAINER_NAME ($CONTAINER_ID)" | tee -a "$LOG_FILE"
+echo "[$(date)] Monitor logs : tail -f $LOG_FILE" | tee -a "$LOG_FILE"
+echo "[$(date)] Live logs    : docker logs -f $CONTAINER_NAME" | tee -a "$LOG_FILE"
+
+# Stream container logs to LOG_FILE in background (best-effort; dies on SSH disconnect but container keeps running)
+docker logs -f "$CONTAINER_NAME" >> "$LOG_FILE" 2>&1 &
+_STREAM_PID=$!
+
+# Wait for container to finish and collect exit code
+EXIT_CODE=$(docker wait "$CONTAINER_NAME" 2>/dev/null || echo 1)
+
+kill $_STREAM_PID 2>/dev/null || true
+wait $_STREAM_PID 2>/dev/null || true
+
+# Cleanup container
+docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
 update_eval_symlink "$MODEL_ID"
 
-if [ $EXIT_CODE -eq 0 ]; then
+if [ "$EXIT_CODE" -eq 0 ]; then
     echo "[$(date)] Training completed successfully!" | tee -a "$LOG_FILE"
     exit 0
 fi

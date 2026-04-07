@@ -3,7 +3,7 @@
 # Central project configuration
 # Edit these values here — all scripts derive their settings from it
 # =============================================================
-DOCKER_USER="jmseo1204"
+DOCKER_USER="junjolp2026spring"
 WANDB_ENTITY="jmseo1204-seoul-national-university"
 DOCKER_IMAGE="mctd:0.1"
 WANDB_PROJECT="mctd_eval"

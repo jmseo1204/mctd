@@ -128,15 +128,10 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         # non_obs_bundle_indices: action and reward positions within the bundle (for zeroing).
         self.non_obs_bundle_indices: list = list(range(_n_obs, self.unstacked_dim))
         cfg.x_shape = (self.unstacked_dim,)
-        self.episode_len = cfg.episode_len
-
         # Manually initialize frame_stack as requested to solve dependency order
         self.frame_stack = cfg.frame_stack
-        assert self.episode_len % self.frame_stack == 0, (
-            "Episode length must be divisible by frame stack size"
-        )
-        self.n_tokens = self.episode_len // self.frame_stack
         self.valid_episode_len_multiple = cfg.get("valid_episode_len_multiple", 1)
+
 
         self.reward_mean = cfg.reward_mean
         self.reward_std = cfg.reward_std
@@ -166,6 +161,31 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.replanning_target_level = _rpl if _rpl is not None else ((_sampling_ts // 3) if _sampling_ts is not None else 0)
         self.mctd_skip_level_steps = cfg.get("mctd_skip_level_steps", None)
         self.jump = cfg.jump
+
+        # [Eval / Planning] ─────────────────────────────────────────────────────
+        # eval_episode_len: raw episode length (pre-jump), set in df_planning.yaml.
+        # Only used in eval (planning). Training code must NOT depend on this.
+        self.eval_episode_len = cfg.get("eval_episode_len", None)
+        if self.eval_episode_len is not None:
+            assert self.eval_episode_len % (self.jump * self.frame_stack) == 0, (
+                f"eval_episode_len={self.eval_episode_len} must be divisible by "
+                f"jump*frame_stack={self.jump}*{self.frame_stack}={self.jump * self.frame_stack}"
+            )
+            self.n_tokens = (self.eval_episode_len // self.jump) // self.frame_stack + 1
+        else:
+            self.n_tokens = None  # training: n_tokens determined from batch shape
+
+        # [Train / Visualization] ───────────────────────────────────────────────
+        # episode_len: raw sliding-window length from dataset (pre-jump), set in
+        # train_df_planning.yaml as ${dataset.episode_len}. Only used for training
+        # visualization. eval_episode_len must NOT be used here.
+        _train_ep = cfg.get("episode_len", None)
+        if _train_ep is not None:
+            _valid_ep = int(self.valid_episode_len_multiple * _train_ep)
+            self._valid_n_tokens = _valid_ep // (self.jump * self.frame_stack) + 1
+        else:
+            self._valid_n_tokens = None  # eval mode: no training visualization
+
         self.time_limit = cfg.get("time_limit", None)
         self.parallel_search_node = cfg.get("parallel_search_node", 1)
         self.parallel_search_num = self.parallel_search_node * len(self.mctd_guidance_scales)
@@ -282,7 +302,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             extra_meta={
                 "env_id": self.env_id,
                 "frame_stack": self.frame_stack,
-                "episode_len": self.episode_len,
+                "eval_episode_len": self.eval_episode_len,
                 "job_name": _ti_job_name,
             },
             debug_mode=self.cfg.get("DEBUG", True),
@@ -652,10 +672,10 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         xs = self._unstack_and_unnormalize(xs)[self.frame_stack - 1 :]
         xs_pred = self._unstack_and_unnormalize(xs_pred)[self.frame_stack - 1 :]
 
-        # Visualization: generate a fresh plan of valid_episode_len tokens via DDIM
-        # (valid_episode_len = episode_len * valid_episode_len_multiple)
-        if self.global_step % 10000 == 0:
-            valid_n_tokens = int(self.n_tokens * self.valid_episode_len_multiple)
+        # Visualization: generate a fresh plan of valid_n_tokens tokens via DDIM
+        # (valid_n_tokens = episode_len * valid_episode_len_multiple // (jump * frame_stack) + 1)
+        if self.global_step % 10000 == 0 and self._valid_n_tokens is not None:
+            valid_n_tokens = self._valid_n_tokens
             _viz_batch = 8
             _n_viz_steps = 20
             with torch.no_grad():
@@ -675,7 +695,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         (valid_n_tokens, _viz_batch), int(_sched[_m + 1]),
                         dtype=torch.long, device=self.device,
                     )
-                    _x_t = self.diffusion_model.sample_step(_x_t, None, _from_nl, _to_nl)
+                    _x_t = self.diffusion_model.sample_step(_x_t, None, _from_nl, _to_nl, force_ddim=True)
             _xs_viz = self._unstack_and_unnormalize(_x_t)[self.frame_stack - 1:]
             _o_viz, _, _ = self.split_bundle(_xs_viz)
             trajectory = _o_viz.detach().cpu().numpy()[:-1]  # remove dummy last obs
@@ -1537,7 +1557,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # These trees are maintained across MPC steps and expanded
             # alternately within each planning call.
             # ----------------------------------------------------------------
-            horizon: int = int(self.episode_len * self.horizon_scale)
+            horizon: int = int(self.eval_episode_len * self.horizon_scale) // self.jump
             _bidir_start_np = start.cpu().numpy()[:, self.obs_dim_indices]  # (b, obs_dim)
             _bidir_goal_np = goal.cpu().numpy()[:, self.obs_dim_indices]  # (b, obs_dim)
             # Capture initial physical state (always, regardless of use_rollout)

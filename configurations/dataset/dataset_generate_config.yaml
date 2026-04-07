@@ -2,4 +2,4 @@
 
 debug: ${debug} # inherited from configurations/config.yaml
 jump: ${jump} # inherited from configurations/config.yaml
-extract_episode_ratio_from_sample: 0.5 # episode_len = sample_length * this ratio (sample_length determined at runtime from dataset)
+extract_episode_ratio_from_sample: 1.0 # episode_len = sample_length * this ratio (sample_length determined at runtime from dataset)
