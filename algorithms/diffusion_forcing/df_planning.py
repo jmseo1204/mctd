@@ -2365,7 +2365,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
     def _compute_node_uncertainty(
         self,
-        parent_node: "TreeNode",
+        curr_obs: np.ndarray,  # (obs_dim,) — unnormalized current observation
         target_node: "TreeNode",
         tail_obs: np.ndarray,  # (G*K, obs_dim) — unnormalized tail observations
         gamma: float = 0.995,
@@ -2389,7 +2389,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         HILP (PyTorch) uses a different get_phi signature and is NOT supported.
 
         Args:
-            parent_node: Current tree node (source of curr_obs).
+            curr_obs: Current node observation (obs_dim,) — the node being evaluated.
             target_node: Goal tree node (source of goal_obs).
             tail_obs: (G*K, obs_dim) unnormalized observations at the tail of each unc sample.
             gamma: Discount factor used during HILP training (default 0.995).
@@ -2403,7 +2403,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         import math
 
         hilp_fn = self._get_hilp_value_fn()
-        curr_obs: np.ndarray = parent_node.obs  # (obs_dim,)
         goal_obs: np.ndarray = target_node.obs  # (obs_dim,)
         K: int = tail_obs.shape[0]
 
@@ -3327,9 +3326,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 # Compute -uncertainty as value for each candidate.
                 values = np.zeros(len(expanded_node_candidates))
                 for i, candidate in enumerate(expanded_node_candidates):
-                    parent_node_i = candidate["parent_node"]
                     target_node_i = candidate["target_node"]
-                    child_depth_i = candidate["depth"]
+                    curr_depth_i = candidate["depth"]
                     unc_hists_i   = uncertainty_plan_hists_per_candidate[i]
                     assert unc_hists_i is not None, (
                         f"[Uncertainty] uncertainty_plan_hists_per_candidate[{i}] is None "
@@ -3339,11 +3337,18 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     # samples are independent.  Use all G*K for sigma estimation.
                     tail_obs_i = self._extract_obs_at_boundary(
                         unc_hists_i[-1],           # (plan_tokens*fs, G*K, c)
-                        depth=child_depth_i + 1,   # next segment boundary (undenoised region)
+                        depth=curr_depth_i + 1,   # next segment boundary (undenoised region)
                         seg_size=seg_size,
                     )  # (G*K, obs_dim)
+                    # Extract current node's obs from the plan at depth=curr_depth_i boundary.
+                    # candidate["obs"] is set later (post-dedup), so we derive it here directly.
+                    curr_obs_i = self._extract_obs_at_boundary(
+                        expanded_node_plan_hists[-1, :, i].unsqueeze(1),  # (plan_tokens*fs, 1, c)
+                        depth=curr_depth_i,
+                        seg_size=seg_size,
+                    )[0]  # (obs_dim,)
                     unc_result = self._compute_node_uncertainty(
-                        parent_node=parent_node_i,
+                        curr_obs=curr_obs_i,
                         target_node=target_node_i,
                         tail_obs=tail_obs_i,
                     )

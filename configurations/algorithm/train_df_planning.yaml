@@ -34,7 +34,7 @@ noise_level: random_all
 # ── Visualization (read by train.sh; used every 10k steps in training_step) ──
 # valid_episode_len = episode_len * valid_episode_len_multiple tokens are generated
 # via DDIM and logged to training_visualization/sample_* in WandB.
-valid_episode_len_multiple: 1
+valid_episode_len_multiple: 1.0
 
 # ── Training loop (read by train.sh → passed as experiment.* CLI overrides) ──
 # Edit these to change training behavior without touching train.sh.

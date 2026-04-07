@@ -144,7 +144,7 @@ def compute_guidance_grad_np(
             kde_data_xy = planner._get_kde_data_xy()
             kde_score = _kde_score_np(query_xy, kde_data_xy, sigma=planner.kde_sigma)
         
-        # Filter: set score to 0 where ||kde_score|| < μ (- k * sigma)
+        # Filter: set score to 0 where ||kde_score|| < μ + k * sigma
         kde_score_norm = np.linalg.norm(kde_score, axis=-1)  # (N,)
         score_mean = float(kde_score_norm.mean())
         score_std = float(kde_score_norm.std()) + 1e-8

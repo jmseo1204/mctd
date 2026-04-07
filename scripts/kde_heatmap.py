@@ -32,10 +32,10 @@ def _load_kde_cfg() -> dict:
         raw = yaml.safe_load(f)
 
     return {
-        "kde_sigma":        float(raw.get("kde_sigma",        0.2)),
-        "kde_lam":          float(raw.get("kde_lam",          0.07)),
-        "kde_sample_ratio": float(raw.get("kde_sample_ratio", 0.1)),
-        "kde_save_dir":     os.path.expanduser(raw.get("kde_save_dir", "~/.ogbench/data")),
+        "kde_sigma":                   float(raw.get("kde_sigma",                   0.2)),
+        "kde_grad_thres_sigma_coeff":  float(raw.get("kde_grad_thres_sigma_coeff",  0.0)),
+        "kde_sample_ratio":            float(raw.get("kde_sample_ratio",            0.1)),
+        "kde_save_dir":                os.path.expanduser(raw.get("kde_save_dir",   "~/.ogbench/data")),
     }
 
 
@@ -86,11 +86,11 @@ def main():
     # ── Load hyperparams from yaml ────────────────────────────────────────────
     cfg = _load_kde_cfg()
     sigma        = cfg["kde_sigma"]
-    lam          = cfg["kde_lam"]
+    thres_coeff  = cfg["kde_grad_thres_sigma_coeff"]
     sample_ratio = cfg["kde_sample_ratio"]
     save_dir     = cfg["kde_save_dir"]
 
-    print(f"[CFG] sigma={sigma}  lam={lam}  sample_ratio={sample_ratio}  save_dir={save_dir}")
+    print(f"[CFG] sigma={sigma}  thres_coeff={thres_coeff}  sample_ratio={sample_ratio}  save_dir={save_dir}")
 
     # ── Load raw observations ─────────────────────────────────────────────────
     npz_path = os.path.join(save_dir, f"{args.dataset}.npz")
@@ -145,8 +145,8 @@ def main():
     s11 = scores_grid[ix + 1, iy + 1]
     score_q = s00*(1-tx)*(1-ty) + s10*tx*(1-ty) + s01*(1-tx)*ty + s11*tx*ty  # (Q², 2)
 
-    sx = (lam * score_q[:, 0]).reshape(args.quiver_res, args.quiver_res)
-    sy = (lam * score_q[:, 1]).reshape(args.quiver_res, args.quiver_res)
+    sx = score_q[:, 0].reshape(args.quiver_res, args.quiver_res)
+    sy = score_q[:, 1].reshape(args.quiver_res, args.quiver_res)
 
     # ── Plot ──────────────────────────────────────────────────────────────────
     import matplotlib.pyplot as plt
@@ -154,7 +154,7 @@ def main():
     fig, axes = plt.subplots(1, 2, figsize=(16, 7))
     fig.suptitle(
         f"KDE  |  dataset: {args.dataset}\n"
-        f"σ={sigma}  λ={lam}  N={n_use:,} pts  grid={res}²",
+        f"σ={sigma}  N={n_use:,} pts  grid={res}²",
         fontsize=11,
     )
 
@@ -212,8 +212,8 @@ def main():
     mag_std  = float(mag.std()) + 1e-8
     mag_normalized = (mag - mag_mean) / mag_std  # z-score: mean=0, std=1
     
-    # Filter: set magnitude to 0 where mag < μ
-    threshold = mag_mean
+    # Filter: set magnitude to 0 where mag < μ + coeff * σ  (mirrors guidance.py:151)
+    threshold = mag_mean + thres_coeff * mag_std
     mask_below_threshold = mag < threshold
     mag_filtered = mag.copy()
     mag_filtered[mask_below_threshold] = 0.0
@@ -254,9 +254,9 @@ def main():
     ax2.set_xlabel("x (world)")
     ax2.set_ylabel("y (world)")
     ax2.set_title(
-        f"λ·∇log p  —  KDE score field  (λ={lam})\n"
+        f"∇log p  —  KDE score field\n"
         f"arrow length: z-score normalized (μ={mag_mean:.3f}, σ={mag_std:.3f}), scaled to [0.1, 3.0]\n"
-        f"filtered: {n_filtered:,}/{n_total:,} ({100*n_filtered/n_total:.1f}%) gradients < μ-0.5σ"
+        f"filtered: {n_filtered:,}/{n_total:,} ({100*n_filtered/n_total:.1f}%) gradients < μ+{thres_coeff}σ"
     )
 
     plt.tight_layout()

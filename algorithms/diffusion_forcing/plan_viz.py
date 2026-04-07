@@ -94,7 +94,7 @@ class PlanVizMixin:
     def _compute_guidance_grad_fields(
         self,
         target_pos: np.ndarray,
-        grid_step: float = 2.0,
+        grid_step: float = 1.0,
     ) -> Optional[dict]:
         """
         Compute HILP gradient field over the maze for visualization.
