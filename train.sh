@@ -480,7 +480,8 @@ _CUDA_VIS_FLAG=""
 MEM_LOG_DOCKER="$DOCKER_PROJECT/logs/mem_monitor_$(date +%Y%m%d_%H%M%S).log"
 echo "[$(date)] Memory monitor log: $PROJECT_DIR/logs/$(basename "$MEM_LOG_DOCKER")" | tee -a "$LOG_FILE"
 
-FULL_CMD="docker run -d --gpus all ${_CUDA_VIS_FLAG} --name ${CONTAINER_NAME} --shm-size=8g \
+FULL_CMD="docker run -d --gpus all --user root ${_CUDA_VIS_FLAG} --name ${CONTAINER_NAME} --shm-size=8g \
+    -e HOME=/home/$DOCKER_USER \
     -e MUJOCO_GL=osmesa \
     -e HYDRA_FULL_ERROR=1 \
     -e WANDB_ENTITY=$WANDB_ENTITY \

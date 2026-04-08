@@ -199,6 +199,8 @@ def load_raw_hilp_model(
         sys.path.insert(0, project_root)
 
     if checkpoint_path.endswith(".pkl"):
+        import os as _os
+        _os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
         import jax
         _jax_cache = os.path.expanduser("~/.jax_cache")
         os.makedirs(_jax_cache, exist_ok=True)

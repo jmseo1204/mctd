@@ -167,18 +167,14 @@ echo "====================================================="
 echo ""
 
 export AVAILABLE_GPUS
-python3 scripts/run_jobs.py 2>&1 | tee /tmp/mctd_run_jobs.log
+nohup python3 scripts/run_jobs.py > /tmp/mctd_run_jobs.log 2>&1 &
+RUN_JOBS_PID=$!
 
-JOB_EXIT_CODE=$?
-
+echo "✓ Jobs launched in background (PID: $RUN_JOBS_PID)"
+echo "  Log: /tmp/mctd_run_jobs.log"
+echo "  Monitor: tail -f /tmp/mctd_run_jobs.log"
+echo "  Containers: docker ps --filter 'name=exp_gpu'"
 echo ""
-if [ $JOB_EXIT_CODE -eq 0 ]; then
-    echo "====================================================="
-    echo "  ✅ All Jobs Complete Successfully!"
-    echo "====================================================="
-else
-    echo "====================================================="
-    echo "  ❌ Jobs Failed with exit code: $JOB_EXIT_CODE"
-    echo "====================================================="
-    exit $JOB_EXIT_CODE
-fi
+echo "====================================================="
+echo "  ✅ Jobs Running in Background"
+echo "====================================================="

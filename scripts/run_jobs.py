@@ -170,7 +170,8 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
 
     if server == "localhost":
         command = f"""
-        docker run -d --gpus all --name {exp_name} --shm-size=50g \
+        docker run -d --gpus all --user root --name {exp_name} --shm-size=50g \
+        -e HOME=/home/{docker_user} \
         -e MUJOCO_GL=osmesa \
         -e HYDRA_FULL_ERROR=1 \
         -e CUDA_VISIBLE_DEVICES={gpu_id} \
@@ -193,7 +194,8 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
     else:
         # Multi-server setup example (ssh)
         command = f"""
-        ssh {server} "docker run -d --gpus all --name {exp_name} --shm-size=50g \
+        ssh {server} "docker run -d --gpus all --user root --name {exp_name} --shm-size=50g \
+        -e HOME=/home/{docker_user} \
         -e MUJOCO_GL=osmesa \
         -e HYDRA_FULL_ERROR=1 \
         -e CUDA_VISIBLE_DEVICES=0 \
