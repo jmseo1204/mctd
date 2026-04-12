@@ -14,7 +14,7 @@ LOG_DIR="$PROJECT_ROOT/logs"
 
 if [ $# -lt 1 ]; then
     LATEST=$(find "$LOG_DIR" -maxdepth 1 -name "validation_anal_*.jsonl" -print 2>/dev/null \
-        | sort -r | head -1)
+        | sort -r | { head -1; cat > /dev/null; })
     if [ -z "$LATEST" ]; then
         echo "Error: no validation_anal_*.jsonl files found in $LOG_DIR/"
         echo "  (run a job first, or pass a log path explicitly)"

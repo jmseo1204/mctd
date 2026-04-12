@@ -39,6 +39,7 @@ class Diffusion(nn.Module):
         self.cum_snr_decay = cfg.cum_snr_decay
         self.ddim_sampling_eta = cfg.get('ddim_sampling_eta', 0.1)
         self.sampling_way = cfg.get('sampling_way', 'linear')
+        self.sampling_huber_delta = cfg.get('sampling_huber_delta', 0.5)
         self.clip_noise = cfg.clip_noise
         self.max_guidance_ratio = cfg.get("max_guidance_ratio", float("inf"))
         self.arch = cfg.architecture
@@ -352,6 +353,24 @@ class Diffusion(nn.Module):
             idx = torch.arange(self.sampling_timesteps + 1, device=x.device)
             a = raw - idx
             real_steps = torch.cummax(a, dim=0).values + idx
+        elif self.sampling_way == 'huber':
+            # Huber-like spacing: quadratic near x_0 (t < delta), linear elsewhere.
+            # Normalized so f(0)=0, f(1)=1, C1-continuous at t=delta.
+            #   t < delta: f(t) = t² / (2δ·norm)
+            #   t ≥ delta: f(t) = (t - δ/2) / norm       where norm = 1 - δ/2
+            delta = self.sampling_huber_delta
+            norm = 1.0 - delta / 2.0
+            t = torch.linspace(0, 1, steps=self.sampling_timesteps + 1, device=x.device)
+            t_mapped = torch.where(
+                t < delta,
+                t ** 2 / (2.0 * delta * norm),
+                (t - delta / 2.0) / norm,
+            )
+            raw = (t_mapped * self.timesteps - 1).long()
+            # Same cascade deduplication as quadratic (prevents repeated timestep indices near x_0)
+            idx = torch.arange(self.sampling_timesteps + 1, device=x.device)
+            a = raw - idx
+            real_steps = torch.cummax(a, dim=0).values + idx
         else:  # 'linear' (default)
             # Linear spacing: uniform stride across timesteps
             real_steps = torch.linspace(-1, self.timesteps - 1, steps=self.sampling_timesteps + 1, device=x.device).long()
@@ -473,6 +492,7 @@ class Diffusion(nn.Module):
         # Used by _step_hook to report per-guidance gradient contributions.
         _per_guidance_grads = {}
         _per_guidance_grads_clean = {}  # ∂V/∂x̂_0 (clean-space grads, no Jacobian)
+        _per_guidance_xstart_displacements = {}  # exact Δx̂_0_k for direct-x0 mode
         _pred_x_start_raw = None        # x̂_0 before guidance correction
 
         if guidance_fn is not None:
@@ -525,42 +545,79 @@ class Diffusion(nn.Module):
                     g = torch.autograd.grad(guidance_loss.sum(), x, allow_unused=True)[0]
                     grad = torch.zeros_like(x) if g is None else g
 
-            # Apply gradient to pred_noise, then recompute x_start to keep consistency.
-            # Net effect on x_{t-1}: grad * (sqrt_recipm1 * sqrt(α_next) - c)
-            # ≈ 0.41 at high noise (effective anchor), ≈ 0 at low noise (no drift).
+            # Two guidance injection modes:
+            #   1. DPS-style xt injection (default): modify pred_noise using ∂V/∂x_t
+            #   2. Direct x0 injection: modify x_start using ∂V/∂x̂_0, then reconstruct pred_noise
             if torch.isnan(grad).any() or torch.isinf(grad).any():
                 grad = torch.zeros_like(grad)
 
-            # Soft norm clipping (DPS-respecting): guidance grad를 prior norm 기준으로 제한.
-            # 정상 범위(ratio ≤ max_guidance_ratio)는 그대로 유지, 초과분만 축소.
-            # pred_noise 할당 전에 적용하여 prior 정보 오염을 방지.
+            _use_direct_x0 = bool(getattr(self.cfg, "use_directly_inject_guidance_to_x0", False))
+            prior_norm = model_pred.pred_noise.detach().norm(dim=-1, keepdim=True)
+            grad_norm  = grad.norm(dim=-1, keepdim=True)
+            scale = torch.ones_like(grad_norm)
             if self.max_guidance_ratio < float("inf"):
-                prior_norm = model_pred.pred_noise.detach().norm(dim=-1, keepdim=True)
-                grad_norm  = grad.norm(dim=-1, keepdim=True)
-                scale = (self.max_guidance_ratio * prior_norm / (grad_norm + 1e-8)).clamp(max=1.0)
+                if _use_direct_x0:
+                    alpha_ch = self.add_shape_channels(alpha)
+                    sigma_t = self.add_shape_channels((1.0 - alpha).clamp(min=0.0).sqrt())
+                    prior_scale = alpha_ch.sqrt().clamp(min=1e-8)
+                    direct_coeff = float(getattr(self.cfg, "direct_x0_guidance_scale", 0.2))
+                    g_clean_total_preclip = torch.zeros_like(model_pred.pred_x_start)
+                    for v in _per_guidance_grads_clean.values():
+                        g_clean_total_preclip = g_clean_total_preclip + v
+                    direct_disp_norm = (direct_coeff * (sigma_t / prior_scale) * g_clean_total_preclip).norm(dim=-1, keepdim=True)
+                    prior_x0_norm = ((sigma_t / prior_scale) * model_pred.pred_noise.detach()).norm(dim=-1, keepdim=True)
+                    scale = (self.max_guidance_ratio * prior_x0_norm / (direct_disp_norm + 1e-8)).clamp(max=1.0)
+                    _log_prior_norm = prior_x0_norm
+                    _log_grad_norm = direct_disp_norm
+                else:
+                    scale = (self.max_guidance_ratio * prior_norm / (grad_norm + 1e-8)).clamp(max=1.0)
+                    _log_prior_norm = prior_norm
+                    _log_grad_norm = grad_norm
+
                 grad = grad * scale
                 _per_guidance_grads = {k: v * scale for k, v in _per_guidance_grads.items()}
                 _per_guidance_grads_clean = {k: v * scale for k, v in _per_guidance_grads_clean.items()}
                 _t = get_tracer()
                 if _t is not None:
                     _t.log("diffusion.clip_scale", {
+                        "space": "x0" if _use_direct_x0 else "xt",
                         "scale_mean": round(scale.mean().item(), 4),
                         "scale_min":  round(scale.min().item(), 4),
-                        "prior_norm_mean": round(prior_norm.mean().item(), 6),
-                        "grad_norm_mean":  round(grad_norm.mean().item(), 6),
+                        "prior_norm_mean": round(_log_prior_norm.mean().item(), 6),
+                        "grad_norm_mean":  round(_log_grad_norm.mean().item(), 6),
                     }, depth=1)
 
-            pred_noise = model_pred.pred_noise - grad
+            if _use_direct_x0:
+                # Direct x0 guidance for pred_x0-style reasoning:
+                # x̂_0_guided = x̂_0 + η_t * ∂V/∂x̂_0,  η_t = κ * sqrt((1-α_t)/α_t)
+                # Then reconstruct the implied pred_noise for DDIM consistency.
+                alpha_ch = self.add_shape_channels(alpha)
+                sigma_t = self.add_shape_channels((1.0 - alpha).clamp(min=0.0).sqrt())
+                prior_scale = alpha_ch.sqrt().clamp(min=1e-8)
+                direct_coeff = float(getattr(self.cfg, "direct_x0_guidance_scale", 0.2))
+                eta_t = direct_coeff * (sigma_t / prior_scale)
+
+                g_clean_total = torch.zeros_like(model_pred.pred_x_start)
+                for k, v in _per_guidance_grads_clean.items():
+                    g_clean_total = g_clean_total + v
+                    _per_guidance_xstart_displacements[k] = (eta_t * v).detach()
+
+                x_start = model_pred.pred_x_start + eta_t * g_clean_total
+                pred_noise = self.predict_noise_from_start(x, clipped_curr_noise_level, x_start)
+            else:
+                # DPS-style xt injection: modify pred_noise, then recompute x_start.
+                pred_noise = model_pred.pred_noise - grad
+                x_start = self.predict_start_from_noise(x, clipped_curr_noise_level, pred_noise)
 
             if pred_noise.abs().max() > self.clip_noise:
                 pred_noise = torch.clamp(pred_noise, -self.clip_noise, self.clip_noise)
+                if _use_direct_x0:
+                    x_start = self.predict_start_from_noise(x, clipped_curr_noise_level, pred_noise)
                 _t = get_tracer()
                 if _t is not None:
                     _t.log("diffusion.clip_warning", {
                         "clip_limit": float(self.clip_noise),
                     }, depth=1)
-
-            x_start = self.predict_start_from_noise(x, clipped_curr_noise_level, pred_noise)
 
             _t = get_tracer()
             if _t is not None:
@@ -612,6 +669,12 @@ class Diffusion(nn.Module):
                     _t.log("diffusion.grad_norm", {
                         "grad_norm": round(g_norm_val, 6),
                     }, depth=1)
+                    if _use_direct_x0:
+                        _dx0 = (x_start.detach() - model_pred.pred_x_start.detach()).norm(dim=-1)[mask_final].mean().item()
+                        _t.log("diffusion.direct_x0_update", {
+                            "direct_x0_guidance_scale": float(getattr(self.cfg, "direct_x0_guidance_scale", 0.2)),
+                            "delta_x0_norm": round(_dx0, 6),
+                        }, depth=1)
 
         else:
             model_pred = self.model_predictions(
@@ -629,7 +692,9 @@ class Diffusion(nn.Module):
                 'prior_pred_noise': model_pred.pred_noise.detach(),  # (n_tokens, B, dim) – raw score
                 'guidance_grads': _per_guidance_grads,               # dict[name → ∂V/∂x_t tensor]
                 'guidance_grads_clean': _per_guidance_grads_clean,   # dict[name → ∂V/∂x̂_0 tensor]
+                'guidance_xstart_displacements': _per_guidance_xstart_displacements,  # dict[name → exact Δx̂_0_k] for direct-x0 mode
                 'pred_x_start': _pred_x_start_raw,                   # x̂_0 before guidance (n_tokens, B, dim) or None
+                'pred_x_start_after': x_start.detach(),              # x̂_0 after guidance correction (= before if no guidance)
                 'curr_noise_level': clipped_curr_noise_level.detach(),
             })
 

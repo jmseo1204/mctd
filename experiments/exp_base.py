@@ -578,8 +578,8 @@ class BaseLightningExperiment(BaseExperiment):
             return
 
         # episode_len: restore dataset.episode_len from ckpt for dataset loading.
-        # algorithm.episode_len is NOT restored — train uses ${dataset.episode_len}
-        # interpolation; eval uses eval_episode_len from df_planning.yaml (override).
+        # Stored as raw (pre-jump) in both training_config.yaml and new ckpts.
+        # algorithm.episode_len is NOT restored — train uses ${dataset.episode_len} interpolation.
         if 'episode_len' in hparams:
             ep_len = int(hparams['episode_len'])
             OmegaConf.update(self.root_cfg, "dataset.episode_len", ep_len, merge=True)
@@ -669,6 +669,13 @@ class BaseLightningExperiment(BaseExperiment):
                 # 2. Fallback: training_config.yaml saved by train.sh alongside the ckpt
                 if not hparams:
                     hparams = self._load_cache_hparams(self.ckpt_path)
+                else:
+                    # training_config.yaml always stores raw (pre-jump) episode_len.
+                    # Override binary ckpt's episode_len with it for backward compatibility —
+                    # old checkpoints stored raw // jump; training_config.yaml is always correct.
+                    _cache = self._load_cache_hparams(self.ckpt_path)
+                    if _cache.get('episode_len') is not None:
+                        hparams['episode_len'] = _cache['episode_len']
                 if hparams:
                     self._apply_ckpt_hparams_to_cfg(hparams)
                     print(

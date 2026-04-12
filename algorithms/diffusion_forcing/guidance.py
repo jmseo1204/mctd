@@ -1,4 +1,5 @@
-from typing import Optional, Union, Dict, Tuple
+from typing import Optional, Union, Dict, Tuple, List
+import math
 import time
 import torch
 import torch.nn as nn
@@ -85,6 +86,97 @@ def prepare_pred(planner, x: torch.Tensor) -> torch.Tensor:
         x, "t b (fs c) -> (t fs) b c", fs=planner.frame_stack
     )  # (t*fs, b, c)
     return planner._unnormalize_x(pred)
+
+
+def build_active_range_mask(
+    candidate_pos: torch.Tensor,
+    active_frame_ranges: Optional[List[Tuple[int, int]]],
+    batch_size: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Return a per-batch mask over candidate frame indices.
+
+    Args:
+        candidate_pos: (N,) candidate frame indices in full-sequence frame space.
+        active_frame_ranges: optional list of half-open [start_f, end_f) pairs,
+            one per batch item.
+        batch_size: batch size B.
+        device: target device.
+
+    Returns:
+        mask: (N, B) bool tensor when active_frame_ranges is provided, otherwise None.
+    """
+    if active_frame_ranges is None:
+        return None
+
+    assert len(active_frame_ranges) == batch_size, (
+        f"active_frame_ranges length {len(active_frame_ranges)} != batch_size {batch_size}"
+    )
+    starts = torch.tensor([s for s, _ in active_frame_ranges], device=device, dtype=torch.long)
+    ends = torch.tensor([e for _, e in active_frame_ranges], device=device, dtype=torch.long)
+    pos = candidate_pos.to(device=device, dtype=torch.long).unsqueeze(1)  # (N, 1)
+    return (pos >= starts.unsqueeze(0)) & (pos < ends.unsqueeze(0))  # (N, B)
+
+
+def select_active_positions(
+    candidate_pos: torch.Tensor,
+    active_frame_ranges: Optional[List[Tuple[int, int]]],
+    batch_size: int,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    """Select one in-range candidate position per batch item.
+
+    Sliding-window guidance is expected to have exactly one semantically-active
+    target position of each kind per batch item. When multiple candidates fall
+    inside the active range, the right-most one is selected.
+    """
+    if active_frame_ranges is None:
+        return candidate_pos.to(device=device, dtype=torch.long)
+
+    mask = build_active_range_mask(candidate_pos, active_frame_ranges, batch_size, device)
+    assert mask is not None
+    counts = mask.sum(dim=0)
+    if torch.any(counts == 0):
+        raise ValueError(f"{name}: no candidate positions inside active_frame_ranges for some batch items")
+
+    expanded = candidate_pos.to(device=device, dtype=torch.long).unsqueeze(1).expand(-1, batch_size)
+    selected = torch.where(mask, expanded, torch.full_like(expanded, -1)).max(dim=0).values  # (B,)
+    return selected
+
+
+def get_segment_head_positions(
+    planner,
+    horizon: int,
+    device: torch.device,
+    total_frames: int,
+) -> torch.Tensor:
+    """Frame-space indices of each segment head within the predicted plan."""
+    segment_size = horizon // planner.sequence_dividing_factor
+    head_pos = torch.arange(
+        planner.frame_stack,
+        planner.frame_stack + horizon,
+        segment_size,
+        device=device,
+    )
+    return head_pos[head_pos < total_frames]
+
+
+def get_segment_tail_positions(
+    planner,
+    horizon: int,
+    device: torch.device,
+    total_frames: int,
+) -> torch.Tensor:
+    """Frame-space indices of each segment tail within the predicted plan."""
+    segment_size = horizon // planner.sequence_dividing_factor
+    tail_pos = torch.arange(
+        planner.frame_stack + segment_size - 1,
+        planner.frame_stack + horizon,
+        segment_size,
+        device=device,
+    )
+    return tail_pos[tail_pos < total_frames]
 
 def compute_guidance_grad_np(
     planner,
@@ -189,7 +281,7 @@ def compute_guidance_grad_np(
 
 def goal_guidance(
     planner, x: torch.Tensor, goal: torch.Tensor, horizon: int,
-    active_tail_per_batch: Optional[list] = None,
+    active_frame_ranges: Optional[List[Tuple[int, int]]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, list, list]:
     """
     Target guidance to reach goal/start.
@@ -203,9 +295,9 @@ def goal_guidance(
           where t=plan_tokens, b=batch_size, fs*c flattened observation
         goal: (b, obs_dim) normalized goal observations
         horizon: planning horizon in timesteps
-        active_tail_per_batch: When provided (smooth noise mode), list of length B with
-            per-batch frame-space indices of the single tail to apply guidance to.
-            None → apply to all segment tails (causal mode default).
+        active_frame_ranges: When provided, restrict guidance targets to candidate
+            positions that fall inside the current sliding-window frame range for
+            each batch item. None → apply to all segment tails (full-seq default).
 
     Returns:
         (hilp_loss, rmse_loss, hilp_per_batch_list, rmse_per_batch_list):
@@ -230,13 +322,13 @@ def goal_guidance(
         # Compute distance at tail positions of each segment only
         T, B = pred.shape[0], pred.shape[1]
         segment_size = horizon // planner.sequence_dividing_factor
+        tail_pos = get_segment_tail_positions(planner, horizon, pred.device, T)
 
-        if active_tail_per_batch is not None:
-            # ── smooth mode: per-batch single active tail ──────────────────────
-            # Each candidate has exactly one segment being denoised this turn;
-            # restrict guidance to that tail to avoid perturbing already-denoised
-            # past segments that still participate in the smooth forward pass.
-            _atail = torch.tensor(active_tail_per_batch, device=pred.device)  # (B,)
+        if active_frame_ranges is not None:
+            # Sliding-window mode: select the single in-range tail per batch item.
+            _atail = select_active_positions(
+                tail_pos, active_frame_ranges, B, pred.device, "goal_guidance/tail_pos"
+            )  # (B,)
             _bidx  = torch.arange(B, device=pred.device)
 
             _obs_idx = planner.obs_bundle_indices  # model-space obs indices (Method A)
@@ -259,7 +351,7 @@ def goal_guidance(
 
             hilp_fn = getattr(planner, '_hilp_value_fn_instance', None)
             assert hilp_fn is not None and hasattr(hilp_fn, 'compute_grads'), \
-                "active_tail_per_batch requires HILP guidance to be configured"
+                "active_frame_ranges requires HILP guidance to be configured"
 
             _t0 = time.time()
             combined_np, hilp_values_np, far_mask_np, hilp_combined_np, rmse_grad_np, _hilp_grad_ms, _hilp_value_ms = compute_guidance_grad_np(
@@ -285,24 +377,16 @@ def goal_guidance(
                     "far_count": int(far_mask_np.sum()),
                     "TD_thres": TD_thres,
                     "hilp_values": hilp_values_np.tolist(),
-                    "active_tail_mode": "per_batch",
+                    "active_range_mode": "per_batch",
                 })
 
             # pred[_atail, _bidx, :2]: (B, 2) — gather active tail per batch item
             _pos = pred[_atail, _bidx][:, planner.pos_dim_indices]  # (B, pos_dim)
             hilp_pseudo_loss = (_pos * hilp_t * (~far_mask_t)).sum(dim=1)  # (B,)
             rmse_pseudo_loss = (_pos * rmse_t * far_mask_t).sum(dim=1)     # (B,)
-            return hilp_pseudo_loss.mean(), rmse_pseudo_loss.mean(), hilp_pseudo_loss.tolist(), rmse_pseudo_loss.tolist()
-
-        # ── causal mode (default): all segment tails ──────────────────────────
-        # Tail positions: last frame of each segment
-        tail_pos = torch.arange(
-            planner.frame_stack + segment_size - 1,
-            planner.frame_stack + horizon,
-            segment_size,
-            device=pred.device,
-        )
-        tail_pos = tail_pos[tail_pos < T]
+            # Return per-batch (B,) tensors so combined_guidance can apply per-batch scaling.
+            # .mean() here would mix batch elements and break guidance_scale=[0.4, 0.0] separation.
+            return hilp_pseudo_loss, rmse_pseudo_loss, hilp_pseudo_loss.tolist(), rmse_pseudo_loss.tolist()
 
         # --- HILP unit-vector guidance (pseudo-loss trick for JAX backend) ---
         # HILPJax breaks PyTorch autograd, so we compute gradients via JAX and
@@ -373,7 +457,9 @@ def goal_guidance(
             hilp_pseudo_loss = (_pos * hilp_t * (~far_mask_t)).sum(dim=(0, 2))  # (B,)
             rmse_pseudo_loss = (_pos * rmse_t * far_mask_t).sum(dim=(0, 2))    # (B,)
 
-            return hilp_pseudo_loss.mean(), rmse_pseudo_loss.mean(), hilp_pseudo_loss.tolist(), rmse_pseudo_loss.tolist()
+            # Return per-batch (B,) tensors so combined_guidance can apply per-batch scaling.
+            # .mean() here would mix batch elements and break guidance_scale=[0.4, 0.0] separation.
+            return hilp_pseudo_loss, rmse_pseudo_loss, hilp_pseudo_loss.tolist(), rmse_pseudo_loss.tolist()
 
         # --- Fallback: RMSE distance to goal ---
         assert 0, "HILP guidance is not recognized for some reason"
@@ -395,14 +481,22 @@ def goal_guidance(
     zero = x.sum() * 0.0
     return -(dist_per_batch).mean(), zero, dist_per_batch.tolist(), last_token_dist.tolist()
 
-def anchor_dist_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor:
+def anchor_dist_guidance(
+    planner,
+    x: torch.Tensor,
+    horizon: int,
+    active_frame_ranges: Optional[List[Tuple[int, int]]] = None,
+) -> torch.Tensor:
     """
     Anchor distance regularization: pulls each segment head toward the end of the
     previous segment, enforcing temporal continuity between sub-plans.
 
-    Gradient scale is normalized to match goal_guidance: per-active-position magnitude
-    is 1/B regardless of sequence_dividing_factor.  weighted_loss() divides by
-    active_count (= n_segs), so we multiply back by n_active to cancel that factor.
+    Index structure (mirrors goal_guidance's tail_pos pattern):
+      head_pos[k]   = frame_stack + k * segment_size        (segment k의 첫 프레임)
+      anchor_pos[k] = head_pos[k] - 1                       (직전 segment의 마지막 프레임)
+
+    anchor_pos 값들은 goal_guidance의 tail_pos와 동일하며,
+    맨 앞에 frame_stack - 1 (conditioning 마지막 프레임)이 하나 추가된 형태.
 
     Args:
         planner: The DiffusionForcingPlanning instance
@@ -410,36 +504,88 @@ def anchor_dist_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
         horizon: planning horizon
 
     Returns:
-        loss: scalar loss (positive → DPS pushes segment heads toward anchors)
+        loss: scalar loss (DPS pushes segment heads toward anchors)
     """
     pred = prepare_pred(planner, x)
     pred_detached = pred.detach()
+    T = pred.shape[0]
 
     segment_size = horizon // planner.sequence_dividing_factor
-    head_of_each_segments = pred_detached[
-        planner.frame_stack - 1 : planner.frame_stack + horizon - 1 : segment_size
-    ]
-    anchor_plan = torch.zeros_like(pred_detached)
-    anchor_plan[
-        planner.frame_stack : planner.frame_stack + horizon : segment_size
-    ] = head_of_each_segments
-    dist_anchor = nn.functional.mse_loss(pred, anchor_plan, reduction="none")
 
-    anchor_weight = torch.zeros_like(pred_detached[:, 0, 0])
-    anchor_weight[
-        planner.frame_stack : planner.frame_stack + horizon : segment_size
-    ] = 1
-    n_active = (anchor_weight > 0).sum().float().clamp(min=1)
+    # head_pos: 각 segment의 첫 프레임 (guidance 적용 대상)
+    head_pos = get_segment_head_positions(planner, horizon, pred.device, T)
 
-    # weighted_loss divides by active_count (n_segs); multiply back to cancel that
-    # so the per-position gradient magnitude is 1/B, matching goal_guidance.
-    weighted_dist_anchor = weighted_loss(planner, dist_anchor, anchor_weight)
-    return -(weighted_dist_anchor * n_active).mean()
+    # anchor_pos: head_pos - 1 = 직전 segment의 tail
+    anchor_pos = head_pos - 1  # (n_segs,)
 
-def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor:
+    if len(head_pos) == 0:
+        return x.sum() * 0.0
+
+    if active_frame_ranges is not None:
+        selected_head_pos = select_active_positions(
+            head_pos, active_frame_ranges, pred.shape[1], pred.device, "anchor_dist_guidance/head_pos"
+        )  # (B,)
+        selected_anchor_pos = selected_head_pos - 1
+        bidx = torch.arange(pred.shape[1], device=pred.device)
+        head_preds = pred[selected_head_pos, bidx][:, planner.pos_dim_indices]             # (B, pos_dim)
+        anchor_refs = pred_detached[selected_anchor_pos, bidx][:, planner.pos_dim_indices] # (B, pos_dim)
+        dist = ((head_preds - anchor_refs) ** 2).sum(dim=-1)  # (B,)
+        dist = (dist + 1e-6).sqrt()
+        return -dist  # (B,)
+
+    # 명시적 인덱스로 head/anchor 위치만 추출
+    head_preds  = pred[head_pos][:, :, planner.pos_dim_indices]             # (n_segs, B, pos_dim)
+    anchor_refs = pred_detached[anchor_pos][:, :, planner.pos_dim_indices]  # (n_segs, B, pos_dim)
+
+    dist = ((head_preds - anchor_refs) ** 2).sum(dim=-1)  # (n_segs, B)
+    dist = (dist + 1e-6).sqrt()
+    # sum over segments → (B,) per-batch loss.
+    # combined_guidance multiplies by per-batch anchor_guidance_scale then .sum() → scalar.
+    return -(dist.sum(dim=0))  # (B,)
+
+def segment_rdf_guidance(
+    planner,
+    x: torch.Tensor,
+    horizon: int,
+    active_frame_ranges: Optional[List[Tuple[int, int]]] = None,
+) -> torch.Tensor:
     """
-    Temporal consistency guidance using RDF kernel with a sliding window.
-    Repels current state from states in the window [idx-7-segment_size, idx-7].
+    Within-segment repulsion: each segment's tail is repelled from its own head.
+
+    Index structure (mirrors anchor_dist_guidance):
+      head_pos[k] = frame_stack + k * segment_size        (first frame of segment k) — detached
+      tail_pos[k] = frame_stack + (k+1) * segment_size - 1 (last frame of segment k) — gradient target
+
+    Repulsive potential with short-range singularity and long-range exponential cutoff:
+      U(d) = -C · exp(-d² / (2σ²)) / (d + eps)
+
+    Let f(d) = exp(-d² / (2σ²)) / (d + eps).  For d > 0,
+      f'(d) = exp(-d² / (2σ²)) · [ -d/(σ²(d+eps)) - 1/(d+eps)² ] < 0
+    so
+      U'(d) = -C f'(d) > 0   (for C > 0).
+
+    Since ∇_tail d = (tail - head) / d, the tail gradient is
+      ∇_tail U = U'(d) · (tail - head) / d
+    which always points AWAY from the head.  Therefore the guidance is
+    consistently repulsive for all d > 0.
+
+    Additional properties:
+      - d → 0: |∇_tail U| grows strongly due to the 1/(d+eps) singularity
+      - d > σ : influence decays exponentially via exp(-d² / (2σ²))
+
+    We choose C so that |∇_tail U| = 1 at d = σ.
+    The radial derivative magnitude is
+      U'(d) = C · exp(-d²/(2σ²)) · [ d/(σ²(d+eps)) + 1/(d+eps)² ]
+    so at d = σ:
+      1 = C · exp(-1/2) · [ 1/(σ(σ+eps)) + 1/(σ+eps)² ]
+    hence
+      C = exp(1/2) / [ 1/(σ(σ+eps)) + 1/(σ+eps)² ]
+        = exp(1/2) · σ(σ+eps)² / (2σ + eps)
+
+    After combined_guidance multiplies by rdf_guidance_scale, the effective
+    gradient magnitude at d = σ becomes rdf_guidance_scale.
+    After combined_guidance multiplies by rdf_guidance_scale, the effective
+    gradient magnitude at d = σ becomes rdf_guidance_scale.
 
     Args:
         planner: The DiffusionForcingPlanning instance
@@ -447,59 +593,68 @@ def segment_rdf_guidance(planner, x: torch.Tensor, horizon: int) -> torch.Tensor
         horizon: planning horizon
 
     Returns:
-        loss: scalar negative repulsion loss
+        loss: scalar (normalized repulsion loss, to be scaled by rdf_guidance_scale externally)
     """
-    # x is a tensor of shape [t b (fs c)]
     pred = prepare_pred(planner, x)
-    total_T = pred.shape[0]
+    pred_detached = pred.detach()
+    T = pred.shape[0]
 
-    # Extract observation part (first pos_dim dimensions for position)
-    pred_obs = pred[:, :, planner.pos_dim_indices]  # Shape: [T, B, pos_dim]
+    sigma = float(planner.rdf_sigma)
+    segment_size = horizon // planner.sequence_dividing_factor
 
-    # Create indices for pairwise comparison
-    indices = torch.arange(total_T, device=x.device)
-    j_idx = indices.view(-1, 1)
-    k_idx = indices.view(1, -1)
+    # head_pos: identical to anchor_dist_guidance
+    head_pos = get_segment_head_positions(planner, horizon, pred.device, T)
 
-    # Sliding window mask: k is between [j-7-segment_size, j-7]
-    ignore_latest = 6* planner.frame_stack
-    pair_mask = (k_idx <= j_idx - ignore_latest) # & (k_idx >= j_idx - ignore_latest - segment_size)
+    # tail_pos: last frame of each segment
+    tail_pos = head_pos + segment_size - 1
 
-    # Only apply to states within the planning horizon (after conditioning frames)
-    planning_mask = (j_idx >= planner.frame_stack) & (
-        j_idx < planner.frame_stack + horizon
-    )
-    pair_mask = pair_mask & planning_mask
+    n_segs = min(len(head_pos), int((tail_pos < T).sum()))
+    if n_segs == 0:
+        return x.sum() * 0.0
 
-    if not pair_mask.any():
-        return x.sum() * 0.0  # connected to x so autograd.grad doesn't fail
+    head_pos = head_pos[:n_segs]
+    tail_pos = tail_pos[:n_segs]
 
-    # Pairwise squared distances [B, T, T]
-    pred_obs_b = pred_obs.transpose(0, 1)  # [B, T, 2]
-    dist_sq = torch.cdist(pred_obs_b, pred_obs_b, p=2).pow(2)
+    if active_frame_ranges is not None:
+        selected_head_pos = select_active_positions(
+            head_pos, active_frame_ranges, pred.shape[1], pred.device, "segment_rdf_guidance/head_pos"
+        )  # (B,)
+        selected_tail_pos = selected_head_pos + segment_size - 1
+        bidx = torch.arange(pred.shape[1], device=pred.device)
+        head_refs = pred_detached[selected_head_pos, bidx][:, planner.pos_dim_indices]  # (B, pos_dim)
+        tail_preds = pred[selected_tail_pos, bidx][:, planner.pos_dim_indices]           # (B, pos_dim)
 
-    # RDF kernel matrix [B, T, T]
-    h = 2.0  # bandwidth
-    rdf_matrix = torch.exp(-dist_sq / h)
+        dist_sq = ((tail_preds - head_refs) ** 2).sum(dim=-1)  # (B,)
+        dist = (dist_sq + 1e-12).sqrt()
 
-    # Apply mask: set invalid pairs to 0
-    masked_rdf = rdf_matrix * pair_mask.unsqueeze(0).float()
+        eps = 1e-6
+        norm_factor = math.exp(0.5) * sigma * (sigma + eps) ** 2 / (2.0 * sigma + eps)
+        rdf_loss = -norm_factor * torch.exp(-dist_sq / (2.0 * sigma ** 2)) / (dist + eps)  # (B,)
+        return rdf_loss.sum()  # scalar
 
-    # For each j (dim 1), find mean of top 3 RDF among valid k's (dim 2)
-    topk_rdf, _ = torch.topk(masked_rdf, k=3, dim=2)
-    topk_rdf_mean_per_j = topk_rdf.mean(dim=2)
+    # head is the fixed reference (detached); gradient flows through tail
+    head_refs  = pred_detached[head_pos][:, :, planner.pos_dim_indices]  # (n_segs, B, pos_dim)
+    tail_preds = pred[tail_pos][:, :, planner.pos_dim_indices]            # (n_segs, B, pos_dim)
 
-    # Average over j's that have at least one valid candidate k
-    j_has_candidates = pair_mask.any(dim=1)
-    if not j_has_candidates.any():
-        return x.sum() * 0.0  # connected to x so autograd.grad doesn't fail
+    dist_sq = ((tail_preds - head_refs) ** 2).sum(dim=-1)  # (n_segs, B)
+    dist = (dist_sq + 1e-12).sqrt()
 
-    mean_loss = topk_rdf_mean_per_j[:, j_has_candidates].sum()
+    # Inverse-distance repulsion with Gaussian cutoff, normalized so
+    # |∇_tail loss| = 1 at d = sigma.
+    eps = 1e-6
+    norm_factor = math.exp(0.5) * sigma * (sigma + eps) ** 2 / (2.0 * sigma + eps)
+    rdf_loss = -norm_factor * torch.exp(-dist_sq / (2.0 * sigma ** 2)) / (dist + eps)  # (n_segs, B)
 
-    # Return negative loss (gradient descent will minimize repulsion)
-    return -mean_loss
+    # Sum over segments and batch for consistency with other summed guidance terms.
+    return rdf_loss.sum()                                  # scalar
 
-def particle_guidance(planner, x: torch.Tensor, horizon: int, group_ids: Optional[list] = None) -> torch.Tensor:
+def particle_guidance(
+    planner,
+    x: torch.Tensor,
+    horizon: int,
+    group_ids: Optional[list] = None,
+    active_frame_ranges: Optional[List[Tuple[int, int]]] = None,
+) -> torch.Tensor:
     """
     Particle diversity guidance via pairwise L2 repulsion at segment tail positions.
 
@@ -527,21 +682,21 @@ def particle_guidance(planner, x: torch.Tensor, horizon: int, group_ids: Optiona
     segment_size = horizon // planner.sequence_dividing_factor
 
     # Tail positions: identical to goal_guidance causal mode
-    tail_pos = torch.arange(
-        planner.frame_stack + segment_size - 1,
-        planner.frame_stack + horizon,
-        segment_size,
-        device=pred.device,
-    )
-    tail_pos = tail_pos[tail_pos < T]  # (n_tails,)
+    tail_pos = get_segment_tail_positions(planner, horizon, pred.device, T)
 
     if len(tail_pos) == 0:
         return x.sum() * 0.0
 
     pos_dim_indices = planner.pos_dim_indices
-    # Extract (x,y) at tail positions: (n_tails, b, pos_dim) → (b, n_tails*pos_dim)
-    tails = pred[tail_pos][:, :, pos_dim_indices]              # (n_tails, b, pos_dim)
-    tails_flat = tails.permute(1, 0, 2).reshape(b, -1)        # (b, n_tails*pos_dim)
+    if active_frame_ranges is not None:
+        selected_tail_pos = select_active_positions(
+            tail_pos, active_frame_ranges, b, pred.device, "particle_guidance/tail_pos"
+        )  # (B,)
+        tails_flat = pred[selected_tail_pos, torch.arange(b, device=pred.device)][:, pos_dim_indices]  # (B, pos_dim)
+    else:
+        # Extract (x,y) at tail positions: (n_tails, b, pos_dim) → (b, n_tails*pos_dim)
+        tails = pred[tail_pos][:, :, pos_dim_indices]              # (n_tails, b, pos_dim)
+        tails_flat = tails.permute(1, 0, 2).reshape(b, -1)        # (b, n_tails*pos_dim)
 
     # Pairwise L2 distance — gradient is unit-normalized by construction
     dist = torch.cdist(tails_flat, tails_flat, p=2)  # (b, b)
@@ -553,10 +708,10 @@ def particle_guidance(planner, x: torch.Tensor, horizon: int, group_ids: Optiona
         n_pairs = pair_mask.sum()
         if n_pairs == 0:
             return x.sum() * 0.0
-        mean_dist = (dist * pair_mask).sum() / n_pairs
+        mean_dist = (dist * pair_mask).sum()
     else:
         off_diag = 1.0 - torch.eye(b, device=x.device)
-        mean_dist = (dist * off_diag).sum() / off_diag.sum()
+        mean_dist = (dist * off_diag).sum()
 
     # Positive: DPS applies pred_noise -= grad, so pred_x_start moves in grad direction.
     # grad(mean_dist) w.r.t. pred_i points AWAY from j → repulsion (diversity).
@@ -565,7 +720,7 @@ def particle_guidance(planner, x: torch.Tensor, horizon: int, group_ids: Optiona
 def combined_guidance(planner, x_start, goal, horizon, guidance_scale,
                       particle_guidance_scale: float = 0.0,
                       group_ids: Optional[list] = None,
-                      active_tail_per_batch: Optional[list] = None):
+                      active_frame_ranges: Optional[List[Tuple[int, int]]] = None):
     """
     Combined guidance signals for diffusion model.
 
@@ -574,28 +729,48 @@ def combined_guidance(planner, x_start, goal, horizon, guidance_scale,
             When > 0 and batch_size > 1, a repulsion loss pushes sibling trajectories apart.
         group_ids: Optional sibling group ids of length b (see particle_guidance).
             When provided, repulsion is applied only within groups of same id.
-        active_tail_per_batch: When provided (smooth noise mode), list of per-batch
-            frame-space indices indicating the single tail position to apply goal
-            guidance to.  None → apply to all segment tails (causal mode default).
+        active_frame_ranges: When provided, restrict all guidance target indices to
+            positions inside the current sliding-window frame range for each batch item.
 
     Returns:
         guidance_dict: dict of guidance losses
     """
-    anchor_guidance_scale = guidance_scale * planner.anchor_guidance_scale_ratio + 0.2
-    anchor_loss = anchor_dist_guidance(planner, x_start, horizon) * anchor_guidance_scale 
+    # anchor_dist_guidance returns (B,) per-batch; scale per-batch then sum to scalar.
+    # This ensures guidance_scale[b]=0.0 batch elements receive zero anchor gradient.
+    anchor_guidance_scale = guidance_scale * planner.anchor_guidance_scale_ratio + 0.1  # (B,)
+    anchor_loss = (
+        anchor_dist_guidance(
+            planner, x_start, horizon, active_frame_ranges=active_frame_ranges
+        ) * anchor_guidance_scale
+    ).sum()
+
+    # goal_guidance returns (B,) per-batch tensors for hilp and rmse.
+    # Scale per-batch so guidance_scale[b]=0.0 zeroes out HILP for that element.
+    # rmse_guidance_scale is global (not per-batch) — applies equally to all elements.
     # NOTE: goal_guidance() returns HILP and RMSE components separately so each can be
     # scaled independently: TD_guidance_scale (via guidance_scale arg) for HILP,
     # rmse_guidance_scale for the far-target RMSE direction.
     _hilp_inner, _rmse_inner, _, _ = goal_guidance(
         planner, x_start, goal, horizon,
-        active_tail_per_batch=active_tail_per_batch,
-    )
+        active_frame_ranges=active_frame_ranges,
+    )  # both (B,) per-batch tensors
     rmse_guidance_scale = getattr(planner, 'rmse_guidance_scale', 1.0)
-    goal_loss = guidance_scale * _hilp_inner + rmse_guidance_scale * _rmse_inner
-    rdf_loss = segment_rdf_guidance(planner, x_start, horizon) * planner.rdf_guidance_scale
+    goal_loss = (guidance_scale * _hilp_inner + rmse_guidance_scale * _rmse_inner).sum()
+
+    rdf_loss = (
+        segment_rdf_guidance(
+            planner, x_start, horizon, active_frame_ranges=active_frame_ranges
+        ) * planner.rdf_guidance_scale
+    )
 
     particle_loss = (
-        particle_guidance(planner, x_start, horizon=horizon, group_ids=group_ids) * particle_guidance_scale
+        particle_guidance(
+            planner,
+            x_start,
+            horizon=horizon,
+            group_ids=group_ids,
+            active_frame_ranges=active_frame_ranges,
+        ) * particle_guidance_scale
         if particle_guidance_scale > 0.0
         else x_start.sum() * 0.0  # zero but connected to x_start for autograd
     )

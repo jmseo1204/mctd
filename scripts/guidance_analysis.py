@@ -205,9 +205,9 @@ def analyze(records: List[dict], log_name: str) -> None:
             recs = scale_data[scale]
             n = len(recs)
 
-            # dist_per_batch and final_token_dist are lists-per-record
+            # dist_per_batch is a list-per-record; final_token_dist is a scalar float
             dpb_vals = [_mean(r["dist_per_batch"]) for r in recs if r.get("dist_per_batch")]
-            ftd_vals = [_mean(r["final_token_dist"]) for r in recs if r.get("final_token_dist")]
+            ftd_vals = [float(r["final_token_dist"]) for r in recs if r.get("final_token_dist") is not None]
 
             avg_dpb = _mean(dpb_vals)
             avg_ftd = _mean(ftd_vals)

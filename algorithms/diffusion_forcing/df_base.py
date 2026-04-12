@@ -7,7 +7,7 @@ and the `LICENSE` file to credit the author.
 
 from typing import Optional
 from tqdm import tqdm
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import json
 import math
 import os
@@ -132,10 +132,8 @@ class DiffusionForcingBase(BasePytorchAlgo):
             if _val is not None:
                 from omegaconf import OmegaConf as _OC
                 hparams[_key] = _OC.to_container(_val, resolve=True) if hasattr(_val, '_metadata') else _val
-        # Save effective (subsampled) episode_len = raw_episode_len // jump.
+        # Save raw (pre-jump) episode_len from dataset config.
         # jump is declared in both train_df_planning.yaml and df_planning.yaml, so self.cfg.jump is always available.
-        # This ensures eval-time job generation gets the model-aligned episode_len directly
-        # without relying on stale WandB/hydra configs.
         jump = int(self.cfg.get('jump', 1))
         hparams['jump'] = jump
         raw_episode_len = (
@@ -144,15 +142,27 @@ class DiffusionForcingBase(BasePytorchAlgo):
             else None
         )
         if raw_episode_len is not None:
-            hparams['episode_len'] = raw_episode_len // jump
+            hparams['episode_len'] = raw_episode_len
         checkpoint['training_hparams'] = hparams
 
     def _build_model(self):
+        # Propagate algorithm-level guidance injection params into diffusion sub-cfg.
+        # diffusion.py reads these via getattr(self.cfg, key, default), but self.cfg
+        # is cfg.diffusion (the sub-section), so top-level keys are invisible without this.
+        # cfg.diffusion may be a struct DictConfig (no new keys allowed), so convert to
+        # plain dict first, inject missing keys, then rebuild as a non-struct DictConfig.
+        _keys_to_propagate = ("use_directly_inject_guidance_to_x0", "direct_x0_guidance_scale")
+        _diffusion_dict = OmegaConf.to_container(self.cfg.diffusion, resolve=True)
+        assert isinstance(_diffusion_dict, dict)
+        for k in _keys_to_propagate:
+            if k in self.cfg and k not in _diffusion_dict:
+                _diffusion_dict[k] = self.cfg[k]
+        diffusion_cfg: DictConfig = OmegaConf.create(_diffusion_dict)  # type: ignore[assignment]
         self.diffusion_model = Diffusion(
             x_shape=self.x_stacked_shape,
             external_cond_dim=self.external_cond_dim,
             is_causal=self.causal,
-            cfg=self.cfg.diffusion,
+            cfg=diffusion_cfg,
         )
         self.register_data_mean_std(self.cfg.data_mean, self.cfg.data_std)
 

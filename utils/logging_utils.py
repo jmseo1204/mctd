@@ -36,6 +36,34 @@ OGBENCH_ENVS = [
     "antmaze-teleport-v0",
 ]
 
+GUIDANCE_COMPONENT_SPECS = {
+    "score": {
+        "color": "yellow",
+        "label_xt": "Prior score (x_t)",
+        "label_x0": "Prior score (x̂_0)",
+    },
+    "anchor": {
+        "color": "deepskyblue",
+        "label_xt": "Anchor grad (x_t)",
+        "label_x0": "Anchor grad (x̂_0)",
+    },
+    "goal": {
+        "color": "lime",
+        "label_xt": "Goal grad (x_t)",
+        "label_x0": "Goal grad (x̂_0)",
+    },
+    "rdf": {
+        "color": "magenta",
+        "label_xt": "RDF grad (x_t)",
+        "label_x0": "RDF grad (x̂_0)",
+    },
+    "particle": {
+        "color": "cyan",
+        "label_xt": "Particle grad (x_t)",
+        "label_x0": "Particle grad (x̂_0)",
+    },
+}
+
 
 # FIXME: clean up & check this util
 def log_video(
@@ -316,6 +344,17 @@ def _parse_trajectory_plot_inputs(trajectory):
         if key in plot_data and plot_data[key] is not None:
             plot_data[key] = np.asarray(plot_data[key])
 
+    for key in [
+        "guidance_component_vectors",
+        "pred_x_start_guidance_component_vectors",
+    ]:
+        if key in plot_data and plot_data[key] is not None:
+            plot_data[key] = {
+                comp: np.asarray(vecs)
+                for comp, vecs in plot_data[key].items()
+                if vecs is not None
+            }
+
     plot_data["plan"] = _maybe_add_batch_dim(plot_data.get("plan"))
     plot_data["rollout_agent_history"] = _maybe_add_batch_dim(plot_data.get("rollout_agent_history"))
     plot_data["rollout_current_agent"] = _maybe_add_batch_dim(plot_data.get("rollout_current_agent"))
@@ -338,14 +377,17 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
     pred_x_start_pos = plot_data.get("pred_x_start_pos")
     pred_x_start_guidance_grad = plot_data.get("pred_x_start_guidance_grad")
     pred_x_start_prior_grad = plot_data.get("pred_x_start_prior_grad")
+    guidance_component_vectors = plot_data.get("guidance_component_vectors")
+    pred_x_start_guidance_component_vectors = plot_data.get("pred_x_start_guidance_component_vectors")
     rollout_agent_history = plot_data.get("rollout_agent_history")
     rollout_current_agent = plot_data.get("rollout_current_agent")
     rollout_current_subgoal = plot_data.get("rollout_current_subgoal")
     postprocessed_plan = plot_data.get("postprocessed_plan")
     unc_plans_list = plot_data.get("unc_plans_list")          # list of (T, pos_dim) arrays or None
     unc_guidance_targets = plot_data.get("unc_guidance_targets")  # (G*K, pos_dim) or None
-    unc_guidance_alphas = plot_data.get("unc_guidance_alphas")    # (G*K,) floats or None
-    unc_guidance_legend = plot_data.get("unc_guidance_legend")    # list of (label, alpha) per scale or None
+    unc_scale_colors = plot_data.get("unc_scale_colors")          # (G*K, 3) RGB per sample or None
+    unc_guidance_legend = plot_data.get("unc_guidance_legend")    # list of (label, rgb) per scale or None
+    tail_dot_color = plot_data.get("tail_dot_color", (0.2, 0.85, 0.2))  # RGB for x_t/pred_x0 dots
 
     if is_grid_env(env_id):
         maze_grid = get_maze_grid(env_id)
@@ -387,7 +429,7 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
         # unc_plans_list: list of G*K arrays (T, pos_dim) — uncertainty fast-sampled trajectories.
         # Each is rendered as a red-gradient scatter (same style as the main plan).
         # unc_guidance_targets: (G*K, pos_dim) — endpoint positions.
-        # unc_guidance_alphas: (G*K,) — green dot alpha scaled by relative guidance intensity.
+        # unc_scale_colors: (G*K, 3) — per-sample RGB color from plasma cmap, keyed by guidance scale.
         for j, traj_j in enumerate(unc_plans_list):
             if traj_j is None or len(traj_j) == 0:
                 continue
@@ -396,25 +438,25 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
                        alpha=0.5, s=20, zorder=4)
 
         if unc_guidance_targets is not None and len(unc_guidance_targets) > 0:
-            alphas = unc_guidance_alphas if unc_guidance_alphas is not None else np.ones(len(unc_guidance_targets))
+            _unc_fixed_alpha = 0.85
             for j, ep in enumerate(unc_guidance_targets):
                 ep_xy = _to_plot_coords(env_id, np.asarray(ep)[:2])
-                alpha_j = float(np.clip(alphas[j], 0.0, 1.0)) if j < len(alphas) else 1.0
-                ax.scatter(ep_xy[0], ep_xy[1], c="lime", marker="o", s=80, zorder=9,
-                           edgecolors="green", linewidth=1.2, alpha=alpha_j,
+                dot_color = tuple(unc_scale_colors[j]) if unc_scale_colors is not None and j < len(unc_scale_colors) else (0.2, 0.85, 0.2)
+                ax.scatter(ep_xy[0], ep_xy[1], color=dot_color, marker="o", s=80, zorder=9,
+                           edgecolors="none", linewidth=0, alpha=_unc_fixed_alpha,
                            label="_nolegend_")
 
             # Add one proxy legend entry per unique guidance scale.
             if unc_guidance_legend is not None:
                 import matplotlib.lines as mlines
                 proxy_handles = []
-                for label, leg_alpha in unc_guidance_legend:
-                    proxy = mlines.Line2D([], [], color="lime", marker="o", linestyle="None",
-                                         markersize=7, markeredgecolor="green",
-                                         markeredgewidth=1.2, alpha=leg_alpha, label=label)
+                for label, leg_color in unc_guidance_legend:
+                    proxy = mlines.Line2D([], [], color=leg_color, marker="o", linestyle="None",
+                                         markersize=7, markeredgecolor="none",
+                                         markeredgewidth=0, alpha=_unc_fixed_alpha, label=label)
                     proxy_handles.append(proxy)
                 unc_leg = ax.legend(handles=proxy_handles, loc="lower right", framealpha=0.6,
-                                    fontsize=9, title="unc gs", title_fontsize=9)
+                                    fontsize=4.5, title="unc gs", title_fontsize=4.5)
                 ax.add_artist(unc_leg)  # pin so the main ax.legend() call below doesn't overwrite it
 
     if target_node_trajectory is not None and len(target_node_trajectory) > 0:
@@ -483,21 +525,52 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
     if has_guidance_targets:
         for idx, gpos in enumerate(guidance_targets):
             gxy = _to_plot_coords(env_id, np.asarray(gpos)[:2])
-            ax.scatter(gxy[0], gxy[1], c="lime", marker="o", s=120, zorder=9,
-                       edgecolors="green", linewidth=1.5,
-                       label="Guidance Tgt" if idx == 0 else "_nolegend_")
+            ax.scatter(gxy[0], gxy[1], color=tail_dot_color, marker="o", s=120, zorder=9,
+                       edgecolors="none", linewidth=0, alpha=0.9,
+                       label="x_t tail" if idx == 0 else "_nolegend_")
 
-    has_goal_grad = has_guidance_targets and goal_grad_vectors is not None and len(goal_grad_vectors) > 0
-    if has_goal_grad:
-        for idx, (gpos, gvec) in enumerate(zip(guidance_targets, goal_grad_vectors)):
-            gxy = _to_plot_coords(env_id, np.asarray(gpos)[:2])
-            if env_id in OGBENCH_ENVS:
-                gdx, gdy = gvec[0] / 4, gvec[1] / 4
-            else:
-                gdx, gdy = float(gvec[0]), float(gvec[1])
-            ax.quiver(gxy[0], gxy[1], gdx, gdy, color="lime", angles="xy", scale_units="xy",
-                      scale=1.0, width=0.006, zorder=12,
-                      label="Guidance grad" if idx == 0 else "_nolegend_")
+    has_component_guidance = (
+        has_guidance_targets
+        and guidance_component_vectors is not None
+        and any(len(vecs) > 0 for vecs in guidance_component_vectors.values())
+    )
+    if has_component_guidance:
+        component_legend_added = set()
+        for comp_name in ["anchor", "goal", "rdf", "particle"]:
+            vecs = guidance_component_vectors.get(comp_name)
+            if vecs is None or len(vecs) == 0:
+                continue
+            spec = GUIDANCE_COMPONENT_SPECS.get(comp_name, {})
+            color = spec.get("color", "lime")
+            label_xt = spec.get("label_xt", f"{comp_name} grad (x_t)")
+            for idx, (gpos, gvec) in enumerate(zip(guidance_targets, vecs)):
+                gxy = _to_plot_coords(env_id, np.asarray(gpos)[:2])
+                if env_id in OGBENCH_ENVS:
+                    gdx, gdy = float(gvec[0]) / 4, float(gvec[1]) / 4
+                else:
+                    gdx, gdy = float(gvec[0]), float(gvec[1])
+                ax.quiver(
+                    gxy[0], gxy[1], gdx, gdy,
+                    color=color, angles="xy", scale_units="xy",
+                    scale=1.0, width=0.006, zorder=12,
+                    label=label_xt if comp_name not in component_legend_added else "_nolegend_",
+                )
+                component_legend_added.add(comp_name)
+    else:
+        has_goal_grad = has_guidance_targets and goal_grad_vectors is not None and len(goal_grad_vectors) > 0
+        if has_goal_grad:
+            for idx, (gpos, gvec) in enumerate(zip(guidance_targets, goal_grad_vectors)):
+                gxy = _to_plot_coords(env_id, np.asarray(gpos)[:2])
+                if env_id in OGBENCH_ENVS:
+                    gdx, gdy = gvec[0] / 4, gvec[1] / 4
+                else:
+                    gdx, gdy = float(gvec[0]), float(gvec[1])
+                ax.quiver(gxy[0], gxy[1], gdx, gdy, color="lime", angles="xy", scale_units="xy",
+                          scale=1.0, width=0.006, zorder=12,
+                          label="Guidance grad" if idx == 0 else "_nolegend_")
+    has_goal_grad = has_component_guidance or (
+        has_guidance_targets and goal_grad_vectors is not None and len(goal_grad_vectors) > 0
+    )
 
     has_prior_grad = has_guidance_targets and prior_grad_vectors is not None and len(prior_grad_vectors) > 0
     if has_prior_grad:
@@ -512,35 +585,70 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
                       label="Prior score" if idx == 0 else "_nolegend_")
 
     # --- pred_x_start (x̂_0) visualization ---
-    # Lighter green dot + dashed arrows for ∂V/∂x̂_0 (green) and prior score (yellow)
+    # pred_x_start (x̂_0) dot: same color as x_t tail but lower alpha (alpha 0.35 vs 0.9)
     has_xs_pos = pred_x_start_pos is not None and len(pred_x_start_pos) > 0
     if has_xs_pos:
         for idx, xspos in enumerate(pred_x_start_pos):
             xsxy = _to_plot_coords(env_id, np.asarray(xspos)[:2])
-            ax.scatter(xsxy[0], xsxy[1], c="lime", marker="o", s=80, zorder=8,
-                       alpha=0.5, edgecolors="green", linewidth=1.0,
-                       label="x̂_0 (pred_x_start)" if idx == 0 else "_nolegend_")
+            ax.scatter(xsxy[0], xsxy[1], color=tail_dot_color, marker="o", s=80, zorder=8,
+                       alpha=0.35, edgecolors="none", linewidth=0,
+                       label="x̂_0 tail" if idx == 0 else "_nolegend_")
 
-    has_xs_gg = has_xs_pos and pred_x_start_guidance_grad is not None and len(pred_x_start_guidance_grad) > 0
-    if has_xs_gg:
-        _xs_gg_legend_added = False
-        for idx, (xspos, gvec) in enumerate(zip(pred_x_start_pos, pred_x_start_guidance_grad)):
-            xsxy = _to_plot_coords(env_id, np.asarray(xspos)[:2])
-            if env_id in OGBENCH_ENVS:
-                gdx, gdy = float(gvec[0]) / 4, float(gvec[1]) / 4
-            else:
-                gdx, gdy = float(gvec[0]), float(gvec[1])
-            arrow = FancyArrowPatch(
-                posA=(xsxy[0], xsxy[1]),
-                posB=(xsxy[0] + gdx, xsxy[1] + gdy),
-                arrowstyle='-|>', mutation_scale=10,
-                color="lime", linestyle="dashed", linewidth=1.5,
-                transform=ax.transData, zorder=13,
-            )
-            ax.add_patch(arrow)
-            if not _xs_gg_legend_added:
-                ax.plot([], [], color="lime", linestyle="dashed", linewidth=1.5, label="Guidance grad (x̂_0)")
-                _xs_gg_legend_added = True
+    has_xs_component_guidance = (
+        has_xs_pos
+        and pred_x_start_guidance_component_vectors is not None
+        and any(len(vecs) > 0 for vecs in pred_x_start_guidance_component_vectors.values())
+    )
+    if has_xs_component_guidance:
+        xs_component_legend_added = set()
+        for comp_name in ["anchor", "goal", "rdf", "particle"]:
+            vecs = pred_x_start_guidance_component_vectors.get(comp_name)
+            if vecs is None or len(vecs) == 0:
+                continue
+            spec = GUIDANCE_COMPONENT_SPECS.get(comp_name, {})
+            color = spec.get("color", "lime")
+            label_x0 = spec.get("label_x0", f"{comp_name} grad (x̂_0)")
+            for xspos, gvec in zip(pred_x_start_pos, vecs):
+                xsxy = _to_plot_coords(env_id, np.asarray(xspos)[:2])
+                if env_id in OGBENCH_ENVS:
+                    gdx, gdy = float(gvec[0]) / 4, float(gvec[1]) / 4
+                else:
+                    gdx, gdy = float(gvec[0]), float(gvec[1])
+                arrow = FancyArrowPatch(
+                    posA=(xsxy[0], xsxy[1]),
+                    posB=(xsxy[0] + gdx, xsxy[1] + gdy),
+                    arrowstyle='-|>', mutation_scale=10,
+                    color=color, linestyle="dashed", linewidth=1.5,
+                    transform=ax.transData, zorder=13,
+                )
+                ax.add_patch(arrow)
+            if comp_name not in xs_component_legend_added:
+                ax.plot([], [], color=color, linestyle="dashed", linewidth=1.5, label=label_x0)
+                xs_component_legend_added.add(comp_name)
+    else:
+        has_xs_gg = has_xs_pos and pred_x_start_guidance_grad is not None and len(pred_x_start_guidance_grad) > 0
+        if has_xs_gg:
+            _xs_gg_legend_added = False
+            for idx, (xspos, gvec) in enumerate(zip(pred_x_start_pos, pred_x_start_guidance_grad)):
+                xsxy = _to_plot_coords(env_id, np.asarray(xspos)[:2])
+                if env_id in OGBENCH_ENVS:
+                    gdx, gdy = float(gvec[0]) / 4, float(gvec[1]) / 4
+                else:
+                    gdx, gdy = float(gvec[0]), float(gvec[1])
+                arrow = FancyArrowPatch(
+                    posA=(xsxy[0], xsxy[1]),
+                    posB=(xsxy[0] + gdx, xsxy[1] + gdy),
+                    arrowstyle='-|>', mutation_scale=10,
+                    color="lime", linestyle="dashed", linewidth=1.5,
+                    transform=ax.transData, zorder=13,
+                )
+                ax.add_patch(arrow)
+                if not _xs_gg_legend_added:
+                    ax.plot([], [], color="lime", linestyle="dashed", linewidth=1.5, label="Guidance grad (x̂_0)")
+                    _xs_gg_legend_added = True
+    has_xs_gg = has_xs_component_guidance or (
+        has_xs_pos and pred_x_start_guidance_grad is not None and len(pred_x_start_guidance_grad) > 0
+    )
 
     has_xs_pg = has_xs_pos and pred_x_start_prior_grad is not None and len(pred_x_start_prior_grad) > 0
     if has_xs_pg:
@@ -635,7 +743,7 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
             or rollout_current_agent is not None
             or rollout_current_subgoal is not None
             or postprocessed_plan is not None):
-        ax.legend(loc="upper right", fontsize=10)
+        ax.legend(loc="upper right", fontsize=5)
 
 
 def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end_points=True):

@@ -15,7 +15,7 @@ All methods reference `self.*` attributes/methods provided by the base class or 
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -30,6 +30,41 @@ class PlanPostprocMixin:
 
     def _get_prefix_len_frames_from_depth(self, depth: int, seg_size: int) -> int:
         return depth * seg_size * self.frame_stack
+
+    def _get_denoised_frame_prefix_len(
+        self, depth: int, seg_size: int, total_frames: Optional[int] = None
+    ) -> int:
+        prefix_len = max(self._get_prefix_len_frames_from_depth(depth, seg_size), 0)
+        if total_frames is not None:
+            prefix_len = min(prefix_len, total_frames)
+        return prefix_len
+
+    def _get_plan_viz_valid_frame_bounds(
+        self,
+        depth: int,
+        seg_size: int,
+        total_frames: int,
+        is_forward_tree: bool,
+    ) -> Tuple[int, int]:
+        prefix_len = self._get_denoised_frame_prefix_len(depth, seg_size, total_frames)
+        if is_forward_tree:
+            return 0, prefix_len
+        return total_frames - prefix_len, total_frames
+
+    def _mask_plan_obs_outside_valid_frames(
+        self,
+        plan_obs: np.ndarray,
+        valid_frame_bounds: List[Tuple[int, int]],
+    ) -> np.ndarray:
+        total_frames = plan_obs.shape[0]
+        for i, (valid_start, valid_end) in enumerate(valid_frame_bounds):
+            valid_start = max(0, min(int(valid_start), total_frames))
+            valid_end = max(valid_start, min(int(valid_end), total_frames))
+            if valid_start > 0:
+                plan_obs[:valid_start, i, :] = np.nan
+            if valid_end < total_frames:
+                plan_obs[valid_end:, i, :] = np.nan
+        return plan_obs
 
     def _extract_obs_at_boundary(
         self,

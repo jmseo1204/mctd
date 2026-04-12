@@ -16,11 +16,11 @@ time_limit: null
 virtual_visit_weight: 1.0
 parallel_multiple_visits: False
 leaf_parallelization: True
-mctd_max_search_num: 15
-max_child_resets: 3
+mctd_max_search_num: 10
+max_child_resets: 1
 DEBUG: True
 debug_memory_profile: True
-noise_level_building_way: smooth # smooth, causal, or others
+noise_level_building_way: others # smooth, causal, or others
 num_tries_for_bad_plans: 1
 open_loop_horizon: 1300 #fixme -> best: int(eval_episode_len * horizon_scale) // jump
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
@@ -28,8 +28,7 @@ sub_goal_interval: 3
 sub_goal_blend_steps: 1 # steps to blend old/new sub_goal actions after a sub_goal switch (antmaze only)
 sequence_dividing_factor: 3
 parallel_search_node: 3 # parallel_search_num = parallel_search_node * len(mctd_guidance_scales)
-horizon_scale: 1.0 # horizon = int(eval_episode_len * horizon_scale) // jump
-eval_episode_len: 600 # raw episode length (pre-jump); n_tokens = (eval_episode_len // jump) // frame_stack + 1
+segment_episode_len: 250 # raw episode length per segment (pre-jump); effective = segment_episode_len * sequence_dividing_factor; n_tokens = (effective // jump) // frame_stack + 1
 
 # HILP value function guidance
 # For .pkl checkpoints (JAX/Flax): all hyper-params are auto-detected from the file.
@@ -38,11 +37,14 @@ eval_episode_len: 600 # raw episode length (pre-jump); n_tokens = (eval_episode_
 #   If no sidecar exists, inner_prod is used (matches training default).
 # For legacy .pt checkpoints: hilp_obs_dim / hilp_skill_dim are still needed.
 hilp_checkpoint_path: "td_models/params_1000000_20260324_002241.pkl"
-mctd_guidance_scales: [0.4, 0.0] # HILP gradient scale for near-target positions (TD_thres or above)
-rmse_guidance_scale: 0.4 # RMSE direction scale for far-target positions (below TD_thres)
-anchor_guidance_scale_ratio: 0.9 # 0.4
-rdf_guidance_scale: 0.0
-particle_guidance_scale: 0.1 # sibling repulsion during denoising (0 = disabled)
+mctd_guidance_scales: [0.3, 0.0] # HILP gradient scale for near-target positions (TD_thres or above)
+rmse_guidance_scale: 0.2 # RMSE direction scale for far-target positions (below TD_thres)
+anchor_guidance_scale_ratio: 1.2
+rdf_guidance_scale: 2.0
+rdf_sigma: 0.7 # bandwidth for segment_rdf_guidance; at d=sigma the gradient magnitude equals rdf_guidance_scale
+particle_guidance_scale: 0.0 # sibling repulsion during denoising (0 = disabled)
+use_directly_inject_guidance_to_x0: true # if true: apply guidance in clean x0 space instead of DPS-style xt space
+direct_x0_guidance_scale: 0.2 # κ in η_t = κ * sqrt((1-α_t)/α_t) for direct x0 guidance
 
 # [state proximity threshold]
 use_TD_metric_as_dist: true # If true, use HILP temporal distance (-V(s,g)) instead of L2(x,y)
@@ -53,15 +55,15 @@ plan_feasibility_delta: 99999.0 # max per-frame movement (world units) to count 
 meeting_delta: 1.2
 
 # [wandb visualization]
-viz_agent_rollout: false # set True to upload *_interaction/sample_*_video to wandb (slow)
+viz_agent_rollout: true # set True to upload *_interaction/sample_*_video to wandb (slow)
 viz_final_plans: true
 viz_compare_expanded_to_value: false
 viz_mujoco_renderer: false
 viz_subplan_denoising: true # set True to upload plan/plan_at_* to wandb (slow)
-viz_replanning: true # set True to also log replanned stage denoising video (requires mcts_use_replan)
+viz_replanning: false # set True to also log replanned stage denoising video (requires mcts_use_replan)
 viz_uncertain_next_subplan_last_obs: true
 profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
-frame_sampling_way: 'linear' # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
+frame_sampling_way: "linear" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
 
 # HILP memoization: precompute phi(s) on a 2D grid and use bilinear interpolation
 use_hilp_memoization: true # set true to enable
@@ -71,7 +73,7 @@ hilp_memoization_grid_size: 360 # grid resolution per axis
 use_score_func_with_TD: true # if true: HILP grad + KDE score grad; if false: HILP grad only
 TD_thres_for_far_target: -200.0 # HILP value threshold: V < threshold → use RMSE guidance
 # KDE-weighted guidance: unit_grad = ∇V/|∇V| + kde_lam·∇log p
-kde_sigma: 0.3 # KDE bandwidth (world units)
+kde_sigma: 0.1 # KDE bandwidth (world units)
 kde_grad_thres_sigma_coeff: 0.3 # threshold = mean + coeff * std for KDE gradient filtering
 kde_lam: 0.0 # scale for ∇log p term
 regularize_goal_guidance: true # if true: re-normalize (unit_hilp + kde_lam·kde_score) to unit vector before applying guidance_scale
@@ -79,8 +81,8 @@ kde_sample_ratio: 0.1 # fraction of dataset to use for KDE (1.0 = full dataset)
 kde_save_dir: "~/.ogbench/data" # dataset npz directory for KDE positions
 
 # REPLANNING
-mcts_use_replan: true
-replanning_target_level: 20 # 11 for linear, noise level to add when replanning already-denoised prefix
+mcts_use_replan: false
+replanning_target_level: 25 # 11 for linear, noise level to add when replanning already-denoised prefix
 
 # UNCERTAINTY CHECK
 use_uncertainty_as_value: true
@@ -90,6 +92,7 @@ fast_sampling_steps: 20 # denoising steps for fast uncertainty sampling (< sampl
 # [MPC-style agent control]
 use_rollout: false
 use_dynamic_obs_padding: false
+use_segment_wise_sliding_window: true
 
 # ── Inherited from root config ────────────────────────────────────────────────
 debug: ${debug}
@@ -137,7 +140,8 @@ diffusion:
   # Controls both denoising granularity and step count (must satisfy: sampling_timesteps <= timesteps).
   # For fast uncertainty sampling, use fast_sampling_steps < sampling_timesteps.
   sampling_timesteps: 100
-  sampling_way: 'quadratic' # 'linear': uniform stride; 'quadratic': dense near x_0 (low timesteps)
+  sampling_way: "huber" # 'linear': uniform stride; 'quadratic': dense near x_0; 'huber': quadratic below delta, linear above
+  sampling_huber_delta: 0.3 # t-space threshold for huber mode (0~1); larger = wider quadratic region (more dense near x_0)
   # Schema stubs restored from ckpt training_hparams (actual values come from ckpt)
   timesteps: null
   beta_schedule: null

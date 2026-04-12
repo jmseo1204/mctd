@@ -1,12 +1,17 @@
 import os
+import sys
 import json
 import yaml
 import argparse
 from datetime import datetime
 import copy
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from project_config import DOCKER_USER as _DOCKER_USER, WANDB_ENTITY as _WANDB_ENTITY, \
     DOCKER_IMAGE as _DOCKER_IMAGE, WANDB_PROJECT as _WANDB_PROJECT
+from utils.planning_utils import episode_len_to_plan_tokens
+
+_DOWNLOADED_DIR = f"/home/{_DOCKER_USER}/mctd/outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"
 
 def detect_frame_stack_from_ckpt(model_id, obs_dim, act_dim, downloaded_dir=f"/home/{_DOCKER_USER}/mctd/outputs/downloaded/{_WANDB_ENTITY}/{_WANDB_PROJECT}"):
     """
@@ -204,57 +209,18 @@ def find_local_training_config(model_id, downloaded_dir=f"/home/{_DOCKER_USER}/m
     return None
 
 
-def find_config_yaml(model_id, outputs_root=None):
-    if outputs_root is None:
-        outputs_root = f"/home/{_DOCKER_USER}/mctd/outputs"
+
+def get_default_segment_episode_len(config_path="configurations/algorithm/df_planning.yaml"):
     """
-    Search for config.yaml in WANDB run directories matching the model_id.
-
-    Priority:
-    1. WandB training run dir: *-{model_id}/files/config.yaml  (run IS the training run)
-    2. Hydra eval run dir: .hydra/config.yaml where load == model_id
-       → picks the OLDEST such file (least contaminated by later config changes)
-    """
-    outputs_path = Path(outputs_root)
-    if not outputs_path.exists():
-        return None
-
-    # 1. Training run: WandB run directory ends with model_id
-    pattern = f"*-{model_id}"
-    matches = list(outputs_path.glob(f"**/{pattern}/files/config.yaml"))
-    if matches:
-        matches.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-        return matches[0]
-
-    # 2. Eval run: .hydra/config.yaml where `load: {model_id}`
-    hydra_matches = []
-    for hydra_cfg in outputs_path.glob("**/.hydra/config.yaml"):
-        try:
-            with open(hydra_cfg, "r") as f:
-                data = yaml.safe_load(f)
-            if isinstance(data, dict) and data.get("load") == model_id:
-                hydra_matches.append(hydra_cfg)
-        except Exception:
-            continue
-    if hydra_matches:
-        # Oldest first — most likely to reflect the original training config
-        hydra_matches.sort(key=lambda x: x.stat().st_mtime)
-        chosen = hydra_matches[0]
-        print(f"  [config detect] Training config not found for {model_id}; "
-              f"using oldest eval .hydra/config.yaml: {chosen}")
-        return chosen
-    return None
-
-def get_default_horizon_scale(config_path="configurations/algorithm/df_planning.yaml"):
-    """
-    Load horizon_scale from the default algorithm config file.
+    Load segment_episode_len from the default algorithm config file.
+    Returns None if not found (caller must handle).
     """
     try:
         with open(config_path, 'r') as f:
             data = yaml.safe_load(f)
-            return data.get('horizon_scale', 0.9) # default fallback
+            return data.get('segment_episode_len')
     except Exception:
-        return 0.9
+        return None
 
 def extract_from_config(config_path):
     """
@@ -422,9 +388,8 @@ def main():
     parser.add_argument("--num_tasks", type=int, default=5, help="Number of tasks to generate")
     parser.add_argument("--num_seeds", type=int, default=3, help="Number of seeds per task")
     parser.add_argument("--start_task_id", type=int, default=1, help="Starting task index (1-based)")
-    parser.add_argument("--horizon_scale", type=float, default=None, help="Override Multiplier")
-    parser.add_argument("--episode_len", type=int, default=None, help="Override episode_len (useful for offline/local runs without config.yaml)")
-    parser.add_argument("--outputs_root", default=f"/home/{_DOCKER_USER}/mctd/outputs", help="Root directory of outputs/wandb logs")
+    parser.add_argument("--segment_episode_len", type=int, default=None,
+                        help="Override segment_episode_len (raw, pre-jump). Defaults to value in df_planning.yaml.")
 
     args = parser.parse_args()
 
@@ -448,12 +413,22 @@ def main():
 
     if ckpt_hparams:
         # ── New path: checkpoint carries all training params ──────────────────
-        # episode_len in ckpt is already effective (raw // jump), saved by on_save_checkpoint.
+        # episode_len: raw (pre-jump). training_config.yaml always stores raw and takes
+        # precedence over binary ckpt (old ckpts stored raw // jump before this fix).
         actual_jump = ckpt_hparams.get('jump', 1)
+        _tc_path = Path(_DOWNLOADED_DIR) / args.model_id / "training_config.yaml"
+        try:
+            if _tc_path.exists():
+                with open(_tc_path) as _f:
+                    _tc = yaml.safe_load(_f) or {}
+                _raw_ep = (_tc.get('dataset') or {}).get('episode_len')
+                if _raw_ep is not None:
+                    ckpt_hparams['episode_len'] = int(_raw_ep)
+        except Exception:
+            pass
         actual_episode_len = (
-            args.episode_len
-            or ckpt_hparams.get('episode_len')
-            or full_cfg['dataset'].get('episode_len', 50) // actual_jump
+            ckpt_hparams.get('episode_len')
+            or full_cfg['dataset'].get('episode_len')
         )
         actual_frame_stack = ckpt_hparams.get('frame_stack', 10)
         actual_obs_dim_indices = ckpt_hparams.get('obs_dim_indices')
@@ -477,19 +452,12 @@ def main():
         )
     else:
         # ── Legacy path: detect params from weights + wandb/local config ─────
-        config_path = find_config_yaml(args.model_id, args.outputs_root)
-
         model_metadata = {}
-        if config_path:
-            print(f"Found WandB config for model at: {config_path}")
-            model_metadata = extract_from_config(config_path)
-            print(f"Model-specific metadata (from WandB config): {model_metadata}")
-        else:
-            local_config = find_local_training_config(args.model_id)
-            if local_config:
-                print(f"Found local training config at: {local_config}")
-                model_metadata = extract_from_config(local_config)
-                print(f"Model-specific metadata (from training_config.yaml): {model_metadata}")
+        local_config = find_local_training_config(args.model_id)
+        if local_config:
+            print(f"Found local training config at: {local_config}")
+            model_metadata = extract_from_config(local_config)
+            print(f"Model-specific metadata (from training_config.yaml): {model_metadata}")
 
         # If training config names a different dataset, reload with that dataset
         detected_dataset_config = model_metadata.get('dataset_config')
@@ -509,15 +477,12 @@ def main():
             else:
                 print(f"  [config detect] WARNING: Could not load '{detected_dataset_config}'. Keeping '{args.dataset}'.")
 
-        # Determine jump first (needed to divide dataset raw episode_len).
-        # metadata already stores the effective (divided) episode_len, so no post-processing there.
+        # episode_len: raw (pre-jump). training_config.yaml stores raw; dataset config is raw.
         actual_jump = model_metadata.get('jump') or 1
         dataset_episode_len = full_cfg['dataset'].get('episode_len')
         actual_episode_len = (
-            args.episode_len
-            or (dataset_episode_len // actual_jump if dataset_episode_len else None)
+            dataset_episode_len
             or model_metadata.get('episode_len')
-            or 50
         )
 
         # obs_dim_indices: prefer from training_config.yaml (set after our fix), else infer from dataset
@@ -557,20 +522,25 @@ def main():
             print(f"Detected training config: causal={actual_causal}, scheduling_matrix={actual_scheduling_matrix}, attn_heads={actual_attn_heads}")
 
     # 3. Validate plan_tokens divisibility
-    actual_horizon_scale = args.horizon_scale if args.horizon_scale is not None else get_default_horizon_scale()
+    actual_segment_ep = args.segment_episode_len or get_default_segment_episode_len()
+    assert actual_segment_ep is not None, (
+        "segment_episode_len must be set in configurations/algorithm/df_planning.yaml or via --segment_episode_len"
+    )
     actual_seq_div = full_cfg['algorithm'].get('sequence_dividing_factor', 3)
-    horizon = int(actual_episode_len * actual_horizon_scale)
-    plan_tokens = horizon // actual_frame_stack
-    if plan_tokens == 0 or plan_tokens % actual_seq_div != 0:
-        min_horizon = actual_seq_div * actual_frame_stack
-        actual_horizon_scale = min_horizon / actual_episode_len
-        horizon = int(actual_episode_len * actual_horizon_scale)
-        plan_tokens = horizon // actual_frame_stack
-        print(f"WARNING: original horizon_scale would give invalid plan_tokens. "
-              f"Adjusted horizon_scale to {actual_horizon_scale:.4f} (horizon={horizon}, plan_tokens={plan_tokens})")
+    plan_tokens = episode_len_to_plan_tokens(actual_segment_ep * actual_seq_div, actual_jump, actual_frame_stack)
+    assert plan_tokens > 0 and plan_tokens % actual_seq_div == 0, (
+        f"plan_tokens={plan_tokens} must be positive and divisible by sequence_dividing_factor={actual_seq_div}. "
+        f"Check segment_episode_len={actual_segment_ep}, jump={actual_jump}, frame_stack={actual_frame_stack}"
+    )
+    if actual_episode_len is not None:
+        max_plan_tokens = episode_len_to_plan_tokens(actual_episode_len, actual_jump, actual_frame_stack)
+        assert plan_tokens <= max_plan_tokens, (
+            f"plan_tokens={plan_tokens} exceeds dataset capacity "
+            f"(episode_len_to_plan_tokens({actual_episode_len}, {actual_jump}, {actual_frame_stack})={max_plan_tokens})"
+        )
 
-    print(f"Final Plan: episode_len={actual_episode_len}, frame_stack={actual_frame_stack}, "
-          f"horizon_scale={actual_horizon_scale}, plan_tokens={plan_tokens}")
+    print(f"Final Plan: segment_episode_len={actual_segment_ep}, seq_div={actual_seq_div}, "
+          f"jump={actual_jump}, frame_stack={actual_frame_stack}, plan_tokens={plan_tokens}")
 
     # 4. Build job config
     basic_job_config = {
@@ -585,7 +555,7 @@ def main():
 
     basic_job_config.update({
         "dataset.jump": actual_jump,
-        "algorithm.horizon_scale": actual_horizon_scale,
+        "algorithm.segment_episode_len": actual_segment_ep,
         "experiment.tasks": ["validation"],
         "experiment.validation.batch_size": 1,
         "experiment.validation.precision": 32,

@@ -23,6 +23,7 @@ from utils.logging_utils import (
     _sample_frame_indices,
 )
 from utils.tracer import Tracer, set_default_tracer, get_tracer
+from utils.planning_utils import episode_len_to_plan_tokens
 from .tree_node import TreeNode
 from . import guidance
 from .hilp_loader import HILPMemoizedWrapper, get_hilp_fn
@@ -163,15 +164,24 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.jump = cfg.jump
 
         # [Eval / Planning] ─────────────────────────────────────────────────────
-        # eval_episode_len: raw episode length (pre-jump), set in df_planning.yaml.
+        # segment_episode_len: raw episode length per segment (pre-jump).
+        # effective episode = segment_episode_len * sequence_dividing_factor.
         # Only used in eval (planning). Training code must NOT depend on this.
-        self.eval_episode_len = cfg.get("eval_episode_len", None)
-        if self.eval_episode_len is not None:
-            assert self.eval_episode_len % (self.jump * self.frame_stack) == 0, (
-                f"eval_episode_len={self.eval_episode_len} must be divisible by "
+        self.sequence_dividing_factor = cfg.get("sequence_dividing_factor", None)
+        self.segment_episode_len = cfg.get("segment_episode_len", None)
+        if self.segment_episode_len is None:
+            # Fallback: use episode_len from ckpt training_hparams (restored by _apply_ckpt_hparams_to_cfg).
+            # effective planning horizon = episode_len * sequence_dividing_factor.
+            _ckpt_ep = cfg.get("episode_len", None)
+            if _ckpt_ep is not None:
+                self.segment_episode_len = int(_ckpt_ep)
+        if self.segment_episode_len is not None and self.sequence_dividing_factor is not None:
+            _effective_ep = self.segment_episode_len * self.sequence_dividing_factor
+            assert _effective_ep % (self.jump * self.frame_stack) == 0, (
+                f"segment_episode_len*sequence_dividing_factor={_effective_ep} must be divisible by "
                 f"jump*frame_stack={self.jump}*{self.frame_stack}={self.jump * self.frame_stack}"
             )
-            self.n_tokens = (self.eval_episode_len // self.jump) // self.frame_stack + 1
+            self.n_tokens = episode_len_to_plan_tokens(_effective_ep, self.jump, self.frame_stack) + 1
         else:
             self.n_tokens = None  # training: n_tokens determined from batch shape
 
@@ -182,7 +192,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         _train_ep = cfg.get("episode_len", None)
         if _train_ep is not None:
             _valid_ep = int(self.valid_episode_len_multiple * _train_ep)
-            self._valid_n_tokens = _valid_ep // (self.jump * self.frame_stack) + 1
+            self._valid_n_tokens = episode_len_to_plan_tokens(_valid_ep, self.jump, self.frame_stack) + 1
         else:
             self._valid_n_tokens = None  # eval mode: no training visualization
 
@@ -213,8 +223,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.use_TD_metric_as_dist = cfg.get("use_TD_metric_as_dist", False)
         self.debug_memory_profile = cfg.get("debug_memory_profile", False)
         self.profiler_snapshot_frames = cfg.get("profiler_snapshot_frames", cfg.get("max_plan_hist_keep", 20))  # Number of denoising frames kept for video
-        self.sequence_dividing_factor = cfg.get("sequence_dividing_factor", None)
-        self.horizon_scale = cfg.get("horizon_scale", None)
         self.noise_level_building_way = cfg.get("noise_level_building_way", "pyramid")
 
         # HILP value function guidance
@@ -231,6 +239,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         # We don't initialize it here to prevent PyTorch from registering it as a submodule
         self.anchor_guidance_scale_ratio = cfg.get("anchor_guidance_scale_ratio", 1.0)
         self.rdf_guidance_scale = cfg.get("rdf_guidance_scale", 2.0)
+        self.rdf_sigma = cfg.get("rdf_sigma", 1.0)
         self.rmse_guidance_scale = cfg.get("rmse_guidance_scale", 1.0)
         self.use_score_func_with_TD = cfg.get("use_score_func_with_TD", True)
         self.TD_thres_for_far_target = cfg.get("TD_thres_for_far_target", None)
@@ -248,6 +257,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.fast_sampling_steps: int = cfg.get("fast_sampling_steps", 10)
         self.use_rollout: bool = cfg.get("use_rollout", False)
         self.use_dynamic_obs_padding: bool = cfg.get("use_dynamic_obs_padding", True)
+        self.use_segment_wise_sliding_window: bool = cfg.get("use_segment_wise_sliding_window", False)
 
         super().__init__(cfg)
         self.plot_end_points = cfg.get("plot_start_goal", False)
@@ -258,6 +268,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.validation_video_fps: int = int(cfg.get("validation_video_fps", 8))
         self.viz_subplan_denoising: bool = bool(cfg.get("viz_subplan_denoising", False))
         self.viz_agent_rollout: bool = bool(cfg.get("viz_agent_rollout", False))
+        self.use_directly_inject_guidance_to_x0: bool = bool(cfg.get("use_directly_inject_guidance_to_x0", False))
+        self.direct_x0_guidance_scale: float = float(cfg.get("direct_x0_guidance_scale", 0.2))
         self.viz_mujoco_renderer: bool = bool(cfg.get("viz_mujoco_renderer", False))
         self.viz_compare_expanded_to_value: bool = bool(cfg.get("viz_compare_expanded_to_value", False))
 
@@ -302,13 +314,16 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             extra_meta={
                 "env_id": self.env_id,
                 "frame_stack": self.frame_stack,
-                "eval_episode_len": self.eval_episode_len,
+                "segment_episode_len": self.segment_episode_len,
                 "job_name": _ti_job_name,
             },
             debug_mode=self.cfg.get("DEBUG", True),
         )
         self.tracer.__enter__()  # Open file now (before interact() is called)
-        set_default_tracer(self.tracer)
+        # Only set as default if no tracer is already active (e.g. validation_anal tracer
+        # set by exp_base.py before _build_algo() is called).
+        if get_tracer() is None:
+            set_default_tracer(self.tracer)
         self.tracer.log("lifecycle.algo_init_complete", {
             "elapsed_s": round(time.time() - _PROC_T0, 2),
         }, step=0, depth=0)
@@ -759,6 +774,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self,
         level_array: np.ndarray,
         sequence_dividing_factor: int,
+        prefix_len: Optional[int] = None,
         is_replanning = False,
         num_denoising_steps_override: Optional[int] = None,
     ) -> np.ndarray:
@@ -775,14 +791,22 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         work_array = level_array.copy()
 
-        non_zero_indices = np.where(work_array > 0)[0]
-        if len(non_zero_indices) == 0:
-            if not is_replanning:
-                return np.expand_dims(level_array, 0)
-            # is_replanning + all zeros: entire plan is denoised, add noise to all tokens
-            start_idx = plan_tokens
+        if prefix_len is not None:
+            start_idx = prefix_len
+            if start_idx >= plan_tokens:
+                if not is_replanning:
+                    return np.expand_dims(level_array, 0)
+                # is_replanning + fully denoised: treat same as all-zeros case
+                start_idx = plan_tokens
         else:
-            start_idx = non_zero_indices[0]
+            non_zero_indices = np.where(work_array > 0)[0]
+            if len(non_zero_indices) == 0:
+                if not is_replanning:
+                    return np.expand_dims(level_array, 0)
+                # is_replanning + all zeros: entire plan is denoised, add noise to all tokens
+                start_idx = plan_tokens
+            else:
+                start_idx = non_zero_indices[0]
         end_idx = min(start_idx + segment_size, plan_tokens)
 
         if is_replanning:
@@ -1009,24 +1033,25 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             _pgs = particle_guidance_scale  # capture for lambda closure
             _gids = group_ids               # capture for lambda closure
 
-            # smooth 모드: 과거 segment도 forward pass를 거치므로 guidance를
-            # 현재 denoising 중인 segment tail 하나에만 적용해야 한다.
-            # prefix_len_list[i] = i번째 candidate의 이미 denoised된 prefix token 수
-            #   → active segment tail (frame-space) = frame_stack + (prefix_len + seg_size) * frame_stack - 1
-            _active_tails = None
-            if (getattr(self, 'noise_level_building_way', 'causal') == 'smooth'
-                    and prefix_len_list is not None):
+            # Sliding-window mode: each batch item has a single active frame range
+            # covering [window_start_frame, window_end_frame) in half-open form.
+            # Start is (pl+1)*fs (AFTER obs_parent token) to prevent the previous
+            # segment's tail from being selected as a guidance target.
+            _active_frame_ranges = None
+            if self.use_segment_wise_sliding_window and prefix_len_list is not None:
                 _seg_t = horizon // self.frame_stack // self.sequence_dividing_factor
-                _active_tails = [
-                    self.frame_stack * (1 + pl + _seg_t) - 1
+                _active_frame_ranges = [
+                    (
+                        (pl + 1) * self.frame_stack,
+                        (pl + 1 + _seg_t) * self.frame_stack,
+                    )
                     for pl in prefix_len_list
                 ]
 
-            _pat = _active_tails  # capture for lambda closure
             guidance_fn = lambda x: guidance.combined_guidance(
                 self, x, goal, horizon, guidance_scale,
                 particle_guidance_scale=_pgs, group_ids=_gids,
-                active_tail_per_batch=_pat,
+                active_frame_ranges=_active_frame_ranges,
             )
 
         # [TIMING] Wrap guidance_fn to measure per-step cost and capture last loss values
@@ -1036,7 +1061,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             _raw_gfn = guidance_fn
             def guidance_fn(x, _fn=_raw_gfn):
                 _gt0 = time.time()
-                r = _fn(x)
+                # Sliding window: scatter (1+seg, b, fs*c) → (n_tokens, b, fs*c) so guidance
+                # functions (which index by absolute frame position) work correctly.
+                r = _fn(_scatter_window_to_full(x, self.n_tokens, _sc_plens) if self.use_segment_wise_sliding_window else x)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 _guidance_call_ms.append((time.time() - _gt0) * 1000)
@@ -1150,28 +1177,99 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         _sc_plan_tokens = plan_tokens
         _sc_prefix_len_list = prefix_len_list
         _sc_fs = self.frame_stack
+        # Sliding-window hook support: precompute per-element prefix offsets (in token units).
+        # When use_segment_wise_sliding_window=True, sample_step receives a window of
+        # (1+seg, B, fs*c) instead of (n_tokens, B, fs*c).  The hook must:
+        #   1. extract with seg tokens and relative prefix_len=0 (obs_parent is always window[0])
+        #   2. pad the result back to (plan_tokens*fs, B, c) at the correct per-element offset
+        #      so downstream viz code (plan_viz.py tail_vis indexing) stays untouched.
+        _sc_seg = plan_tokens // self.sequence_dividing_factor if self.sequence_dividing_factor else plan_tokens
+        _sc_plens = [
+            (prefix_len_list[i] if prefix_len_list is not None else 0)
+            for i in range(batch_size)
+        ]  # per-element absolute prefix_len (token units); used regardless of use_dynamic_obs_padding
+        _sc_frame_offsets = [pl * _sc_fs for pl in _sc_plens]  # same, but in frame units
+
+        def _scatter_window_to_full(win_tensor, full_t, offsets):
+            """Scatter (win_t, B, *rest) into zeros (full_t, B, *rest) at per-element offsets.
+
+            offsets[i] is the start index for batch element i in the full tensor's first dim.
+            Uses torch.index_put (non-in-place) so autograd is preserved through win_tensor.
+            Used by both the denoising-step hook (capture) and guidance_fn (gradient computation).
+            """
+            win_t, B = win_tensor.shape[0], win_tensor.shape[1]
+            rest = win_tensor.shape[2:]
+            full = torch.zeros(full_t, B, *rest, dtype=win_tensor.dtype, device=win_tensor.device)
+            idx_t = torch.tensor(
+                [[offsets[i] + t for i in range(B)] for t in range(win_t)],
+                dtype=torch.long, device=win_tensor.device,
+            )  # (win_t, B)
+            idx_b = torch.arange(B, device=win_tensor.device).unsqueeze(0).expand_as(idx_t)
+            return torch.index_put(
+                full,
+                (idx_t.reshape(-1), idx_b.reshape(-1)),
+                win_tensor.reshape(win_t * B, *rest),
+            )
 
         def _capture_hook(data):
             """Extract plan-space pred_noise & guidance grads, move to CPU."""
-            pn = data['prior_pred_noise']          # (n_tokens, B, fs*c) GPU
-            pn_chunk = extract_plan_chunk(pn, _sc_plan_tokens, _sc_prefix_len_list)
+            if self.use_segment_wise_sliding_window:
+                # Window inputs: (1+seg, B, fs*c).  obs_parent is at window[0], so relative
+                # prefix_len=0 for all elements.  Extract seg tokens, then pad to plan_tokens.
+                win_plan_tokens = _sc_seg
+                win_prefix_list = [0] * batch_size
+            else:
+                win_plan_tokens = _sc_plan_tokens
+                win_prefix_list = _sc_prefix_len_list
+
+            pn = data['prior_pred_noise']
+            pn_chunk = extract_plan_chunk(pn, win_plan_tokens, win_prefix_list)
             pn_exp = rearrange(pn_chunk, "t b (fs c) -> (t fs) b c", fs=_sc_fs)
+            if self.use_segment_wise_sliding_window:
+                pn_exp = _scatter_window_to_full(pn_exp, _sc_plan_tokens * _sc_fs, _sc_frame_offsets)
+
             gg_exp = {}
             for k, v in data['guidance_grads'].items():
-                v_chunk = extract_plan_chunk(v.detach(), _sc_plan_tokens, _sc_prefix_len_list)
-                gg_exp[k] = rearrange(v_chunk, "t b (fs c) -> (t fs) b c", fs=_sc_fs).cpu()
+                v_chunk = extract_plan_chunk(v.detach(), win_plan_tokens, win_prefix_list)
+                v_exp = rearrange(v_chunk, "t b (fs c) -> (t fs) b c", fs=_sc_fs)
+                if self.use_segment_wise_sliding_window:
+                    v_exp = _scatter_window_to_full(v_exp, _sc_plan_tokens * _sc_fs, _sc_frame_offsets)
+                gg_exp[k] = v_exp.cpu()
             # Clean-space grads: ∂V/∂x̂_0 (no Jacobian — matches crimson HILP grad field direction)
             gg_clean_exp = {}
             for k, v in data.get('guidance_grads_clean', {}).items():
-                v_chunk = extract_plan_chunk(v.detach(), _sc_plan_tokens, _sc_prefix_len_list)
-                gg_clean_exp[k] = rearrange(v_chunk, "t b (fs c) -> (t fs) b c", fs=_sc_fs).cpu()
-            # pred_x_start: x̂_0 denoised estimate at this step (n_tokens, B, fs*c)
+                v_chunk = extract_plan_chunk(v.detach(), win_plan_tokens, win_prefix_list)
+                v_exp = rearrange(v_chunk, "t b (fs c) -> (t fs) b c", fs=_sc_fs)
+                if self.use_segment_wise_sliding_window:
+                    v_exp = _scatter_window_to_full(v_exp, _sc_plan_tokens * _sc_fs, _sc_frame_offsets)
+                gg_clean_exp[k] = v_exp.cpu()
+            gg_xs_disp_exp = {}
+            for k, v in data.get('guidance_xstart_displacements', {}).items():
+                v_chunk = extract_plan_chunk(v.detach(), win_plan_tokens, win_prefix_list)
+                v_exp = rearrange(v_chunk, "t b (fs c) -> (t fs) b c", fs=_sc_fs)
+                if self.use_segment_wise_sliding_window:
+                    v_exp = _scatter_window_to_full(v_exp, _sc_plan_tokens * _sc_fs, _sc_frame_offsets)
+                gg_xs_disp_exp[k] = v_exp.cpu()
+            # pred_x_start: x̂_0 before guidance (n_tokens, B, fs*c)
             pxs = data.get('pred_x_start')
             if pxs is not None:
-                pxs_chunk = extract_plan_chunk(pxs.detach(), _sc_plan_tokens, _sc_prefix_len_list)
-                pxs_exp = rearrange(pxs_chunk, "t b (fs c) -> (t fs) b c", fs=_sc_fs).cpu()
+                pxs_chunk = extract_plan_chunk(pxs.detach(), win_plan_tokens, win_prefix_list)
+                pxs_exp = rearrange(pxs_chunk, "t b (fs c) -> (t fs) b c", fs=_sc_fs)
+                if self.use_segment_wise_sliding_window:
+                    pxs_exp = _scatter_window_to_full(pxs_exp, _sc_plan_tokens * _sc_fs, _sc_frame_offsets)
+                pxs_exp = pxs_exp.cpu()
             else:
                 pxs_exp = None
+            # pred_x_start_after: x̂_0 after guidance correction (= before if no guidance)
+            pxs_after = data.get('pred_x_start_after')
+            if pxs_after is not None:
+                pxs_after_chunk = extract_plan_chunk(pxs_after.detach(), win_plan_tokens, win_prefix_list)
+                pxs_after_exp = rearrange(pxs_after_chunk, "t b (fs c) -> (t fs) b c", fs=_sc_fs)
+                if self.use_segment_wise_sliding_window:
+                    pxs_after_exp = _scatter_window_to_full(pxs_after_exp, _sc_plan_tokens * _sc_fs, _sc_frame_offsets)
+                pxs_after_exp = pxs_after_exp.cpu()
+            else:
+                pxs_after_exp = None
             # Capture effective DDIM scale: sqrt(1 - alpha_t) for each plan token.
             # curr_noise_level is an INTEGER timestep index (0..timesteps-1), NOT a float.
             # Look up alphas_cumprod[t] to get the true alpha, then sqrt(1-alpha) ≈ c coefficient.
@@ -1179,7 +1277,10 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # Low noise (late denoising, small t) → alpha → 1 → sqrt(1-alpha) ≈ 0 (small arrows)
             nl = data.get('curr_noise_level')  # (n_tokens, B) integer GPU tensor
             if nl is not None:
-                nl_chunk = extract_plan_chunk(nl.unsqueeze(-1), _sc_plan_tokens, _sc_prefix_len_list)  # (plan_tokens, B, 1)
+                nl_chunk = extract_plan_chunk(nl.unsqueeze(-1), win_plan_tokens, win_prefix_list)  # (win_t, B, 1)
+                if self.use_segment_wise_sliding_window:
+                    # nl_chunk is in token-space: use token offsets (_sc_plens), not frame offsets
+                    nl_chunk = _scatter_window_to_full(nl_chunk, _sc_plan_tokens, _sc_plens)  # (plan_tokens, B, 1)
                 nl_int = nl_chunk.squeeze(-1).detach().long()  # (plan_tokens, B) integer timestep indices
                 _n_alphas = self.diffusion_model.alphas_cumprod.shape[0]
                 nl_int_clamped = nl_int.clamp(0, _n_alphas - 1)
@@ -1191,7 +1292,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 'prior_pred_noise': pn_exp.detach().cpu(),  # (plan_tokens*fs, B, c)
                 'guidance_grads': gg_exp,                   # ∂V/∂x_t (through J_θ)
                 'guidance_grads_clean': gg_clean_exp,       # ∂V/∂x̂_0 (clean space)
-                'pred_x_start_pos': pxs_exp,               # x̂_0 positions (plan_tokens*fs, B, c) or None
+                'guidance_xstart_displacements': gg_xs_disp_exp,  # exact Δx̂_0_k in direct-x0 mode
+                'pred_x_start_pos': pxs_exp,               # x̂_0 before guidance (plan_tokens*fs, B, c) or None
+                'pred_x_start_pos_after': pxs_after_exp,   # x̂_0 after guidance (plan_tokens*fs, B, c) or None
                 'noise_level': nl_cpu,  # (plan_tokens, B) float sqrt(1-alpha) or None
             })
 
@@ -1216,26 +1319,54 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             _gpu_t0 = time.time()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            sample = self.diffusion_model.sample_step(
-                plan_with_given_tokens,  # (n_tokens, b, fs*c)
-                conditions,
-                from_noise_levels,  # (n_tokens, b)
-                to_noise_levels,  # (n_tokens, b)
-                guidance_fn=guidance_fn,
-            )  # (n_tokens, b, fs*c)
+
+            if self.use_segment_wise_sliding_window:
+                # Per-element sliding window: feed [plen_i : plen_i+1+seg] to sample_step.
+                # NOTE: tokens are re-indexed from 0 inside sample_step (positional embedding
+                # mismatch with full-sequence mode is intentional).
+                # _sc_plens and _sc_seg are precomputed in the hook closure above.
+                device = plan_with_given_tokens.device
+                # indices[t, i] = _sc_plens[i] + t  →  shape (1+_sc_seg, b)
+                indices = torch.tensor(
+                    [[_sc_plens[i] + t for i in range(batch_size)] for t in range(1 + _sc_seg)],
+                    dtype=torch.long, device=device,
+                )  # (1+seg, b)
+                b_idx = torch.arange(batch_size, device=device)  # (b,)
+
+                plan_win = plan_with_given_tokens[indices, b_idx]  # (1+seg, b, fs*c)
+                from_win = from_noise_levels[indices, b_idx]        # (1+seg, b)
+                to_win   = to_noise_levels[indices, b_idx]          # (1+seg, b)
+
+                sample_win = self.diffusion_model.sample_step(
+                    plan_win, conditions, from_win, to_win, guidance_fn=guidance_fn,
+                )  # (1+seg, b, fs*c)
+
+                update_mask_win = (from_win > to_win).unsqueeze(-1)  # (1+seg, b, 1)
+                updated_win = torch.where(update_mask_win, sample_win, plan_win)
+
+                plan_with_given_tokens = plan_with_given_tokens.clone()
+                plan_with_given_tokens[indices, b_idx] = updated_win
+            else:
+                sample = self.diffusion_model.sample_step(
+                    plan_with_given_tokens,  # (n_tokens, b, fs*c)
+                    conditions,
+                    from_noise_levels,  # (n_tokens, b)
+                    to_noise_levels,  # (n_tokens, b)
+                    guidance_fn=guidance_fn,
+                )  # (n_tokens, b, fs*c)
+
+                # Update only tokens whose noise level is actively decreasing this step.
+                # This preserves denoised_prefix (level=0) and obs_parent_token (level=0).
+                update_mask = (from_noise_levels > to_noise_levels).unsqueeze(
+                    -1
+                )  # (n_tokens, b, 1) broadcast mask
+                plan_with_given_tokens = torch.where(
+                    update_mask, sample, plan_with_given_tokens
+                )  # (n_tokens, b, fs*c)
+
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             _gpu_step_times.append(time.time() - _gpu_t0)
-
-            # (Not Necessary) Update only tokens whose noise level is actively decreasing this step.
-            # This preserves denoised_prefix (level=0) and obs_parent_token (level=0).
-            update_mask = (from_noise_levels > to_noise_levels).unsqueeze(
-                -1
-            )  # (n_tokens, b, 1) broadcast mask
-
-            plan_with_given_tokens = torch.where(
-                update_mask, sample, plan_with_given_tokens
-            )  # (n_tokens, b, fs*c)
 
             plan_hist.append(
                 extract_plan_chunk(
@@ -1253,7 +1384,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         # Prepend a null capture so indices align with plan_hist (plan_hist[0] = initial noise,
         # capture[0] = null; capture[m] = step that produced plan_hist[m]).
-        _step_captures.insert(0, {'prior_pred_noise': None, 'guidance_grads': {}, 'guidance_grads_clean': {}, 'pred_x_start_pos': None})
+        _step_captures.insert(0, {'prior_pred_noise': None, 'guidance_grads': {}, 'guidance_grads_clean': {}, 'guidance_xstart_displacements': {}, 'pred_x_start_pos': None, 'pred_x_start_pos_after': None})
 
         # [MEMORY OPTIMIZATION] Keep N frames spanning full denoising process
         _n_keep = self.profiler_snapshot_frames
@@ -1565,7 +1696,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # These trees are maintained across MPC steps and expanded
             # alternately within each planning call.
             # ----------------------------------------------------------------
-            horizon: int = int(self.eval_episode_len * self.horizon_scale) // self.jump
+            horizon: int = episode_len_to_plan_tokens(
+                self.segment_episode_len * self.sequence_dividing_factor, self.jump, self.frame_stack
+            ) * self.frame_stack
             _bidir_start_np = start.cpu().numpy()[:, self.obs_dim_indices]  # (b, obs_dim)
             _bidir_goal_np = goal.cpu().numpy()[:, self.obs_dim_indices]  # (b, obs_dim)
             # Capture initial physical state (always, regardless of use_rollout)
@@ -2146,7 +2279,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
     def visualize_node_value_plans(
         self, is_achieved_plan, search_num, values, names, plans, starts, goals, tag="mcts_plan",
-        denoised_lens=None,
+        valid_frame_bounds=None,
     ):
         # plans: (t fs) b c
 
@@ -2172,11 +2305,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # (t fs) c -> (t fs) 1 c
             plan_obs = plan_obs[:, None, :]
 
-        # Mask tokens beyond denoised length with NaN so they are invisible in plots
-        if denoised_lens is not None:
-            for i, used_len in enumerate(denoised_lens):
-                if used_len < plan_obs.shape[0]:
-                    plan_obs[used_len:, i, :] = np.nan
+        if valid_frame_bounds is not None:
+            plan_obs = self._mask_plan_obs_outside_valid_frames(plan_obs, valid_frame_bounds)
 
         plan_images = make_trajectory_images(
             self.env_id,
@@ -2926,7 +3056,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
                 # Generate bidirectional denoising schedule
                 expanded_node_noise_levels = self._generate_bidirectional_schedule(
-                    parent_levels
+                    parent_levels,
+                    prefix_len_per_batch=np.array(prefix_len_list, dtype=int),
                 )  # (b, m, plan_tokens(=t))
                 expanded_node_updated_levels = expanded_node_noise_levels[
                     :, -1, :
@@ -2973,7 +3104,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                                 'prior_pred_noise': step['prior_pred_noise'][:, _sci] if step['prior_pred_noise'] is not None else None,
                                 'guidance_grads': {k: v[:, _sci] for k, v in step['guidance_grads'].items()},
                                 'guidance_grads_clean': {k: v[:, _sci] for k, v in step.get('guidance_grads_clean', {}).items()},
+                                'guidance_xstart_displacements': {k: v[:, _sci] for k, v in step.get('guidance_xstart_displacements', {}).items()},
                                 'pred_x_start_pos': step['pred_x_start_pos'][:, _sci] if step.get('pred_x_start_pos') is not None else None,
+                                'pred_x_start_pos_after': step['pred_x_start_pos_after'][:, _sci] if step.get('pred_x_start_pos_after') is not None else None,
                                 'noise_level': step['noise_level'][:, _sci] if step.get('noise_level') is not None else None,
                             }
                             for step in _raw_captures
@@ -3175,10 +3308,15 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         replan_initial_levels_list, axis=0
                     )  # (b, plan_tokens)
                     # Generate Schedule for Replanning (Complete Denoising)
+                    replan_prefix_len_per_batch = np.array([
+                        (expanded_node_candidates[i]["parent_node"].depth + 1) * seg_size
+                        for i in range(len(expanded_node_candidates))
+                    ], dtype=int)
                     replan_noise_levels = (
                         self._generate_bidirectional_schedule(
                             replan_initial_levels,
-                            is_replanning = True
+                            prefix_len_per_batch=replan_prefix_len_per_batch,
+                            is_replanning=True,
                         )
                     )  # (b, m, plan_tokens)
 
@@ -3222,85 +3360,90 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 if self.use_uncertainty_as_value:
                     B_cands = len(expanded_node_candidates)
                     K = self.fast_sampling_multiple
-
-                    # Build fast noise schedule using fast_sampling_steps.
-                    # Same starting levels as replanning (expanded_node_updated_levels).
-                    assert expanded_node_updated_levels is not None, (
-                        "expanded_node_updated_levels must be set for uncertainty sampling"
-                    )
-                    unc_noise_levels = self._generate_bidirectional_schedule(
-                        expanded_node_updated_levels,
-                        num_denoising_steps_override=self.fast_sampling_steps,
-                    )  # (B_cands, fast_steps+1, plan_tokens)
-
-                    # Build G*K independent init plans per candidate.
-                    # Batch order: [cand0·g0·k0, cand0·g0·k1, …, cand0·g1·k0, …, cand_{B-1}·g_{G-1}·k_{K-1}]
-                    # Strategy: build ONE base plan per candidate from val_plan_hists (the replanned/
-                    # expanded plan), preserving the denoised prefix + obs_parent + first replanned
-                    # segment.  For each K copy, clone base and replace only the future undenoised
-                    # tokens [child_depth*seg_size+1 : plan_tokens+1] with fresh randn.  This keeps
-                    # the already-denoised trajectory intact while giving K independently diverse
-                    # future trajectories.
                     G = len(self.mctd_guidance_scales)
-                    _plan_tokens_val = horizon // self.frame_stack
-                    unc_noise_levels_rep = np.repeat(unc_noise_levels, K * G, axis=0)  # (B*G*K, fast_steps+1, plan_tokens)
-                    unc_init_plans_rep = []
-                    unc_guidance_scale_vals = []  # per-sample guidance scale (length B*G*K)
-                    for _i in range(B_cands):
-                        _parent_node = expanded_node_candidates[_i]["parent_node"]
-                        # Build base plan from val_plan_hists (replanned or expanded plan)
-                        _plan_t_fs = val_plan_hists[-1, :, _i].unsqueeze(1)  # (plan_tokens*fs, 1, c)
-                        _plan_rearranged_unc = rearrange(
-                            _plan_t_fs, "(t fs) b c -> t b (fs c)", fs=self.frame_stack
-                        )  # (plan_tokens, 1, fs*c)
-                        _base_plan, _ = self._build_plan_from_leaf(
-                            _parent_node, _plan_tokens_val, seg_size,
-                            expanded_plan=_plan_rearranged_unc,
-                        )  # (n_tokens, 1, fs*c)
-                        # Future undenoised tokens: child_depth*seg_size+1 onward (token-space index)
-                        _child_depth = _parent_node.depth + 1
-                        _future_start = _child_depth * seg_size + 1
-                        _n_future = _plan_tokens_val + 1 - _future_start
-                        for g_scale in self.mctd_guidance_scales:
-                            for _ in range(K):
-                                _unc_plan = _base_plan.clone()
-                                if _n_future > 0:
-                                    _unc_plan[_future_start : _plan_tokens_val + 1] = (
-                                        self._sample_clamped_noise(_n_future)
-                                    )
-                                unc_init_plans_rep.append(_unc_plan)
-                                unc_guidance_scale_vals.append(g_scale)
-                    unc_guidance_scale_tensor = torch.tensor(
-                        unc_guidance_scale_vals, dtype=torch.float32, device=self.device
-                    )  # (B*G*K,)
 
-                    # Run parallel_plan for fast uncertainty sampling.
-                    # Replicate obs/goal/prefix_len to match B*G*K batch size.
-                    unc_obs = effective_obs_normalized.repeat_interleave(G * K, dim=0)   # (B*G*K, D)
-                    unc_goal = effective_goal_normalized.repeat_interleave(G * K, dim=0)  # (B*G*K, D)
-                    unc_prefix_len_list = [pl for pl in prefix_len_list for _ in range(G * K)]
-                    unc_batch_plan_hists = self.parallel_plan(
-                        unc_obs,
-                        unc_goal,
-                        horizon,
-                        conditions,
-                        guidance_scale=unc_guidance_scale_tensor,
-                        noise_level=unc_noise_levels_rep,
-                        plans=unc_init_plans_rep,
-                        prefix_len_list=unc_prefix_len_list,
-                        call_type="uncertainty",
-                    )  # (fast_steps+1, plan_tokens*fs, B*G*K, c)
+                    # Terminal-depth candidates have no future segment to explore.
+                    # Uncertainty sampling for them would require a window beyond n_tokens → OOB.
+                    # Skip them here; their value will be set to 0 in the value computation loop.
+                    non_terminal_cand_indices = [
+                        _i for _i in range(B_cands)
+                        if expanded_node_candidates[_i]["parent_node"].depth + 1 < terminal_depth
+                    ]
 
-                    # Reshape into per-candidate tensors: (fast_steps+1, plan_tokens*fs, G*K, c).
-                    for _i in range(B_cands):
-                        start_idx_k = _i * G * K
-                        end_idx_k = start_idx_k + G * K
-                        unc_plan = unc_batch_plan_hists[:, :, start_idx_k:end_idx_k, :]
-                        # Always save the latest generated plan as fallback (regardless of feasibility).
-                        # This ensures uncertainty_plan_hists_per_candidate[i] is never None after
-                        # the retry loop, even if the expansion plan was infeasible across all retries.
-                        _fallback_unc_plan_hists[_i] = unc_plan
-                        uncertainty_plan_hists_per_candidate[_i] = unc_plan
+                    if non_terminal_cand_indices:
+                        # Build fast noise schedule using fast_sampling_steps.
+                        # Same starting levels as replanning (expanded_node_updated_levels).
+                        assert expanded_node_updated_levels is not None, (
+                            "expanded_node_updated_levels must be set for uncertainty sampling"
+                        )
+                        unc_prefix_len_per_batch = np.array([
+                            (expanded_node_candidates[_i]["parent_node"].depth + 1) * seg_size
+                            for _i in non_terminal_cand_indices
+                        ], dtype=int)
+                        unc_noise_levels_nt = self._generate_bidirectional_schedule(
+                            expanded_node_updated_levels[non_terminal_cand_indices],
+                            prefix_len_per_batch=unc_prefix_len_per_batch,
+                            num_denoising_steps_override=self.fast_sampling_steps,
+                        )  # (B_nt, fast_steps+1, plan_tokens)
+
+                        # Build G*K independent init plans per non-terminal candidate.
+                        _plan_tokens_val = horizon // self.frame_stack
+                        unc_noise_levels_rep = np.repeat(unc_noise_levels_nt, K * G, axis=0)
+                        unc_init_plans_rep = []
+                        unc_guidance_scale_vals = []
+                        for _i in non_terminal_cand_indices:
+                            _parent_node = expanded_node_candidates[_i]["parent_node"]
+                            _plan_t_fs = val_plan_hists[-1, :, _i].unsqueeze(1)  # (plan_tokens*fs, 1, c)
+                            _plan_rearranged_unc = rearrange(
+                                _plan_t_fs, "(t fs) b c -> t b (fs c)", fs=self.frame_stack
+                            )  # (plan_tokens, 1, fs*c)
+                            _base_plan, _ = self._build_plan_from_leaf(
+                                _parent_node, _plan_tokens_val, seg_size,
+                                expanded_plan=_plan_rearranged_unc,
+                            )  # (n_tokens, 1, fs*c)
+                            _child_depth = _parent_node.depth + 1
+                            _future_start = _child_depth * seg_size + 1
+                            _n_future = _plan_tokens_val + 1 - _future_start
+                            for g_scale in self.mctd_guidance_scales:
+                                for _ in range(K):
+                                    _unc_plan = _base_plan.clone()
+                                    if _n_future > 0:
+                                        _unc_plan[_future_start : _plan_tokens_val + 1] = (
+                                            self._sample_clamped_noise(_n_future)
+                                        )
+                                    unc_init_plans_rep.append(_unc_plan)
+                                    unc_guidance_scale_vals.append(g_scale)
+                        unc_guidance_scale_tensor = torch.tensor(
+                            unc_guidance_scale_vals, dtype=torch.float32, device=self.device
+                        )
+
+                        nt_idx_tensor = torch.tensor(non_terminal_cand_indices, device=effective_obs_normalized.device)
+                        unc_obs = effective_obs_normalized[nt_idx_tensor].repeat_interleave(G * K, dim=0)
+                        unc_goal = effective_goal_normalized[nt_idx_tensor].repeat_interleave(G * K, dim=0)
+                        unc_prefix_len_list = [
+                            (expanded_node_candidates[_i]["parent_node"].depth + 1) * seg_size
+                            for _i in non_terminal_cand_indices
+                            for _ in range(G * K)
+                        ]
+                        unc_batch_plan_hists = self.parallel_plan(
+                            unc_obs,
+                            unc_goal,
+                            horizon,
+                            conditions,
+                            guidance_scale=unc_guidance_scale_tensor,
+                            noise_level=unc_noise_levels_rep,
+                            plans=unc_init_plans_rep,
+                            prefix_len_list=unc_prefix_len_list,
+                            call_type="uncertainty",
+                        )  # (fast_steps+1, plan_tokens*fs, B_nt*G*K, c)
+
+                        # Map results back to per-candidate slot.
+                        for _ii, _i in enumerate(non_terminal_cand_indices):
+                            start_idx_k = _ii * G * K
+                            end_idx_k = start_idx_k + G * K
+                            unc_plan = unc_batch_plan_hists[:, :, start_idx_k:end_idx_k, :]
+                            _fallback_unc_plan_hists[_i] = unc_plan
+                            uncertainty_plan_hists_per_candidate[_i] = unc_plan
 
 
                 for i in range(len(is_feasible)):
@@ -3371,15 +3514,21 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 # Compute -uncertainty as value for each candidate.
                 values = np.zeros(len(expanded_node_candidates))
                 for i, candidate in enumerate(expanded_node_candidates):
-                    target_node_i = candidate["target_node"]
                     curr_depth_i = candidate["depth"]
+                    # Terminal-depth nodes have no future segment; uncertainty sampling was
+                    # skipped for them.  Assign -inf so they are never selected over
+                    # non-terminal nodes that have a meaningful uncertainty value.
+                    if curr_depth_i >= terminal_depth:
+                        values[i] = -np.inf
+                        unc_results[i] = {"U": np.inf}
+                        continue
+                    target_node_i = candidate["target_node"]
                     unc_hists_i   = uncertainty_plan_hists_per_candidate[i]
                     assert unc_hists_i is not None, (
                         f"[Uncertainty] uncertainty_plan_hists_per_candidate[{i}] is None "
                         "after fallback injection — this should not happen."
                     )
-                    # Each K copy was built with fresh noise (expanded_plan=None) → G*K
-                    # samples are independent.  Use all G*K for sigma estimation.
+                    # Each K copy was built with fresh noise → G*K samples are independent.
                     tail_obs_i = self._extract_obs_at_boundary(
                         unc_hists_i[-1],           # (plan_tokens*fs, G*K, c)
                         depth=curr_depth_i + 1,   # next segment boundary (undenoised region)
@@ -3566,14 +3715,19 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     ]  # m (t fs) b c
                     is_achieved_plan = [True if i in achieved_indices else False for i in visualize_indices]
 
-                    # Compute how many tokens are actually denoised per candidate (depth-based)
-                    visualize_denoised_lens = [
-                        self._get_prefix_len_frames_from_depth(expanded_node_candidates[i]["depth"], seg_size)
+                    is_forward_tree = "from_goal" not in tree.tag
+                    visualize_valid_frame_bounds = [
+                        self._get_plan_viz_valid_frame_bounds(
+                            expanded_node_candidates[i]["depth"],
+                            seg_size,
+                            terminal_expanded_plans.shape[0],
+                            is_forward_tree,
+                        )
                         for i in visualize_indices
                     ]
 
                     # For goal tree visualization, flip the plans so they appear in start→goal direction
-                    if "from_goal" in tree.tag:
+                    if not is_forward_tree:
                         terminal_expanded_plans = torch.flip(terminal_expanded_plans, [0])
 
                     _viz_node_t0 = time.time()
@@ -3586,7 +3740,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         start,
                         goal,
                         tag=tree.tag,
-                        denoised_lens=visualize_denoised_lens,
+                        valid_frame_bounds=visualize_valid_frame_bounds,
                     )
                     _viz_fp_node_ms = (time.time() - _viz_node_t0) * 1000
 
@@ -3967,4 +4121,3 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             bwd_label = "-".join(bwd_parts)
 
         return f"{fwd_label}_{bwd_label}"
-

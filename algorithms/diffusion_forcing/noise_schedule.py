@@ -73,6 +73,7 @@ class NoiseScheduleMixin:
     def _generate_bidirectional_schedule(
         self,
         start_levels: np.ndarray,
+        prefix_len_per_batch: Optional[np.ndarray] = None,
         is_replanning: bool = False,
         num_denoising_steps_override: Optional[int] = None,
     ) -> np.ndarray:
@@ -96,9 +97,11 @@ class NoiseScheduleMixin:
         def _one_segment_pass(levels):
             to_levels_list = []
             for b in range(batch_size):
+                _prefix_len = int(prefix_len_per_batch[b]) if prefix_len_per_batch is not None else None
                 to_levels_b = self.process_segment_noise_levels(
                     levels[b],
                     self.sequence_dividing_factor,
+                    prefix_len=_prefix_len,
                     is_replanning=is_replanning,
                     num_denoising_steps_override=num_denoising_steps_override,
                 )  # (m, t)
