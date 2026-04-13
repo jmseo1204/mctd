@@ -356,17 +356,21 @@ class PlanVizMixin:
         if is_uncertainty_viz:
             unc_diag = vinfo.get("unc_diagnostics")
             if unc_diag is not None:
-                sp = unc_diag.get('sigma_parallel', 0.0)
-                sv = unc_diag.get('sigma_perp', 0.0)
-                # m_rem = unc_diag.get('M_rem', 0.0)
-                T_curr = unc_diag.get('T_curr', 0.0)
-                ln_sp = math.log(sp) if sp > 0 else float('-inf')
-                ln_sv = math.log(sv) if sv > 0 else float('-inf')
-                node_unc_label = (
-                    f"ln\u03c3\u2225={_fmt_sci(ln_sp)}\n"
-                    f"ln\u03c3\u22a5={_fmt_sci(ln_sv)}\n"
-                    f"T_curr={_fmt_sci(T_curr)}"
-                )
+                _umode = getattr(self, 'uncertainty_mode', 'entropy')
+                if _umode == 'variance':
+                    node_unc_label = (
+                        f"V_int={_fmt_sci(unc_diag.get('V_int', 0.0))}\n"
+                        f"V_eg={_fmt_sci(unc_diag.get('V_ext_g', 0.0))}\n"
+                        f"V_ec={_fmt_sci(unc_diag.get('V_ext_c', 0.0))}\n"
+                        f"U={_fmt_sci(unc_diag.get('U', 0.0))}"
+                    )
+                else:
+                    node_unc_label = (
+                        f"H_R={_fmt_sci(unc_diag.get('H_R', 0.0))}\n"
+                        f"H_A={_fmt_sci(unc_diag.get('H_A', 0.0))}\n"
+                        f"C_g={_fmt_sci(unc_diag.get('C_geom_hat', 0.0))}\n"
+                        f"T_curr={_fmt_sci(unc_diag.get('T_curr', 0.0))}"
+                    )
 
         # Expanded node position (world coords) used as anchor for labels.
         expanded_node_pos = (
@@ -561,13 +565,19 @@ class PlanVizMixin:
             return  # skip single-frame (zero-length) video upload
         video = np.stack(frames, axis=0).transpose(0, 3, 1, 2)  # (K, 3, H, W)
         label = self._node_path_label(vnode, active_tree.is_tree1, vnode.target_node)
+        selection_count = vinfo.get("selection_count", getattr(vnode, "selection_count", None))
+        label_with_count = (
+            f"[{selection_count}]_{label}"
+            if selection_count is not None
+            else label
+        )
         video_step = self.get_safe_wandb_step(min_step=loops)
         if log_prefix == "uncertainty_estimate":
             print(
                 "[uncertainty-viz-debug] "
                 + json.dumps(
                     {
-                        "label": label,
+                        "label": label_with_count,
                         "depth": int(vnode.depth),
                         "terminal_depth": int(active_tree.terminal_depth),
                         "unc_diag_is_none": vinfo.get("unc_diagnostics") is None,
@@ -583,8 +593,8 @@ class PlanVizMixin:
                 flush=True,
             )
         print(
-            f"[wandb-video-debug] key={log_prefix}/plan_at_{label} shape={video.shape} "
+            f"[wandb-video-debug] key={log_prefix}/plan_at_{label_with_count} shape={video.shape} "
             f"dtype={video.dtype} fps=4 step={video_step}",
             flush=True,
         )
-        self.log_video(f"{log_prefix}/plan_at_{label}", video, fps=4, step=video_step)
+        self.log_video(f"{log_prefix}/plan_at_{label_with_count}", video, fps=4, step=video_step)

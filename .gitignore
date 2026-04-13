@@ -16,7 +16,7 @@ logs/
 logs_memory_debug/
 td_models/*.npz
 td_models/*.pkl
-outputs/
+outputs
 symlink_to_outputs/
 .gitattributes
 

@@ -28,6 +28,7 @@ context_frames: 1
 padding_mode: "same"
 uncertainty_scale: 1
 external_cond_dim: 0
+uncertainty_lambda: 1.0
 
 # ── Diffusion ─────────────────────────────────────────────────────────────────
 diffusion:

@@ -32,6 +32,7 @@ from .plan_postproc import PlanPostprocMixin
 from .kde_estimator import KDEEstimatorMixin
 from .noise_schedule import NoiseScheduleMixin
 from .plan_viz import PlanVizMixin
+from .uncertainty_estimator import compute_uncertainty_from_embeddings, compute_uncertainty_variance
 
 # Module-level process start time for lifecycle elapsed-time logging.
 # All [LIFECYCLE] prints compute elapsed seconds from this anchor so you can
@@ -252,9 +253,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.mcts_use_replan = cfg.get("mcts_use_replan", False)
         self.viz_replanning: bool = cfg.get("viz_replanning", True)
         self.use_uncertainty_as_value: bool = cfg.get("use_uncertainty_as_value", False)
+        self.uncertainty_mode: str = cfg.get("uncertainty_mode", "entropy")
+        self.uncertainty_lambda: float = float(cfg.get("uncertainty_lambda", 1.0))
+        self.uncertainty_eta: float = float(cfg.get("uncertainty_eta", 1.0))
         self.viz_uncertain_next_subplan_last_obs: bool = cfg.get("viz_uncertain_next_subplan_last_obs", False)
         self.fast_sampling_multiple: int = cfg.get("fast_sampling_multiple", 5)
         self.fast_sampling_steps: int = cfg.get("fast_sampling_steps", 10)
+        self.global_selection_count: int = 0
         self.use_rollout: bool = cfg.get("use_rollout", False)
         self.use_dynamic_obs_padding: bool = cfg.get("use_dynamic_obs_padding", True)
         self.use_segment_wise_sliding_window: bool = cfg.get("use_segment_wise_sliding_window", False)
@@ -1120,6 +1125,12 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         # to concatenated form (n_tokens, b, fs*c)
         plan_with_given_tokens = torch.cat(plans, dim=1)  # (n_tokens, b, fs*c)
 
+        # [OOB-LOGGING] Initialize buffer for window out-of-map analysis
+        if call_type == "expansion" and self.use_segment_wise_sliding_window:
+            self._oob_log_buffer = []
+        elif hasattr(self, '_oob_log_buffer'):
+            del self._oob_log_buffer
+
         # output plan_hist.shape: (m, plan_tokens*fs, b, c)
 
         def extract_plan_chunk(plan_tensor, plan_tokens, prefix_len_list):
@@ -1344,8 +1355,67 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 update_mask_win = (from_win > to_win).unsqueeze(-1)  # (1+seg, b, 1)
                 updated_win = torch.where(update_mask_win, sample_win, plan_win)
 
+                # [CLIP-X-START] Clamp window tokens to valid normalized range to prevent
+                # guidance explosion (observed: guidance delta up to 12000 world coords at high noise).
+                # Controlled by use_sliding_window_clip_x_start flag; clip value from diffusion.clip_x_start.
+                if self.cfg.get('use_sliding_window_clip_x_start', False):
+                    _clip_xs = float(self.cfg.diffusion.get('clip_x_start', float('inf')))
+                    if _clip_xs < float('inf'):
+                        updated_win = updated_win.clamp(-_clip_xs, _clip_xs)
+
                 plan_with_given_tokens = plan_with_given_tokens.clone()
                 plan_with_given_tokens[indices, b_idx] = updated_win
+
+                # [OOB-LOGGING] Buffer window positions for out-of-map analysis
+                if call_type == "expansion" and hasattr(self, '_oob_log_buffer'):
+                    try:
+                        _fs = self.frame_stack
+                        _pidx = self.pos_dim_indices[:2]
+                        # updated_win: (1+seg, b, fs*c) → unnormalize → get xy
+                        _win_unnorm = self._unnormalize_x(
+                            rearrange(updated_win.detach().cpu(), "t b (fs c) -> (t fs) b c", fs=_fs)
+                        )  # ((1+seg)*fs, b, c)
+                        _xy = _win_unnorm[:, :, _pidx].numpy()  # ((1+seg)*fs, b, 2)
+                        _from_nl = from_win.detach().cpu().numpy()  # (1+seg, b)
+
+                        # [OOB-LOGGING v2] Capture pred_x0 before/after guidance for last seg token
+                        # _step_captures[-1] is populated by _capture_hook from ddim_sample_step
+                        _pred_x0_before = None
+                        _pred_x0_after = None
+                        if _step_captures:
+                            _cap = _step_captures[-1]
+                            # pred_x_start_pos_after: (plan_tokens*fs, B, c) in scattered form
+                            _pxs_after = _cap.get('pred_x_start_pos_after')  # may be None
+                            _pxs_before = _cap.get('pred_x_start_pos')       # None if no guidance
+                            if _pxs_after is not None:
+                                # Extract last seg token frames in scattered space.
+                                # extract_plan_chunk removes obs_parent token (tok0), so:
+                                #   tok k in window → seg-token index (k-1) in chunk → frames (k-1)*fs..(k)*fs
+                                # After scatter with offset _sc_frame_offsets[i] = _sc_plens[i]*fs:
+                                #   tok5 (= seg index 4) → scattered frames: _sc_plens[i]*fs + 4*fs
+                                _tok5_after = []
+                                _tok5_before = []
+                                for _bi in range(batch_size):
+                                    _fstart = _sc_frame_offsets[_bi] + (_sc_seg - 1) * _fs
+                                    _fend = _fstart + _fs
+                                    _t5a = self._unnormalize_x(_pxs_after[_fstart:_fend, _bi:_bi+1])[:, 0, _pidx]
+                                    _tok5_after.append(_t5a.numpy().tolist())
+                                    if _pxs_before is not None:
+                                        _t5b = self._unnormalize_x(_pxs_before[_fstart:_fend, _bi:_bi+1])[:, 0, _pidx]
+                                        _tok5_before.append(_t5b.numpy().tolist())
+                                _pred_x0_before = _tok5_before if _tok5_before else None
+                                _pred_x0_after = _tok5_after
+
+                        self._oob_log_buffer.append({
+                            "step": m,
+                            "prefix_lens": _sc_plens,
+                            "xy": _xy.tolist(),       # ((1+seg)*fs, b, 2)
+                            "from_nl": _from_nl.tolist(),  # (1+seg, b)
+                            "pred_x0_before": _pred_x0_before,  # list[b, fs, 2] or None
+                            "pred_x0_after": _pred_x0_after,    # list[b, fs, 2] or None
+                        })
+                    except Exception:
+                        pass
             else:
                 sample = self.diffusion_model.sample_step(
                     plan_with_given_tokens,  # (n_tokens, b, fs*c)
@@ -1458,6 +1528,43 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         # Store last guidance losses so callers (_run_mcts_search) can log them via _glog.
         self._last_guidance_losses = _last_guidance_losses
+
+        # [OOB-LOGGING] Flush buffer if any OOB detected
+        if call_type == "expansion" and hasattr(self, '_oob_log_buffer') and self._oob_log_buffer:
+            try:
+                import json, os
+                _oob_data = self._oob_log_buffer
+                # Detect OOB: unnormalized xy outside ±40 (generous bound for antmaze-giant)
+                _OOB_THRESH = 40.0
+                _has_oob = False
+                for _entry in _oob_data:
+                    for _t_row in _entry["xy"]:
+                        for _b_xy in _t_row:
+                            if abs(_b_xy[0]) > _OOB_THRESH or abs(_b_xy[1]) > _OOB_THRESH:
+                                _has_oob = True
+                                break
+                        if _has_oob:
+                            break
+                    if _has_oob:
+                        break
+                if _has_oob:
+                    _log_path = os.path.join("logs", "window_oob.jsonl")
+                    os.makedirs("logs", exist_ok=True)
+                    with open(_log_path, "a") as _f:
+                        # Write header record
+                        _f.write(json.dumps({
+                            "event": "oob_episode",
+                            "call_type": call_type,
+                            "batch_size": batch_size,
+                            "seg_size": _sc_seg,
+                            "frame_stack": self.frame_stack,
+                            "n_steps": len(_oob_data),
+                        }) + "\n")
+                        for _entry in _oob_data:
+                            _f.write(json.dumps(_entry) + "\n")
+                del self._oob_log_buffer
+            except Exception as _e:
+                pass
 
         return plan_hist  # (m+1, plan_tokens*fs, b, c)
 
@@ -1771,185 +1878,126 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 _start_np = start.cpu().numpy()[:, self.obs_dim_indices]  # (b, n_obs) — select from raw env obs
                 _goal_np = goal.cpu().numpy()  # (b, n_obs) — already indexed by obs_dim_indices
 
-                # Initialize infos dicts so {**infos1, **infos2} is safe even on the first step
-
-                # Alternate expansion: one single_step per MPC iteration
-                active_tree, expanded_node_infos = self._run_mcts_search(
-                    bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2,
-                    bidir_tree2 if expanded_tree_idx == 0 else bidir_tree1,
-                    horizon,
-                    conditions,
-                    _start_np,
-                    _goal_np,
-                    single_step=True,
-                )
-                
-                # Per-leaf MPC rollout: update obs and sim_state for newly expanded leaves
-
-                if self.use_rollout:
-                    for info in expanded_node_infos.values():
-                        parent_node: "TreeNode" = info["parent_node"]
-                        _child: Optional["TreeNode"] = info.get("node")  # set by expand()
-                        if _child is None:
-                            continue
-
-                        # Recompute plan tensor and denoised index range from stored plan_history
-                        plan_hist_last: torch.Tensor = info["plan_history"][-1][-1]  # (t*fs, c)
-                        plan_unnormalized: torch.Tensor = self._unnormalize_x(
-                            plan_hist_last.unsqueeze(1)
-                        )  # (t*fs, 1, c)
-
-                        seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
-                        new_denoised_start: int = self._get_prefix_len_frames_from_depth(parent_node.depth, seg_size)
-                        new_denoised_end: int = self._get_prefix_len_frames_from_depth(parent_node.depth + 1, seg_size)
-
-                        _new_sim_state = self._rollout_leaf_plan(
-                            leaf_plan_unnormalized=plan_unnormalized,
-                            new_denoised_start_idx=new_denoised_start,
-                            new_denoised_end_idx=new_denoised_end,
-                            agent=agent,
-                            envs=envs,
-                            parent_sim_state=parent_node.sim_state,
-                            is_backward=(active_tree is bidir_tree2),
-                        )
-                        assert _new_sim_state is not None, "_new_sim_state is None"
-                        _child.sim_state = _new_sim_state
-                        _child.obs = np.concatenate([_new_sim_state["qpos"], _new_sim_state["qvel"]])[self.obs_dim_indices]
-                
-                else:
-                    # Derive obs from plan_history without physical simulation
-                    seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
-                    for info in expanded_node_infos.values():
-                        parent_node: "TreeNode" = info["parent_node"]
-                        _child: Optional["TreeNode"] = info.get("node")
-                        if _child is None:
-                            continue
-
-                        plan_hist_last: torch.Tensor = info["plan_history"][-1][-1]  # (t*fs, c)
-                        _child.obs = self._extract_obs_at_boundary(
-                            plan_hist_last.unsqueeze(1),  # (t*fs, 1, c)
-                            depth=parent_node.depth + 1,
-                            seg_size=seg_size,
-                        )[0]  # (observation_dim,)
-
-                        # Create new sim_state: copy parent's structure and update qpos[:2] with last valid position
-                        _child.sim_state = {}
-                        for k, v in parent_node.sim_state.items():
-                            if isinstance(v, np.ndarray):
-                                _child.sim_state[k] = v.copy()
-                            else:
-                                _child.sim_state[k] = v
-                        # Update qpos[:2] with position from pos_dim_indices
-                        _child.sim_state['qpos'][:2] = _child.obs[self.pos_dim_indices]
-
-
-                # --- Per-expansion denoising video logging ---
-                # Runs before _select_best_leaf so videos are logged even if the
-                # episode terminates after this loop's plan execution.
-                _v_start_np = start.cpu().numpy()[:, self.pos_dim_indices]
-                _v_goal_np = goal.cpu().numpy()[:, self.pos_dim_indices]
-                _v_hilp_fn = getattr(self, '_hilp_value_fn_instance', None)
-
-                # Heatmap & grad-field are computed per-candidate based on the target (green star),
-                # not the episode goal.  Cache by target_node name to avoid redundant computation.
-                _v_tgt_vis_cache: dict = {}  # target_node_name → (heatmap, grad_field)
-
-                # Per-candidate step captures from the expansion parallel_plan call.
-                _v_sc_by_name: dict = getattr(self, '_expansion_step_captures_by_name', {})
-                # obs_std for converting normalized pred_noise to world-space arrow scale
-                _v_obs_std_np = (
-                    self.data_std.cpu().numpy() if isinstance(self.data_std, torch.Tensor)
-                    else np.array(self.data_std)
-                )[self.pos_dim_indices]
-
-                _viz_subplan_expand_ms = 0.0
-                _viz_subplan_replan_ms = 0.0
-                _viz_subplan_unc_ms = 0.0
-                _viz_subplan_n = 0
-                for _vname, _vinfo in (expanded_node_infos.items() if self.viz_subplan_denoising else []):
-                    _viz_subplan_n += 1
-                    # Always log expanded stage denoising
-                    _viz_t0 = time.time()
-                    self._log_candidate_plan_video(
-                        _vname, _vinfo, active_tree,
-                        _v_start_np, _v_goal_np,
-                        _v_hilp_fn,
-                        _v_tgt_vis_cache,
-                        _v_sc_by_name,
-                        _v_obs_std_np,
-                        loops,
-                        log_prefix="expanded",
-                        plan_hist_override=_vinfo.get("expanded_plan_hist_frame"),
+                if self.use_uncertainty_as_value:
+                    selected_parent_infos = self._select_global_expansion_parents(
+                        bidir_tree1,
+                        bidir_tree2,
                     )
-                    _viz_subplan_expand_ms += (time.time() - _viz_t0) * 1000
-                    # Additionally log replanned stage denoising if mcts_use_replan is enabled
-                    if self.mcts_use_replan and self.viz_replanning and _vinfo.get("replanned_plan_hist_frame") is not None:
-                        _viz_t0 = time.time()
-                        self._log_candidate_plan_video(
-                            _vname, _vinfo, active_tree,
-                            _v_start_np, _v_goal_np,
-                            _v_hilp_fn,
-                            _v_tgt_vis_cache,
-                            _v_sc_by_name,
-                            _v_obs_std_np,
-                            loops,
-                            log_prefix="replanned",
-                            plan_hist_override=_vinfo.get("replanned_plan_hist_frame"),
-                        )
-                        _viz_subplan_replan_ms += (time.time() - _viz_t0) * 1000
-                    # Log uncertainty estimate video: K*G fast-sampled sub_plans overlaid,
-                    # each rendered as red gradient with alpha-scaled green endpoint dots.
-                    # Skip if node is at terminal_depth (no further sub-plan denoising possible).
-                    if (
-                        self.viz_uncertain_next_subplan_last_obs
-                        and _vinfo.get("uncertainty_plan_hist_frame") is not None
-                        and _vinfo.get("depth", 0) < active_tree.terminal_depth
+                    if not selected_parent_infos:
+                        terminate = True
+                        break
+
+                    combined_expanded_node_infos: dict[str, dict] = {}
+                    for _tree, _opp_tree in (
+                        (bidir_tree1, bidir_tree2),
+                        (bidir_tree2, bidir_tree1),
                     ):
-                        _viz_t0 = time.time()
-                        self._log_candidate_plan_video(
-                            _vname, _vinfo, active_tree,
-                            _v_start_np, _v_goal_np,
-                            _v_hilp_fn,
-                            _v_tgt_vis_cache,
-                            _v_sc_by_name,
-                            _v_obs_std_np,
-                            loops,
-                            log_prefix="uncertainty_estimate",
-                            plan_hist_override=_vinfo["uncertainty_plan_hist_frame"],
-                            is_uncertainty_viz=True,
+                        selected_parent_nodes = [
+                            info["node"]
+                            for info in selected_parent_infos
+                            if info["tree"] is _tree
+                        ]
+                        if not selected_parent_nodes:
+                            continue
+
+                        active_tree, expanded_node_infos = self._run_mcts_search(
+                            _tree,
+                            _opp_tree,
+                            horizon,
+                            conditions,
+                            _start_np,
+                            _goal_np,
+                            single_step=True,
+                            selected_parent_nodes=selected_parent_nodes,
                         )
-                        _viz_subplan_unc_ms += (time.time() - _viz_t0) * 1000
-                if _viz_subplan_n > 0 or self.viz_subplan_denoising:
-                    self._tlog("timing.viz_subplan_denoising", {
-                        "n_candidates": _viz_subplan_n,
-                        "expand_ms": round(_viz_subplan_expand_ms, 1),
-                        "replan_ms": round(_viz_subplan_replan_ms, 1),
-                        "uncertainty_ms": round(_viz_subplan_unc_ms, 1),
-                        "total_ms": round(_viz_subplan_expand_ms + _viz_subplan_replan_ms + _viz_subplan_unc_ms, 1),
-                    }, depth=1)
+                        self._update_expanded_children_state(
+                            active_tree,
+                            expanded_node_infos,
+                            agent,
+                            envs,
+                        )
+                        self._log_expanded_node_videos(
+                            expanded_node_infos,
+                            active_tree,
+                            start,
+                            goal,
+                            loops,
+                        )
+                        for _name, _info in expanded_node_infos.items():
+                            _info["selected_tree"] = active_tree
+                            combined_expanded_node_infos[f"{active_tree.tag}:{_name}"] = _info
 
-                # Extract plan by selecting best leaf and combining plans
-                best_info: dict = self._select_best_leaf(expanded_node_infos)
+                    best_info = self._select_best_leaf(combined_expanded_node_infos)
+                    if best_info is None:
+                        continue
 
-                # expanded_node_infos can be empty if all candidates were killed by
-                # endpoint deduplication. In that case, skip plan extraction and continue.
-                if best_info is None:
+                    best_node = best_info["node"]
+                    active_tree = best_info["selected_tree"]
+                    _trees_exhausted = (
+                        not bidir_tree1.root_node.is_expandable_flag and
+                        not bidir_tree2.root_node.is_expandable_flag
+                    )
+                    _gap = self._compute_plan_gap(
+                        best_node,
+                        active_tree.plan_tokens,
+                        is_tree1=active_tree.is_tree1,
+                    )
+                    is_meeting = _trees_exhausted or (
+                        _gap is not None and _gap < self.meeting_delta
+                    )
+                    last_is_tree1 = active_tree.is_tree1
+                else:
+                    active_tree, expanded_node_infos = self._run_mcts_search(
+                        bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2,
+                        bidir_tree2 if expanded_tree_idx == 0 else bidir_tree1,
+                        horizon,
+                        conditions,
+                        _start_np,
+                        _goal_np,
+                        single_step=True,
+                    )
+                    self._update_expanded_children_state(
+                        active_tree,
+                        expanded_node_infos,
+                        agent,
+                        envs,
+                    )
+                    self._log_expanded_node_videos(
+                        expanded_node_infos,
+                        active_tree,
+                        start,
+                        goal,
+                        loops,
+                    )
+
+                    # Extract plan by selecting best leaf and combining plans
+                    best_info = self._select_best_leaf(expanded_node_infos)
+
+                    # expanded_node_infos can be empty if all candidates were killed by
+                    # endpoint deduplication. In that case, skip plan extraction and continue.
+                    if best_info is None:
+                        expanded_tree_idx = (expanded_tree_idx + 1) % 2
+                        continue
+
+                    best_node = best_info["node"]
+
+                    # Update meeting condition: trees exhausted or FWD/BWD plans close enough
+                    _trees_exhausted = (
+                        not bidir_tree1.root_node.is_expandable_flag and
+                        not bidir_tree2.root_node.is_expandable_flag
+                    )
+                    _gap = self._compute_plan_gap(
+                        best_node,
+                        active_tree.plan_tokens,
+                        is_tree1=active_tree.is_tree1,
+                    )
+                    is_meeting = _trees_exhausted or (
+                        _gap is not None and _gap < self.meeting_delta
+                    )
+
+                    last_is_tree1 = active_tree.is_tree1
+                    # Alternate trees for next iteration
                     expanded_tree_idx = (expanded_tree_idx + 1) % 2
-                    continue
-                
-                best_node = best_info["node"]
-
-                # Update meeting condition: trees exhausted or FWD/BWD plans close enough
-                _trees_exhausted = (
-                    not bidir_tree1.root_node.is_expandable_flag and
-                    not bidir_tree2.root_node.is_expandable_flag
-                )
-                _gap = self._compute_plan_gap(best_node, active_tree.plan_tokens, is_tree1=(expanded_tree_idx == 0))
-                is_meeting = _trees_exhausted or (_gap is not None and _gap < self.meeting_delta)
-
-                last_is_tree1 = (expanded_tree_idx == 0)
-                # Alternate trees for next iteration
-                expanded_tree_idx = (expanded_tree_idx + 1) % 2
 
             # Single-shot plan extraction and environment execution (after MCTS search completes)
             if best_node is not None:
@@ -2538,41 +2586,16 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         tail_obs: np.ndarray,  # (G*K, obs_dim) — unnormalized tail observations
         gamma: float = 0.995,
         eps: float = 1e-8,
-        eps_progress: float = 0.01,
     ) -> dict:
-        """Compute uncertainty of a tree node from the spread of fast-sampled tail states.
+        """Compute node uncertainty from fast-sampled tail states.
 
-        Theory: HILP converges to V(s,g) = -||phi(s)-phi(g)|| = -(1-γ^{d*})/(1-γ)
-        where d*(s,g) is the true temporal distance and γ is the discount factor.
-
-        Therefore the true temporal distance is recovered as:
-            emb_dist = ||phi(s) - phi(g)||
-            d*(s,g)  = log(1 - emb_dist*(1-γ)) / log(γ)
-
-        Sigma and g_hat are computed in HILP embedding space (not temporal-distance space).
-        T_curr, T_tail, and Delta_bar are in temporal-distance space (converted from emb_dist).
-
-        NOTE: Requires hilp_fn to expose get_phi(torch.Tensor) → torch.Tensor.
-        Currently only HILPJax and HILPMemoizedWrapper implement this interface.
-        HILP (PyTorch) uses a different get_phi signature and is NOT supported.
-
-        Args:
-            curr_obs: Current node observation (obs_dim,) — the node being evaluated.
-            target_node: Goal tree node (source of goal_obs).
-            tail_obs: (G*K, obs_dim) unnormalized observations at the tail of each unc sample.
-            gamma: Discount factor used during HILP training (default 0.995).
-            eps: Small float for numerical stability.
-            eps_progress: Minimum Delta_bar as a fraction of T_curr (prevents M_rem blow-up).
-
-        Returns:
-            dict with keys: U, ln_K, sigma_parallel, sigma_perp,
-                            T_curr, T_tail, Delta_bar, M_rem
+        The local entropy terms are computed in HILP embedding space using the
+        radial-angular estimator, while the final multiplier T_curr is obtained
+        by converting the current embedding goal-distance into temporal distance.
         """
-        import math
 
         hilp_fn = self._get_hilp_value_fn()
         goal_obs: np.ndarray = target_node.obs  # (obs_dim,)
-        K: int = tail_obs.shape[0]
 
         all_obs = np.concatenate(
             [curr_obs[None], goal_obs[None], tail_obs], axis=0
@@ -2587,64 +2610,27 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         z_goal = Z_all[1]   # (D,)
         Z      = Z_all[2:]  # (K, D)
 
-        # --- Degenerate: already at goal in embedding space ---
-        emb_dist_curr = float(np.linalg.norm(z_goal - z_curr))
-        if emb_dist_curr < eps:
-            return {
-                'U': 0.0, 'ln_K': 0.0,
-                'sigma_parallel': 0.0, 'sigma_perp': 0.0,
-                'T_curr': 0.0, 'T_tail': 0.0, 'Delta_bar': 0.0, 'M_rem': 0.0,
-            }
+        _temporal_dist_fn = lambda emb_d: self.emb_dist_to_temporal_dist(emb_d, gamma)
 
-        
-
-        # --- Sigma in embedding space (step 2-4 from spec §3.2) ---
-        z_bar = Z.mean(axis=0)                    # (D,)
-        dZ    = Z - z_bar                          # (K, D)
-        N_cov = max(K - 1, 1)                      # unbiased when K > 1
-        Sigma = (dZ.T @ dZ) / N_cov               # (D, D)
-
-        g_hat = (z_goal - z_curr) / emb_dist_curr  # (D,) unit vector in embedding space
-
-        sigma_parallel_sq = float(g_hat @ Sigma @ g_hat)
-        sigma_parallel_sq = max(sigma_parallel_sq, eps)
-        sigma_perp_sq     = max(float(np.trace(Sigma)) - sigma_parallel_sq, eps)
-
-        # --- Per-step entropy ln_K (spec §2.3) ---
-        ln_K = (
-            math.log(2.0 * math.pi * math.e)
-            + 0.5 * math.log(sigma_parallel_sq)
-            + 0.5 * math.log(sigma_perp_sq)
-        )
-
-        # --- Temporal distances (converted from embedding L2) ---
-        T_curr = float(self.emb_dist_to_temporal_dist(emb_dist_curr, gamma))
-
-        emb_dists_tail = np.linalg.norm(z_goal[None] - Z, axis=-1)  # (K,)
-        T_i    = self.emb_dist_to_temporal_dist(emb_dists_tail, gamma)                          # (K,)
-        T_tail = float(T_i.mean())
-
-        Delta_bar = T_curr - T_tail
-        Delta_bar = max(Delta_bar, T_curr * eps_progress)  # floor at eps_progress fraction
-
-        M_rem = T_tail / Delta_bar
-        # Cap M_rem: when Delta_bar hits the eps_progress floor (T_tail ≈ T_curr → near-zero
-        # progress), M_rem blows up to ~1/eps_progress (~100).  Hard-cap at 20 for display
-        # sanity; the eps_progress floor already handles the U floor implicitly.
-        M_rem = min(M_rem, 20.0)
-        # U     = ln_K * (1.0 + M_rem)
-        U     = ln_K * T_curr
-
-        return {
-            'U':               U,
-            'ln_K':            ln_K,
-            'sigma_parallel':  math.sqrt(sigma_parallel_sq),
-            'sigma_perp':      math.sqrt(sigma_perp_sq),
-            'T_curr':          T_curr,
-            'T_tail':          T_tail,
-            'Delta_bar':       Delta_bar,
-            'M_rem':           M_rem,
-        }
+        if self.uncertainty_mode == "variance":
+            return compute_uncertainty_variance(
+                z_curr=z_curr,
+                z_goal=z_goal,
+                z_tail=Z,
+                temporal_dist_fn=_temporal_dist_fn,
+                lambda_weight=self.uncertainty_lambda,
+                eta_weight=self.uncertainty_eta,
+            )
+        else:
+            return compute_uncertainty_from_embeddings(
+                z_curr=z_curr,
+                z_goal=z_goal,
+                z_tail=Z,
+                temporal_dist_fn=_temporal_dist_fn,
+                lambda_weight=self.uncertainty_lambda,
+                eta_weight=self.uncertainty_eta,
+                eps=eps,
+            )
 
     def _init_mcts_tree(
         self,
@@ -2726,6 +2712,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         start: np.ndarray,
         goal: np.ndarray,
         single_step: bool = False,
+        selected_parent_nodes: Optional[List["TreeNode"]] = None,
     ) -> tuple[MCTSTreeState, dict[str, dict]]:
         """
         (B function) Run the MCTS search loop for a given tree state.
@@ -2812,117 +2799,167 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             #  When leaf parallelization is False, then the selection is done in fully sequential (only one node is selected at a time)
 
             selection_start_time = time.time()
-            psn = self.parallel_search_num
             selected_nodes, expanded_node_candidates = [], []
-            while psn > 0:
-                selected_node = root_node
 
-                _selection_exhausted = False
-                while (
-                    (
-                        not selected_node.is_expandable(
-                            consider_virtually_visited=(
-                                not self.parallel_multiple_visits
-                            )
-                        )
-                    )
-                    and (not selected_node.is_terminal())
-                    and (selected_node.is_selectable())
-                ):
-                    try:
-                        selected_node = selected_node.select(
-                            leaf_parallelization=self.leaf_parallelization,
-                            max_child_resets=self.max_child_resets,
-                        )
-                    except ValueError:
-                        # Node's subtree is fully exhausted (all children permanently killed
-                        # and reset budget spent). Skip this psn slot gracefully.
-                        _selection_exhausted = True
-                        break
+            if selected_parent_nodes is None:
+                psn = self.parallel_search_num
+                while psn > 0:
+                    selected_node = root_node
 
-                # Recompute expandable node names after traversal: select() may call
-                # reset_dead_children() which wipes children and makes previously
-                # non-listed slots expandable again, causing stale-list mismatches.
-                if not self.parallel_multiple_visits:
-                    expandable_node_names = root_node.get_expandable_node_names()
-
-                if _selection_exhausted:
-                    psn -= (
-                        1
-                        if not self.leaf_parallelization
-                        else len(children_node_guidance_scales)
-                    )
-                    continue
-
-                is_term = selected_node.is_terminal()
-                is_exp = selected_node.is_expandable(consider_virtually_visited=(not self.parallel_multiple_visits))
-                is_sel = selected_node.is_selectable()
-
-                if is_term or (not is_sel and not is_exp):
-                    psn -= (
-                        1
-                        if not self.leaf_parallelization
-                        else len(children_node_guidance_scales)
-                    )
-                    continue
-                if self.leaf_parallelization:
-                    for i in range(len(children_node_guidance_scales)):
-                        # Skip slots that already have a child node (created in a previous
-                        # iteration) or are already virtually visited — both mean the slot
-                        # is occupied / scheduled for this round and should not be re-added.
-                        # Also skip permanently_dead slots (dedup-killed): get_expandable_candidate
-                        # with explicit index bypasses the permanently_dead check, so we guard here.
-                        child_slot = selected_node._children_nodes[i]
-                        if child_slot['node'] is not None:
-                            continue
-                        if child_slot['permanently_dead']:
-                            continue
-                        if (not self.parallel_multiple_visits) and child_slot['virtually_visited']:
-                            continue
-
-                        # when multiple visits is False, then we need to consider the virtually visited nodes to visit only once
-                        expanded_node_candidate = (
-                            selected_node.get_expandable_candidate(
-                                index=i,
+                    _selection_exhausted = False
+                    while (
+                        (
+                            not selected_node.is_expandable(
                                 consider_virtually_visited=(
                                     not self.parallel_multiple_visits
-                                ),
+                                )
                             )
+                        )
+                        and (not selected_node.is_terminal())
+                        and (selected_node.is_selectable())
+                    ):
+                        try:
+                            selected_node = selected_node.select(
+                                leaf_parallelization=self.leaf_parallelization,
+                                max_child_resets=self.max_child_resets,
+                            )
+                        except ValueError:
+                            # Node's subtree is fully exhausted (all children permanently killed
+                            # and reset budget spent). Skip this psn slot gracefully.
+                            _selection_exhausted = True
+                            break
+
+                    # Recompute expandable node names after traversal: select() may call
+                    # reset_dead_children() which wipes children and makes previously
+                    # non-listed slots expandable again, causing stale-list mismatches.
+                    if not self.parallel_multiple_visits:
+                        expandable_node_names = root_node.get_expandable_node_names()
+
+                    if _selection_exhausted:
+                        psn -= (
+                            1
+                            if not self.leaf_parallelization
+                            else len(children_node_guidance_scales)
+                        )
+                        continue
+
+                    is_term = selected_node.is_terminal()
+                    is_exp = selected_node.is_expandable(consider_virtually_visited=(not self.parallel_multiple_visits))
+                    is_sel = selected_node.is_selectable()
+
+                    if is_term or (not is_sel and not is_exp):
+                        psn -= (
+                            1
+                            if not self.leaf_parallelization
+                            else len(children_node_guidance_scales)
+                        )
+                        continue
+                    if self.leaf_parallelization:
+                        for i in range(len(children_node_guidance_scales)):
+                            # Skip slots that already have a child node (created in a previous
+                            # iteration) or are already virtually visited — both mean the slot
+                            # is occupied / scheduled for this round and should not be re-added.
+                            # Also skip permanently_dead slots (dedup-killed): get_expandable_candidate
+                            # with explicit index bypasses the permanently_dead check, so we guard here.
+                            child_slot = selected_node._children_nodes[i]
+                            if child_slot['node'] is not None:
+                                continue
+                            if child_slot['permanently_dead']:
+                                continue
+                            if (not self.parallel_multiple_visits) and child_slot['virtually_visited']:
+                                continue
+
+                            # when multiple visits is False, then we need to consider the virtually visited nodes to visit only once
+                            expanded_node_candidate = (
+                                selected_node.get_expandable_candidate(
+                                    index=i,
+                                    consider_virtually_visited=(
+                                        not self.parallel_multiple_visits
+                                    ),
+                                )
+                            )
+
+                            selected_nodes.append(selected_node)
+                            expanded_node_candidates.append(expanded_node_candidate)
+                            if not self.parallel_multiple_visits:
+                                if (
+                                    not expanded_node_candidate["name"]
+                                    in expandable_node_names
+                                ):
+                                    raise ValueError(
+                                        f"Expanded node candidate {expanded_node_candidate['name']} is not in expandable node names"
+                                    )
+                                expandable_node_names.remove(
+                                    expanded_node_candidate["name"]
+                                )
+                            psn -= 1
+                    else:
+                        # when multiple visits is False, then we need to consider the virtually visited nodes to visit only once
+                        expanded_node_candidate = selected_node.get_expandable_candidate(
+                            index=None,
+                            consider_virtually_visited=(not self.parallel_multiple_visits),
                         )
 
                         selected_nodes.append(selected_node)
                         expanded_node_candidates.append(expanded_node_candidate)
                         if not self.parallel_multiple_visits:
-                            if (
-                                not expanded_node_candidate["name"]
-                                in expandable_node_names
-                            ):
+                            if not expanded_node_candidate["name"] in expandable_node_names:
                                 raise ValueError(
                                     f"Expanded node candidate {expanded_node_candidate['name']} is not in expandable node names"
                                 )
-                            expandable_node_names.remove(
-                                expanded_node_candidate["name"]
-                            )
+                            expandable_node_names.remove(expanded_node_candidate["name"])
                         psn -= 1
-                else:
-                    # when multiple visits is False, then we need to consider the virtually visited nodes to visit only once
-                    expanded_node_candidate = selected_node.get_expandable_candidate(
-                        index=None,
-                        consider_virtually_visited=(not self.parallel_multiple_visits),
-                    )
-
-                    selected_nodes.append(selected_node)
-                    expanded_node_candidates.append(expanded_node_candidate)
                     if not self.parallel_multiple_visits:
-                        if not expanded_node_candidate["name"] in expandable_node_names:
-                            raise ValueError(
-                                f"Expanded node candidate {expanded_node_candidate['name']} is not in expandable node names"
-                            )
-                        expandable_node_names.remove(expanded_node_candidate["name"])
-                    psn -= 1
+                        if len(expandable_node_names) == 0:
+                            break
+            else:
                 if not self.parallel_multiple_visits:
-                    if len(expandable_node_names) == 0:
-                        break
+                    expandable_node_names = root_node.get_expandable_node_names()
+                for selected_node in selected_parent_nodes:
+                    is_term = selected_node.is_terminal()
+                    is_exp = selected_node.is_expandable(
+                        consider_virtually_visited=(not self.parallel_multiple_visits)
+                    )
+                    is_sel = selected_node.is_selectable()
+
+                    if is_term or (not is_sel and not is_exp):
+                        continue
+
+                    if self.leaf_parallelization:
+                        for i in range(len(children_node_guidance_scales)):
+                            child_slot = selected_node._children_nodes[i]
+                            if child_slot['node'] is not None:
+                                continue
+                            if child_slot['permanently_dead']:
+                                continue
+                            if (not self.parallel_multiple_visits) and child_slot['virtually_visited']:
+                                continue
+
+                            expanded_node_candidate = selected_node.get_expandable_candidate(
+                                index=i,
+                                consider_virtually_visited=(not self.parallel_multiple_visits),
+                            )
+                            selected_nodes.append(selected_node)
+                            expanded_node_candidates.append(expanded_node_candidate)
+                            if not self.parallel_multiple_visits:
+                                if expanded_node_candidate["name"] not in expandable_node_names:
+                                    raise ValueError(
+                                        f"Expanded node candidate {expanded_node_candidate['name']} is not in expandable node names"
+                                    )
+                                expandable_node_names.remove(expanded_node_candidate["name"])
+                    else:
+                        expanded_node_candidate = selected_node.get_expandable_candidate(
+                            index=None,
+                            consider_virtually_visited=(not self.parallel_multiple_visits),
+                        )
+                        selected_nodes.append(selected_node)
+                        expanded_node_candidates.append(expanded_node_candidate)
+                        if not self.parallel_multiple_visits:
+                            if expanded_node_candidate["name"] not in expandable_node_names:
+                                raise ValueError(
+                                    f"Expanded node candidate {expanded_node_candidate['name']} is not in expandable node names"
+                                )
+                            expandable_node_names.remove(expanded_node_candidate["name"])
             if len(selected_nodes) == 0:
                 break
             selection_end_time = time.time()
@@ -3391,6 +3428,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         unc_noise_levels_rep = np.repeat(unc_noise_levels_nt, K * G, axis=0)
                         unc_init_plans_rep = []
                         unc_guidance_scale_vals = []
+                        unc_goal_list = []
+                        all_opposite_nodes_unc = opposite_tree.get_all_nodes()
                         for _i in non_terminal_cand_indices:
                             _parent_node = expanded_node_candidates[_i]["parent_node"]
                             _plan_t_fs = val_plan_hists[-1, :, _i].unsqueeze(1)  # (plan_tokens*fs, 1, c)
@@ -3404,6 +3443,23 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                             _child_depth = _parent_node.depth + 1
                             _future_start = _child_depth * seg_size + 1
                             _n_future = _plan_tokens_val + 1 - _future_start
+
+                            # Select goal from opposite tree based on child segment tail position,
+                            # not parent_node position. _extract_obs_at_boundary returns (N, obs_dim)
+                            # unnormalized; depth=_child_depth gives frame index child_depth*seg_size*fs-1.
+                            _tail_obs_unnorm = self._extract_obs_at_boundary(
+                                _plan_t_fs, depth=_child_depth, seg_size=seg_size
+                            )[0]  # (obs_dim,)
+                            _unc_target_node = self._select_dynamic_goal(
+                                current_leaf_obs=_tail_obs_unnorm,
+                                opposite_tree_all_nodes=all_opposite_nodes_unc,
+                            )
+                            _unc_goal_norm = torch.tensor(
+                                (_unc_target_node.obs - obs_mean_np) / obs_std_np,
+                                dtype=torch.float32,
+                                device=self.device,
+                            ).unsqueeze(0)  # (1, obs_dim)
+
                             for g_scale in self.mctd_guidance_scales:
                                 for _ in range(K):
                                     _unc_plan = _base_plan.clone()
@@ -3413,13 +3469,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                                         )
                                     unc_init_plans_rep.append(_unc_plan)
                                     unc_guidance_scale_vals.append(g_scale)
+                                    unc_goal_list.append(_unc_goal_norm)
                         unc_guidance_scale_tensor = torch.tensor(
                             unc_guidance_scale_vals, dtype=torch.float32, device=self.device
                         )
 
                         nt_idx_tensor = torch.tensor(non_terminal_cand_indices, device=effective_obs_normalized.device)
                         unc_obs = effective_obs_normalized[nt_idx_tensor].repeat_interleave(G * K, dim=0)
-                        unc_goal = effective_goal_normalized[nt_idx_tensor].repeat_interleave(G * K, dim=0)
+                        unc_goal = torch.cat(unc_goal_list, dim=0)  # (B_nt*G*K, obs_dim)
                         unc_prefix_len_list = [
                             (expanded_node_candidates[_i]["parent_node"].depth + 1) * seg_size
                             for _i in non_terminal_cand_indices
@@ -3666,7 +3723,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             distinct_selected_nodes = np.unique(selected_nodes)
             for selected_node in distinct_selected_nodes:
                 if any(c["node"] is not None for c in selected_node._children_nodes):
-                    selected_node.backpropagate()
+                    selected_node.backpropagate(
+                        preserve_value=self.use_uncertainty_as_value,
+                    )
 
             backprop_end_time = time.time()
             tree.backprop_time.append(backprop_end_time - backprop_start_time)
@@ -3855,6 +3914,226 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         """Sample (n_tokens, batch_size, *x_stacked_shape) randn clamped to clip_noise."""
         noise = torch.randn((n_tokens, batch_size, *self.x_stacked_shape), device=self.device)
         return torch.clamp(noise, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise)
+
+    def _parent_selection_budget(self) -> int:
+        """Return how many distinct parent nodes may be selected in one round."""
+        if self.leaf_parallelization:
+            return self.parallel_search_num // len(self.mctd_guidance_scales)
+        return self.parallel_search_num
+
+    def _collect_global_expansion_candidates(
+        self,
+        tree: MCTSTreeState,
+        opposite_tree: MCTSTreeState,
+    ) -> List[dict]:
+        """Collect expandable nodes from one tree for uncertainty-mode global ranking."""
+        candidates: List[dict] = []
+        for node in tree.get_all_nodes():
+            if node.obs is None or node.is_terminal():
+                continue
+            if not node.is_expandable(
+                consider_virtually_visited=(not self.parallel_multiple_visits)
+            ):
+                continue
+            candidates.append(
+                {
+                    "node": node,
+                    "tree": tree,
+                    "opposite_tree": opposite_tree,
+                    "value": node.value if node.value is not None else float("-inf"),
+                }
+            )
+        return candidates
+
+    def _select_global_expansion_parents(
+        self,
+        tree1: MCTSTreeState,
+        tree2: MCTSTreeState,
+    ) -> List[dict]:
+        """Select top-K expandable parents globally across both trees."""
+        candidate_pool = self._collect_global_expansion_candidates(tree1, tree2)
+        candidate_pool.extend(self._collect_global_expansion_candidates(tree2, tree1))
+        candidate_pool.sort(
+            key=lambda item: (
+                -float(item["value"]),
+                -int(item["node"].depth),
+                item["node"].name,
+            )
+        )
+        selected_parent_infos = candidate_pool[: self._parent_selection_budget()]
+        for parent_info in selected_parent_infos:
+            self.global_selection_count += 1
+            selection_count = self.global_selection_count
+            parent_info["selection_count"] = selection_count
+            parent_info["node"].last_selection_count = selection_count
+        return selected_parent_infos
+
+    def _update_expanded_children_state(
+        self,
+        active_tree: MCTSTreeState,
+        expanded_node_infos: dict[str, dict],
+        agent,
+        envs,
+    ) -> None:
+        """Populate obs/sim_state for freshly created child nodes."""
+        if self.use_rollout:
+            for info in expanded_node_infos.values():
+                parent_node: "TreeNode" = info["parent_node"]
+                _child: Optional["TreeNode"] = info.get("node")
+                if _child is None:
+                    continue
+
+                plan_hist_last: torch.Tensor = info["plan_history"][-1][-1]
+                plan_unnormalized: torch.Tensor = self._unnormalize_x(
+                    plan_hist_last.unsqueeze(1)
+                )
+
+                seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
+                new_denoised_start: int = self._get_prefix_len_frames_from_depth(
+                    parent_node.depth, seg_size
+                )
+                new_denoised_end: int = self._get_prefix_len_frames_from_depth(
+                    parent_node.depth + 1, seg_size
+                )
+
+                _new_sim_state = self._rollout_leaf_plan(
+                    leaf_plan_unnormalized=plan_unnormalized,
+                    new_denoised_start_idx=new_denoised_start,
+                    new_denoised_end_idx=new_denoised_end,
+                    agent=agent,
+                    envs=envs,
+                    parent_sim_state=parent_node.sim_state,
+                    is_backward=(not active_tree.is_tree1),
+                )
+                assert _new_sim_state is not None, "_new_sim_state is None"
+                _child.sim_state = _new_sim_state
+                _child.obs = np.concatenate(
+                    [_new_sim_state["qpos"], _new_sim_state["qvel"]]
+                )[self.obs_dim_indices]
+        else:
+            seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
+            for info in expanded_node_infos.values():
+                parent_node: "TreeNode" = info["parent_node"]
+                _child: Optional["TreeNode"] = info.get("node")
+                if _child is None:
+                    continue
+
+                plan_hist_last: torch.Tensor = info["plan_history"][-1][-1]
+                _child.obs = self._extract_obs_at_boundary(
+                    plan_hist_last.unsqueeze(1),
+                    depth=parent_node.depth + 1,
+                    seg_size=seg_size,
+                )[0]
+
+                _child.sim_state = {}
+                for k, v in parent_node.sim_state.items():
+                    if isinstance(v, np.ndarray):
+                        _child.sim_state[k] = v.copy()
+                    else:
+                        _child.sim_state[k] = v
+                _child.sim_state["qpos"][:2] = _child.obs[self.pos_dim_indices]
+
+    def _log_expanded_node_videos(
+        self,
+        expanded_node_infos: dict[str, dict],
+        active_tree: MCTSTreeState,
+        start: torch.Tensor,
+        goal: torch.Tensor,
+        loops: int,
+    ) -> None:
+        """Log per-candidate denoising videos for one expansion batch."""
+        _v_start_np = start.cpu().numpy()[:, self.pos_dim_indices]
+        _v_goal_np = goal.cpu().numpy()[:, self.pos_dim_indices]
+        _v_hilp_fn = getattr(self, "_hilp_value_fn_instance", None)
+        _v_tgt_vis_cache: dict = {}
+        _v_sc_by_name: dict = getattr(self, "_expansion_step_captures_by_name", {})
+        _v_obs_std_np = (
+            self.data_std.cpu().numpy() if isinstance(self.data_std, torch.Tensor)
+            else np.array(self.data_std)
+        )[self.pos_dim_indices]
+
+        _viz_subplan_expand_ms = 0.0
+        _viz_subplan_replan_ms = 0.0
+        _viz_subplan_unc_ms = 0.0
+        _viz_subplan_n = 0
+        for _vname, _vinfo in (expanded_node_infos.items() if self.viz_subplan_denoising else []):
+            _viz_subplan_n += 1
+            _viz_t0 = time.time()
+            self._log_candidate_plan_video(
+                _vname,
+                _vinfo,
+                active_tree,
+                _v_start_np,
+                _v_goal_np,
+                _v_hilp_fn,
+                _v_tgt_vis_cache,
+                _v_sc_by_name,
+                _v_obs_std_np,
+                loops,
+                log_prefix="expanded",
+                plan_hist_override=_vinfo.get("expanded_plan_hist_frame"),
+            )
+            _viz_subplan_expand_ms += (time.time() - _viz_t0) * 1000
+
+            if self.mcts_use_replan and self.viz_replanning and _vinfo.get("replanned_plan_hist_frame") is not None:
+                _viz_t0 = time.time()
+                self._log_candidate_plan_video(
+                    _vname,
+                    _vinfo,
+                    active_tree,
+                    _v_start_np,
+                    _v_goal_np,
+                    _v_hilp_fn,
+                    _v_tgt_vis_cache,
+                    _v_sc_by_name,
+                    _v_obs_std_np,
+                    loops,
+                    log_prefix="replanned",
+                    plan_hist_override=_vinfo.get("replanned_plan_hist_frame"),
+                )
+                _viz_subplan_replan_ms += (time.time() - _viz_t0) * 1000
+
+            if (
+                self.viz_uncertain_next_subplan_last_obs
+                and _vinfo.get("uncertainty_plan_hist_frame") is not None
+                and _vinfo.get("depth", 0) < active_tree.terminal_depth
+            ):
+                _viz_t0 = time.time()
+                self._log_candidate_plan_video(
+                    _vname,
+                    _vinfo,
+                    active_tree,
+                    _v_start_np,
+                    _v_goal_np,
+                    _v_hilp_fn,
+                    _v_tgt_vis_cache,
+                    _v_sc_by_name,
+                    _v_obs_std_np,
+                    loops,
+                    log_prefix="uncertainty_estimate",
+                    plan_hist_override=_vinfo["uncertainty_plan_hist_frame"],
+                    is_uncertainty_viz=True,
+                )
+                _viz_subplan_unc_ms += (time.time() - _viz_t0) * 1000
+
+        if _viz_subplan_n > 0 or self.viz_subplan_denoising:
+            self._tlog(
+                "timing.viz_subplan_denoising",
+                {
+                    "tree_tag": active_tree.tag,
+                    "n_candidates": _viz_subplan_n,
+                    "expand_ms": round(_viz_subplan_expand_ms, 1),
+                    "replan_ms": round(_viz_subplan_replan_ms, 1),
+                    "uncertainty_ms": round(_viz_subplan_unc_ms, 1),
+                    "total_ms": round(
+                        _viz_subplan_expand_ms
+                        + _viz_subplan_replan_ms
+                        + _viz_subplan_unc_ms,
+                        1,
+                    ),
+                },
+                depth=1,
+            )
 
     def _build_obs_parent_token(self, parent_node: "TreeNode") -> torch.Tensor:
         """Build the obs_parent_token (position 0 anchor) for a plan tensor.

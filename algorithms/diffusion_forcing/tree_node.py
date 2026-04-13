@@ -12,7 +12,8 @@ class TreeNode():
                  virtual_visit_weight: float = 0.0, current_levels: Optional[np.ndarray] = None,
                  obs: Optional[np.ndarray] = None,
                  sim_state: Optional[dict] = None,
-                 target_node: Optional['TreeNode'] = None):
+                 target_node: Optional['TreeNode'] = None,
+                 selection_count: Optional[int] = None):
         self.name = name
         self.depth = depth
         self._parent_node = parent_node
@@ -43,6 +44,11 @@ class TreeNode():
         # The opposite tree's leaf node that this node targets during bidirectional search.
         # Set by _select_dynamic_goal() in _run_mcts_search().
         self.target_node: Optional['TreeNode'] = target_node
+        # Global selection-event counter bookkeeping.
+        # selection_count: count at which this node itself was created.
+        # last_selection_count: latest count at which this node was selected as a parent.
+        self.selection_count: Optional[int] = selection_count
+        self.last_selection_count: Optional[int] = selection_count
 
         # Expansion state flag: tracks whether this node can be expanded further.
         # For leaf nodes: initialized based on is_expandable() evaluation.
@@ -202,6 +208,7 @@ class TreeNode():
             'obs': None,  # Will be set by _rollout_leaf_plan() after MPC rollout
             'sim_state': None,
             'target_node': None,  # Will be set by _select_dynamic_goal() in _run_mcts_search()
+            'selection_count': self.last_selection_count,
         }
         # this function call means that the node is virtually visited in parallel search
         self._children_nodes[selected_index]['virtually_visited'] = True
@@ -217,10 +224,11 @@ class TreeNode():
                     expandable_nodes.extend(child_node["node"].get_expandable_node_names(consider_virtually_visited=consider_virtually_visited))
         return expandable_nodes
 
-    def backpropagate(self):
+    def backpropagate(self, preserve_value: bool = False):
         self.visit_count += 1
         self.virtual_visit_count = 0 # reset the virtual visit count
-        self.value = max([child_node["node"].value for child_node in self._children_nodes if child_node["node"] is not None])
+        if not preserve_value:
+            self.value = max([child_node["node"].value for child_node in self._children_nodes if child_node["node"] is not None])
 
         # [EXPANSION STATE] Update is_expandable_flag during backpropagation
         # For leaf nodes: evaluate using is_expandable() method
@@ -237,7 +245,7 @@ class TreeNode():
                 self.is_expandable_flag = False
 
         if self._parent_node is not None:
-            self._parent_node.backpropagate()
+            self._parent_node.backpropagate(preserve_value=preserve_value)
 
     def check_virtual_visit_count(self):
         for child_node in self._children_nodes:

@@ -41,6 +41,7 @@ class Diffusion(nn.Module):
         self.sampling_way = cfg.get('sampling_way', 'linear')
         self.sampling_huber_delta = cfg.get('sampling_huber_delta', 0.5)
         self.clip_noise = cfg.clip_noise
+        self.clip_x_start = float(cfg.get("clip_x_start", float("inf")))
         self.max_guidance_ratio = cfg.get("max_guidance_ratio", float("inf"))
         self.arch = cfg.architecture
         self.stabilization_level = cfg.stabilization_level
@@ -596,6 +597,13 @@ class Diffusion(nn.Module):
                 prior_scale = alpha_ch.sqrt().clamp(min=1e-8)
                 direct_coeff = float(getattr(self.cfg, "direct_x0_guidance_scale", 0.2))
                 eta_t = direct_coeff * (sigma_t / prior_scale)
+                # [ETA-CAP] Hard cap on eta_t to prevent guidance explosion at high noise.
+                # At t=T (alpha≈0.001): eta_t = 0.2 × sqrt(999) ≈ 6.3. With direct_x0_eta_cap=1.0,
+                # this saturates at 1.0, preventing guidance from dominating at max-noise steps.
+                _eta_cap_raw = getattr(self.cfg, "direct_x0_eta_cap", None)
+                _eta_cap = float(_eta_cap_raw) if _eta_cap_raw is not None else float("inf")
+                if _eta_cap < float("inf"):
+                    eta_t = eta_t.clamp(max=_eta_cap)
 
                 g_clean_total = torch.zeros_like(model_pred.pred_x_start)
                 for k, v in _per_guidance_grads_clean.items():
@@ -603,13 +611,18 @@ class Diffusion(nn.Module):
                     _per_guidance_xstart_displacements[k] = (eta_t * v).detach()
 
                 x_start = model_pred.pred_x_start + eta_t * g_clean_total
+                if self.clip_x_start < float("inf"):
+                    x_start = x_start.clamp(-self.clip_x_start, self.clip_x_start)
                 pred_noise = self.predict_noise_from_start(x, clipped_curr_noise_level, x_start)
             else:
                 # DPS-style xt injection: modify pred_noise, then recompute x_start.
                 pred_noise = model_pred.pred_noise - grad
                 x_start = self.predict_start_from_noise(x, clipped_curr_noise_level, pred_noise)
+                if self.clip_x_start < float("inf"):
+                    x_start = x_start.clamp(-self.clip_x_start, self.clip_x_start)
+                    pred_noise = self.predict_noise_from_start(x, clipped_curr_noise_level, x_start)
 
-            if pred_noise.abs().max() > self.clip_noise:
+            if self.clip_noise is not None and pred_noise.abs().max() > self.clip_noise:
                 pred_noise = torch.clamp(pred_noise, -self.clip_noise, self.clip_noise)
                 if _use_direct_x0:
                     x_start = self.predict_start_from_noise(x, clipped_curr_noise_level, pred_noise)

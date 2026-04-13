@@ -16,7 +16,7 @@ time_limit: null
 virtual_visit_weight: 1.0
 parallel_multiple_visits: False
 leaf_parallelization: True
-mctd_max_search_num: 10
+mctd_max_search_num: 20
 max_child_resets: 1
 DEBUG: True
 debug_memory_profile: True
@@ -26,9 +26,9 @@ open_loop_horizon: 1300 #fixme -> best: int(eval_episode_len * horizon_scale) //
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
 sub_goal_interval: 3
 sub_goal_blend_steps: 1 # steps to blend old/new sub_goal actions after a sub_goal switch (antmaze only)
-sequence_dividing_factor: 3
+sequence_dividing_factor: 5
 parallel_search_node: 3 # parallel_search_num = parallel_search_node * len(mctd_guidance_scales)
-segment_episode_len: 250 # raw episode length per segment (pre-jump); effective = segment_episode_len * sequence_dividing_factor; n_tokens = (effective // jump) // frame_stack + 1
+segment_episode_len: 200 # raw episode length per segment (pre-jump); effective = segment_episode_len * sequence_dividing_factor; n_tokens = (effective // jump) // frame_stack + 1
 
 # HILP value function guidance
 # For .pkl checkpoints (JAX/Flax): all hyper-params are auto-detected from the file.
@@ -37,7 +37,7 @@ segment_episode_len: 250 # raw episode length per segment (pre-jump); effective 
 #   If no sidecar exists, inner_prod is used (matches training default).
 # For legacy .pt checkpoints: hilp_obs_dim / hilp_skill_dim are still needed.
 hilp_checkpoint_path: "td_models/params_1000000_20260324_002241.pkl"
-mctd_guidance_scales: [0.3, 0.0] # HILP gradient scale for near-target positions (TD_thres or above)
+mctd_guidance_scales: [0.4, 0.8] # HILP gradient scale for near-target positions (TD_thres or above)
 rmse_guidance_scale: 0.2 # RMSE direction scale for far-target positions (below TD_thres)
 anchor_guidance_scale_ratio: 1.2
 rdf_guidance_scale: 2.0
@@ -45,6 +45,7 @@ rdf_sigma: 0.7 # bandwidth for segment_rdf_guidance; at d=sigma the gradient mag
 particle_guidance_scale: 0.0 # sibling repulsion during denoising (0 = disabled)
 use_directly_inject_guidance_to_x0: true # if true: apply guidance in clean x0 space instead of DPS-style xt space
 direct_x0_guidance_scale: 0.2 # κ in η_t = κ * sqrt((1-α_t)/α_t) for direct x0 guidance
+direct_x0_eta_cap: 1.0 # hard cap on η_t (null = no cap). At t=T, η_t≈6.3; set 1.0 to prevent high-noise guidance explosion
 
 # [state proximity threshold]
 use_TD_metric_as_dist: true # If true, use HILP temporal distance (-V(s,g)) instead of L2(x,y)
@@ -86,6 +87,9 @@ replanning_target_level: 25 # 11 for linear, noise level to add when replanning 
 
 # UNCERTAINTY CHECK
 use_uncertainty_as_value: true
+uncertainty_mode: 'variance' # 'entropy' | 'variance'
+uncertainty_lambda: 1.0 # entropy: weight on angular entropy surrogate; variance: weight on V_ext_g
+uncertainty_eta: 1.0 # entropy: weight on geometry correction; variance: weight on V_ext_c
 fast_sampling_multiple: 5 # number of fast samples per candidate
 fast_sampling_steps: 20 # denoising steps for fast uncertainty sampling (< sampling_timesteps)
 
@@ -93,6 +97,7 @@ fast_sampling_steps: 20 # denoising steps for fast uncertainty sampling (< sampl
 use_rollout: false
 use_dynamic_obs_padding: false
 use_segment_wise_sliding_window: true
+use_sliding_window_clip_x_start: true # if true: clamp window tokens to ±clip_x_start sigma after each window DDIM step (prevents guidance explosion in sliding window mode)
 
 # ── Inherited from root config ────────────────────────────────────────────────
 debug: ${debug}
@@ -159,4 +164,8 @@ diffusion:
   snr_clip: null
   cum_snr_decay: null
   clip_noise: null
+  clip_x_start: 2.0  # clamp guided x_start to ±N sigma (normalized); antmaze-giant map x/y range is ±1.54σ from mean
+                     # (x∈[0,52] → normalized ±1.54σ). Set 2.0 for map-safe clipping (covers map + small margin).
+                     # 5.0 is too loose (allows world coords up to ±110, well outside map).
+                     # Only active when use_sliding_window_clip_x_start: true.
   stabilization_level: null

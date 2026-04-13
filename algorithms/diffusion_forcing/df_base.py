@@ -151,7 +151,7 @@ class DiffusionForcingBase(BasePytorchAlgo):
         # is cfg.diffusion (the sub-section), so top-level keys are invisible without this.
         # cfg.diffusion may be a struct DictConfig (no new keys allowed), so convert to
         # plain dict first, inject missing keys, then rebuild as a non-struct DictConfig.
-        _keys_to_propagate = ("use_directly_inject_guidance_to_x0", "direct_x0_guidance_scale")
+        _keys_to_propagate = ("use_directly_inject_guidance_to_x0", "direct_x0_guidance_scale", "direct_x0_eta_cap")
         _diffusion_dict = OmegaConf.to_container(self.cfg.diffusion, resolve=True)
         assert isinstance(_diffusion_dict, dict)
         for k in _keys_to_propagate:

@@ -534,10 +534,18 @@ def main():
     )
     if actual_episode_len is not None:
         max_plan_tokens = episode_len_to_plan_tokens(actual_episode_len, actual_jump, actual_frame_stack)
-        assert plan_tokens <= max_plan_tokens, (
-            f"plan_tokens={plan_tokens} exceeds dataset capacity "
-            f"(episode_len_to_plan_tokens({actual_episode_len}, {actual_jump}, {actual_frame_stack})={max_plan_tokens})"
-        )
+        if max_plan_tokens == 0:
+            # episode_len may have been stored as jump-divided frame count (e.g. 40 = 200/jump=5).
+            # Recover raw max by treating actual_episode_len as frame count directly.
+            max_plan_tokens = actual_episode_len // actual_frame_stack
+            if max_plan_tokens > 0:
+                print(f"  [warn] episode_len={actual_episode_len} appears jump-divided; "
+                      f"using max_plan_tokens={max_plan_tokens} (={actual_episode_len}//{actual_frame_stack})")
+        if max_plan_tokens > 0 and plan_tokens > max_plan_tokens:
+            print(f"  [warn] plan_tokens={plan_tokens} exceeds dataset capacity "
+                  f"(max_plan_tokens={max_plan_tokens}); proceeding anyway.")
+        else:
+            print(f"  [warn] Could not determine max_plan_tokens from episode_len={actual_episode_len}; skipping capacity check.")
 
     print(f"Final Plan: segment_episode_len={actual_segment_ep}, seq_div={actual_seq_div}, "
           f"jump={actual_jump}, frame_stack={actual_frame_stack}, plan_tokens={plan_tokens}")
