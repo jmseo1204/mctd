@@ -13,7 +13,8 @@ class TreeNode():
                  obs: Optional[np.ndarray] = None,
                  sim_state: Optional[dict] = None,
                  target_node: Optional['TreeNode'] = None,
-                 selection_count: Optional[int] = None):
+                 selection_count: Optional[int] = None,
+                 cluster_subplans: Optional[list] = None):
         self.name = name
         self.depth = depth
         self._parent_node = parent_node
@@ -49,6 +50,16 @@ class TreeNode():
         # last_selection_count: latest count at which this node was selected as a parent.
         self.selection_count: Optional[int] = selection_count
         self.last_selection_count: Optional[int] = selection_count
+
+        # Per-cluster sub-plans derived from uncertainty sampling.
+        # Populated after _compute_node_uncertainty when use_cluster_subplan_as_expansion=True.
+        # Each entry is a dict with keys:
+        #   "plan_hist":      (fast_steps+1, plan_tokens*fs, c) tensor — full denoising history
+        #                     of the representative sample (index [0]) for this cluster.
+        #   "guidance_scale": float — guidance scale used for that sample.
+        #   "current_levels": (1, plan_tokens) np.ndarray — noise state for next expansion.
+        # len(cluster_subplans) == n_clusters for this node.
+        self.cluster_subplans: Optional[list] = cluster_subplans
 
         # Expansion state flag: tracks whether this node can be expanded further.
         # For leaf nodes: initialized based on is_expandable() evaluation.
@@ -86,6 +97,34 @@ class TreeNode():
         Dead slots are skipped by is_expandable() and get_expandable_candidate()
         and can never be revived, unlike the temporary virtually_visited flag."""
         self._children_nodes[slot_index]["permanently_dead"] = True
+        self.is_expandable_flag = self.is_expandable()
+
+    def reset_children_slots(self, n_slots: int, guidance_scales: list) -> None:
+        """Replace _children_nodes with a fresh set of n_slots slots.
+
+        Used by the cluster-reuse expansion path to resize the children array
+        to match the number of clusters found during uncertainty sampling.
+        All existing slot state (permanently_dead, virtually_visited, node
+        references) is discarded and replaced with clean empty slots.
+
+        Args:
+            n_slots: Number of new child slots (= number of clusters).
+            guidance_scales: Per-slot guidance scale values, length n_slots.
+        """
+        assert len(guidance_scales) == n_slots, (
+            f"reset_children_slots: guidance_scales length {len(guidance_scales)} "
+            f"!= n_slots {n_slots}"
+        )
+        self._children_node_guidance_scales = list(guidance_scales)
+        self._children_nodes = [
+            {
+                "guidance_scale": guidance_scales[i],
+                "node": None,
+                "virtually_visited": False,
+                "permanently_dead": False,
+            }
+            for i in range(n_slots)
+        ]
         self.is_expandable_flag = self.is_expandable()
 
     def reset_dead_children(self) -> bool:

@@ -12,6 +12,9 @@ This module provides two uncertainty estimators:
    computed directly in temporal-distance space using three variance terms:
    internal pairwise variance (``V_int``), external target variance
    (``V_ext_g``), and external current variance (``V_ext_c``).
+
+3. ``cluster_tail_by_temporal_dist``: Complete-linkage hierarchical clustering
+   of tail embeddings using temporal distance as the pairwise metric.
 """
 
 from __future__ import annotations
@@ -76,23 +79,6 @@ def compute_uncertainty_from_embeddings(
         )
 
     emb_dist_curr = float(np.linalg.norm(z_goal - z_curr))
-    if emb_dist_curr < eps:
-        return {
-            "U": 0.0,
-            "H_local": 0.0,
-            "H_R": 0.0,
-            "H_A": 0.0,
-            "C_geom_hat": 0.0,
-            "S_R": 0.0,
-            "S_A": 0.0,
-            "S_U": 0.0,
-            "T_curr": 0.0,
-            "emb_dist_curr": 0.0,
-            "num_samples": num_samples,
-            "emb_dim": emb_dim,
-            "angular_dim": max(emb_dim - 1, 0),
-            "degenerate": True,
-        }
 
     radial_vectors = z_tail - z_goal[None, :]
     radii = np.linalg.norm(radial_vectors, axis=-1)
@@ -226,13 +212,81 @@ def compute_uncertainty_variance(
     )
     v_int = float(np.var(d_int, ddof=1))
 
-    u = v_int + lambda_weight * v_ext_g + eta_weight * v_ext_c
+    variance_sum = v_int + lambda_weight * v_ext_g + eta_weight * v_ext_c
+
+    # Compute T_curr: temporal distance from current node to goal (same as in
+    # compute_uncertainty_from_embeddings).
+    emb_dist_curr = float(np.linalg.norm(z_goal - z_curr))
+    t_curr = float(np.asarray(temporal_dist_fn(np.asarray(emb_dist_curr))).item())
+
+    # u = math.log(variance_sum + 1e-8) * t_curr
+    u = math.log(v_int + 1e-8) * t_curr
 
     return {
         "U": u,
         "V_int": v_int,
         "V_ext_g": v_ext_g,
         "V_ext_c": v_ext_c,
+        "variance_sum": variance_sum,
+        "T_curr": t_curr,
+        "emb_dist_curr": emb_dist_curr,
         "num_samples": num_samples,
         "num_pairs": num_pairs,
     }
+
+
+# ---------------------------------------------------------------------------
+# Complete-linkage hierarchical clustering on temporal distance
+# ---------------------------------------------------------------------------
+
+def cluster_tail_by_temporal_dist(
+    z_tail: np.ndarray,
+    temporal_dist_fn: Callable[[np.ndarray], np.ndarray],
+    max_intra_dist: float,
+) -> np.ndarray:
+    """Cluster tail embeddings using complete-linkage hierarchical clustering.
+
+    Pairwise distances are measured in temporal-distance space: embedding L2
+    distances are first computed and then converted via ``temporal_dist_fn``
+    (i.e. ``emb_dist_to_temporal_dist``).  The dendrogram is cut at
+    ``max_intra_dist`` so that the maximum temporal distance between any two
+    members within a cluster does not exceed that threshold.
+
+    Args:
+        z_tail: Tail embeddings, shape ``(N, D)``.
+        temporal_dist_fn: Maps embedding L2 distances (scalar or array) to
+            temporal distances.  Should accept arbitrary numpy array shapes.
+        max_intra_dist: Cut threshold in temporal-distance units (e.g. 20.0
+            means at most 20 planning steps apart within a cluster).
+
+    Returns:
+        cluster_labels: Integer array of shape ``(N,)``, 0-indexed cluster
+            assignments.  All N samples are assigned a cluster; if N == 1 the
+            single sample always receives label 0.
+    """
+    from scipy.cluster.hierarchy import linkage, fcluster
+
+    z_tail = np.asarray(z_tail, dtype=np.float64)
+    n = z_tail.shape[0]
+
+    if n == 1:
+        return np.zeros(1, dtype=int)
+
+    # Pairwise L2 distances → upper-triangle condensed form
+    pairwise_sq = _pairwise_squared_distances(z_tail)
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    condensed_emb_dist = np.sqrt(np.maximum(pairwise_sq[idx_i, idx_j], 0.0))
+
+    # Convert to temporal distances
+    condensed_td = np.asarray(
+        temporal_dist_fn(condensed_emb_dist), dtype=np.float64
+    )
+
+    # Complete-linkage hierarchical clustering
+    Z = linkage(condensed_td, method="complete")
+
+    # Cut dendrogram at max_intra_dist threshold
+    labels = fcluster(Z, t=max_intra_dist, criterion="distance")
+
+    # scipy returns 1-indexed labels; convert to 0-indexed
+    return (labels - 1).astype(int)

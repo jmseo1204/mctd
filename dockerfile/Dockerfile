@@ -96,3 +96,7 @@ RUN pip install 'wandb>=0.24.0,<0.25.0'
 
 # Install distrax (JAX-based distributions, required by hilp_gcrl networks)
 RUN pip install distrax==0.1.5
+
+# scipy is already pulled in as a transitive dependency (stable-baselines3 / gluonts),
+# but we pin it explicitly so the version is tracked and auditable.
+RUN pip install "scipy>=1.10.0"

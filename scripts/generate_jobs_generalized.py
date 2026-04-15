@@ -521,34 +521,35 @@ def main():
         else:
             print(f"Detected training config: causal={actual_causal}, scheduling_matrix={actual_scheduling_matrix}, attn_heads={actual_attn_heads}")
 
-    # 3. Validate plan_tokens divisibility
+    # 3. Validate total planning token count
     actual_segment_ep = args.segment_episode_len or get_default_segment_episode_len()
     assert actual_segment_ep is not None, (
         "segment_episode_len must be set in configurations/algorithm/df_planning.yaml or via --segment_episode_len"
     )
     actual_seq_div = full_cfg['algorithm'].get('sequence_dividing_factor', 3)
-    plan_tokens = episode_len_to_plan_tokens(actual_segment_ep * actual_seq_div, actual_jump, actual_frame_stack)
-    assert plan_tokens > 0 and plan_tokens % actual_seq_div == 0, (
-        f"plan_tokens={plan_tokens} must be positive and divisible by sequence_dividing_factor={actual_seq_div}. "
+    total_plan_tokens = episode_len_to_plan_tokens(
+        actual_segment_ep * actual_seq_div,
+        actual_jump,
+        actual_frame_stack,
+    )
+    assert total_plan_tokens > 0 and total_plan_tokens % actual_seq_div == 0, (
+        f"plan_tokens={total_plan_tokens} must be positive and divisible by sequence_dividing_factor={actual_seq_div}. "
         f"Check segment_episode_len={actual_segment_ep}, jump={actual_jump}, frame_stack={actual_frame_stack}"
     )
     if actual_episode_len is not None:
-        max_plan_tokens = episode_len_to_plan_tokens(actual_episode_len, actual_jump, actual_frame_stack)
-        if max_plan_tokens == 0:
-            # episode_len may have been stored as jump-divided frame count (e.g. 40 = 200/jump=5).
-            # Recover raw max by treating actual_episode_len as frame count directly.
-            max_plan_tokens = actual_episode_len // actual_frame_stack
-            if max_plan_tokens > 0:
-                print(f"  [warn] episode_len={actual_episode_len} appears jump-divided; "
-                      f"using max_plan_tokens={max_plan_tokens} (={actual_episode_len}//{actual_frame_stack})")
-        if max_plan_tokens > 0 and plan_tokens > max_plan_tokens:
-            print(f"  [warn] plan_tokens={plan_tokens} exceeds dataset capacity "
-                  f"(max_plan_tokens={max_plan_tokens}); proceeding anyway.")
-        else:
-            print(f"  [warn] Could not determine max_plan_tokens from episode_len={actual_episode_len}; skipping capacity check.")
+        # This is the token count for a single training/eval segment, not a cap on the
+        # full planning horizon after multiplying by sequence_dividing_factor.
+        segment_plan_tokens = episode_len_to_plan_tokens(
+            actual_episode_len,
+            actual_jump,
+            actual_frame_stack,
+        )
+        if segment_plan_tokens == 0:
+            # Some legacy metadata stores jump-divided frame count (e.g. 40 = 200/jump=5).
+            segment_plan_tokens = actual_episode_len // actual_frame_stack
 
     print(f"Final Plan: segment_episode_len={actual_segment_ep}, seq_div={actual_seq_div}, "
-          f"jump={actual_jump}, frame_stack={actual_frame_stack}, plan_tokens={plan_tokens}")
+          f"jump={actual_jump}, frame_stack={actual_frame_stack}, plan_tokens={total_plan_tokens}")
 
     # 4. Build job config
     basic_job_config = {

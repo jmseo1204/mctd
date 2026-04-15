@@ -128,10 +128,17 @@ class PlanPostprocMixin:
         # Group candidate indices by parent node name
         parent_groups: dict = {}  # parent_name -> list of candidate indices
         for i in range(B):
-            parent_name = expanded_node_candidates[i]["parent_node"].name
-            if parent_name not in parent_groups:
-                parent_groups[parent_name] = []
-            parent_groups[parent_name].append(i)
+            parent_key = expanded_node_candidates[i].get("parent_key")
+            if parent_key is None:
+                parent_name = expanded_node_candidates[i]["parent_node"].name
+                selected_tree = expanded_node_candidates[i].get("selected_tree")
+                if selected_tree is not None:
+                    parent_key = f"{selected_tree.tag}:{parent_name}"
+                else:
+                    parent_key = parent_name
+            if parent_key not in parent_groups:
+                parent_groups[parent_key] = []
+            parent_groups[parent_key].append(i)
 
         # Within each parent group, compute HILP values and pairwise deduplicate
         for parent_name, indices in parent_groups.items():

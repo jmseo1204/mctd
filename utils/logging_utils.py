@@ -387,6 +387,7 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
     unc_guidance_targets = plot_data.get("unc_guidance_targets")  # (G*K, pos_dim) or None
     unc_scale_colors = plot_data.get("unc_scale_colors")          # (G*K, 3) RGB per sample or None
     unc_guidance_legend = plot_data.get("unc_guidance_legend")    # list of (label, rgb) per scale or None
+    unc_cluster_labels = plot_data.get("unc_cluster_labels")      # (G*K,) int cluster indices or None
     tail_dot_color = plot_data.get("tail_dot_color", (0.2, 0.85, 0.2))  # RGB for x_t/pred_x0 dots
 
     if is_grid_env(env_id):
@@ -438,9 +439,31 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
                        alpha=0.5, s=20, zorder=4)
 
         if unc_guidance_targets is not None and len(unc_guidance_targets) > 0:
-            _unc_fixed_alpha = 0.85
+            _unc_fixed_alpha = 0.40
+            # tab10 palette for cluster border dots (up to 10 clusters, then wraps).
+            _tab10 = [
+                (0.122, 0.467, 0.706),  # blue
+                (1.000, 0.498, 0.055),  # orange
+                (0.173, 0.627, 0.173),  # green
+                (0.839, 0.153, 0.157),  # red
+                (0.580, 0.404, 0.741),  # purple
+                (0.549, 0.337, 0.294),  # brown
+                (0.890, 0.467, 0.761),  # pink
+                (0.498, 0.498, 0.498),  # gray
+                (0.737, 0.741, 0.133),  # olive
+                (0.090, 0.745, 0.812),  # cyan
+            ]
             for j, ep in enumerate(unc_guidance_targets):
                 ep_xy = _to_plot_coords(env_id, np.asarray(ep)[:2])
+                # Draw cluster-border dot first (larger, behind the main dot).
+                # Border size ~242 gives 2x the border width vs main dot size 80
+                # (border_width ∝ sqrt(s_border) - sqrt(s_main)).
+                if unc_cluster_labels is not None and j < len(unc_cluster_labels):
+                    _cl_idx = int(unc_cluster_labels[j]) % len(_tab10)
+                    _border_color = _tab10[_cl_idx]
+                    ax.scatter(ep_xy[0], ep_xy[1], color=_border_color, marker="o", s=242,
+                               zorder=8, edgecolors="none", linewidth=0, alpha=_unc_fixed_alpha,
+                               label="_nolegend_")
                 dot_color = tuple(unc_scale_colors[j]) if unc_scale_colors is not None and j < len(unc_scale_colors) else (0.2, 0.85, 0.2)
                 ax.scatter(ep_xy[0], ep_xy[1], color=dot_color, marker="o", s=80, zorder=9,
                            edgecolors="none", linewidth=0, alpha=_unc_fixed_alpha,

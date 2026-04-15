@@ -2,6 +2,7 @@ from typing import Optional, Any, List, Tuple, Union
 from dataclasses import dataclass, field
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
+import math
 import time
 import numpy as np
 from random import random
@@ -32,7 +33,7 @@ from .plan_postproc import PlanPostprocMixin
 from .kde_estimator import KDEEstimatorMixin
 from .noise_schedule import NoiseScheduleMixin
 from .plan_viz import PlanVizMixin
-from .uncertainty_estimator import compute_uncertainty_from_embeddings, compute_uncertainty_variance
+from .uncertainty_estimator import compute_uncertainty_from_embeddings, compute_uncertainty_variance, cluster_tail_by_temporal_dist
 
 # Module-level process start time for lifecycle elapsed-time logging.
 # All [LIFECYCLE] prints compute elapsed seconds from this anchor so you can
@@ -58,13 +59,11 @@ class MCTSTreeState:
 
     # --- Static config (set at init, never mutated) ---
     root_node: TreeNode
-    plan_tokens: int
     terminal_depth: int
     noise_level: Optional[
         np.ndarray
     ]  # always None; bidirectional dynamic schedule used
     children_node_guidance_scales: list
-    max_search_num: int
     skip_level_steps: int
     tag: str
     is_tree1: bool = True  # True for start-rooted tree, False for goal-rooted tree
@@ -72,8 +71,6 @@ class MCTSTreeState:
     # Used to track agent positions across bidirectional expansion rounds.
     tree_root_obs: Optional[np.ndarray] = None  # shape (obs_dim,)
     # --- Mutable search state (updated by _run_mcts_search) ---
-    search_num: int = 0
-    p_search_num: int = 0
     max_depth: int = 0
     achieved: bool = False
     pbar: Any = None
@@ -256,10 +253,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.uncertainty_mode: str = cfg.get("uncertainty_mode", "entropy")
         self.uncertainty_lambda: float = float(cfg.get("uncertainty_lambda", 1.0))
         self.uncertainty_eta: float = float(cfg.get("uncertainty_eta", 1.0))
+        self.uncertainty_max_intra_cluster_dist: float = float(cfg.get("uncertainty_max_intra_cluster_dist", 20.0))
+        self.use_cluster_subplan_as_expansion: bool = cfg.get("use_cluster_subplan_as_expansion", False)
         self.viz_uncertain_next_subplan_last_obs: bool = cfg.get("viz_uncertain_next_subplan_last_obs", False)
         self.fast_sampling_multiple: int = cfg.get("fast_sampling_multiple", 5)
         self.fast_sampling_steps: int = cfg.get("fast_sampling_steps", 10)
         self.global_selection_count: int = 0
+        self.global_search_num: int = 0
+        self.current_plan_tokens: Optional[int] = None
         self.use_rollout: bool = cfg.get("use_rollout", False)
         self.use_dynamic_obs_padding: bool = cfg.get("use_dynamic_obs_padding", True)
         self.use_segment_wise_sliding_window: bool = cfg.get("use_segment_wise_sliding_window", False)
@@ -542,6 +543,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 state1 = state1[..., self.pos_dim_indices]
                 state2 = state2[..., self.pos_dim_indices]
             return np.linalg.norm(state1 - state2, axis=-1)
+
+    def _require_current_plan_tokens(self) -> int:
+        """Return the planner-global plan token count for the current episode."""
+        assert self.current_plan_tokens is not None, (
+            "current_plan_tokens must be initialized before planning helpers run"
+        )
+        return self.current_plan_tokens
 
     def _build_model(self):
         mean = list(self.observation_mean) + list(self.action_mean)
@@ -1806,6 +1814,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             horizon: int = episode_len_to_plan_tokens(
                 self.segment_episode_len * self.sequence_dividing_factor, self.jump, self.frame_stack
             ) * self.frame_stack
+            self.current_plan_tokens = horizon // self.frame_stack
+            self.global_search_num = 0
             _bidir_start_np = start.cpu().numpy()[:, self.obs_dim_indices]  # (b, obs_dim)
             _bidir_goal_np = goal.cpu().numpy()[:, self.obs_dim_indices]  # (b, obs_dim)
             # Capture initial physical state (always, regardless of use_rollout)
@@ -1843,6 +1853,29 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 root_sim_state=goal_sim_state,
                 is_tree1=False,
              )
+            global_search_pbar = None
+            root_uncertainty_infos: dict[str, dict] = {}
+            if self.use_uncertainty_as_value:
+                global_search_pbar = tqdm(
+                    total=self.mctd_max_search_num,
+                    desc="MCTS (mixed)",
+                    leave=True,
+                    dynamic_ncols=True,
+                )
+                if self.use_cluster_subplan_as_expansion:
+                    root_uncertainty_infos = self._ensure_uncertainty_roots_initialized(
+                        bidir_tree1,
+                        bidir_tree2,
+                        horizon,
+                        conditions,
+                    )
+                    self._log_root_uncertainty_videos(
+                        root_uncertainty_infos,
+                        [bidir_tree1, bidir_tree2],
+                        start,
+                        goal,
+                        loops,
+                    )
             
             # Flag: 0 → expand tree1 next, 1 → expand tree2 next
             expanded_tree_idx: int = 0
@@ -1868,6 +1901,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                    not bidir_tree2.root_node.is_expandable_flag:
                     terminate = True
                     break
+                if self.use_uncertainty_as_value and (
+                    self.global_search_num >= self.mctd_max_search_num
+                ):
+                    terminate = True
+                    break
 
                 # Generate plan (start → goal)
                 # _generate_plan_between_points has been inlined here.
@@ -1887,45 +1925,26 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         terminate = True
                         break
 
-                    combined_expanded_node_infos: dict[str, dict] = {}
-                    for _tree, _opp_tree in (
-                        (bidir_tree1, bidir_tree2),
-                        (bidir_tree2, bidir_tree1),
-                    ):
-                        selected_parent_nodes = [
-                            info["node"]
-                            for info in selected_parent_infos
-                            if info["tree"] is _tree
-                        ]
-                        if not selected_parent_nodes:
-                            continue
+                    self.global_search_num += len(selected_parent_infos)
+                    if global_search_pbar is not None:
+                        global_search_pbar.update(len(selected_parent_infos))
 
-                        active_tree, expanded_node_infos = self._run_mcts_search(
-                            _tree,
-                            _opp_tree,
-                            horizon,
-                            conditions,
-                            _start_np,
-                            _goal_np,
-                            single_step=True,
-                            selected_parent_nodes=selected_parent_nodes,
-                        )
-                        self._update_expanded_children_state(
-                            active_tree,
-                            expanded_node_infos,
-                            agent,
-                            envs,
-                        )
-                        self._log_expanded_node_videos(
-                            expanded_node_infos,
-                            active_tree,
-                            start,
-                            goal,
-                            loops,
-                        )
-                        for _name, _info in expanded_node_infos.items():
-                            _info["selected_tree"] = active_tree
-                            combined_expanded_node_infos[f"{active_tree.tag}:{_name}"] = _info
+                    mixed_round_result = self._run_global_uncertainty_expansion_round(
+                        selected_parent_infos=selected_parent_infos,
+                        horizon=horizon,
+                        conditions=conditions,
+                        start=_start_np,
+                        goal=_goal_np,
+                    )
+                    combined_expanded_node_infos = mixed_round_result["expanded_node_infos"]
+                    self._postprocess_tree_local_expansions(
+                        mixed_round_result["tree_batches"],
+                        agent,
+                        envs,
+                        start,
+                        goal,
+                        loops,
+                    )
 
                     best_info = self._select_best_leaf(combined_expanded_node_infos)
                     if best_info is None:
@@ -1939,7 +1958,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     )
                     _gap = self._compute_plan_gap(
                         best_node,
-                        active_tree.plan_tokens,
+                        self.current_plan_tokens,
                         is_tree1=active_tree.is_tree1,
                     )
                     is_meeting = _trees_exhausted or (
@@ -1988,7 +2007,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     )
                     _gap = self._compute_plan_gap(
                         best_node,
-                        active_tree.plan_tokens,
+                        self.current_plan_tokens,
                         is_tree1=active_tree.is_tree1,
                     )
                     is_meeting = _trees_exhausted or (
@@ -2003,7 +2022,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             if best_node is not None:
                 output_plan = self._extract_output_plan(
                     best_node,
-                    plan_tokens=active_tree.plan_tokens,
+                    plan_tokens=self._require_current_plan_tokens(),
                     is_tree1=last_is_tree1,
                     goal_normalized=goal_normalized,
                 )  # (T_combined*fs+goal_pad, 1, c)
@@ -2059,9 +2078,15 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
                 obs_numpy = obs.detach().cpu().numpy()
 
-                _t1_expansions = bidir_tree1.p_search_num
-                _t2_expansions = bidir_tree2.p_search_num
-                print(f"[MCTD] Search complete | loops={loops} | tree1={_t1_expansions}/{self.mctd_max_search_num} tree2={_t2_expansions}/{self.mctd_max_search_num} | plan_frames={plan_unnormalized.shape[0]} | node={best_node.name}", flush=True)
+                _t1_nodes = max(len(bidir_tree1.get_all_nodes()) - 1, 0)
+                _t2_nodes = max(len(bidir_tree2.get_all_nodes()) - 1, 0)
+                print(
+                    f"[MCTD] Search complete | loops={loops} | "
+                    f"parents={self.global_search_num}/{self.mctd_max_search_num} | "
+                    f"tree1_nodes={_t1_nodes} tree2_nodes={_t2_nodes} | "
+                    f"plan_frames={plan_unnormalized.shape[0]} | node={best_node.name}",
+                    flush=True,
+                )
 
                 # Reorder plan frames by proximity to resolve FWD-BWD spatial gap
                 _reorder_t0 = time.time()
@@ -2133,8 +2158,12 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         validation_mujoco_frame_history.append(_mj_frames)
 
             # Close tree pbars (kept open during single_step MPC loop)
-            bidir_tree1.pbar.close()
-            bidir_tree2.pbar.close()
+            if bidir_tree1.pbar is not None:
+                bidir_tree1.pbar.close()
+            if bidir_tree2.pbar is not None:
+                bidir_tree2.pbar.close()
+            if global_search_pbar is not None:
+                global_search_pbar.close()
             print(f"[MCTD] Episode done | loops={loops} | steps={steps} | reached={bool(reached.any())} | reward={float(episode_reward.mean()):.3f}", flush=True)
 
             self.log(f"{namespace}/task_id", float(self.task_id))
@@ -2326,12 +2355,17 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         return torch.cat(bundle, -1)
 
     def visualize_node_value_plans(
-        self, is_achieved_plan, search_num, values, names, plans, starts, goals, tag="mcts_plan",
+        self, is_achieved_plan, viz_step, values, names, plans, starts, goals, tag="mcts_plan",
         valid_frame_bounds=None,
     ):
         # plans: (t fs) b c
 
         batch_size = plans.shape[1]
+
+        if isinstance(starts, torch.Tensor):
+            starts = starts.detach().cpu().numpy()
+        if isinstance(goals, torch.Tensor):
+            goals = goals.detach().cpu().numpy()
 
         if starts.ndim == 1:
             starts = starts[None, :]
@@ -2367,7 +2401,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         for i in range(len(plan_images)):
             img = plan_images[i]
             self.log_image(
-                # f"{tag}/{search_num+i+1}_{names[i]}_V{values[i]}",
+                # f"{tag}/{viz_step+i+1}_{names[i]}_V{values[i]}",
                 f"{tag}/{names[i]}/{'achieved' if is_achieved_plan[i] else 'not_achieved'}",
                 Image.fromarray(img),
             )
@@ -2376,6 +2410,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         # expanded_plans: (t fs) b c  — plans from expanded_node_plan_hists[-1]
         # value_plans:    (t fs) b c  — plans from replanned_plan_hists[-1]
         batch_size = expanded_plans.shape[1]
+
+        if isinstance(starts, torch.Tensor):
+            starts = starts.detach().cpu().numpy()
+        if isinstance(goals, torch.Tensor):
+            goals = goals.detach().cpu().numpy()
 
         if starts.ndim == 1:
             starts = starts[None, :]
@@ -2452,7 +2491,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self,
         expanded_node_candidates: List[dict],
         final_best_plans: torch.Tensor, # (plan_tokens*fs, b, c)
-        tree: "MCTSTreeState",
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute per-node values for bidirectional search by pairing current plan with
         the target opposite-tree leaf node's plan.
@@ -2466,14 +2504,12 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         Args:
             expanded_node_candidates: List of candidate dicts (each has 'parent_node').
             final_best_plans: Tensor of shape (T_total*fs, B, c) — fully denoised plan hists.
-            tree: MCTSTreeState for the current tree (provides plan_tokens, sequence_dividing_factor).
-
         Returns:
             values: np.ndarray shape (B,)
             infos:  np.ndarray shape (B,), dtype str
             achieved_ts: np.ndarray shape (B,)
         """
-        seg_size: int = tree.plan_tokens // self.sequence_dividing_factor
+        seg_size: int = self._require_current_plan_tokens() // self.sequence_dividing_factor
         B: int = len(expanded_node_candidates)
 
         values: np.ndarray = np.zeros(B)
@@ -2527,7 +2563,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self,
         expanded_node_candidates: List[dict],
         final_best_plans: torch.Tensor,  # (plan_tokens*fs, B, c)
-        tree: "MCTSTreeState",
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Lightweight Achieved detection without Warp check.
 
@@ -2541,7 +2576,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             achieved_infos: np.ndarray shape (B,), values 'Achieved' or 'NotReached'
             achieved_ts: np.ndarray shape (B,), frame index of first goal touch or -1
         """
-        seg_size: int = tree.plan_tokens // self.sequence_dividing_factor
+        seg_size: int = self._require_current_plan_tokens() // self.sequence_dividing_factor
         B: int = len(expanded_node_candidates)
         achieved_infos: np.ndarray = np.array(["NotReached"] * B)
         achieved_ts: np.ndarray = np.full(B, -1, dtype=object)
@@ -2612,8 +2647,17 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         _temporal_dist_fn = lambda emb_d: self.emb_dist_to_temporal_dist(emb_d, gamma)
 
+        # Cluster tail embeddings by temporal distance (complete-linkage).
+        # cluster_labels: (G*K,) 0-indexed; n_clusters: int
+        cluster_labels = cluster_tail_by_temporal_dist(
+            z_tail=Z,
+            temporal_dist_fn=_temporal_dist_fn,
+            max_intra_dist=self.uncertainty_max_intra_cluster_dist,
+        )
+        n_clusters = int(cluster_labels.max() + 1) if len(cluster_labels) > 0 else 0
+
         if self.uncertainty_mode == "variance":
-            return compute_uncertainty_variance(
+            result = compute_uncertainty_variance(
                 z_curr=z_curr,
                 z_goal=z_goal,
                 z_tail=Z,
@@ -2621,8 +2665,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 lambda_weight=self.uncertainty_lambda,
                 eta_weight=self.uncertainty_eta,
             )
+        elif self.uncertainty_mode == "cluster":
+            _emb_dist_curr = float(np.linalg.norm(z_goal - z_curr))
+            _t_curr = float(np.asarray(_temporal_dist_fn(np.asarray(_emb_dist_curr))).item())
+            _u = math.log(n_clusters + 1) * _t_curr if n_clusters > 0 else 0.0
+            result = {"U": _u, "T_curr": _t_curr}
         else:
-            return compute_uncertainty_from_embeddings(
+            result = compute_uncertainty_from_embeddings(
                 z_curr=z_curr,
                 z_goal=z_goal,
                 z_tail=Z,
@@ -2631,6 +2680,223 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 eta_weight=self.uncertainty_eta,
                 eps=eps,
             )
+
+        result["cluster_labels"] = cluster_labels
+        result["n_clusters"] = n_clusters
+        return result
+
+    def _run_fast_uncertainty_sampling(
+        self,
+        parent_nodes: List["TreeNode"],
+        val_plan_last_batch: torch.Tensor,  # (plan_tokens*fs, B_nt, c)
+        updated_levels: np.ndarray,         # (B_nt, plan_tokens)
+        current_prefix_len_per_batch: np.ndarray,  # (B_nt,)
+        seg_size: int,
+        horizon: int,
+        conditions: Optional[Any],
+        obs_normalized: torch.Tensor,       # (B_nt, obs_dim)
+        opposite_tree: Optional["MCTSTreeState"],
+        obs_mean_np: np.ndarray,
+        obs_std_np: np.ndarray,
+        opposite_trees: Optional[List["MCTSTreeState"]] = None,
+    ) -> dict:
+        """Run fast uncertainty sampling for a batch of non-terminal candidates.
+
+        Builds G*K init plans per candidate from val_plan_last_batch, runs
+        parallel_plan with fast_sampling_steps, and returns per-candidate results.
+
+        Returns:
+            unc_hists_per_cand: list[Tensor] of len B_nt,
+                each (fast_steps+1, plan_tokens*fs, G*K, c)
+            unc_noise_levels_per_cand: list[ndarray] of len B_nt,
+                each (G*K, fast_steps+1, plan_tokens)
+            unc_guidance_scale_per_cand: list[list[float]] of len B_nt,
+                each of length G*K
+        """
+        B_nt = len(parent_nodes)
+        K = self.fast_sampling_multiple
+        G = len(self.mctd_guidance_scales)
+        _plan_tokens_val = horizon // self.frame_stack
+        current_prefix_len_per_batch = np.asarray(
+            current_prefix_len_per_batch, dtype=int
+        )
+        assert current_prefix_len_per_batch.shape == (B_nt,), (
+            "current_prefix_len_per_batch must have shape "
+            f"({B_nt},), got {current_prefix_len_per_batch.shape}"
+        )
+
+        # Build fast noise schedule
+        unc_noise_levels_nt = self._generate_bidirectional_schedule(
+            updated_levels,
+            prefix_len_per_batch=current_prefix_len_per_batch,
+            num_denoising_steps_override=self.fast_sampling_steps,
+        )  # (B_nt, fast_steps+1, plan_tokens)
+        unc_noise_levels_rep = np.repeat(unc_noise_levels_nt, K * G, axis=0)
+        # (B_nt*G*K, fast_steps+1, plan_tokens)
+
+        unc_init_plans_rep: list = []
+        unc_guidance_scale_vals: list = []
+        unc_goal_list: list = []
+
+        for _ii, _parent_node in enumerate(parent_nodes):
+            _curr_prefix_len = int(current_prefix_len_per_batch[_ii])
+            _plan_t_fs = val_plan_last_batch[:, _ii, :].unsqueeze(1)  # (plan_tokens*fs, 1, c)
+            _plan_rearranged_unc = rearrange(
+                _plan_t_fs, "(t fs) b c -> t b (fs c)", fs=self.frame_stack
+            )  # (plan_tokens, 1, fs*c)
+            _base_plan, _ = self._build_plan_from_leaf(
+                _parent_node, _plan_tokens_val, seg_size,
+                expanded_plan=_plan_rearranged_unc,
+            )  # (n_tokens, 1, fs*c)
+            # Re-noise from the first plan token after obs_parent, starting at the
+            # current expansion boundary itself. This makes the uncertainty batch's
+            # initial frame show G*K distinct noisy next-segment hypotheses, and it
+            # matches the uncertainty schedule which denoises the segment beginning
+            # at prefix_len_per_batch.
+            _future_start = _curr_prefix_len + 1
+            _n_future = _plan_tokens_val + 1 - _future_start
+
+            if _curr_prefix_len > 0:
+                _curr_depth = _curr_prefix_len // seg_size
+                _tail_obs_unnorm = self._extract_obs_at_boundary(
+                    _plan_t_fs, depth=_curr_depth, seg_size=seg_size
+                )[0]  # (obs_dim,)
+            else:
+                _tail_obs_unnorm = _parent_node.obs
+            _opp_tree = opposite_trees[_ii] if opposite_trees is not None else opposite_tree
+            assert _opp_tree is not None, "opposite_tree must be provided for uncertainty sampling"
+            all_opposite_nodes_unc = _opp_tree.get_all_nodes()
+            _unc_target_node = self._select_dynamic_goal(
+                current_leaf_obs=_tail_obs_unnorm,
+                opposite_tree_all_nodes=all_opposite_nodes_unc,
+            )
+            _unc_goal_norm = torch.tensor(
+                (_unc_target_node.obs - obs_mean_np) / obs_std_np,
+                dtype=torch.float32,
+                device=self.device,
+            ).unsqueeze(0)  # (1, obs_dim)
+
+            for g_scale in self.mctd_guidance_scales:
+                for _ in range(K):
+                    _unc_plan = _base_plan.clone()
+                    if _n_future > 0:
+                        _unc_plan[_future_start : _plan_tokens_val + 1] = (
+                            self._sample_clamped_noise(_n_future)
+                        )
+                    unc_init_plans_rep.append(_unc_plan)
+                    unc_guidance_scale_vals.append(g_scale)
+                    unc_goal_list.append(_unc_goal_norm)
+
+        unc_guidance_scale_tensor = torch.tensor(
+            unc_guidance_scale_vals, dtype=torch.float32, device=self.device
+        )
+        unc_obs = obs_normalized.repeat_interleave(G * K, dim=0)  # (B_nt*G*K, obs_dim)
+        unc_goal = torch.cat(unc_goal_list, dim=0)  # (B_nt*G*K, obs_dim)
+        unc_prefix_len_list = [
+            int(current_prefix_len_per_batch[_ii])
+            for _ii in range(B_nt)
+            for _ in range(G * K)
+        ]
+        unc_batch_plan_hists = self.parallel_plan(
+            unc_obs,
+            unc_goal,
+            horizon,
+            conditions,
+            guidance_scale=unc_guidance_scale_tensor,
+            noise_level=unc_noise_levels_rep,
+            plans=unc_init_plans_rep,
+            prefix_len_list=unc_prefix_len_list,
+            call_type="uncertainty",
+        )  # (fast_steps+1, plan_tokens*fs, B_nt*G*K, c)
+
+        # Split results back per candidate
+        unc_hists_per_cand = []
+        unc_noise_levels_per_cand = []
+        unc_guidance_scale_per_cand = []
+        for _ii in range(B_nt):
+            _s = _ii * G * K
+            _e = _s + G * K
+            unc_hists_per_cand.append(unc_batch_plan_hists[:, :, _s:_e, :])
+            unc_noise_levels_per_cand.append(unc_noise_levels_rep[_s:_e])  # (G*K, fast_steps+1, plan_tokens)
+            unc_guidance_scale_per_cand.append(unc_guidance_scale_vals[_s:_e])
+
+        return {
+            "unc_hists_per_cand": unc_hists_per_cand,
+            "unc_noise_levels_per_cand": unc_noise_levels_per_cand,
+            "unc_guidance_scale_per_cand": unc_guidance_scale_per_cand,
+        }
+
+    def _compute_uncertainty_and_clusters(
+        self,
+        unc_hists_per_cand: List[torch.Tensor],     # B_nt × (fast_steps+1, plan_tokens*fs, G*K, c)
+        curr_plan_last_batch: torch.Tensor,          # (plan_tokens*fs, B_nt, c)
+        node_depths: List[int],                      # B_nt candidate depths
+        seg_size: int,
+        unc_noise_levels_per_cand: List[np.ndarray], # B_nt × (G*K, fast_steps+1, plan_tokens)
+        unc_guidance_scale_per_cand: List[list],     # B_nt × G*K floats
+        target_nodes: List["TreeNode"],              # B_nt
+    ) -> dict:
+        """Compute uncertainty values and build cluster_subplans for each candidate.
+
+        Returns:
+            values: list[float] of len B_nt, each entry is -U
+            cluster_subplans: list[list[dict]|None] of len B_nt
+            unc_results: list[dict] of len B_nt (raw _compute_node_uncertainty output)
+        """
+        B_nt = len(unc_hists_per_cand)
+        values: list = []
+        cluster_subplans: list = []
+        unc_results_out: list = []
+
+        for _ii in range(B_nt):
+            unc_hists_i = unc_hists_per_cand[_ii]  # (fast_steps+1, plan_tokens*fs, G*K, c)
+            curr_depth_i = node_depths[_ii]
+
+            tail_obs_i = self._extract_obs_at_boundary(
+                unc_hists_i[-1],              # (plan_tokens*fs, G*K, c)
+                depth=curr_depth_i + 1,
+                seg_size=seg_size,
+            )  # (G*K, obs_dim)
+
+            curr_obs_i = self._extract_obs_at_boundary(
+                curr_plan_last_batch[:, _ii, :].unsqueeze(1),  # (plan_tokens*fs, 1, c)
+                depth=curr_depth_i,
+                seg_size=seg_size,
+            )[0]  # (obs_dim,)
+
+            unc_result = self._compute_node_uncertainty(
+                curr_obs=curr_obs_i,
+                target_node=target_nodes[_ii],
+                tail_obs=tail_obs_i,
+            )
+            values.append(-unc_result["U"])
+            unc_results_out.append(unc_result)
+
+            # Build cluster_subplans
+            if self.use_cluster_subplan_as_expansion:
+                _cl_labels = unc_result["cluster_labels"]
+                _n_cl = unc_result["n_clusters"]
+                _csp_list = []
+                for _c in range(_n_cl):
+                    _rep_j = int(np.where(_cl_labels == _c)[0][0])
+                    _ph_j = unc_hists_i[:, :, _rep_j, :]  # (fast_steps+1, plan_tokens*fs, c)
+                    _gs_j = float(unc_guidance_scale_per_cand[_ii][_rep_j])
+                    _lvl_j = unc_noise_levels_per_cand[_ii][_rep_j : _rep_j + 1, -1, :]
+                    # (1, plan_tokens)
+                    _csp_list.append({
+                        "plan_hist":      _ph_j,
+                        "guidance_scale": _gs_j,
+                        "current_levels": np.asarray(_lvl_j, dtype=np.int64),
+                    })
+                cluster_subplans.append(_csp_list)
+            else:
+                cluster_subplans.append(None)
+
+        return {
+            "values": values,
+            "cluster_subplans": cluster_subplans,
+            "unc_results": unc_results_out,
+        }
 
     def _init_mcts_tree(
         self,
@@ -2654,7 +2920,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         """
         plan_tokens: int = horizon // self.frame_stack  # t
         children_node_guidance_scales: list = self.mctd_guidance_scales
-        max_search_num: int = self.mctd_max_search_num
         skip_level_steps: int = self.mctd_skip_level_steps
 
         assert plan_tokens <= self.n_tokens - 1, (
@@ -2682,26 +2947,159 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         )
         root_node.set_value(0)  # Initialize the value of the root node
 
-        pbar = tqdm(
-            total=max_search_num,
-            desc=f"MCTS ({tag})",
-            leave=True,
-            dynamic_ncols=True,
-        )
+        pbar = None
+        if not self.use_uncertainty_as_value:
+            pbar = tqdm(
+                total=self.mctd_max_search_num,
+                desc=f"MCTS ({tag})",
+                leave=True,
+                dynamic_ncols=True,
+            )
 
         return MCTSTreeState(
             root_node=root_node,
-            plan_tokens=plan_tokens,
             terminal_depth=terminal_depth,
             noise_level=noise_level,
             children_node_guidance_scales=children_node_guidance_scales,
-            max_search_num=max_search_num,
             skip_level_steps=skip_level_steps,
             tag=tag,
             is_tree1=is_tree1,
             pbar=pbar,
             tree_root_obs=root_obs,
         )
+
+    def _ensure_uncertainty_roots_initialized(
+        self,
+        tree1: "MCTSTreeState",
+        tree2: "MCTSTreeState",
+        horizon: int,
+        conditions: Optional[Any],
+    ) -> dict[str, dict]:
+        """Initialize uncertainty (cluster_subplans + value) for both bidirectional tree roots.
+
+        Called once before the MCTS search loop when use_cluster_subplan_as_expansion
+        and use_uncertainty_as_value are both True.  Delegates to
+        _init_root_node_uncertainty for each root individually.
+        """
+        root_uncertainty_infos: dict[str, dict] = {}
+        if tree1.root_node.cluster_subplans is None:
+            root_uncertainty_infos[tree1.tag] = self._init_root_node_uncertainty(
+                root_node=tree1.root_node,
+                opposite_tree=tree2,
+                horizon=horizon,
+                conditions=conditions,
+            )
+        else:
+            _existing = getattr(tree1.root_node, "_root_uncertainty_vinfo", None)
+            if _existing is not None:
+                root_uncertainty_infos[tree1.tag] = _existing
+        if tree2.root_node.cluster_subplans is None:
+            root_uncertainty_infos[tree2.tag] = self._init_root_node_uncertainty(
+                root_node=tree2.root_node,
+                opposite_tree=tree1,
+                horizon=horizon,
+                conditions=conditions,
+            )
+        else:
+            _existing = getattr(tree2.root_node, "_root_uncertainty_vinfo", None)
+            if _existing is not None:
+                root_uncertainty_infos[tree2.tag] = _existing
+        return root_uncertainty_infos
+
+    def _init_root_node_uncertainty(
+        self,
+        root_node: "TreeNode",
+        opposite_tree: "MCTSTreeState",
+        horizon: int,
+        conditions: Optional[Any],
+    ) -> dict:
+        """Initialize root node uncertainty before MCTS search begins.
+
+        Builds a noisy init plan from root_node via _build_plan_from_leaf (no full
+        denoising expansion), then runs fast uncertainty sampling (G*K copies,
+        fast_sampling_steps) to populate root_node.cluster_subplans and set
+        root_node.value = -U.
+
+        Called once per tree before the MCTS while-loop when both
+        use_cluster_subplan_as_expansion and use_uncertainty_as_value are True.
+        """
+        plan_tokens = horizon // self.frame_stack
+        seg_size = plan_tokens // self.sequence_dividing_factor
+        obs_mean_np = np.array(self.observation_mean)
+        obs_std_np = np.array(self.observation_std)
+
+        # 1. Build noisy init plan (init token + noisy sequence, no full denoising)
+        noisy_plan, _ = self._build_plan_from_leaf(
+            parent_node=root_node,
+            plan_tokens=plan_tokens,
+            segment_size=seg_size,
+        )  # (n_tokens, 1, fs*c); structure: [obs_parent(1) | noisy(plan_tokens) | pad]
+
+        # Extract plan_tokens portion (skip obs_parent at index 0), rearrange to (plan_tokens*fs, c)
+        noisy_plan_tokens = noisy_plan[1 : plan_tokens + 1, 0, :]  # (plan_tokens, fs*c)
+        val_plan_last = rearrange(
+            noisy_plan_tokens, "t (fs c) -> (t fs) c", fs=self.frame_stack
+        )  # (plan_tokens*fs, c)
+
+        # 2. Root uncertainty starts from the raw root-noise state: no denoised prefix yet.
+        root_levels = root_node.current_levels  # (1, plan_tokens)
+        root_prefix_len_per_batch = np.array([0], dtype=int)
+
+        # 3. Normalize root obs
+        obs_normalized = torch.tensor(
+            (root_node.obs - obs_mean_np) / obs_std_np,
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)  # (1, obs_dim)
+
+        # 4. Run fast uncertainty sampling (G*K denoising passes from the noisy init plan)
+        val_plan_last_batch = val_plan_last.unsqueeze(1)  # (plan_tokens*fs, 1, c)
+        unc_sampling_result = self._run_fast_uncertainty_sampling(
+            parent_nodes=[root_node],
+            val_plan_last_batch=val_plan_last_batch,
+            updated_levels=root_levels,
+            current_prefix_len_per_batch=root_prefix_len_per_batch,
+            seg_size=seg_size,
+            horizon=horizon,
+            conditions=conditions,
+            obs_normalized=obs_normalized,
+            opposite_tree=opposite_tree,
+            obs_mean_np=obs_mean_np,
+            obs_std_np=obs_std_np,
+        )
+
+        # 5. Select target node for uncertainty computation (based on root obs)
+        all_opposite_nodes = opposite_tree.get_all_nodes()
+        target_node = self._select_dynamic_goal(
+            current_leaf_obs=root_node.obs,
+            opposite_tree_all_nodes=all_opposite_nodes,
+        )
+
+        # 6. Compute uncertainty and cluster_subplans
+        unc_compute_result = self._compute_uncertainty_and_clusters(
+            unc_hists_per_cand=unc_sampling_result["unc_hists_per_cand"],
+            curr_plan_last_batch=val_plan_last_batch,
+            node_depths=[0],
+            seg_size=seg_size,
+            unc_noise_levels_per_cand=unc_sampling_result["unc_noise_levels_per_cand"],
+            unc_guidance_scale_per_cand=unc_sampling_result["unc_guidance_scale_per_cand"],
+            target_nodes=[target_node],
+        )
+
+        # 7. Set root node cluster_subplans and value
+        root_node.cluster_subplans = unc_compute_result["cluster_subplans"][0]
+        root_node.set_value(unc_compute_result["values"][0])  # values[0] = -U
+        root_vinfo = {
+            "node": root_node,
+            "depth": int(root_node.depth),
+            "value": unc_compute_result["values"][0],
+            "target_node": target_node,
+            "selection_count": root_node.selection_count,
+            "uncertainty_plan_hist_frame": unc_sampling_result["unc_hists_per_cand"][0],
+            "unc_diagnostics": unc_compute_result["unc_results"][0],
+        }
+        setattr(root_node, "_root_uncertainty_vinfo", root_vinfo)
+        return root_vinfo
 
     def _run_mcts_search(
         self,
@@ -2717,7 +3115,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         """
         (B function) Run the MCTS search loop for a given tree state.
 
-        When `single_step=False` (default), runs until max_search_num or time_limit.
+        When `single_step=False` (default), runs until the local parent-selection
+        budget or time_limit is reached.
         When `single_step=True`, executes exactly one Selection→Expansion→Simulation→
         Backpropagation→EarlyTermination cycle and returns.
 
@@ -2759,6 +3158,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         # Holds the expanded node infos from the latest iteration (reset each iteration)
         expanded_node_infos: dict = {}
+        local_round_idx: int = 0
+        local_parent_expansions: int = 0
+        local_child_expansions: int = 0
         
         # [MEMORY DEBUG] Log tree search start
         if self.profiler:
@@ -2771,8 +3173,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self._glog("tree.search.start", {
             "tree_tag": tree.tag,
             "terminal_depth": tree.terminal_depth,
-            "max_search_num": tree.max_search_num,
-            "plan_tokens": tree.plan_tokens,
+            "search_budget": self.mctd_max_search_num,
+            "plan_tokens": self._require_current_plan_tokens(),
         }, depth=0)
 
         while True:
@@ -2780,17 +3182,16 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 if time.time() - self.start_time > self.time_limit:
                     break
             else:
-                # if search_num >= max_search_num:
-                if tree.p_search_num >= tree.max_search_num:
+                if local_parent_expansions >= self.mctd_max_search_num:
                     break
 
             ## For checking the virtual visit count
             # root_node.check_virtual_visit_count()
             # [MEMORY DEBUG] Periodic memory logging
-            if self.profiler and (tree.search_num > 0) and (tree.search_num % 10 == 0):
+            if self.profiler and (local_round_idx > 0) and (local_round_idx % 10 == 0):
                 self.profiler.snapshot(
-                    f"mcts_search_iter_{tree.search_num}_{tree.tag}",
-                    phase=f"mcts_iter_{tree.search_num}"
+                    f"mcts_search_iter_{local_round_idx}_{tree.tag}",
+                    phase=f"mcts_iter_{local_round_idx}"
                 )
 
             ###############################
@@ -2962,6 +3363,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                             expandable_node_names.remove(expanded_node_candidate["name"])
             if len(selected_nodes) == 0:
                 break
+            round_parent_count = len({id(node): node for node in selected_nodes})
             selection_end_time = time.time()
             tree.selection_time.append(selection_end_time - selection_start_time)
 
@@ -2974,15 +3376,57 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 if info["parent_node"].obs is not None:
                     valid_candidates.append(info)
 
-
             # If no valid candidates (all had None obs), skip diffusion and continue
             if not valid_candidates:
                 break  # Exit search loop
 
-            assert tree.plan_tokens % self.sequence_dividing_factor == 0, (
-                f"plan_tokens {tree.plan_tokens} is not divisible by sequence_dividing_factor {self.sequence_dividing_factor}"
+            # ------------------------------------------------------------------
+            # [CLUSTER REUSE] Pre-process valid_candidates.
+            # When use_cluster_subplan_as_expansion=True and a parent node has
+            # cluster_subplans stored from a previous uncertainty-sampling pass,
+            # replace its single candidate slot with N_c slots (one per cluster).
+            # The parent's _children_nodes array is reset to match N_c.
+            # After this block, valid_candidates / expanded_node_candidates /
+            # selected_nodes are all replaced to stay in sync.
+            # ------------------------------------------------------------------
+            _is_cluster_reuse_expansion = False
+            _cluster_reuse_slot_map: dict = {}  # new cand name → cluster index
+            if self.use_cluster_subplan_as_expansion:
+                # Build a mapping from candidate name → selected_node (parent),
+                # then expand any parent that already has cluster_subplans.
+                _old_sel_map = {}
+                for _oi, _info in enumerate(expanded_node_candidates):
+                    _old_sel_map[_info["name"]] = selected_nodes[_oi]
+
+                _new_valid: list = []
+                _new_sel: list = []
+                for _info in valid_candidates:
+                    _parent = _info["parent_node"]
+                    _sel = _old_sel_map[_info["name"]]
+                    if _parent.cluster_subplans is not None:
+                        _is_cluster_reuse_expansion = True
+                        _N_c = len(_parent.cluster_subplans)
+                        _gs_list = [float(_cs["guidance_scale"]) for _cs in _parent.cluster_subplans]
+                        _parent.reset_children_slots(_N_c, _gs_list)
+                        for _slot_i in range(_N_c):
+                            _cand = _parent.get_expandable_candidate(index=_slot_i)
+                            _new_valid.append(_cand)
+                            _new_sel.append(_sel)
+                            _cluster_reuse_slot_map[_cand["name"]] = _slot_i
+                    else:
+                        _new_valid.append(_info)
+                        _new_sel.append(_sel)
+
+                if _is_cluster_reuse_expansion:
+                    valid_candidates = _new_valid
+                    expanded_node_candidates = _new_valid   # keep indices in sync
+                    selected_nodes = _new_sel
+
+            plan_tokens = self._require_current_plan_tokens()
+            assert plan_tokens % self.sequence_dividing_factor == 0, (
+                f"plan_tokens {plan_tokens} is not divisible by sequence_dividing_factor {self.sequence_dividing_factor}"
             )
-            seg_size = tree.plan_tokens // self.sequence_dividing_factor
+            seg_size = plan_tokens // self.sequence_dividing_factor
 
             eff_obs_norm_list, eff_goal_norm_list = [], []
             eff_start_np_list, eff_goal_np_list = [], []
@@ -3041,6 +3485,27 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # Used to fill uncertainty_plan_hists_per_candidate[i] when a candidate's plan
             # remains infeasible across all retries (mirrors the plan fallback at line ~3061).
             _fallback_unc_plan_hists: list = [None] * len(valid_candidates)
+            # Per-candidate cluster subplans: populated after _compute_node_uncertainty.
+            # Each entry is list[dict] (one per cluster) or None.
+            # Passed to child TreeNode so that the next expansion can reuse these plans.
+            cluster_subplans_per_candidate: list = [None] * len(valid_candidates)
+
+            # Pre-compute non-terminal candidate indices (constant across retries).
+            # Also allocate per-candidate noise-level/guidance-scale buffers for Helper 2.
+            # These are populated on the first retry and reused (they are constant across retries
+            # because they depend only on parent depths and self.mctd_guidance_scales).
+            if self.use_uncertainty_as_value:
+                _B_cands_pre = len(expanded_node_candidates)
+                non_terminal_cand_indices = [
+                    _i for _i in range(_B_cands_pre)
+                    if expanded_node_candidates[_i]["parent_node"].depth + 1 < terminal_depth
+                ]
+                _unc_noise_levels_per_cand: list = [None] * len(valid_candidates)
+                _unc_guidance_scale_per_cand: list = [None] * len(valid_candidates)
+            else:
+                non_terminal_cand_indices = []
+                _unc_noise_levels_per_cand = []
+                _unc_guidance_scale_per_cand = []
 
             for _ in range(
                 self.num_tries_for_bad_plans
@@ -3048,87 +3513,121 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 ###############################
                 # Expansion
                 expansion_start_time = time.time()
-                expanded_node_plans = []
-                expanded_node_noise_levels = []
-                expanded_node_guidance_scales = []
 
-                prefix_len_list = []
-                for info in expanded_node_candidates:
-                    # Build pre-built plan from leaf history (n_tokens(=t), 1, fs*c)
-                    initial_plan, prefix_len = self._build_plan_from_leaf(
-                        parent_node=info["parent_node"],
-                        plan_tokens=tree.plan_tokens,
-                        segment_size=seg_size,
-                    )  # (n_tokens(=t), 1, fs*c)
-                    expanded_node_plans.append(initial_plan)
-                    expanded_node_guidance_scales.append(info["guidance_scale"])
-                    prefix_len_list.append(prefix_len)
-
-                expanded_node_guidance_scales = torch.tensor(
-                    expanded_node_guidance_scales, device=self.device
-                )  # (b,)
-
-                # Build parent_levels: (b, plan_tokens(=t)) — noise state for each candidate
-                parent_levels_list = []
-                for info in expanded_node_candidates:
-                    parent_node = info["parent_node"]
-                    if parent_node.current_levels is not None:
-                        parent_levels_list.append(parent_node.current_levels)
-                    else:
-                        assert horizon % self.frame_stack == 0, (
-                            f"horizon {horizon} is not divisible by frame_stack {self.frame_stack}"
+                if _is_cluster_reuse_expansion:
+                    # ── Cluster-reuse path ──────────────────────────────────────
+                    # Directly assemble expanded_node_plan_hists from stored
+                    # cluster subplans instead of running parallel_plan.
+                    # Each candidate maps to a cluster slot in its parent node.
+                    _cr_plan_hist_list = []
+                    _cr_updated_levels_list = []
+                    for _cinfo in valid_candidates:
+                        _cp = _cinfo["parent_node"]
+                        assert _cp.cluster_subplans is not None, (
+                            f"Cluster-reuse expansion expects parent '{_cp.name}' to have "
+                            "cluster_subplans, but it is None."
                         )
-                        _plan_tokens = horizon // self.frame_stack
-                        parent_levels_list.append(
-                            np.full(
-                                (1, _plan_tokens),
-                                self.sampling_timesteps,
-                                dtype=np.int64,
+                        _slot_i = _cluster_reuse_slot_map[_cinfo["name"]]
+                        _cs = _cp.cluster_subplans[_slot_i]
+                        # plan_hist: (fast_steps+1, plan_tokens*fs, c) → add batch dim
+                        _ph = _cs["plan_hist"]
+                        if not isinstance(_ph, torch.Tensor):
+                            _ph = torch.tensor(_ph, dtype=torch.float32, device=self.device)
+                        else:
+                            _ph = _ph.to(self.device)
+                        _cr_plan_hist_list.append(_ph.unsqueeze(2))  # (fast_steps+1, plan_tokens*fs, 1, c)
+                        _cr_updated_levels_list.append(
+                            np.asarray(_cs["current_levels"], dtype=np.int64)
+                        )  # (1, plan_tokens)
+                    # Stack along batch dim
+                    expanded_node_plan_hists = torch.cat(_cr_plan_hist_list, dim=2)  # (fast_steps+1, plan_tokens*fs, B, c)
+                    expanded_node_updated_levels = np.concatenate(_cr_updated_levels_list, axis=0)  # (B, plan_tokens)
+                    expanded_node_noise_levels = None      # not used in cluster-reuse path
+                    expanded_node_guidance_scales = None  # not used in cluster-reuse path
+                    self._expansion_step_captures_by_name = {}  # no denoising captures
+                else:
+                    # ── Standard denoising path ──────────────────────────────────
+                    expanded_node_plans = []
+                    expanded_node_noise_levels = []
+                    expanded_node_guidance_scales = []
+
+                    prefix_len_list = []
+                    for info in expanded_node_candidates:
+                        # Build pre-built plan from leaf history (n_tokens(=t), 1, fs*c)
+                        initial_plan, prefix_len = self._build_plan_from_leaf(
+                            parent_node=info["parent_node"],
+                            plan_tokens=plan_tokens,
+                            segment_size=seg_size,
+                        )  # (n_tokens(=t), 1, fs*c)
+                        expanded_node_plans.append(initial_plan)
+                        expanded_node_guidance_scales.append(info["guidance_scale"])
+                        prefix_len_list.append(prefix_len)
+
+                    expanded_node_guidance_scales = torch.tensor(
+                        expanded_node_guidance_scales, device=self.device
+                    )  # (b,)
+
+                    # Build parent_levels: (b, plan_tokens(=t)) — noise state for each candidate
+                    parent_levels_list = []
+                    for info in expanded_node_candidates:
+                        parent_node = info["parent_node"]
+                        if parent_node.current_levels is not None:
+                            parent_levels_list.append(parent_node.current_levels)
+                        else:
+                            assert horizon % self.frame_stack == 0, (
+                                f"horizon {horizon} is not divisible by frame_stack {self.frame_stack}"
                             )
-                        )
+                            _plan_tokens = horizon // self.frame_stack
+                            parent_levels_list.append(
+                                np.full(
+                                    (1, _plan_tokens),
+                                    self.sampling_timesteps,
+                                    dtype=np.int64,
+                                )
+                            )
 
-                parent_levels = np.concatenate(
-                    parent_levels_list, axis=0
-                )  # (b, plan_tokens(=t))
+                    parent_levels = np.concatenate(
+                        parent_levels_list, axis=0
+                    )  # (b, plan_tokens(=t))
 
-                # Generate bidirectional denoising schedule
-                expanded_node_noise_levels = self._generate_bidirectional_schedule(
-                    parent_levels,
-                    prefix_len_per_batch=np.array(prefix_len_list, dtype=int),
-                )  # (b, m, plan_tokens(=t))
-                expanded_node_updated_levels = expanded_node_noise_levels[
-                    :, -1, :
-                ]  # (b, plan_tokens(=t))
+                    # Generate bidirectional denoising schedule
+                    expanded_node_noise_levels = self._generate_bidirectional_schedule(
+                        parent_levels,
+                        prefix_len_per_batch=np.array(prefix_len_list, dtype=int),
+                    )  # (b, m, plan_tokens(=t))
+                    expanded_node_updated_levels = expanded_node_noise_levels[
+                        :, -1, :
+                    ]  # (b, plan_tokens(=t))
 
-                # Tag current tree for guidance JSONL logging (forward vs backward)
-                self._current_tree_tag = tree.tag
+                    # Tag current tree for guidance JSONL logging (forward vs backward)
+                    self._current_tree_tag = tree.tag
 
-                # Expansion: single batched parallel_plan call over all B candidates.
-                # group_ids assigns each candidate an integer sibling-group id (same parent → same id)
-                # so that particle_guidance only repels within-sibling groups, not across parents.
-                # output plan_hist: (m+1, plan_tokens*fs, B, c)
-                _parent_to_gid: dict = {}
-                _group_ids: list = []
-                for _cand in expanded_node_candidates:
-                    _pname = _cand["parent_node"].name
-                    if _pname not in _parent_to_gid:
-                        _parent_to_gid[_pname] = len(_parent_to_gid)
-                    _group_ids.append(_parent_to_gid[_pname])
-                # _group_ids: list[int] of length B — same value = same sibling group
+                    # Expansion: single batched parallel_plan call over all B candidates.
+                    # group_ids assigns each candidate an integer sibling-group id (same parent → same id)
+                    # so that particle_guidance only repels within-sibling groups, not across parents.
+                    # output plan_hist: (m+1, plan_tokens*fs, B, c)
+                    _parent_to_gid: dict = {}
+                    _group_ids: list = []
+                    for _cand in expanded_node_candidates:
+                        _pname = _cand["parent_node"].name
+                        if _pname not in _parent_to_gid:
+                            _parent_to_gid[_pname] = len(_parent_to_gid)
+                        _group_ids.append(_parent_to_gid[_pname])
+                    # _group_ids: list[int] of length B — same value = same sibling group
 
-                expanded_node_plan_hists = self.parallel_plan(
-                    start=effective_obs_normalized,            # (B, obs_dim)
-                    goal=effective_goal_normalized,            # (B, obs_dim)
-                    horizon=horizon,
-                    conditions=conditions,
-                    guidance_scale=expanded_node_guidance_scales,   # (B,)
-                    noise_level=expanded_node_noise_levels,         # (B, m, plan_tokens)
-                    plans=expanded_node_plans,                      # list of B tensors
-                    prefix_len_list=prefix_len_list,                # list of B ints
-                    particle_guidance_scale=self.particle_guidance_scale,
-                    group_ids=_group_ids,
-                    call_type="expansion",
-                )  # (m+1, plan_tokens*fs, B, c)
+                    expanded_node_plan_hists = self.parallel_plan(
+                        start=effective_obs_normalized,            # (B, obs_dim)
+                        goal=effective_goal_normalized,            # (B, obs_dim)
+                        horizon=horizon,
+                        conditions=conditions,
+                        guidance_scale=expanded_node_guidance_scales,   # (B,)
+                        noise_level=expanded_node_noise_levels,         # (B, m, plan_tokens)
+                        plans=expanded_node_plans,                      # list of B tensors
+                        prefix_len_list=prefix_len_list,                # list of B ints
+                        particle_guidance_scale=self.particle_guidance_scale,
+                        group_ids=_group_ids,
+                        call_type="expansion",
+                    )  # (m+1, plan_tokens*fs, B, c)
 
                 # Build per-candidate step captures for video visualization.
                 # Stored in self._expansion_step_captures_by_name (name → list of per-step dicts).
@@ -3169,7 +3668,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     _eff_scale = float(np.mean(_scales)) if _scales else 0.0
                     self._glog("guidance.combined", {
                         "tree_tag": tree.tag,
-                        "search_num": tree.search_num,
+                        "round_idx": local_round_idx + 1,
                         "eff_goal_scale": _eff_scale,
                         "batch_size": len(expanded_node_candidates),
                         "dist_per_batch": [round(d, 4) for d in _dist_per_batch],
@@ -3194,7 +3693,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         _guidance_total = sum(_guidance_norms.values())
                         self._glog("diffusion.grad_comparison", {
                             "tree_tag": tree.tag,
-                            "search_num": tree.search_num,
+                            "round_idx": local_round_idx + 1,
                             "prior_norm": round(_prior_norm, 6),
                             "guidance_total_norm": round(_guidance_total, 6),
                             "ratio": round(_guidance_total / (_prior_norm + 1e-9), 4),
@@ -3392,115 +3891,59 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 ##### NODE UNCERTAINTY CHECK #####
 
                 # uncertainty_plan_hists_per_candidate is initialized before the retry loop.
-                # Here we populate it for each candidate when use_uncertainty_as_value=True.
+                # Here we populate it via _run_fast_uncertainty_sampling for non-terminal
+                # candidates when use_uncertainty_as_value=True.
                 # Input: val_plan_hists (replanned if mcts_use_replan, else expanded).
-                if self.use_uncertainty_as_value:
-                    B_cands = len(expanded_node_candidates)
-                    K = self.fast_sampling_multiple
-                    G = len(self.mctd_guidance_scales)
-
-                    # Terminal-depth candidates have no future segment to explore.
-                    # Uncertainty sampling for them would require a window beyond n_tokens → OOB.
-                    # Skip them here; their value will be set to 0 in the value computation loop.
-                    non_terminal_cand_indices = [
-                        _i for _i in range(B_cands)
-                        if expanded_node_candidates[_i]["parent_node"].depth + 1 < terminal_depth
+                if self.use_uncertainty_as_value and non_terminal_cand_indices:
+                    assert expanded_node_updated_levels is not None, (
+                        "expanded_node_updated_levels must be set for uncertainty sampling"
+                    )
+                    _nt_parent_nodes = [
+                        expanded_node_candidates[_i]["parent_node"]
+                        for _i in non_terminal_cand_indices
                     ]
+                    _nt_val_plan_last = val_plan_hists[-1][:, non_terminal_cand_indices, :]
+                    # (plan_tokens*fs, B_nt, c)
+                    _nt_updated_levels = expanded_node_updated_levels[non_terminal_cand_indices]
+                    # (B_nt, plan_tokens)
+                    _nt_idx_tensor = torch.tensor(
+                        non_terminal_cand_indices, device=effective_obs_normalized.device
+                    )
+                    _nt_obs_norm = effective_obs_normalized[_nt_idx_tensor]
+                    # (B_nt, obs_dim)
 
-                    if non_terminal_cand_indices:
-                        # Build fast noise schedule using fast_sampling_steps.
-                        # Same starting levels as replanning (expanded_node_updated_levels).
-                        assert expanded_node_updated_levels is not None, (
-                            "expanded_node_updated_levels must be set for uncertainty sampling"
-                        )
-                        unc_prefix_len_per_batch = np.array([
-                            (expanded_node_candidates[_i]["parent_node"].depth + 1) * seg_size
-                            for _i in non_terminal_cand_indices
-                        ], dtype=int)
-                        unc_noise_levels_nt = self._generate_bidirectional_schedule(
-                            expanded_node_updated_levels[non_terminal_cand_indices],
-                            prefix_len_per_batch=unc_prefix_len_per_batch,
-                            num_denoising_steps_override=self.fast_sampling_steps,
-                        )  # (B_nt, fast_steps+1, plan_tokens)
+                    _unc_fast_result = self._run_fast_uncertainty_sampling(
+                        parent_nodes=_nt_parent_nodes,
+                        val_plan_last_batch=_nt_val_plan_last,
+                        updated_levels=_nt_updated_levels,
+                        current_prefix_len_per_batch=np.array(
+                            [
+                                expanded_node_candidates[_i]["depth"] * seg_size
+                                for _i in non_terminal_cand_indices
+                            ],
+                            dtype=int,
+                        ),
+                        seg_size=seg_size,
+                        horizon=horizon,
+                        conditions=conditions,
+                        obs_normalized=_nt_obs_norm,
+                        opposite_tree=opposite_tree,
+                        obs_mean_np=obs_mean_np,
+                        obs_std_np=obs_std_np,
+                    )
 
-                        # Build G*K independent init plans per non-terminal candidate.
-                        _plan_tokens_val = horizon // self.frame_stack
-                        unc_noise_levels_rep = np.repeat(unc_noise_levels_nt, K * G, axis=0)
-                        unc_init_plans_rep = []
-                        unc_guidance_scale_vals = []
-                        unc_goal_list = []
-                        all_opposite_nodes_unc = opposite_tree.get_all_nodes()
-                        for _i in non_terminal_cand_indices:
-                            _parent_node = expanded_node_candidates[_i]["parent_node"]
-                            _plan_t_fs = val_plan_hists[-1, :, _i].unsqueeze(1)  # (plan_tokens*fs, 1, c)
-                            _plan_rearranged_unc = rearrange(
-                                _plan_t_fs, "(t fs) b c -> t b (fs c)", fs=self.frame_stack
-                            )  # (plan_tokens, 1, fs*c)
-                            _base_plan, _ = self._build_plan_from_leaf(
-                                _parent_node, _plan_tokens_val, seg_size,
-                                expanded_plan=_plan_rearranged_unc,
-                            )  # (n_tokens, 1, fs*c)
-                            _child_depth = _parent_node.depth + 1
-                            _future_start = _child_depth * seg_size + 1
-                            _n_future = _plan_tokens_val + 1 - _future_start
-
-                            # Select goal from opposite tree based on child segment tail position,
-                            # not parent_node position. _extract_obs_at_boundary returns (N, obs_dim)
-                            # unnormalized; depth=_child_depth gives frame index child_depth*seg_size*fs-1.
-                            _tail_obs_unnorm = self._extract_obs_at_boundary(
-                                _plan_t_fs, depth=_child_depth, seg_size=seg_size
-                            )[0]  # (obs_dim,)
-                            _unc_target_node = self._select_dynamic_goal(
-                                current_leaf_obs=_tail_obs_unnorm,
-                                opposite_tree_all_nodes=all_opposite_nodes_unc,
+                    for _ii, _i in enumerate(non_terminal_cand_indices):
+                        _unc_h = _unc_fast_result["unc_hists_per_cand"][_ii]
+                        _fallback_unc_plan_hists[_i] = _unc_h
+                        uncertainty_plan_hists_per_candidate[_i] = _unc_h
+                        # Store noise levels and guidance scales (constant across retries)
+                        if _unc_noise_levels_per_cand[_i] is None:
+                            _unc_noise_levels_per_cand[_i] = (
+                                _unc_fast_result["unc_noise_levels_per_cand"][_ii]
                             )
-                            _unc_goal_norm = torch.tensor(
-                                (_unc_target_node.obs - obs_mean_np) / obs_std_np,
-                                dtype=torch.float32,
-                                device=self.device,
-                            ).unsqueeze(0)  # (1, obs_dim)
-
-                            for g_scale in self.mctd_guidance_scales:
-                                for _ in range(K):
-                                    _unc_plan = _base_plan.clone()
-                                    if _n_future > 0:
-                                        _unc_plan[_future_start : _plan_tokens_val + 1] = (
-                                            self._sample_clamped_noise(_n_future)
-                                        )
-                                    unc_init_plans_rep.append(_unc_plan)
-                                    unc_guidance_scale_vals.append(g_scale)
-                                    unc_goal_list.append(_unc_goal_norm)
-                        unc_guidance_scale_tensor = torch.tensor(
-                            unc_guidance_scale_vals, dtype=torch.float32, device=self.device
-                        )
-
-                        nt_idx_tensor = torch.tensor(non_terminal_cand_indices, device=effective_obs_normalized.device)
-                        unc_obs = effective_obs_normalized[nt_idx_tensor].repeat_interleave(G * K, dim=0)
-                        unc_goal = torch.cat(unc_goal_list, dim=0)  # (B_nt*G*K, obs_dim)
-                        unc_prefix_len_list = [
-                            (expanded_node_candidates[_i]["parent_node"].depth + 1) * seg_size
-                            for _i in non_terminal_cand_indices
-                            for _ in range(G * K)
-                        ]
-                        unc_batch_plan_hists = self.parallel_plan(
-                            unc_obs,
-                            unc_goal,
-                            horizon,
-                            conditions,
-                            guidance_scale=unc_guidance_scale_tensor,
-                            noise_level=unc_noise_levels_rep,
-                            plans=unc_init_plans_rep,
-                            prefix_len_list=unc_prefix_len_list,
-                            call_type="uncertainty",
-                        )  # (fast_steps+1, plan_tokens*fs, B_nt*G*K, c)
-
-                        # Map results back to per-candidate slot.
-                        for _ii, _i in enumerate(non_terminal_cand_indices):
-                            start_idx_k = _ii * G * K
-                            end_idx_k = start_idx_k + G * K
-                            unc_plan = unc_batch_plan_hists[:, :, start_idx_k:end_idx_k, :]
-                            _fallback_unc_plan_hists[_i] = unc_plan
-                            uncertainty_plan_hists_per_candidate[_i] = unc_plan
+                            _unc_guidance_scale_per_cand[_i] = (
+                                _unc_fast_result["unc_guidance_scale_per_cand"][_ii]
+                            )
 
 
                 for i in range(len(is_feasible)):
@@ -3561,53 +4004,71 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 # [A5] Achieved detection without Warp: value is decided solely by uncertainty.
                 # Warp is not checked — only goal proximity matters for recording Achieved.
                 achieved_infos, achieved_ts = self._check_achieved_bidir(
-                    expanded_node_candidates, final_best_plans, tree
+                    expanded_node_candidates, final_best_plans
                 )
                 for i in range(len(achieved_infos)):
                     if achieved_infos[i] == "Achieved":
                         tree.achieved = True
                         achieved_indices.append(i)
 
-                # Compute -uncertainty as value for each candidate.
+                # Compute -uncertainty as value for each candidate via helper.
                 values = np.zeros(len(expanded_node_candidates))
-                for i, candidate in enumerate(expanded_node_candidates):
-                    curr_depth_i = candidate["depth"]
-                    # Terminal-depth nodes have no future segment; uncertainty sampling was
-                    # skipped for them.  Assign -inf so they are never selected over
-                    # non-terminal nodes that have a meaningful uncertainty value.
-                    if curr_depth_i >= terminal_depth:
-                        values[i] = -np.inf
-                        unc_results[i] = {"U": np.inf}
-                        continue
-                    target_node_i = candidate["target_node"]
-                    unc_hists_i   = uncertainty_plan_hists_per_candidate[i]
-                    assert unc_hists_i is not None, (
-                        f"[Uncertainty] uncertainty_plan_hists_per_candidate[{i}] is None "
-                        "after fallback injection — this should not happen."
-                    )
-                    # Each K copy was built with fresh noise → G*K samples are independent.
-                    tail_obs_i = self._extract_obs_at_boundary(
-                        unc_hists_i[-1],           # (plan_tokens*fs, G*K, c)
-                        depth=curr_depth_i + 1,   # next segment boundary (undenoised region)
+
+                # Terminal-depth candidates: assign -inf (no future segment).
+                terminal_cand_indices = [
+                    i for i, cand in enumerate(expanded_node_candidates)
+                    if cand["depth"] >= terminal_depth
+                ]
+                for i in terminal_cand_indices:
+                    values[i] = -np.inf
+                    unc_results[i] = {"U": np.inf}
+
+                # Non-terminal candidates: compute via _compute_uncertainty_and_clusters.
+                if non_terminal_cand_indices:
+                    _nt_unc_hists = [
+                        uncertainty_plan_hists_per_candidate[_i]
+                        for _i in non_terminal_cand_indices
+                    ]
+                    for _ii, _i in enumerate(non_terminal_cand_indices):
+                        assert _nt_unc_hists[_ii] is not None, (
+                            f"[Uncertainty] uncertainty_plan_hists_per_candidate[{_i}] is None "
+                            "after fallback injection — this should not happen."
+                        )
+                    _nt_curr_plan_last = expanded_node_plan_hists[-1][:, non_terminal_cand_indices, :]
+                    # (plan_tokens*fs, B_nt, c)
+                    _nt_depths = [
+                        expanded_node_candidates[_i]["depth"] for _i in non_terminal_cand_indices
+                    ]
+                    _nt_target_nodes = [
+                        expanded_node_candidates[_i]["target_node"]
+                        for _i in non_terminal_cand_indices
+                    ]
+                    _nt_noise_levels = [
+                        _unc_noise_levels_per_cand[_i] for _i in non_terminal_cand_indices
+                    ]
+                    _nt_guidance_scales = [
+                        _unc_guidance_scale_per_cand[_i] for _i in non_terminal_cand_indices
+                    ]
+
+                    _unc_compute_result = self._compute_uncertainty_and_clusters(
+                        unc_hists_per_cand=_nt_unc_hists,
+                        curr_plan_last_batch=_nt_curr_plan_last,
+                        node_depths=_nt_depths,
                         seg_size=seg_size,
-                    )  # (G*K, obs_dim)
-                    # Extract current node's obs from the plan at depth=curr_depth_i boundary.
-                    # candidate["obs"] is set later (post-dedup), so we derive it here directly.
-                    curr_obs_i = self._extract_obs_at_boundary(
-                        expanded_node_plan_hists[-1, :, i].unsqueeze(1),  # (plan_tokens*fs, 1, c)
-                        depth=curr_depth_i,
-                        seg_size=seg_size,
-                    )[0]  # (obs_dim,)
-                    unc_result = self._compute_node_uncertainty(
-                        curr_obs=curr_obs_i,
-                        target_node=target_node_i,
-                        tail_obs=tail_obs_i,
+                        unc_noise_levels_per_cand=_nt_noise_levels,
+                        unc_guidance_scale_per_cand=_nt_guidance_scales,
+                        target_nodes=_nt_target_nodes,
                     )
-                    values[i] = -unc_result['U']
-                    unc_results[i] = unc_result  # store for visualization
+
+                    for _ii, _i in enumerate(non_terminal_cand_indices):
+                        values[_i] = _unc_compute_result["values"][_ii]
+                        unc_results[_i] = _unc_compute_result["unc_results"][_ii]
+                        cluster_subplans_per_candidate[_i] = (
+                            _unc_compute_result["cluster_subplans"][_ii]
+                        )
             else:
                 values, achieved_infos, achieved_ts = self.calculate_values_bidir(
-                    expanded_node_candidates, final_best_plans, tree
+                    expanded_node_candidates, final_best_plans
                 )
                 for i in range(len(achieved_infos)):
                     if achieved_infos[i] == "Achieved":
@@ -3645,14 +4106,12 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 else:
                     parent_node._children_nodes[slot_index]["virtually_visited"] = False
 
-            selected_nodes_for_expansion = {}
             expanded_node_infos = {}
             for i in range(len(expanded_node_candidates)):  # B
                 if not is_kept[i]:
                     continue  # slot remains empty, available for future expansion rounds
                 name = expanded_node_candidates[i]["name"]
                 if name not in expanded_node_infos:
-                    selected_nodes_for_expansion[name] = selected_nodes[i]
                     expanded_node_infos[name] = expanded_node_candidates[i]
                     expanded_node_infos[name]["plan_history"].append([])
                     # Note: is_tree1 is a property of MCTSTreeState (tree), not individual nodes
@@ -3683,6 +4142,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     expanded_node_infos[name]["uncertainty_plan_hist_frame"] = uncertainty_plan_hists_per_candidate[i]
                     expanded_node_infos[name]["unc_diagnostics"] = unc_results.get(i)
                     expanded_node_infos[name]["current_levels"] = updated_level
+                    expanded_node_infos[name]["cluster_subplans"] = cluster_subplans_per_candidate[i]
                 else:
                     if value > expanded_node_infos[name]["value"]:
                         expanded_node_infos[name]["value"] = value
@@ -3695,11 +4155,15 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         expanded_node_infos[name]["uncertainty_plan_hist_frame"] = uncertainty_plan_hists_per_candidate[i]
                         expanded_node_infos[name]["unc_diagnostics"] = unc_results.get(i)
                         expanded_node_infos[name]["current_levels"] = updated_level
+                        expanded_node_infos[name]["cluster_subplans"] = cluster_subplans_per_candidate[i]
 
-            for name in selected_nodes_for_expansion:
-                parent_node_for_expand = selected_nodes_for_expansion[name]
+            # Use parent_node directly from expanded_node_infos (selected_nodes_for_expansion
+            # is no longer needed — parent_node is already stored in each candidate info dict).
+            for name in expanded_node_infos:
+                parent_node_for_expand = expanded_node_infos[name]["parent_node"]
                 expand_kwargs = {k: v for k, v in expanded_node_infos[name].items()
-                                 if k not in ("expanded_plan_hist_frame", "replanned_plan_hist_frame", "uncertainty_plan_hist_frame", "unc_diagnostics")}
+                                 if k not in ("expanded_plan_hist_frame", "replanned_plan_hist_frame",
+                                              "uncertainty_plan_hist_frame", "unc_diagnostics")}
                 child_node = parent_node_for_expand.expand(
                     **expand_kwargs
                 )
@@ -3734,9 +4198,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # Early Termination
             early_termination_start_time = time.time()
 
-            tree.search_num += 1
-            tree.p_search_num += len(expanded_node_candidates)
-            tree.pbar.update(len(expanded_node_candidates))
+            local_round_idx += 1
+            local_parent_expansions += round_parent_count
+            local_child_expansions += len(expanded_node_candidates)
+            if tree.pbar is not None:
+                tree.pbar.update(round_parent_count)
             tree.max_depth = max(
                 tree.max_depth,
                 max([info["depth"] for info in expanded_node_candidates]),
@@ -3792,7 +4258,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     _viz_node_t0 = time.time()
                     self.visualize_node_value_plans(
                         is_achieved_plan,
-                        tree.search_num,
+                        local_round_idx,
                         terminal_values,
                         terminal_names,
                         terminal_expanded_plans,
@@ -3844,7 +4310,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 if tree.expansion_time:
                     self._tlog("timing.expansion", {
                         "tree_tag": tree.tag,
-                        "expansion_idx": tree.search_num,
+                        "expansion_idx": local_round_idx,
                         "expansion_ms": round(tree.expansion_time[-1] * 1000, 1),
                         "selection_ms": round(tree.selection_time[-1] * 1000, 1) if tree.selection_time else 0.0,
                         "replanning_ms": round(tree.replanning_time[-1] * 1000, 1) if tree.replanning_time else 0.0,
@@ -3853,18 +4319,19 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     }, depth=0)
                 break
 
-        if not single_step:
+        if not single_step and tree.pbar is not None:
             tree.pbar.close()
 
         # [LOGGING] Record search completion → guidance_anal (tree quality) + timing_anal (phase breakdown)
         terminal_depth_reached = tree.max_depth >= tree.terminal_depth
         self._glog("tree.search.complete", {
             "tree_tag": tree.tag,
-            "final_search_num": tree.search_num,
+            "final_selected_parents": local_parent_expansions,
+            "n_rounds": local_round_idx,
             "final_max_depth": tree.max_depth,
             "terminal_depth": tree.terminal_depth,
             "terminal_depth_reached": terminal_depth_reached,
-            "total_nodes_expanded": tree.search_num,
+            "total_children_created": local_child_expansions,
         }, depth=0)
 
         # [TIMING SUMMARY] Phase breakdown for bottleneck analysis → timestamp_anal
@@ -3882,8 +4349,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         total_ms = sel_ms + exp_ms + replan_ms + bp_ms + et_ms
         self._tlog("timing.phase_breakdown", {
             "tree_tag": tree.tag,
-            "n_iters": tree.search_num,
-            "n_nodes": tree.p_search_num,
+            "n_iters": local_round_idx,
+            "n_selected_parents": local_parent_expansions,
+            "n_nodes": local_child_expansions,
             "parallel_search_num": self.parallel_search_num,
             "total_ms": total_ms,
             "selection_ms": sel_ms,
@@ -3951,6 +4419,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         tree2: MCTSTreeState,
     ) -> List[dict]:
         """Select top-K expandable parents globally across both trees."""
+        remaining_budget = max(self.mctd_max_search_num - self.global_search_num, 0)
+        selection_budget = min(self._parent_selection_budget(), remaining_budget)
+        if selection_budget <= 0:
+            return []
+
         candidate_pool = self._collect_global_expansion_candidates(tree1, tree2)
         candidate_pool.extend(self._collect_global_expansion_candidates(tree2, tree1))
         candidate_pool.sort(
@@ -3960,13 +4433,970 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 item["node"].name,
             )
         )
-        selected_parent_infos = candidate_pool[: self._parent_selection_budget()]
+        selected_parent_infos = candidate_pool[:selection_budget]
         for parent_info in selected_parent_infos:
             self.global_selection_count += 1
             selection_count = self.global_selection_count
             parent_info["selection_count"] = selection_count
             parent_info["node"].last_selection_count = selection_count
         return selected_parent_infos
+
+    def _run_global_uncertainty_expansion_round(
+        self,
+        selected_parent_infos: List[dict],
+        horizon: int,
+        conditions: Optional[Any],
+        start: Optional[np.ndarray] = None,
+        goal: Optional[np.ndarray] = None,
+    ) -> dict:
+        """Expand globally selected parents in one mixed uncertainty batch."""
+        del start, goal  # Mixed expansion does not require raw endpoints directly.
+
+        if not selected_parent_infos:
+            return {
+                "expanded_node_infos": {},
+                "tree_batches": {},
+                "mixed_stats": {"n_selected_parents": 0, "n_candidates": 0},
+            }
+
+        selected_nodes: list = []
+        expanded_node_candidates: list = []
+        base_tree = selected_parent_infos[0]["tree"]
+        children_node_guidance_scales = base_tree.children_node_guidance_scales
+        terminal_depth = base_tree.terminal_depth
+        plan_tokens = self._require_current_plan_tokens()
+        seg_size = plan_tokens // self.sequence_dividing_factor
+
+        for parent_info in selected_parent_infos:
+            selected_tree: MCTSTreeState = parent_info["tree"]
+            opposite_tree: MCTSTreeState = parent_info["opposite_tree"]
+            selected_node: "TreeNode" = parent_info["node"]
+            parent_key = f"{selected_tree.tag}:{selected_node.name}"
+
+            if selected_node.obs is None:
+                continue
+
+            is_term = selected_node.is_terminal()
+            is_exp = selected_node.is_expandable(
+                consider_virtually_visited=(not self.parallel_multiple_visits)
+            )
+            is_sel = selected_node.is_selectable()
+            if is_term or (not is_sel and not is_exp):
+                continue
+
+            if self.leaf_parallelization:
+                # When cluster-reuse is active and this parent already has cluster_subplans,
+                # we only need ONE sentinel candidate: the actual N_c child slots will be
+                # created later by reset_children_slots in the cluster-reuse block.
+                # For parents without cluster_subplans, generate one candidate per guidance scale
+                # (standard leaf-parallelization behaviour).
+                _is_cluster_parent = (
+                    self.use_cluster_subplan_as_expansion
+                    and selected_node.cluster_subplans is not None
+                )
+                _sentinel_done = False
+                for i in range(len(children_node_guidance_scales)):
+                    if _is_cluster_parent and _sentinel_done:
+                        break
+                    child_slot = selected_node._children_nodes[i]
+                    if child_slot["node"] is not None:
+                        continue
+                    if child_slot["permanently_dead"]:
+                        continue
+                    if (not self.parallel_multiple_visits) and child_slot["virtually_visited"]:
+                        continue
+                    expanded_node_candidate = selected_node.get_expandable_candidate(
+                        index=i,
+                        consider_virtually_visited=(not self.parallel_multiple_visits),
+                    )
+                    expanded_node_candidate["selected_tree"] = selected_tree
+                    expanded_node_candidate["opposite_tree"] = opposite_tree
+                    expanded_node_candidate["parent_key"] = parent_key
+                    selected_nodes.append(selected_node)
+                    expanded_node_candidates.append(expanded_node_candidate)
+                    if _is_cluster_parent:
+                        _sentinel_done = True
+            else:
+                expanded_node_candidate = selected_node.get_expandable_candidate(
+                    index=None,
+                    consider_virtually_visited=(not self.parallel_multiple_visits),
+                )
+                expanded_node_candidate["selected_tree"] = selected_tree
+                expanded_node_candidate["opposite_tree"] = opposite_tree
+                expanded_node_candidate["parent_key"] = parent_key
+                selected_nodes.append(selected_node)
+                expanded_node_candidates.append(expanded_node_candidate)
+
+        if not expanded_node_candidates:
+            return {
+                "expanded_node_infos": {},
+                "tree_batches": {},
+                "mixed_stats": {
+                    "n_selected_parents": len(selected_parent_infos),
+                    "n_candidates": 0,
+                },
+            }
+
+        valid_candidates = [
+            info for info in expanded_node_candidates if info["parent_node"].obs is not None
+        ]
+        if not valid_candidates:
+            return {
+                "expanded_node_infos": {},
+                "tree_batches": {},
+                "mixed_stats": {
+                    "n_selected_parents": len(selected_parent_infos),
+                    "n_candidates": 0,
+                },
+            }
+
+        _is_cluster_reuse_expansion = False
+        _cluster_reuse_slot_map: dict[str, int] = {}
+        if self.use_cluster_subplan_as_expansion:
+            _old_sel_map: dict[str, tuple] = {}
+            for _oi, _info in enumerate(expanded_node_candidates):
+                _cand_key = f"{_info['selected_tree'].tag}:{_info['name']}"
+                _old_sel_map[_cand_key] = (
+                    selected_nodes[_oi],
+                    _info["selected_tree"],
+                    _info["opposite_tree"],
+                    _info["parent_key"],
+                )
+
+            _new_valid: list = []
+            _new_sel: list = []
+            for _info in valid_candidates:
+                _cand_key = f"{_info['selected_tree'].tag}:{_info['name']}"
+                _sel, _sel_tree, _opp_tree, _parent_key = _old_sel_map[_cand_key]
+                _parent = _info["parent_node"]
+                if _parent.cluster_subplans is not None:
+                    _is_cluster_reuse_expansion = True
+                    _n_clusters = len(_parent.cluster_subplans)
+                    _gs_list = [
+                        float(_cs["guidance_scale"]) for _cs in _parent.cluster_subplans
+                    ]
+                    _parent.reset_children_slots(_n_clusters, _gs_list)
+                    for _slot_i in range(_n_clusters):
+                        _cand = _parent.get_expandable_candidate(index=_slot_i)
+                        _cand["selected_tree"] = _sel_tree
+                        _cand["opposite_tree"] = _opp_tree
+                        _cand["parent_key"] = _parent_key
+                        _new_valid.append(_cand)
+                        _new_sel.append(_sel)
+                        _cluster_reuse_slot_map[
+                            f"{_sel_tree.tag}:{_cand['name']}"
+                        ] = _slot_i
+                else:
+                    _new_valid.append(_info)
+                    _new_sel.append(_sel)
+
+            if _is_cluster_reuse_expansion:
+                valid_candidates = _new_valid
+                expanded_node_candidates = _new_valid
+                selected_nodes = _new_sel
+            else:
+                expanded_node_candidates = valid_candidates
+                selected_nodes = selected_nodes[: len(valid_candidates)]
+        else:
+            expanded_node_candidates = valid_candidates
+            selected_nodes = selected_nodes[: len(valid_candidates)]
+
+        obs_mean_np = np.array(self.observation_mean)
+        obs_std_np = np.array(self.observation_std)
+        eff_obs_norm_list, eff_goal_norm_list = [], []
+
+        for info in expanded_node_candidates:
+            parent_node = info["parent_node"]
+            parent_obs = parent_node.obs
+            p_norm = torch.tensor(
+                (parent_obs - obs_mean_np) / obs_std_np,
+                dtype=torch.float32,
+                device=self.device,
+            ).unsqueeze(0)
+            eff_obs_norm_list.append(p_norm)
+
+            all_opposite_nodes = info["opposite_tree"].get_all_nodes()
+            assert len(all_opposite_nodes) > 0, "opposite_tree has no nodes"
+            target_node = self._select_dynamic_goal(
+                current_leaf_obs=parent_obs,
+                opposite_tree_all_nodes=all_opposite_nodes,
+            )
+            info["target_node"] = target_node
+            target_pos = target_node.obs
+            g_norm = torch.tensor(
+                (target_pos - obs_mean_np) / obs_std_np,
+                dtype=torch.float32,
+                device=self.device,
+            ).unsqueeze(0)
+            eff_goal_norm_list.append(g_norm)
+
+        effective_obs_normalized = torch.cat(eff_obs_norm_list, dim=0)
+        effective_goal_normalized = torch.cat(eff_goal_norm_list, dim=0)
+
+        filtered_expanded_node_plan_hists = [None] * len(expanded_node_candidates)
+        filtered_replanned_plan_hists = [None] * len(expanded_node_candidates)
+        uncertainty_plan_hists_per_candidate: list = [None] * len(expanded_node_candidates)
+        fallback_unc_plan_hists: list = [None] * len(expanded_node_candidates)
+        cluster_subplans_per_candidate: list = [None] * len(expanded_node_candidates)
+        non_terminal_cand_indices = [
+            i
+            for i, cand in enumerate(expanded_node_candidates)
+            if cand["parent_node"].depth + 1 < terminal_depth
+        ]
+        unc_noise_levels_per_cand: list = [None] * len(expanded_node_candidates)
+        unc_guidance_scale_per_cand: list = [None] * len(expanded_node_candidates)
+        expanded_node_plan_hists: Optional[torch.Tensor] = None
+        replanned_plan_hists: Optional[torch.Tensor] = None
+        expanded_node_updated_levels: Optional[np.ndarray] = None
+        values = np.zeros(len(expanded_node_candidates))
+        unc_results: dict = {}
+        achieved_indices: list[int] = []
+        mixed_stats = {
+            "n_selected_parents": len(selected_parent_infos),
+            "n_candidates": len(expanded_node_candidates),
+            "cluster_reuse": bool(_is_cluster_reuse_expansion),
+        }
+
+        for _ in range(self.num_tries_for_bad_plans):
+            expansion_start_time = time.time()
+
+            if _is_cluster_reuse_expansion:
+                cr_plan_hist_list = []
+                cr_updated_levels_list = []
+                for cinfo in expanded_node_candidates:
+                    parent = cinfo["parent_node"]
+                    assert parent.cluster_subplans is not None, (
+                        f"Cluster-reuse expansion expects parent '{parent.name}' to have "
+                        "cluster_subplans, but it is None."
+                    )
+                    cand_key = f"{cinfo['selected_tree'].tag}:{cinfo['name']}"
+                    slot_i = _cluster_reuse_slot_map[cand_key]
+                    cluster_subplan = parent.cluster_subplans[slot_i]
+                    plan_hist = cluster_subplan["plan_hist"]
+                    if not isinstance(plan_hist, torch.Tensor):
+                        plan_hist = torch.tensor(
+                            plan_hist, dtype=torch.float32, device=self.device
+                        )
+                    else:
+                        plan_hist = plan_hist.to(self.device)
+                    cr_plan_hist_list.append(plan_hist.unsqueeze(2))
+                    cr_updated_levels_list.append(
+                        np.asarray(cluster_subplan["current_levels"], dtype=np.int64)
+                    )
+                expanded_node_plan_hists = torch.cat(cr_plan_hist_list, dim=2)
+                expanded_node_updated_levels = np.concatenate(cr_updated_levels_list, axis=0)
+                expanded_node_guidance_scales = None
+                self._expansion_step_captures_by_name = {}
+            else:
+                expanded_node_plans = []
+                expanded_node_guidance_scales = []
+                prefix_len_list = []
+                for info in expanded_node_candidates:
+                    initial_plan, prefix_len = self._build_plan_from_leaf(
+                        parent_node=info["parent_node"],
+                        plan_tokens=plan_tokens,
+                        segment_size=seg_size,
+                    )
+                    expanded_node_plans.append(initial_plan)
+                    expanded_node_guidance_scales.append(info["guidance_scale"])
+                    prefix_len_list.append(prefix_len)
+
+                expanded_node_guidance_scales = torch.tensor(
+                    expanded_node_guidance_scales, device=self.device
+                )
+
+                parent_levels_list = []
+                for info in expanded_node_candidates:
+                    parent_node = info["parent_node"]
+                    if parent_node.current_levels is not None:
+                        parent_levels_list.append(parent_node.current_levels)
+                    else:
+                        plan_tokens = horizon // self.frame_stack
+                        parent_levels_list.append(
+                            np.full(
+                                (1, plan_tokens),
+                                self.sampling_timesteps,
+                                dtype=np.int64,
+                            )
+                        )
+
+                parent_levels = np.concatenate(parent_levels_list, axis=0)
+                expanded_node_noise_levels = self._generate_bidirectional_schedule(
+                    parent_levels,
+                    prefix_len_per_batch=np.array(prefix_len_list, dtype=int),
+                )
+                expanded_node_updated_levels = expanded_node_noise_levels[:, -1, :]
+                self._current_tree_tag = "mixed"
+
+                parent_to_gid: dict[str, int] = {}
+                group_ids: list[int] = []
+                for cand in expanded_node_candidates:
+                    parent_key = cand["parent_key"]
+                    if parent_key not in parent_to_gid:
+                        parent_to_gid[parent_key] = len(parent_to_gid)
+                    group_ids.append(parent_to_gid[parent_key])
+
+                expanded_node_plan_hists = self.parallel_plan(
+                    start=effective_obs_normalized,
+                    goal=effective_goal_normalized,
+                    horizon=horizon,
+                    conditions=conditions,
+                    guidance_scale=expanded_node_guidance_scales,
+                    noise_level=expanded_node_noise_levels,
+                    plans=expanded_node_plans,
+                    prefix_len_list=prefix_len_list,
+                    particle_guidance_scale=self.particle_guidance_scale,
+                    group_ids=group_ids,
+                    call_type="expansion",
+                )
+
+            raw_captures = getattr(self, "_parallel_plan_step_captures", None)
+            exp_sc_by_global_key: dict[str, list] = {}
+            if raw_captures:
+                for sci, cand in enumerate(expanded_node_candidates):
+                    exp_sc_by_global_key[f"{cand['selected_tree'].tag}:{cand['name']}"] = [
+                        {
+                            "prior_pred_noise": step["prior_pred_noise"][:, sci]
+                            if step["prior_pred_noise"] is not None
+                            else None,
+                            "guidance_grads": {
+                                k: v[:, sci] for k, v in step["guidance_grads"].items()
+                            },
+                            "guidance_grads_clean": {
+                                k: v[:, sci]
+                                for k, v in step.get("guidance_grads_clean", {}).items()
+                            },
+                            "guidance_xstart_displacements": {
+                                k: v[:, sci]
+                                for k, v in step.get(
+                                    "guidance_xstart_displacements", {}
+                                ).items()
+                            },
+                            "pred_x_start_pos": step["pred_x_start_pos"][:, sci]
+                            if step.get("pred_x_start_pos") is not None
+                            else None,
+                            "pred_x_start_pos_after": step["pred_x_start_pos_after"][:, sci]
+                            if step.get("pred_x_start_pos_after") is not None
+                            else None,
+                            "noise_level": step["noise_level"][:, sci]
+                            if step.get("noise_level") is not None
+                            else None,
+                        }
+                        for step in raw_captures
+                    ]
+
+            g_losses = getattr(self, "_last_guidance_losses", {})
+            if g_losses or expanded_node_guidance_scales is not None:
+                final_plan = self._unnormalize_x(expanded_node_plan_hists[-1])
+                goal_unnorm = self._unnormalize_x(effective_goal_normalized)
+                final_pos = (
+                    final_plan[-1, :, self.pos_dim_indices].detach().cpu().numpy()
+                )
+                goal_pos = goal_unnorm[:, self.pos_dim_indices].detach().cpu().numpy()
+                dist_per_batch = np.linalg.norm(final_pos - goal_pos, axis=-1).tolist()
+                scales = (
+                    expanded_node_guidance_scales.tolist()
+                    if hasattr(expanded_node_guidance_scales, "tolist")
+                    else list(expanded_node_guidance_scales)
+                    if expanded_node_guidance_scales is not None
+                    else []
+                )
+                eff_scale = float(np.mean(scales)) if scales else 0.0
+                self._glog(
+                    "guidance.combined",
+                    {
+                        "tree_tag": "mixed",
+                        "global_parent_count": self.global_search_num,
+                        "eff_goal_scale": eff_scale,
+                        "batch_size": len(expanded_node_candidates),
+                        "dist_per_batch": [round(d, 4) for d in dist_per_batch],
+                        "final_token_dist": round(float(np.mean(dist_per_batch)), 4),
+                        "anchor_loss": round(g_losses.get("anchor", 0.0), 6),
+                        "goal_loss": round(g_losses.get("goal", 0.0), 6),
+                        "rdf_loss": round(g_losses.get("rdf", 0.0), 6),
+                        "particle_loss": round(g_losses.get("particle", 0.0), 6),
+                        "goal_anchor_ratio": round(
+                            abs(g_losses.get("goal", 0.0))
+                            / (abs(g_losses.get("anchor", 1e-9)) + 1e-9),
+                            4,
+                        ),
+                    },
+                    depth=1,
+                )
+
+            if raw_captures and len(raw_captures) > 1:
+                last_cap = raw_captures[-1]
+                prior_noise = last_cap.get("prior_pred_noise")
+                guidance_grads = last_cap.get("guidance_grads", {})
+                if prior_noise is not None and guidance_grads:
+                    prior_norm = float(prior_noise.norm().item())
+                    guidance_norms = {
+                        k: round(float(v.norm().item()), 6)
+                        for k, v in guidance_grads.items()
+                    }
+                    guidance_total = sum(guidance_norms.values())
+                    self._glog(
+                        "diffusion.grad_comparison",
+                        {
+                            "tree_tag": "mixed",
+                            "global_parent_count": self.global_search_num,
+                            "prior_norm": round(prior_norm, 6),
+                            "guidance_total_norm": round(guidance_total, 6),
+                            "ratio": round(guidance_total / (prior_norm + 1e-9), 4),
+                            "per_guidance_norms": guidance_norms,
+                        },
+                        depth=1,
+                    )
+
+            assert expanded_node_plan_hists.ndim == 4
+            assert expanded_node_plan_hists.shape[2] == len(expanded_node_candidates)
+            mixed_stats["expansion_ms"] = round(
+                (time.time() - expansion_start_time) * 1000, 1
+            )
+
+            replanning_start_time = time.time()
+
+            def check_feasibility(plan_hists):
+                plans = (
+                    self._unnormalize_x(plan_hists[-1])[:-1].detach().cpu().numpy()
+                )
+
+                def get_root_obs(node):
+                    padding_node = node
+                    while padding_node._parent_node is not None:
+                        padding_node = padding_node._parent_node
+                    return padding_node.obs
+
+                parent_node_list = [
+                    expanded_node_candidates[i]["parent_node"]
+                    for i in range(plans.shape[1])
+                ]
+                root_obs_list = [get_root_obs(i) for i in parent_node_list]
+                if all(p is not None for p in root_obs_list):
+                    root_obs_np = np.stack(root_obs_list, axis=0)[np.newaxis]
+                    plans = np.concatenate([root_obs_np, plans], axis=0)
+
+                plan_len, batch_size, channels = plans[:-1].shape
+                diffs = self._compute_distance(
+                    plans[:-1].reshape(plan_len * batch_size, channels),
+                    plans[1:].reshape(plan_len * batch_size, channels),
+                ).reshape(plan_len, batch_size)
+
+                is_proximal = [False] * batch_size
+                for i in range(batch_size):
+                    is_proximal[i] = np.all(diffs[:, i] < self.plan_feasibility_delta)
+
+                is_not_stagnant = [False] * batch_size
+                if self.min_progress_threshold > 0.0:
+                    for i, parent_node in enumerate(parent_node_list):
+                        if parent_node.obs is not None:
+                            progress = float(
+                                self._compute_distance(
+                                    parent_node.obs[np.newaxis],
+                                    plans[-1, i][np.newaxis],
+                                )[0]
+                            )
+                            if progress > self.min_progress_threshold:
+                                is_not_stagnant[i] = True
+
+                return [
+                    is_proximal[i] and is_not_stagnant[i] for i in range(batch_size)
+                ]
+
+            if not self.mcts_use_replan:
+                replanned_plan_hists = expanded_node_plan_hists
+                val_plan_hists = expanded_node_plan_hists
+            else:
+                replan_init_plans = []
+                for i in range(len(expanded_node_candidates)):
+                    plan_t_fs = expanded_node_plan_hists[-1, :, i].unsqueeze(1)
+                    plan_tokens = horizon // self.frame_stack
+                    plan_rearranged = rearrange(
+                        plan_t_fs, "(t fs) b c -> t b (fs c)", fs=self.frame_stack
+                    )
+                    parent_node = expanded_node_candidates[i]["parent_node"]
+                    sim_plan, _ = self._build_plan_from_leaf(
+                        parent_node, plan_tokens, seg_size, expanded_plan=plan_rearranged
+                    )
+                    replan_init_plans.append(sim_plan)
+
+                assert expanded_node_updated_levels is not None
+                replan_initial_levels = np.concatenate(
+                    [expanded_node_updated_levels[i : i + 1] for i in range(len(expanded_node_candidates))],
+                    axis=0,
+                )
+                replan_prefix_len_per_batch = np.array(
+                    [
+                        (expanded_node_candidates[i]["parent_node"].depth + 1) * seg_size
+                        for i in range(len(expanded_node_candidates))
+                    ],
+                    dtype=int,
+                )
+                replan_noise_levels = self._generate_bidirectional_schedule(
+                    replan_initial_levels,
+                    prefix_len_per_batch=replan_prefix_len_per_batch,
+                    is_replanning=True,
+                )
+                replanned_plan_hists = self.parallel_plan(
+                    effective_obs_normalized,
+                    effective_goal_normalized,
+                    horizon,
+                    conditions,
+                    guidance_scale=torch.zeros(
+                        len(expanded_node_candidates), device=self.device
+                    ),
+                    noise_level=replan_noise_levels,
+                    plans=replan_init_plans,
+                    prefix_len_list=[
+                        (expanded_node_candidates[i]["parent_node"].depth) * seg_size
+                        for i in range(len(expanded_node_candidates))
+                    ],
+                    call_type="replan",
+                )
+                assert replanned_plan_hists.ndim == 4
+                assert replanned_plan_hists.shape[2] == len(expanded_node_candidates)
+                val_plan_hists = replanned_plan_hists
+
+            is_feasible = check_feasibility(val_plan_hists)
+
+            if non_terminal_cand_indices:
+                assert expanded_node_updated_levels is not None, (
+                    "expanded_node_updated_levels must be set for uncertainty sampling"
+                )
+                nt_parent_nodes = [
+                    expanded_node_candidates[i]["parent_node"]
+                    for i in non_terminal_cand_indices
+                ]
+                nt_val_plan_last = val_plan_hists[-1][:, non_terminal_cand_indices, :]
+                nt_updated_levels = expanded_node_updated_levels[non_terminal_cand_indices]
+                nt_idx_tensor = torch.tensor(
+                    non_terminal_cand_indices, device=effective_obs_normalized.device
+                )
+                nt_obs_norm = effective_obs_normalized[nt_idx_tensor]
+
+                unc_fast_result = self._run_fast_uncertainty_sampling(
+                    parent_nodes=nt_parent_nodes,
+                    val_plan_last_batch=nt_val_plan_last,
+                    updated_levels=nt_updated_levels,
+                    current_prefix_len_per_batch=np.array(
+                        [
+                            expanded_node_candidates[i]["depth"] * seg_size
+                            for i in non_terminal_cand_indices
+                        ],
+                        dtype=int,
+                    ),
+                    seg_size=seg_size,
+                    horizon=horizon,
+                    conditions=conditions,
+                    obs_normalized=nt_obs_norm,
+                    opposite_tree=None,
+                    obs_mean_np=obs_mean_np,
+                    obs_std_np=obs_std_np,
+                    opposite_trees=[
+                        expanded_node_candidates[i]["opposite_tree"]
+                        for i in non_terminal_cand_indices
+                    ],
+                )
+
+                for ii, i in enumerate(non_terminal_cand_indices):
+                    unc_hist = unc_fast_result["unc_hists_per_cand"][ii]
+                    fallback_unc_plan_hists[i] = unc_hist
+                    uncertainty_plan_hists_per_candidate[i] = unc_hist
+                    if unc_noise_levels_per_cand[i] is None:
+                        unc_noise_levels_per_cand[i] = (
+                            unc_fast_result["unc_noise_levels_per_cand"][ii]
+                        )
+                        unc_guidance_scale_per_cand[i] = (
+                            unc_fast_result["unc_guidance_scale_per_cand"][ii]
+                        )
+
+            for i in range(len(is_feasible)):
+                if is_feasible[i] and filtered_expanded_node_plan_hists[i] is None:
+                    filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[:, :, i]
+                    filtered_replanned_plan_hists[i] = val_plan_hists[:, :, i]
+
+            for i in range(len(expanded_node_candidates)):
+                if filtered_expanded_node_plan_hists[i] is None:
+                    uncertainty_plan_hists_per_candidate[i] = None
+
+            if None in filtered_expanded_node_plan_hists:
+                mixed_stats["replanning_ms"] = round(
+                    (time.time() - replanning_start_time) * 1000, 1
+                )
+                continue
+            break
+
+        assert expanded_node_plan_hists is not None
+        assert replanned_plan_hists is not None
+
+        final_is_feasible = [
+            fh is not None for fh in filtered_expanded_node_plan_hists
+        ]
+        for i in range(len(filtered_expanded_node_plan_hists)):
+            if filtered_expanded_node_plan_hists[i] is None:
+                filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[:, :, i]
+                filtered_replanned_plan_hists[i] = replanned_plan_hists[:, :, i]
+                if uncertainty_plan_hists_per_candidate[i] is None:
+                    uncertainty_plan_hists_per_candidate[i] = fallback_unc_plan_hists[i]
+
+        expanded_node_plan_hists = torch.stack(filtered_expanded_node_plan_hists, dim=2)
+        replanned_plan_hists = torch.stack(filtered_replanned_plan_hists, dim=2)
+
+        final_best_plans = replanned_plan_hists[-1]
+        achieved_infos, achieved_ts = self._check_achieved_bidir(
+            expanded_node_candidates,
+            final_best_plans,
+        )
+        tree_achieved_flags: dict[str, bool] = {}
+        for i in range(len(achieved_infos)):
+            if achieved_infos[i] == "Achieved":
+                achieved_indices.append(i)
+                tree_tag = expanded_node_candidates[i]["selected_tree"].tag
+                tree_achieved_flags[tree_tag] = True
+
+        terminal_cand_indices = [
+            i
+            for i, cand in enumerate(expanded_node_candidates)
+            if cand["depth"] >= terminal_depth
+        ]
+        for i in terminal_cand_indices:
+            values[i] = -np.inf
+            unc_results[i] = {"U": np.inf}
+
+        if non_terminal_cand_indices:
+            nt_unc_hists = [
+                uncertainty_plan_hists_per_candidate[i] for i in non_terminal_cand_indices
+            ]
+            for ii, i in enumerate(non_terminal_cand_indices):
+                assert nt_unc_hists[ii] is not None, (
+                    f"[Uncertainty] uncertainty_plan_hists_per_candidate[{i}] is None "
+                    "after fallback injection — this should not happen."
+                )
+            nt_curr_plan_last = expanded_node_plan_hists[-1][:, non_terminal_cand_indices, :]
+            nt_depths = [
+                expanded_node_candidates[i]["depth"] for i in non_terminal_cand_indices
+            ]
+            nt_target_nodes = [
+                expanded_node_candidates[i]["target_node"]
+                for i in non_terminal_cand_indices
+            ]
+            nt_noise_levels = [
+                unc_noise_levels_per_cand[i] for i in non_terminal_cand_indices
+            ]
+            nt_guidance_scales = [
+                unc_guidance_scale_per_cand[i] for i in non_terminal_cand_indices
+            ]
+
+            unc_compute_result = self._compute_uncertainty_and_clusters(
+                unc_hists_per_cand=nt_unc_hists,
+                curr_plan_last_batch=nt_curr_plan_last,
+                node_depths=nt_depths,
+                seg_size=seg_size,
+                unc_noise_levels_per_cand=nt_noise_levels,
+                unc_guidance_scale_per_cand=nt_guidance_scales,
+                target_nodes=nt_target_nodes,
+            )
+            for ii, i in enumerate(non_terminal_cand_indices):
+                values[i] = unc_compute_result["values"][ii]
+                unc_results[i] = unc_compute_result["unc_results"][ii]
+                cluster_subplans_per_candidate[i] = unc_compute_result["cluster_subplans"][ii]
+
+        candidate_obses = []
+        for i in range(len(expanded_node_candidates)):
+            child_depth = expanded_node_candidates[i]["depth"]
+            plan_hists_last_i = expanded_node_plan_hists[-1, :, i]
+            obs_i = self._extract_obs_at_boundary(
+                plan_hists_last_i.unsqueeze(1),
+                depth=child_depth,
+                seg_size=seg_size,
+            )[0]
+            candidate_obses.append(obs_i)
+
+        is_kept = self._deduplicate_by_endpoint(
+            expanded_node_candidates,
+            candidate_obses,
+            final_is_feasible,
+        )
+
+        expanded_node_infos: dict[str, dict] = {}
+        for i in range(len(expanded_node_candidates)):
+            candidate = expanded_node_candidates[i]
+            name = candidate["name"]
+            selected_tree = candidate["selected_tree"]
+            global_name = f"{selected_tree.tag}:{name}"
+            slot_index = int(name.split("-")[-1])
+            parent_node = candidate["parent_node"]
+            if not is_kept[i]:
+                parent_node.mark_slot_permanently_dead(slot_index)
+                continue
+            parent_node._children_nodes[slot_index]["virtually_visited"] = False
+
+            if global_name not in expanded_node_infos:
+                expanded_node_infos[global_name] = candidate
+                expanded_node_infos[global_name]["plan_history"].append([])
+
+            value = values[i]
+            plan_hist = (
+                expanded_node_plan_hists[:, :, i]
+                if not self.mcts_use_replan
+                else replanned_plan_hists[:, :, i]
+            )
+            replanned_plan = replanned_plan_hists[-1, :, i]
+            updated_level = (
+                expanded_node_updated_levels[i : i + 1]
+                if expanded_node_updated_levels is not None
+                else None
+            )
+
+            if expanded_node_infos[global_name]["value"] is None or value > expanded_node_infos[global_name]["value"]:
+                expanded_node_infos[global_name]["value"] = value
+                expanded_node_infos[global_name]["replanned_plan"] = replanned_plan
+                expanded_node_infos[global_name]["plan_history"][-1] = plan_hist
+                expanded_node_infos[global_name]["expanded_plan_hist_frame"] = (
+                    expanded_node_plan_hists[:, :, i]
+                )
+                expanded_node_infos[global_name]["replanned_plan_hist_frame"] = (
+                    replanned_plan_hists[:, :, i] if self.mcts_use_replan else None
+                )
+                expanded_node_infos[global_name]["uncertainty_plan_hist_frame"] = (
+                    uncertainty_plan_hists_per_candidate[i]
+                )
+                expanded_node_infos[global_name]["unc_diagnostics"] = unc_results.get(i)
+                expanded_node_infos[global_name]["current_levels"] = updated_level
+                expanded_node_infos[global_name]["cluster_subplans"] = (
+                    cluster_subplans_per_candidate[i]
+                )
+
+        for global_name, info in expanded_node_infos.items():
+            parent_node_for_expand = info["parent_node"]
+            expand_kwargs = {
+                k: v
+                for k, v in info.items()
+                if k
+                not in (
+                    "expanded_plan_hist_frame",
+                    "replanned_plan_hist_frame",
+                    "uncertainty_plan_hist_frame",
+                    "unc_diagnostics",
+                    "selected_tree",
+                    "opposite_tree",
+                    "parent_key",
+                    "node",
+                )
+            }
+            child_node = parent_node_for_expand.expand(**expand_kwargs)
+            info["node"] = child_node
+
+        tree_batches: dict[str, dict] = {}
+        for global_idx, candidate in enumerate(expanded_node_candidates):
+            selected_tree = candidate["selected_tree"]
+            tree_tag = selected_tree.tag
+            batch = tree_batches.setdefault(
+                tree_tag,
+                {
+                    "tree": selected_tree,
+                    "tree_indices": [],
+                    "selected_nodes": [],
+                    "expanded_node_infos": {},
+                    "step_captures_by_name": {},
+                    "had_achieved": False,
+                },
+            )
+            batch["tree_indices"].append(global_idx)
+            batch["selected_nodes"].append(selected_nodes[global_idx])
+            if tree_achieved_flags.get(tree_tag):
+                batch["had_achieved"] = True
+
+        for global_name, info in expanded_node_infos.items():
+            tree_tag = info["selected_tree"].tag
+            tree_batches[tree_tag]["expanded_node_infos"][info["name"]] = info
+
+        for tree_tag, batch in tree_batches.items():
+            indices = batch.pop("tree_indices")
+            batch["expanded_node_candidates"] = [
+                expanded_node_candidates[i] for i in indices
+            ]
+            batch["values"] = np.asarray([values[i] for i in indices], dtype=np.float32)
+            batch["achieved_indices"] = [
+                local_i for local_i, global_i in enumerate(indices) if global_i in achieved_indices
+            ]
+            batch["expanded_node_plan_hists"] = expanded_node_plan_hists[:, :, indices, :]
+            batch["replanned_plan_hists"] = replanned_plan_hists[:, :, indices, :]
+            for global_i in indices:
+                candidate = expanded_node_candidates[global_i]
+                global_cand_key = f"{tree_tag}:{candidate['name']}"
+                if global_cand_key in exp_sc_by_global_key:
+                    batch["step_captures_by_name"][candidate["name"]] = exp_sc_by_global_key[
+                        global_cand_key
+                    ]
+
+        self._expansion_step_captures_by_name = {}
+        return {
+            "expanded_node_infos": expanded_node_infos,
+            "tree_batches": tree_batches,
+            "mixed_stats": mixed_stats,
+        }
+
+    def _visualize_tree_final_plans(
+        self,
+        tree: MCTSTreeState,
+        tree_batch: dict,
+        start: torch.Tensor,
+        goal: torch.Tensor,
+        viz_step: int,
+    ) -> None:
+        """Visualize terminal candidate plans for a single tree batch."""
+        viz_fp_t0 = time.time()
+        viz_fp_node_ms = 0.0
+        viz_fp_compare_ms = 0.0
+        if self.viz_final_plans and tree_batch["expanded_node_candidates"]:
+            expanded_node_candidates = tree_batch["expanded_node_candidates"]
+            values = tree_batch["values"]
+            achieved_indices = tree_batch["achieved_indices"]
+            expanded_node_plan_hists = tree_batch["expanded_node_plan_hists"]
+            replanned_plan_hists = tree_batch["replanned_plan_hists"]
+            seg_size = self._require_current_plan_tokens() // self.sequence_dividing_factor
+            terminal_depth_indices = [
+                i
+                for i, info in enumerate(expanded_node_candidates)
+                if info["depth"] == tree.terminal_depth
+            ]
+
+            if tree_batch.get("had_achieved", False):
+                visualize_indices = sorted(
+                    set(terminal_depth_indices) | set(achieved_indices)
+                )
+            else:
+                visualize_indices = sorted(terminal_depth_indices)
+
+            if visualize_indices:
+                terminal_values = values[visualize_indices]
+                terminal_names = [
+                    expanded_node_candidates[i]["name"] for i in visualize_indices
+                ]
+                terminal_expanded_plans = expanded_node_plan_hists[
+                    -1, :, visualize_indices
+                ]
+                is_achieved_plan = [
+                    i in achieved_indices for i in visualize_indices
+                ]
+                is_forward_tree = "from_goal" not in tree.tag
+                visualize_valid_frame_bounds = [
+                    self._get_plan_viz_valid_frame_bounds(
+                        expanded_node_candidates[i]["depth"],
+                        seg_size,
+                        terminal_expanded_plans.shape[0],
+                        is_forward_tree,
+                    )
+                    for i in visualize_indices
+                ]
+
+                if not is_forward_tree:
+                    terminal_expanded_plans = torch.flip(terminal_expanded_plans, [0])
+
+                viz_node_t0 = time.time()
+                self.visualize_node_value_plans(
+                    is_achieved_plan,
+                    viz_step,
+                    terminal_values,
+                    terminal_names,
+                    terminal_expanded_plans,
+                    start,
+                    goal,
+                    tag=tree.tag,
+                    valid_frame_bounds=visualize_valid_frame_bounds,
+                )
+                viz_fp_node_ms = (time.time() - viz_node_t0) * 1000
+
+                if self.viz_compare_expanded_to_value:
+                    viz_cmp_t0 = time.time()
+                    terminal_value_plans = replanned_plan_hists[
+                        -1, :, visualize_indices
+                    ]
+                    if "from_goal" in tree.tag:
+                        terminal_value_plans = torch.flip(terminal_value_plans, [0])
+                    self.visualize_expanded_vs_value_plans(
+                        is_achieved_plan,
+                        terminal_names,
+                        terminal_expanded_plans,
+                        terminal_value_plans,
+                        start,
+                        goal,
+                    )
+                    viz_fp_compare_ms = (time.time() - viz_cmp_t0) * 1000
+
+        viz_fp_total_ms = (time.time() - viz_fp_t0) * 1000
+        self._tlog(
+            "timing.viz_final_plans",
+            {
+                "tree_tag": tree.tag,
+                "node_value_ms": round(viz_fp_node_ms, 1),
+                "compare_ms": round(viz_fp_compare_ms, 1),
+                "total_ms": round(viz_fp_total_ms, 1),
+            },
+            depth=1,
+        )
+
+    def _postprocess_tree_local_expansions(
+        self,
+        tree_batches: dict[str, dict],
+        agent,
+        envs,
+        start: torch.Tensor,
+        goal: torch.Tensor,
+        loops: int,
+    ) -> None:
+        """Run tree-local backprop, state rollout, and visualization after mixed expansion."""
+        original_step_captures = getattr(self, "_expansion_step_captures_by_name", {})
+        try:
+            for tree_batch in tree_batches.values():
+                tree: MCTSTreeState = tree_batch["tree"]
+                expanded_node_infos = tree_batch["expanded_node_infos"]
+
+                backprop_start_time = time.time()
+                created_parent_nodes = {}
+                for info in expanded_node_infos.values():
+                    created_parent_nodes[id(info["parent_node"])] = info["parent_node"]
+                for selected_node in created_parent_nodes.values():
+                    selected_node.backpropagate(
+                        preserve_value=self.use_uncertainty_as_value,
+                    )
+                tree.backprop_time.append(time.time() - backprop_start_time)
+
+                if tree_batch.get("had_achieved", False):
+                    tree.achieved = True
+                if expanded_node_infos:
+                    tree.max_depth = max(
+                        tree.max_depth,
+                        max(info["depth"] for info in expanded_node_infos.values()),
+                    )
+
+                self._expansion_step_captures_by_name = tree_batch.get(
+                    "step_captures_by_name", {}
+                )
+                if expanded_node_infos:
+                    self._update_expanded_children_state(
+                        tree,
+                        expanded_node_infos,
+                        agent,
+                        envs,
+                    )
+                    self._log_expanded_node_videos(
+                        expanded_node_infos,
+                        tree,
+                        start,
+                        goal,
+                        loops,
+                    )
+                self._visualize_tree_final_plans(
+                    tree,
+                    tree_batch,
+                    start,
+                    goal,
+                    viz_step=self.global_search_num,
+                )
+        finally:
+            self._expansion_step_captures_by_name = original_step_captures
 
     def _update_expanded_children_state(
         self,
@@ -3988,7 +5418,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     plan_hist_last.unsqueeze(1)
                 )
 
-                seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
+                seg_size: int = self._require_current_plan_tokens() // self.sequence_dividing_factor
                 new_denoised_start: int = self._get_prefix_len_frames_from_depth(
                     parent_node.depth, seg_size
                 )
@@ -4011,7 +5441,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     [_new_sim_state["qpos"], _new_sim_state["qvel"]]
                 )[self.obs_dim_indices]
         else:
-            seg_size: int = active_tree.plan_tokens // self.sequence_dividing_factor
+            seg_size: int = self._require_current_plan_tokens() // self.sequence_dividing_factor
             for info in expanded_node_infos.values():
                 parent_node: "TreeNode" = info["parent_node"]
                 _child: Optional["TreeNode"] = info.get("node")
@@ -4032,6 +5462,51 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     else:
                         _child.sim_state[k] = v
                 _child.sim_state["qpos"][:2] = _child.obs[self.pos_dim_indices]
+
+    def _log_root_uncertainty_videos(
+        self,
+        root_uncertainty_infos: dict[str, dict],
+        trees: List[MCTSTreeState],
+        start: torch.Tensor,
+        goal: torch.Tensor,
+        loops: int,
+    ) -> None:
+        """Log root fast-sampling uncertainty videos before the first expansion round."""
+        if not self.viz_uncertain_next_subplan_last_obs or not root_uncertainty_infos:
+            return
+
+        trees_by_tag = {tree.tag: tree for tree in trees}
+        _v_start_np = start.cpu().numpy()[:, self.pos_dim_indices]
+        _v_goal_np = goal.cpu().numpy()[:, self.pos_dim_indices]
+        _v_hilp_fn = getattr(self, "_hilp_value_fn_instance", None)
+        _v_tgt_vis_cache: dict = {}
+        _v_obs_std_np = (
+            self.data_std.cpu().numpy() if isinstance(self.data_std, torch.Tensor)
+            else np.array(self.data_std)
+        )[self.pos_dim_indices]
+
+        for tree_tag, root_vinfo in root_uncertainty_infos.items():
+            active_tree = trees_by_tag.get(tree_tag)
+            if active_tree is None:
+                continue
+            _unc_hist = root_vinfo.get("uncertainty_plan_hist_frame")
+            if _unc_hist is None:
+                continue
+            self._log_candidate_plan_video(
+                f"{tree_tag}:root",
+                root_vinfo,
+                active_tree,
+                _v_start_np,
+                _v_goal_np,
+                _v_hilp_fn,
+                _v_tgt_vis_cache,
+                {},
+                _v_obs_std_np,
+                loops,
+                log_prefix="uncertainty_estimate",
+                plan_hist_override=_unc_hist,
+                is_uncertainty_viz=True,
+            )
 
     def _log_expanded_node_videos(
         self,
@@ -4056,24 +5531,26 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         _viz_subplan_replan_ms = 0.0
         _viz_subplan_unc_ms = 0.0
         _viz_subplan_n = 0
-        for _vname, _vinfo in (expanded_node_infos.items() if self.viz_subplan_denoising else []):
+        for _vname, _vinfo in (expanded_node_infos.items()):
             _viz_subplan_n += 1
-            _viz_t0 = time.time()
-            self._log_candidate_plan_video(
-                _vname,
-                _vinfo,
-                active_tree,
-                _v_start_np,
-                _v_goal_np,
-                _v_hilp_fn,
-                _v_tgt_vis_cache,
-                _v_sc_by_name,
-                _v_obs_std_np,
-                loops,
-                log_prefix="expanded",
-                plan_hist_override=_vinfo.get("expanded_plan_hist_frame"),
-            )
-            _viz_subplan_expand_ms += (time.time() - _viz_t0) * 1000
+            
+            if self.viz_subplan_denoising:
+                _viz_t0 = time.time()
+                self._log_candidate_plan_video(
+                    _vname,
+                    _vinfo,
+                    active_tree,
+                    _v_start_np,
+                    _v_goal_np,
+                    _v_hilp_fn,
+                    _v_tgt_vis_cache,
+                    _v_sc_by_name,
+                    _v_obs_std_np,
+                    loops,
+                    log_prefix="expanded",
+                    plan_hist_override=_vinfo.get("expanded_plan_hist_frame"),
+                )
+                _viz_subplan_expand_ms += (time.time() - _viz_t0) * 1000
 
             if self.mcts_use_replan and self.viz_replanning and _vinfo.get("replanned_plan_hist_frame") is not None:
                 _viz_t0 = time.time()
@@ -4093,11 +5570,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 )
                 _viz_subplan_replan_ms += (time.time() - _viz_t0) * 1000
 
-            if (
+            _unc_hist = _vinfo.get("uncertainty_plan_hist_frame")
+            _should_log_unc = (
                 self.viz_uncertain_next_subplan_last_obs
-                and _vinfo.get("uncertainty_plan_hist_frame") is not None
+                and _unc_hist is not None
                 and _vinfo.get("depth", 0) < active_tree.terminal_depth
-            ):
+            )
+            if _should_log_unc:
                 _viz_t0 = time.time()
                 self._log_candidate_plan_video(
                     _vname,

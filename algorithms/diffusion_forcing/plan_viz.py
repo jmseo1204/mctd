@@ -13,7 +13,6 @@ All methods reference `self.*` attributes/methods provided by the base class or 
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from typing import Optional
@@ -96,7 +95,7 @@ class PlanVizMixin:
     def _compute_guidance_grad_fields(
         self,
         target_pos: np.ndarray,
-        grid_step: float = 1.0,
+        grid_step: float = 2.0,
     ) -> Optional[dict]:
         """
         Compute HILP gradient field over the maze for visualization.
@@ -265,12 +264,15 @@ class PlanVizMixin:
                 dots with alpha proportional to relative guidance-scale intensity.
         """
         vnode = vinfo.get("node")
-        if vnode is None or not vnode.plan_history:
+        if vnode is None:
+            return
+        if plan_hist_override is None and not vnode.plan_history:
             return
 
         hist = plan_hist_override if plan_hist_override is not None else vnode.plan_history[-1]  # (steps, plan_tokens*fs, [G*K,] c)
-        seg_size = active_tree.plan_tokens // self.sequence_dividing_factor
+        seg_size = self._require_current_plan_tokens() // self.sequence_dividing_factor
         alen = self._get_denoised_frame_prefix_len(vnode.depth, seg_size, hist.shape[1])
+        target_node = getattr(vnode, "target_node", None) or vinfo.get("target_node")
 
         if is_uncertainty_viz and plan_hist_override is not None:
             # In uncertainty mode the endpoint is the NEXT segment boundary.
@@ -301,23 +303,31 @@ class PlanVizMixin:
                 (f"gs={s:.3g}", _scale_rgbs[i])
                 for i, s in enumerate(scales)
             ]
+            # Per-sample cluster labels from unc_diagnostics (computed once, same across frames).
+            _unc_diag = vinfo.get("unc_diagnostics")
+            unc_cluster_labels = (
+                np.asarray(_unc_diag["cluster_labels"], dtype=int)
+                if _unc_diag is not None and "cluster_labels" in _unc_diag
+                else None
+            )
         else:
             unc_alen = None
             unc_scale_colors = None
             unc_guidance_legend = None
+            unc_cluster_labels = None
             # Single guidance-target index: end of the currently denoised segment.
             tail_vis = np.array([alen - 1]) if alen > 0 else np.array([], dtype=int)
 
         node_traj = self._extract_node_trajectory(vnode)
         is_fwd = active_tree.is_tree1
         tgt_node_traj = (
-            self._extract_node_trajectory(vnode.target_node)
-            if vnode.target_node is not None
+            self._extract_node_trajectory(target_node)
+            if target_node is not None
             else None
         )
         tgt_pos = (
-            vnode.target_node.obs
-            if vnode.target_node is not None and getattr(vnode.target_node, 'obs', None) is not None
+            target_node.obs
+            if target_node is not None and getattr(target_node, 'obs', None) is not None
             else None
         )
 
@@ -325,7 +335,7 @@ class PlanVizMixin:
         cand_heatmap = None
         cand_grad_field = None
         if tgt_pos is not None and hilp_fn is not None:
-            tgt_name = getattr(vnode.target_node, 'name', None)
+            tgt_name = getattr(target_node, 'name', None)
             if tgt_name is not None and tgt_name in tgt_vis_cache:
                 cand_heatmap, cand_grad_field = tgt_vis_cache[tgt_name]
             else:
@@ -362,14 +372,21 @@ class PlanVizMixin:
                         f"V_int={_fmt_sci(unc_diag.get('V_int', 0.0))}\n"
                         f"V_eg={_fmt_sci(unc_diag.get('V_ext_g', 0.0))}\n"
                         f"V_ec={_fmt_sci(unc_diag.get('V_ext_c', 0.0))}\n"
-                        f"U={_fmt_sci(unc_diag.get('U', 0.0))}"
+                        f"U={_fmt_sci(unc_diag.get('U', 0.0))}\n"
+                        f"n_cl={unc_diag.get('n_clusters', '?')}"
+                    )
+                elif _umode == 'cluster':
+                    node_unc_label = (
+                        f"U={_fmt_sci(unc_diag.get('U', 0.0))}\n"
+                        f"n_cl={unc_diag.get('n_clusters', '?')}"
                     )
                 else:
                     node_unc_label = (
                         f"H_R={_fmt_sci(unc_diag.get('H_R', 0.0))}\n"
                         f"H_A={_fmt_sci(unc_diag.get('H_A', 0.0))}\n"
                         f"C_g={_fmt_sci(unc_diag.get('C_geom_hat', 0.0))}\n"
-                        f"T_curr={_fmt_sci(unc_diag.get('T_curr', 0.0))}"
+                        f"T_curr={_fmt_sci(unc_diag.get('T_curr', 0.0))}\n"
+                        f"n_cl={unc_diag.get('n_clusters', '?')}"
                     )
 
         # Expanded node position (world coords) used as anchor for labels.
@@ -540,6 +557,7 @@ class PlanVizMixin:
                 'unc_guidance_targets': unc_guidance_targets,
                 'unc_scale_colors': unc_scale_colors_frame,
                 'unc_guidance_legend': unc_guidance_legend,
+                'unc_cluster_labels': unc_cluster_labels,
                 'tail_dot_color': tail_dot_color,
                 # Value & uncertainty labels (same for every denoising-step frame)
                 'expanded_node_pos': expanded_node_pos,
@@ -564,7 +582,7 @@ class PlanVizMixin:
         if len(frames) <= 1:
             return  # skip single-frame (zero-length) video upload
         video = np.stack(frames, axis=0).transpose(0, 3, 1, 2)  # (K, 3, H, W)
-        label = self._node_path_label(vnode, active_tree.is_tree1, vnode.target_node)
+        label = self._node_path_label(vnode, active_tree.is_tree1, target_node)
         selection_count = vinfo.get("selection_count", getattr(vnode, "selection_count", None))
         label_with_count = (
             f"[{selection_count}]_{label}"
@@ -572,26 +590,6 @@ class PlanVizMixin:
             else label
         )
         video_step = self.get_safe_wandb_step(min_step=loops)
-        if log_prefix == "uncertainty_estimate":
-            print(
-                "[uncertainty-viz-debug] "
-                + json.dumps(
-                    {
-                        "label": label_with_count,
-                        "depth": int(vnode.depth),
-                        "terminal_depth": int(active_tree.terminal_depth),
-                        "unc_diag_is_none": vinfo.get("unc_diagnostics") is None,
-                        "expanded_node_pos": (
-                            [float(x) for x in np.asarray(expanded_node_pos).flatten()[:2]]
-                            if expanded_node_pos is not None
-                            else None
-                        ),
-                    },
-                    ensure_ascii=True,
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
         print(
             f"[wandb-video-debug] key={log_prefix}/plan_at_{label_with_count} shape={video.shape} "
             f"dtype={video.dtype} fps=4 step={video_step}",

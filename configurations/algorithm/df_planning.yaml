@@ -60,7 +60,7 @@ viz_agent_rollout: true # set True to upload *_interaction/sample_*_video to wan
 viz_final_plans: true
 viz_compare_expanded_to_value: false
 viz_mujoco_renderer: false
-viz_subplan_denoising: true # set True to upload plan/plan_at_* to wandb (slow)
+viz_subplan_denoising: false # set True to upload plan/plan_at_* to wandb (slow)
 viz_replanning: false # set True to also log replanned stage denoising video (requires mcts_use_replan)
 viz_uncertain_next_subplan_last_obs: true
 profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
@@ -87,11 +87,13 @@ replanning_target_level: 25 # 11 for linear, noise level to add when replanning 
 
 # UNCERTAINTY CHECK
 use_uncertainty_as_value: true
-uncertainty_mode: 'variance' # 'entropy' | 'variance'
+uncertainty_mode: 'cluster' # 'entropy' | 'variance' | 'cluster'
 uncertainty_lambda: 1.0 # entropy: weight on angular entropy surrogate; variance: weight on V_ext_g
 uncertainty_eta: 1.0 # entropy: weight on geometry correction; variance: weight on V_ext_c
 fast_sampling_multiple: 5 # number of fast samples per candidate
 fast_sampling_steps: 20 # denoising steps for fast uncertainty sampling (< sampling_timesteps)
+uncertainty_max_intra_cluster_dist: 30.0 # max temporal distance (steps) within a cluster for complete-linkage cut
+use_cluster_subplan_as_expansion: true # if true: reuse per-cluster subplans from uncertainty sampling as child expansions
 
 # [MPC-style agent control]
 use_rollout: false
