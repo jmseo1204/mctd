@@ -370,3 +370,32 @@ class PlanPostprocMixin:
         assert output.shape[1] == 1, f"output.shape[1]={output.shape[1]}, expected 1"
 
         return output
+
+    def _build_postprocessed_plan_from_node(
+        self,
+        best_node,
+        plan_tokens: int,
+        is_tree1: bool,
+        goal_normalized: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Materialize the final output plan and its reordered execution variant.
+
+        Returns a small bundle so callers can reuse the postprocessed plan without
+        recomputing output extraction + unnormalization + greedy reordering.
+        """
+        output_plan = self._extract_output_plan(
+            best_node,
+            plan_tokens=plan_tokens,
+            is_tree1=is_tree1,
+            goal_normalized=goal_normalized,
+        )  # (T_combined*fs+goal_pad, 1, c)
+
+        plan_unnormalized = self._unnormalize_x(output_plan.unsqueeze(0))[-1]
+        postprocessed_plan = self._reorder_plan_by_proximity(plan_unnormalized)
+
+        return {
+            "output_plan": output_plan,
+            "plan_unnormalized": plan_unnormalized,
+            "postprocessed_plan": postprocessed_plan,
+            "postprocessed_len": int(postprocessed_plan.shape[0]),
+        }

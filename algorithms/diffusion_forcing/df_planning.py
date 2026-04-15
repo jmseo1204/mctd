@@ -216,6 +216,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.plan_feasibility_delta = cfg.get("plan_feasibility_delta", 100.0)
         self.diverge_threshold = cfg.get("diverge_threshold", 2.0)
         self.min_progress_threshold = cfg.get("min_progress_threshold", 0.0)
+        self.thres_min_dist_to_prior_plan = float(
+            cfg.get("thres_min_dist_to_prior_plan", 0.0)
+        )
         self.max_child_resets = cfg.get("max_child_resets", 3)
         self.particle_guidance_scale = cfg.get("particle_guidance_scale", 0.0)
         self.use_TD_metric_as_dist = cfg.get("use_TD_metric_as_dist", False)
@@ -543,6 +546,114 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 state1 = state1[..., self.pos_dim_indices]
                 state2 = state2[..., self.pos_dim_indices]
             return np.linalg.norm(state1 - state2, axis=-1)
+
+    def _get_root_obs(self, node: Optional["TreeNode"]) -> Optional[np.ndarray]:
+        """Return the root observation for a node's tree."""
+        if node is None:
+            return None
+        root_node = node
+        while root_node._parent_node is not None:
+            root_node = root_node._parent_node
+        return root_node.obs
+
+    def _check_plan_batch_feasibility(
+        self,
+        plan_hists: torch.Tensor,  # (m, plan_tokens*fs, B, c)
+        root_obs_list: List[Optional[np.ndarray]],
+        progress_obs_list: List[Optional[np.ndarray]],
+        prefix_len_frames_list: Optional[List[int]] = None,
+        subplan_tail_depths: Optional[List[int]] = None,
+        seg_size: Optional[int] = None,
+    ) -> List[bool]:
+        """Run the planner's full-plan feasibility checks on a batch of plans.
+
+        This intentionally checks the entire reconstructed plan, not just the local
+        subplan. When `use_dynamic_obs_padding=False`, `parallel_plan()` strips the
+        root anchor token from the returned history, so we prepend each candidate's
+        root observation before running continuity checks.
+
+        The progress filter remains a full-plan check: it measures progress between
+        the current boundary observation and the final frame of the full plan.
+        The prior-plan-distance filter is the new local-subplan constraint: it
+        compares the current subplan tail against frames before `prefix_len` in the
+        raw plan sequence (without the synthetic root prepend).
+        """
+        raw_plans = (
+            self._unnormalize_x(plan_hists[-1])[:-1].detach().cpu().numpy()
+        )  # (t*fs-1, B, c)
+        plans = raw_plans
+
+        if root_obs_list and all(root_obs is not None for root_obs in root_obs_list):
+            root_obs_np = np.stack(root_obs_list, axis=0)[np.newaxis]  # (1, B, c)
+            plans = np.concatenate([root_obs_np, plans], axis=0)
+
+        plan_len, batch_size, channels = plans[:-1].shape
+        diffs = self._compute_distance(
+            plans[:-1].reshape(plan_len * batch_size, channels),
+            plans[1:].reshape(plan_len * batch_size, channels),
+        ).reshape(plan_len, batch_size)
+
+        is_proximal = [
+            bool(np.all(diffs[:, i] < self.plan_feasibility_delta))
+            for i in range(batch_size)
+        ]
+
+        if self.min_progress_threshold > 0.0:
+            is_not_stagnant = [False] * batch_size
+            for i, progress_obs in enumerate(progress_obs_list):
+                if progress_obs is None:
+                    continue
+                progress = float(
+                    self._compute_distance(
+                        progress_obs[np.newaxis],
+                        plans[-1, i][np.newaxis],
+                    )[0]
+                )
+                if progress > self.min_progress_threshold:
+                    is_not_stagnant[i] = True
+        else:
+            is_not_stagnant = [True] * batch_size
+
+        is_far_from_prior = [True] * batch_size
+        if (
+            self.thres_min_dist_to_prior_plan > 0.0
+            and prefix_len_frames_list is not None
+            and subplan_tail_depths is not None
+            and seg_size is not None
+        ):
+            for i in range(batch_size):
+                prefix_len_frames = max(0, int(prefix_len_frames_list[i]))
+                if prefix_len_frames <= 0:
+                    continue
+
+                prior_end = min(prefix_len_frames, raw_plans.shape[0])
+                if prior_end <= 0:
+                    continue
+
+                tail_depth = int(subplan_tail_depths[i])
+                tail_idx = min(
+                    self._get_prefix_len_frames_from_depth(tail_depth, seg_size) - 1,
+                    raw_plans.shape[0] - 1,
+                )
+                if tail_idx < 0:
+                    continue
+
+                tail_obs = raw_plans[tail_idx, i : i + 1]
+                prior_obs = raw_plans[:prior_end, i]
+                if prior_obs.size == 0:
+                    continue
+
+                tail_rep = np.repeat(tail_obs, prior_obs.shape[0], axis=0)
+                min_dist_to_prior = float(
+                    np.min(self._compute_distance(prior_obs, tail_rep))
+                )
+                if min_dist_to_prior < self.thres_min_dist_to_prior_plan:
+                    is_far_from_prior[i] = False
+
+        return [
+            is_proximal[i] and is_not_stagnant[i] and is_far_from_prior[i]
+            for i in range(batch_size)
+        ]
 
     def _require_current_plan_tokens(self) -> int:
         """Return the planner-global plan token count for the current episode."""
@@ -1889,6 +2000,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # Single-shot planning state
             is_meeting: bool = False
             best_node: Optional["TreeNode"] = None
+            selected_plan_bundle: Optional[dict] = None
             last_is_tree1: bool = True
             active_tree = bidir_tree1
             planning_start_time: float = time.time()
@@ -1946,25 +2058,31 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         loops,
                     )
 
-                    best_info = self._select_best_leaf(combined_expanded_node_infos)
-                    if best_info is None:
-                        continue
-
-                    best_node = best_info["node"]
-                    active_tree = best_info["selected_tree"]
+                    round_selection = self._select_round_plan_candidate(
+                        combined_expanded_node_infos,
+                        goal_normalized=goal_normalized,
+                    )
+                    meeting_winner = round_selection["meeting_winner"]
+                    round_fallback = round_selection["round_fallback"]
                     _trees_exhausted = (
                         not bidir_tree1.root_node.is_expandable_flag and
                         not bidir_tree2.root_node.is_expandable_flag
                     )
-                    _gap = self._compute_plan_gap(
-                        best_node,
-                        self.current_plan_tokens,
-                        is_tree1=active_tree.is_tree1,
-                    )
-                    is_meeting = _trees_exhausted or (
-                        _gap is not None and _gap < self.meeting_delta
-                    )
-                    last_is_tree1 = active_tree.is_tree1
+                    if meeting_winner is not None:
+                        best_node = meeting_winner["node"]
+                        active_tree = meeting_winner["selected_tree"]
+                        last_is_tree1 = meeting_winner["is_tree1"]
+                        selected_plan_bundle = meeting_winner
+                        is_meeting = True
+                    else:
+                        if round_fallback is not None:
+                            best_node = round_fallback["node"]
+                            active_tree = round_fallback["selected_tree"]
+                            last_is_tree1 = round_fallback["is_tree1"]
+                            selected_plan_bundle = None
+                        is_meeting = False
+                    if _trees_exhausted:
+                        terminate = True
                 else:
                     active_tree, expanded_node_infos = self._run_mcts_search(
                         bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2,
@@ -1989,45 +2107,52 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         loops,
                     )
 
-                    # Extract plan by selecting best leaf and combining plans
-                    best_info = self._select_best_leaf(expanded_node_infos)
+                    round_selection = self._select_round_plan_candidate(
+                        expanded_node_infos,
+                        goal_normalized=goal_normalized,
+                        default_tree=active_tree,
+                    )
+                    meeting_winner = round_selection["meeting_winner"]
+                    round_fallback = round_selection["round_fallback"]
 
-                    # expanded_node_infos can be empty if all candidates were killed by
-                    # endpoint deduplication. In that case, skip plan extraction and continue.
-                    if best_info is None:
-                        expanded_tree_idx = (expanded_tree_idx + 1) % 2
-                        continue
-
-                    best_node = best_info["node"]
-
-                    # Update meeting condition: trees exhausted or FWD/BWD plans close enough
                     _trees_exhausted = (
                         not bidir_tree1.root_node.is_expandable_flag and
                         not bidir_tree2.root_node.is_expandable_flag
                     )
-                    _gap = self._compute_plan_gap(
-                        best_node,
-                        self.current_plan_tokens,
-                        is_tree1=active_tree.is_tree1,
-                    )
-                    is_meeting = _trees_exhausted or (
-                        _gap is not None and _gap < self.meeting_delta
-                    )
-
-                    last_is_tree1 = active_tree.is_tree1
+                    if meeting_winner is not None:
+                        best_node = meeting_winner["node"]
+                        active_tree = meeting_winner["selected_tree"]
+                        last_is_tree1 = meeting_winner["is_tree1"]
+                        selected_plan_bundle = meeting_winner
+                        is_meeting = True
+                    else:
+                        if round_fallback is not None:
+                            best_node = round_fallback["node"]
+                            active_tree = round_fallback["selected_tree"]
+                            last_is_tree1 = round_fallback["is_tree1"]
+                            selected_plan_bundle = None
+                        is_meeting = False
+                    if _trees_exhausted:
+                        terminate = True
                     # Alternate trees for next iteration
                     expanded_tree_idx = (expanded_tree_idx + 1) % 2
 
             # Single-shot plan extraction and environment execution (after MCTS search completes)
             if best_node is not None:
-                output_plan = self._extract_output_plan(
-                    best_node,
-                    plan_tokens=self._require_current_plan_tokens(),
-                    is_tree1=last_is_tree1,
-                    goal_normalized=goal_normalized,
-                )  # (T_combined*fs+goal_pad, 1, c)
+                if selected_plan_bundle is None:
+                    _reorder_t0 = time.time()
+                    selected_plan_bundle = self._build_postprocessed_plan_from_node(
+                        best_node,
+                        plan_tokens=self._require_current_plan_tokens(),
+                        is_tree1=last_is_tree1,
+                        goal_normalized=goal_normalized,
+                    )
+                    _reorder_ms = (time.time() - _reorder_t0) * 1000
+                else:
+                    _reorder_ms = 0.0
 
-                plan_unnormalized = self._unnormalize_x(output_plan.unsqueeze(0))[-1]  # (T_combined*fs, 1, c)
+                plan_unnormalized = selected_plan_bundle["plan_unnormalized"]
+                postprocessed_plan = selected_plan_bundle["postprocessed_plan"]
 
                 # Visualization with both forward and reverse trajectories
                 start_numpy = start.cpu().numpy()[:, self.pos_dim_indices]
@@ -2084,18 +2209,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     f"[MCTD] Search complete | loops={loops} | "
                     f"parents={self.global_search_num}/{self.mctd_max_search_num} | "
                     f"tree1_nodes={_t1_nodes} tree2_nodes={_t2_nodes} | "
-                    f"plan_frames={plan_unnormalized.shape[0]} | node={best_node.name}",
+                    f"plan_frames={plan_unnormalized.shape[0]} | "
+                    f"post_frames={postprocessed_plan.shape[0]} | node={best_node.name}",
                     flush=True,
                 )
 
-                # Reorder plan frames by proximity to resolve FWD-BWD spatial gap
-                _reorder_t0 = time.time()
-                plan_unnormalized = self._reorder_plan_by_proximity(plan_unnormalized)
-                _reorder_ms = (time.time() - _reorder_t0) * 1000
-
                 # Visualize postprocessed plan
                 _ppviz_t0 = time.time()
-                _pp_plan_np = plan_unnormalized[:, :, self.pos_dim_indices].detach().cpu().numpy()  # (K, 1, pos_dim)
+                _pp_plan_np = postprocessed_plan[:, :, self.pos_dim_indices].detach().cpu().numpy()  # (K, 1, pos_dim)
                 _pp_images = make_trajectory_images(
                     self.env_id, _pp_plan_np, 1, start_numpy.tolist(), goal_numpy.tolist(), self.plot_end_points
                 )
@@ -2106,7 +2227,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     )
                 _ppviz_ms = (time.time() - _ppviz_t0) * 1000
                 self._tlog("timing.plan_postproc", {
-                    "n_frames": int(plan_unnormalized.shape[0]),
+                    "n_frames": int(postprocessed_plan.shape[0]),
                     "reorder_ms": round(_reorder_ms, 1),
                     "pre_exec_viz_ms": round(_ppviz_ms, 1),
                     "total_ms": round(_reorder_ms + _ppviz_ms, 1),
@@ -2115,7 +2236,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 # Use unified plan execution function
                 _exec_start_time = time.time()
                 trajectory_exec, reward_dict, rollout_viz = self._execute_plan_in_env(
-                    plan_frame_format=plan_unnormalized,
+                    plan_frame_format=postprocessed_plan,
                     envs=envs,
                     agent=agent if "antmaze" in self.env_id else None,
                     use_diffused_action=use_diffused_action,
@@ -2656,7 +2777,22 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         )
         n_clusters = int(cluster_labels.max() + 1) if len(cluster_labels) > 0 else 0
 
-        if self.uncertainty_mode == "variance":
+        min_required_samples = {
+            "cluster": 1,
+            "entropy": 2,
+            "variance": 3,
+        }.get(self.uncertainty_mode, 1)
+        is_degenerate = int(Z.shape[0]) < min_required_samples
+
+        if is_degenerate:
+            _emb_dist_curr = float(np.linalg.norm(z_goal - z_curr))
+            _t_curr = float(np.asarray(_temporal_dist_fn(np.asarray(_emb_dist_curr))).item())
+            result = {
+                "U": 0.0,
+                "T_curr": _t_curr,
+                "degenerate": True,
+            }
+        elif self.uncertainty_mode == "variance":
             result = compute_uncertainty_variance(
                 z_curr=z_curr,
                 z_goal=z_goal,
@@ -2683,6 +2819,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         result["cluster_labels"] = cluster_labels
         result["n_clusters"] = n_clusters
+        result["num_samples"] = int(Z.shape[0])
+        result.setdefault("degenerate", False)
         return result
 
     def _run_fast_uncertainty_sampling(
@@ -2749,10 +2887,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 expanded_plan=_plan_rearranged_unc,
             )  # (n_tokens, 1, fs*c)
             # Re-noise from the first plan token after obs_parent, starting at the
-            # current expansion boundary itself. This makes the uncertainty batch's
-            # initial frame show G*K distinct noisy next-segment hypotheses, and it
-            # matches the uncertainty schedule which denoises the segment beginning
-            # at prefix_len_per_batch.
+            # current expansion boundary itself. This keeps feasibility checking and
+            # uncertainty sampling aligned to the same next-segment window.
             _future_start = _curr_prefix_len + 1
             _n_future = _plan_tokens_val + 1 - _future_start
 
@@ -2830,6 +2966,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self,
         unc_hists_per_cand: List[torch.Tensor],     # B_nt × (fast_steps+1, plan_tokens*fs, G*K, c)
         curr_plan_last_batch: torch.Tensor,          # (plan_tokens*fs, B_nt, c)
+        parent_nodes: List["TreeNode"],              # B_nt
         node_depths: List[int],                      # B_nt candidate depths
         seg_size: int,
         unc_noise_levels_per_cand: List[np.ndarray], # B_nt × (G*K, fast_steps+1, plan_tokens)
@@ -2847,16 +2984,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         values: list = []
         cluster_subplans: list = []
         unc_results_out: list = []
+        filtered_unc_hists: list = []
 
         for _ii in range(B_nt):
             unc_hists_i = unc_hists_per_cand[_ii]  # (fast_steps+1, plan_tokens*fs, G*K, c)
             curr_depth_i = node_depths[_ii]
-
-            tail_obs_i = self._extract_obs_at_boundary(
-                unc_hists_i[-1],              # (plan_tokens*fs, G*K, c)
-                depth=curr_depth_i + 1,
-                seg_size=seg_size,
-            )  # (G*K, obs_dim)
 
             curr_obs_i = self._extract_obs_at_boundary(
                 curr_plan_last_batch[:, _ii, :].unsqueeze(1),  # (plan_tokens*fs, 1, c)
@@ -2864,11 +2996,63 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 seg_size=seg_size,
             )[0]  # (obs_dim,)
 
+            feasible_mask_i = self._check_plan_batch_feasibility(
+                plan_hists=unc_hists_i,
+                root_obs_list=[self._get_root_obs(parent_nodes[_ii])] * unc_hists_i.shape[2],
+                progress_obs_list=[curr_obs_i] * unc_hists_i.shape[2],
+                prefix_len_frames_list=[
+                    self._get_prefix_len_frames_from_depth(curr_depth_i, seg_size)
+                ] * unc_hists_i.shape[2],
+                subplan_tail_depths=[curr_depth_i + 1] * unc_hists_i.shape[2],
+                seg_size=seg_size,
+            )
+            feasible_sample_indices = np.asarray(
+                np.where(np.asarray(feasible_mask_i, dtype=bool))[0],
+                dtype=int,
+            )
+
+            if feasible_sample_indices.size == 0:
+                values.append(-np.inf)
+                cluster_subplans.append([])
+                unc_results_out.append(
+                    {
+                        "U": np.inf,
+                        "cluster_labels": np.array([], dtype=int),
+                        "n_clusters": 0,
+                        "degenerate": True,
+                        "num_samples": 0,
+                        "num_raw_samples": int(unc_hists_i.shape[2]),
+                        "num_feasible_samples": 0,
+                        "feasible_sample_indices": feasible_sample_indices,
+                        "sample_guidance_scales": [],
+                    }
+                )
+                filtered_unc_hists.append(None)
+                continue
+
+            filtered_unc_hists_i = unc_hists_i[:, :, feasible_sample_indices, :]
+            filtered_unc_hists.append(filtered_unc_hists_i)
+            filtered_noise_levels_i = unc_noise_levels_per_cand[_ii][feasible_sample_indices]
+            filtered_guidance_scales_i = [
+                float(unc_guidance_scale_per_cand[_ii][_j])
+                for _j in feasible_sample_indices
+            ]
+
+            tail_obs_i = self._extract_obs_at_boundary(
+                filtered_unc_hists_i[-1],  # (plan_tokens*fs, N_survive, c)
+                depth=curr_depth_i + 1,
+                seg_size=seg_size,
+            )  # (N_survive, obs_dim)
+
             unc_result = self._compute_node_uncertainty(
                 curr_obs=curr_obs_i,
                 target_node=target_nodes[_ii],
                 tail_obs=tail_obs_i,
             )
+            unc_result["num_raw_samples"] = int(unc_hists_i.shape[2])
+            unc_result["num_feasible_samples"] = int(feasible_sample_indices.size)
+            unc_result["feasible_sample_indices"] = feasible_sample_indices
+            unc_result["sample_guidance_scales"] = filtered_guidance_scales_i
             values.append(-unc_result["U"])
             unc_results_out.append(unc_result)
 
@@ -2879,9 +3063,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 _csp_list = []
                 for _c in range(_n_cl):
                     _rep_j = int(np.where(_cl_labels == _c)[0][0])
-                    _ph_j = unc_hists_i[:, :, _rep_j, :]  # (fast_steps+1, plan_tokens*fs, c)
-                    _gs_j = float(unc_guidance_scale_per_cand[_ii][_rep_j])
-                    _lvl_j = unc_noise_levels_per_cand[_ii][_rep_j : _rep_j + 1, -1, :]
+                    _ph_j = filtered_unc_hists_i[:, :, _rep_j, :]  # (fast_steps+1, plan_tokens*fs, c)
+                    _gs_j = float(filtered_guidance_scales_i[_rep_j])
+                    _lvl_j = filtered_noise_levels_i[_rep_j : _rep_j + 1, -1, :]
                     # (1, plan_tokens)
                     _csp_list.append({
                         "plan_hist":      _ph_j,
@@ -2896,6 +3080,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             "values": values,
             "cluster_subplans": cluster_subplans,
             "unc_results": unc_results_out,
+            "filtered_unc_hists": filtered_unc_hists,
         }
 
     def _init_mcts_tree(
@@ -3079,6 +3264,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         unc_compute_result = self._compute_uncertainty_and_clusters(
             unc_hists_per_cand=unc_sampling_result["unc_hists_per_cand"],
             curr_plan_last_batch=val_plan_last_batch,
+            parent_nodes=[root_node],
             node_depths=[0],
             seg_size=seg_size,
             unc_noise_levels_per_cand=unc_sampling_result["unc_noise_levels_per_cand"],
@@ -3088,6 +3274,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         # 7. Set root node cluster_subplans and value
         root_node.cluster_subplans = unc_compute_result["cluster_subplans"][0]
+        if root_node.cluster_subplans == []:
+            root_node.reset_children_slots(0, [])
         root_node.set_value(unc_compute_result["values"][0])  # values[0] = -U
         root_vinfo = {
             "node": root_node,
@@ -3095,7 +3283,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             "value": unc_compute_result["values"][0],
             "target_node": target_node,
             "selection_count": root_node.selection_count,
-            "uncertainty_plan_hist_frame": unc_sampling_result["unc_hists_per_cand"][0],
+            "uncertainty_plan_hist_frame": unc_compute_result["filtered_unc_hists"][0],
             "unc_diagnostics": unc_compute_result["unc_results"][0],
         }
         setattr(root_node, "_root_uncertainty_vinfo", root_vinfo)
@@ -3718,65 +3906,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 #  It includes the noise level zero-padding, finding the max denoising steps, replanning, value calculation and node allocation
                 replanning_start_time = time.time()
 
-                def check_feasibility(plan_hists): # plan_hists: (m, plan_tokens*fs, b, c)
-                    plans = (
-                        self._unnormalize_x(plan_hists[-1])[:-1]
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )  # (t*fs-1, b, c)
-
-                    def get_root_obs(node):
-                        padding_node = node
-                        while padding_node._parent_node is not None:
-                            padding_node = padding_node._parent_node
-                        return padding_node.obs
-
-                    # Prepend each candidate's parent obs as frame 0 so that the
-                    # parent→first_plan_token continuity is also checked.
-
-                    parent_node_list = [expanded_node_candidates[i]["parent_node"] for i in range(plans.shape[1])]
-                    root_obs_list = [
-                        get_root_obs(i)
-                        for i in parent_node_list
-                    ]
-                    if all(p is not None for p in root_obs_list):
-                        root_obs_np = np.stack(root_obs_list, axis=0)[np.newaxis]  # (1, b, c)
-                        plans = np.concatenate([root_obs_np, plans], axis=0)  # (t*fs, b, c)
-
-
-                    _pl, _b, _c = plans[:-1].shape
-                    diffs = self._compute_distance(
-                        plans[:-1].reshape(_pl * _b, _c),
-                        plans[1:].reshape(_pl * _b, _c),
-                    ).reshape(_pl, _b)  # (plan_len-1, b)
-
-
-                    batch_size = diffs.shape[1]
-                    # FIX: is_feasible size should match batch_size (number of plans), not expanded_node_candidates
-                    is_proximal = [False] * batch_size
-                    for i in range(batch_size):
-                        is_proximal[i] = np.all(
-                            diffs[:, i] < self.plan_feasibility_delta
-                        )
-
-                    is_not_stagnant = [False] * batch_size
-                    # Progress filter: kill plans whose sub_plan start-end distance is too small
-                    if self.min_progress_threshold > 0.0:
-                        for i, parent_node in enumerate(parent_node_list):
-                            if parent_node.obs is not None:
-                                progress = float(self._compute_distance(
-                                    parent_node.obs[np.newaxis],
-                                    plans[-1, i][np.newaxis],
-                                )[0])
-                                if progress > self.min_progress_threshold:
-                                    is_not_stagnant[i] = True
-
-
-                    is_feasible = [is_proximal[i] and is_not_stagnant[i] for i in range(batch_size)]
-
-                    return is_feasible
-
 
                 if not self.mcts_use_replan:
                     # Skip replanning: use expansion results directly for value.
@@ -3886,7 +4015,29 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     val_plan_hists = replanned_plan_hists
 
                 ##### NODE FEASIBILITY CHECK #####
-                is_feasible = check_feasibility(val_plan_hists)
+                _parent_nodes_for_feasibility = [
+                    expanded_node_candidates[i]["parent_node"]
+                    for i in range(len(expanded_node_candidates))
+                ]
+                is_feasible = self._check_plan_batch_feasibility(
+                    plan_hists=val_plan_hists,
+                    root_obs_list=[
+                        self._get_root_obs(parent_node)
+                        for parent_node in _parent_nodes_for_feasibility
+                    ],
+                    progress_obs_list=[
+                        parent_node.obs for parent_node in _parent_nodes_for_feasibility
+                    ],
+                    prefix_len_frames_list=[
+                        self._get_prefix_len_frames_from_depth(parent_node.depth, seg_size)
+                        for parent_node in _parent_nodes_for_feasibility
+                    ],
+                    subplan_tail_depths=[
+                        expanded_node_candidates[i]["depth"]
+                        for i in range(len(expanded_node_candidates))
+                    ],
+                    seg_size=seg_size,
+                )
                 
                 ##### NODE UNCERTAINTY CHECK #####
 
@@ -4053,6 +4204,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     _unc_compute_result = self._compute_uncertainty_and_clusters(
                         unc_hists_per_cand=_nt_unc_hists,
                         curr_plan_last_batch=_nt_curr_plan_last,
+                        parent_nodes=_nt_parent_nodes,
                         node_depths=_nt_depths,
                         seg_size=seg_size,
                         unc_noise_levels_per_cand=_nt_noise_levels,
@@ -4065,6 +4217,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         unc_results[_i] = _unc_compute_result["unc_results"][_ii]
                         cluster_subplans_per_candidate[_i] = (
                             _unc_compute_result["cluster_subplans"][_ii]
+                        )
+                        uncertainty_plan_hists_per_candidate[_i] = (
+                            _unc_compute_result["filtered_unc_hists"][_ii]
                         )
             else:
                 values, achieved_infos, achieved_ts = self.calculate_values_bidir(
@@ -4856,53 +5011,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
             replanning_start_time = time.time()
 
-            def check_feasibility(plan_hists):
-                plans = (
-                    self._unnormalize_x(plan_hists[-1])[:-1].detach().cpu().numpy()
-                )
-
-                def get_root_obs(node):
-                    padding_node = node
-                    while padding_node._parent_node is not None:
-                        padding_node = padding_node._parent_node
-                    return padding_node.obs
-
-                parent_node_list = [
-                    expanded_node_candidates[i]["parent_node"]
-                    for i in range(plans.shape[1])
-                ]
-                root_obs_list = [get_root_obs(i) for i in parent_node_list]
-                if all(p is not None for p in root_obs_list):
-                    root_obs_np = np.stack(root_obs_list, axis=0)[np.newaxis]
-                    plans = np.concatenate([root_obs_np, plans], axis=0)
-
-                plan_len, batch_size, channels = plans[:-1].shape
-                diffs = self._compute_distance(
-                    plans[:-1].reshape(plan_len * batch_size, channels),
-                    plans[1:].reshape(plan_len * batch_size, channels),
-                ).reshape(plan_len, batch_size)
-
-                is_proximal = [False] * batch_size
-                for i in range(batch_size):
-                    is_proximal[i] = np.all(diffs[:, i] < self.plan_feasibility_delta)
-
-                is_not_stagnant = [False] * batch_size
-                if self.min_progress_threshold > 0.0:
-                    for i, parent_node in enumerate(parent_node_list):
-                        if parent_node.obs is not None:
-                            progress = float(
-                                self._compute_distance(
-                                    parent_node.obs[np.newaxis],
-                                    plans[-1, i][np.newaxis],
-                                )[0]
-                            )
-                            if progress > self.min_progress_threshold:
-                                is_not_stagnant[i] = True
-
-                return [
-                    is_proximal[i] and is_not_stagnant[i] for i in range(batch_size)
-                ]
-
             if not self.mcts_use_replan:
                 replanned_plan_hists = expanded_node_plan_hists
                 val_plan_hists = expanded_node_plan_hists
@@ -4957,7 +5065,29 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 assert replanned_plan_hists.shape[2] == len(expanded_node_candidates)
                 val_plan_hists = replanned_plan_hists
 
-            is_feasible = check_feasibility(val_plan_hists)
+            parent_nodes_for_feasibility = [
+                expanded_node_candidates[i]["parent_node"]
+                for i in range(len(expanded_node_candidates))
+            ]
+            is_feasible = self._check_plan_batch_feasibility(
+                plan_hists=val_plan_hists,
+                root_obs_list=[
+                    self._get_root_obs(parent_node)
+                    for parent_node in parent_nodes_for_feasibility
+                ],
+                progress_obs_list=[
+                    parent_node.obs for parent_node in parent_nodes_for_feasibility
+                ],
+                prefix_len_frames_list=[
+                    self._get_prefix_len_frames_from_depth(parent_node.depth, seg_size)
+                    for parent_node in parent_nodes_for_feasibility
+                ],
+                subplan_tail_depths=[
+                    expanded_node_candidates[i]["depth"]
+                    for i in range(len(expanded_node_candidates))
+                ],
+                seg_size=seg_size,
+            )
 
             if non_terminal_cand_indices:
                 assert expanded_node_updated_levels is not None, (
@@ -5090,6 +5220,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             unc_compute_result = self._compute_uncertainty_and_clusters(
                 unc_hists_per_cand=nt_unc_hists,
                 curr_plan_last_batch=nt_curr_plan_last,
+                parent_nodes=nt_parent_nodes,
                 node_depths=nt_depths,
                 seg_size=seg_size,
                 unc_noise_levels_per_cand=nt_noise_levels,
@@ -5100,6 +5231,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 values[i] = unc_compute_result["values"][ii]
                 unc_results[i] = unc_compute_result["unc_results"][ii]
                 cluster_subplans_per_candidate[i] = unc_compute_result["cluster_subplans"][ii]
+                uncertainty_plan_hists_per_candidate[i] = (
+                    unc_compute_result["filtered_unc_hists"][ii]
+                )
 
         candidate_obses = []
         for i in range(len(expanded_node_candidates)):
@@ -5828,6 +5962,99 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         )
         
         return best_info
+
+    def _select_round_plan_candidate(
+        self,
+        expanded_node_infos: dict[str, dict],
+        goal_normalized: Optional[torch.Tensor],
+        default_tree: Optional["MCTSTreeState"] = None,
+    ) -> dict:
+        """Evaluate this round's expanded children for meeting/fallback selection.
+
+        Selection policy:
+          1. Compute finite plan gaps for the round's expanded children only.
+          2. Fallback candidate = smallest gap among finite-gap candidates.
+          3. Meeting shortlist = candidates with gap < meeting_delta.
+          4. For shortlist only, build postprocessed plans and pick the shortest one.
+             Ties break on smaller total depth, then smaller gap.
+        """
+        result = {
+            "meeting_winner": None,
+            "round_fallback": None,
+            "meeting_candidates": [],
+            "finite_gap_candidates": [],
+        }
+        if not expanded_node_infos:
+            return result
+
+        plan_tokens = self._require_current_plan_tokens()
+        finite_gap_candidates: list[dict] = []
+        meeting_candidates: list[dict] = []
+
+        for info in expanded_node_infos.values():
+            node: Optional["TreeNode"] = info.get("node")
+            if node is None:
+                continue
+
+            selected_tree = info.get("selected_tree", default_tree)
+            if selected_tree is None:
+                continue
+
+            is_tree1 = selected_tree.is_tree1
+            gap = self._compute_plan_gap(
+                node,
+                plan_tokens,
+                is_tree1=is_tree1,
+            )
+            if gap is None or not np.isfinite(gap):
+                continue
+
+            target_depth = node.target_node.depth if node.target_node is not None else 0
+            candidate_eval = {
+                "info": info,
+                "node": node,
+                "selected_tree": selected_tree,
+                "is_tree1": is_tree1,
+                "gap": float(gap),
+                "total_depth": int(node.depth + target_depth),
+            }
+            finite_gap_candidates.append(candidate_eval)
+
+            if gap < self.meeting_delta:
+                candidate_eval.update(
+                    self._build_postprocessed_plan_from_node(
+                        node,
+                        plan_tokens=plan_tokens,
+                        is_tree1=is_tree1,
+                        goal_normalized=goal_normalized,
+                    )
+                )
+                meeting_candidates.append(candidate_eval)
+
+        if finite_gap_candidates:
+            result["round_fallback"] = min(
+                finite_gap_candidates,
+                key=lambda cand: (
+                    cand["gap"],
+                    cand["total_depth"],
+                    cand["node"].name,
+                ),
+            )
+
+        if meeting_candidates:
+            result["meeting_winner"] = min(
+                meeting_candidates,
+                key=lambda cand: (
+                    cand["postprocessed_len"],
+                    cand["total_depth"],
+                    cand["gap"],
+                    cand["node"].name,
+                ),
+            )
+
+        result["meeting_candidates"] = meeting_candidates
+        result["finite_gap_candidates"] = finite_gap_candidates
+        return result
 
     def _node_path_label(
         self,

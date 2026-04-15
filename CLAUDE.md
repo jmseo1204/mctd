@@ -29,12 +29,19 @@ This is the primary file (~5500 lines). It inherits from `DiffusionForcingBase` 
 Key entry points and call chain:
 
 ```
-interact() → p_mctd_plan() → _run_mcts_search() → _extract_output_plan()
-                                                 → _execute_plan_in_env()
+# use_uncertainty_as_value=True (current default):
+interact() → p_mctd_plan() → _run_global_uncertainty_expansion_round()  → _extract_output_plan()
+                           → _postprocess_tree_local_expansions()        → _execute_plan_in_env()
+
+# use_uncertainty_as_value=False (deprecated path):
+interact() → p_mctd_plan() → _run_mcts_search() [DEPRECATED] → _extract_output_plan()
+                                                               → _execute_plan_in_env()
 ```
 
 - `interact()`: Resets env, captures initial_sim_state, initializes bidirectional MCTS trees, runs search, executes plan
-- `_run_mcts_search()`: Iterative tree expansion with diffusion guidance
+- `_run_global_uncertainty_expansion_round()`: Expansion + uncertainty value computation + node allocation (active path)
+- `_postprocess_tree_local_expansions()`: Backprop + sim state rollout + visualization (active path)
+- `_run_mcts_search()`: **DEPRECATED** — used only when `use_uncertainty_as_value=False` (`df_planning.yaml`). The active equivalent is `_run_global_uncertainty_expansion_round` + `_postprocess_tree_local_expansions`. Do not add new features here without mirroring them in the uncertainty path.
 - `_execute_plan_in_env()`: Loops `open_loop_horizon` steps; tracks sim_state, computes actions, steps env
 - `_extract_output_plan()`: In `plan_postproc.py` — concatenates FWD+BWD plan segments based on tree depth and `sequence_dividing_factor`
 

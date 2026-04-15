@@ -24,8 +24,8 @@ noise_level_building_way: others # smooth, causal, or others
 num_tries_for_bad_plans: 1
 open_loop_horizon: 1300 #fixme -> best: int(eval_episode_len * horizon_scale) // jump
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
-sub_goal_interval: 3
-sub_goal_blend_steps: 1 # steps to blend old/new sub_goal actions after a sub_goal switch (antmaze only)
+sub_goal_interval: 1
+sub_goal_blend_steps: 0 # steps to blend old/new sub_goal actions after a sub_goal switch (antmaze only)
 sequence_dividing_factor: 5
 parallel_search_node: 3 # parallel_search_num = parallel_search_node * len(mctd_guidance_scales)
 segment_episode_len: 200 # raw episode length per segment (pre-jump); effective = segment_episode_len * sequence_dividing_factor; n_tokens = (effective // jump) // frame_stack + 1
@@ -37,7 +37,7 @@ segment_episode_len: 200 # raw episode length per segment (pre-jump); effective 
 #   If no sidecar exists, inner_prod is used (matches training default).
 # For legacy .pt checkpoints: hilp_obs_dim / hilp_skill_dim are still needed.
 hilp_checkpoint_path: "td_models/params_1000000_20260324_002241.pkl"
-mctd_guidance_scales: [0.4, 0.8] # HILP gradient scale for near-target positions (TD_thres or above)
+mctd_guidance_scales: [0.8, 0.4, 0.0] # HILP gradient scale for near-target positions (TD_thres or above)
 rmse_guidance_scale: 0.2 # RMSE direction scale for far-target positions (below TD_thres)
 anchor_guidance_scale_ratio: 1.2
 rdf_guidance_scale: 2.0
@@ -53,6 +53,7 @@ warp_threshold: 3.0
 diverge_threshold: 4.0 # min endpoint distance to count as distinct path (below → deduplicate)
 min_progress_threshold: 4.0 # min distance (x,y) between sub_plan start and end
 plan_feasibility_delta: 99999.0 # max per-frame movement (world units) to count a plan as feasible
+thres_min_dist_to_prior_plan: 4.0 # min distance between the current subplan tail and any prior-plan frame before prefix_len
 meeting_delta: 1.2
 
 # [wandb visualization]
@@ -90,8 +91,8 @@ use_uncertainty_as_value: true
 uncertainty_mode: 'cluster' # 'entropy' | 'variance' | 'cluster'
 uncertainty_lambda: 1.0 # entropy: weight on angular entropy surrogate; variance: weight on V_ext_g
 uncertainty_eta: 1.0 # entropy: weight on geometry correction; variance: weight on V_ext_c
-fast_sampling_multiple: 5 # number of fast samples per candidate
-fast_sampling_steps: 20 # denoising steps for fast uncertainty sampling (< sampling_timesteps)
+fast_sampling_multiple: 3 # number of fast samples per candidate
+fast_sampling_steps: 25 # denoising steps for fast uncertainty sampling (< sampling_timesteps)
 uncertainty_max_intra_cluster_dist: 30.0 # max temporal distance (steps) within a cluster for complete-linkage cut
 use_cluster_subplan_as_expansion: true # if true: reuse per-cluster subplans from uncertainty sampling as child expansions
 

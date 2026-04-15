@@ -18,6 +18,10 @@ class TreeNode():
         self.name = name
         self.depth = depth
         self._parent_node = parent_node
+        if cluster_subplans is not None and len(cluster_subplans) == 0:
+            # No feasible uncertainty survivors remain for this node, so keep it
+            # structurally unexpandable from creation time onward.
+            children_node_guidance_scales = []
         self._children_node_guidance_scales = children_node_guidance_scales
         self.plan_history = plan_history
         self.guidance_scale = guidance_scale
@@ -80,6 +84,8 @@ class TreeNode():
         return self._parent_node is None
     
     def is_leaf_node(self):
+        if not self._children_nodes:
+            return False
         if self._children_nodes[0]["node"] is None:
             return False
         return True
@@ -142,6 +148,8 @@ class TreeNode():
         return True
 
     def is_selectable(self):
+        if not self._children_nodes:
+            return False
         for child_node in self._children_nodes:
             if child_node["node"] is None and not child_node["permanently_dead"]:
                 return False

@@ -258,10 +258,13 @@ class PlanVizMixin:
             loops: Current MPC loop index (used for WandB step alignment).
             plan_hist_override: If provided, used instead of vnode.plan_history[-1].
                 In normal mode: (fast_steps+1, plan_tokens*fs, c).
-                In uncertainty mode: (fast_steps+1, plan_tokens*fs, G*K, c).
-            is_uncertainty_viz: If True, plan_hist_override carries G*K fast-sampled
-                trajectories. Each is rendered as a red-gradient scatter; green endpoint
-                dots with alpha proportional to relative guidance-scale intensity.
+                In uncertainty mode: (fast_steps+1, plan_tokens*fs, N, c) where N is
+                the number of surviving fast-sampled trajectories after feasibility
+                filtering.
+            is_uncertainty_viz: If True, plan_hist_override carries the surviving
+                fast-sampled trajectories. Each is rendered as a red-gradient scatter;
+                green endpoint dots with alpha proportional to relative guidance-scale
+                intensity.
         """
         vnode = vinfo.get("node")
         if vnode is None:
@@ -269,7 +272,7 @@ class PlanVizMixin:
         if plan_hist_override is None and not vnode.plan_history:
             return
 
-        hist = plan_hist_override if plan_hist_override is not None else vnode.plan_history[-1]  # (steps, plan_tokens*fs, [G*K,] c)
+        hist = plan_hist_override if plan_hist_override is not None else vnode.plan_history[-1]  # (steps, plan_tokens*fs, [N_samples,] c)
         seg_size = self._require_current_plan_tokens() // self.sequence_dividing_factor
         alen = self._get_denoised_frame_prefix_len(vnode.depth, seg_size, hist.shape[1])
         target_node = getattr(vnode, "target_node", None) or vinfo.get("target_node")
@@ -280,31 +283,59 @@ class PlanVizMixin:
                 vnode.depth + 1, seg_size, plan_hist_override.shape[1]
             )
             tail_vis = np.array([unc_alen - 1]) if unc_alen > 0 else np.array([], dtype=int)
+            _unc_diag = vinfo.get("unc_diagnostics")
 
             # Precompute per-sample colors based on guidance scale (hue differentiation).
-            # Batch ordering within each candidate: for g in G_scales: for k in K_copies.
-            K = self.fast_sampling_multiple
-            gk_total = plan_hist_override.shape[2]  # should equal G*K
+            gk_total = plan_hist_override.shape[2]
             scales = self.mctd_guidance_scales
             G = len(scales)
             _cmap = _mpl_cm.get_cmap('plasma')
-            # Evenly space G colors across the plasma colormap (use 0.15–0.85 to avoid extremes).
-            if G == 1:
-                _scale_rgbs = [_cmap(0.65)[:3]]
+            sample_guidance_scales = (
+                [float(_s) for _s in _unc_diag.get("sample_guidance_scales", [])]
+                if _unc_diag is not None and "sample_guidance_scales" in _unc_diag
+                else []
+            )
+
+            def _scale_to_rgb(_scale_val):
+                if G == 1:
+                    return _cmap(0.65)[:3]
+                try:
+                    _idx = list(scales).index(_scale_val)
+                except ValueError:
+                    _idx = 0
+                return _cmap(0.15 + 0.70 * _idx / (G - 1))[:3]
+
+            if len(sample_guidance_scales) == gk_total and gk_total > 0:
+                unc_scale_colors = np.array(
+                    [_scale_to_rgb(_scale_val) for _scale_val in sample_guidance_scales],
+                    dtype=np.float32,
+                )
+                _legend_scales = []
+                for _scale_val in sample_guidance_scales:
+                    if _scale_val not in _legend_scales:
+                        _legend_scales.append(_scale_val)
+                unc_guidance_legend = [
+                    (f"gs={_scale_val:.3g}", _scale_to_rgb(_scale_val))
+                    for _scale_val in _legend_scales
+                ]
             else:
-                _scale_rgbs = [_cmap(0.15 + 0.70 * i / (G - 1))[:3] for i in range(G)]
-            # For sample index j: g_idx = j // K → pick color from _scale_rgbs[g_idx].
-            unc_scale_colors = np.array([
-                _scale_rgbs[j // K]
-                for j in range(gk_total)
-            ], dtype=np.float32)
-            # Legend entries: one per unique guidance scale (G total), keyed by RGB color.
-            unc_guidance_legend = [
-                (f"gs={s:.3g}", _scale_rgbs[i])
-                for i, s in enumerate(scales)
-            ]
+                # Fallback to the original dense G*K ordering assumption.
+                K = self.fast_sampling_multiple
+                if G == 1:
+                    _scale_rgbs = [_cmap(0.65)[:3]]
+                else:
+                    _scale_rgbs = [
+                        _cmap(0.15 + 0.70 * i / (G - 1))[:3] for i in range(G)
+                    ]
+                unc_scale_colors = np.array([
+                    _scale_rgbs[min(j // K, G - 1)]
+                    for j in range(gk_total)
+                ], dtype=np.float32)
+                unc_guidance_legend = [
+                    (f"gs={s:.3g}", _scale_rgbs[i])
+                    for i, s in enumerate(scales)
+                ]
             # Per-sample cluster labels from unc_diagnostics (computed once, same across frames).
-            _unc_diag = vinfo.get("unc_diagnostics")
             unc_cluster_labels = (
                 np.asarray(_unc_diag["cluster_labels"], dtype=int)
                 if _unc_diag is not None and "cluster_labels" in _unc_diag
