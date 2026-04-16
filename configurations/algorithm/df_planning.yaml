@@ -31,7 +31,7 @@ open_loop_horizon: 1300 #fixme -> best: int(eval_episode_len * horizon_scale) //
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
 sub_goal_interval: 1
 sub_goal_blend_steps: 0 # steps to blend old/new sub_goal actions after a sub_goal switch (antmaze only)
-sequence_dividing_factor: 5
+sequence_dividing_factor: 8
 parallel_search_node: 3 # parallel_search_num = parallel_search_node * len(mctd_guidance_scales)
 segment_episode_len: 200 # raw episode length per segment (pre-jump); effective = segment_episode_len * sequence_dividing_factor; n_tokens = (effective // jump) // frame_stack + 1
 
