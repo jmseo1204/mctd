@@ -80,6 +80,8 @@ class PlanExecutorMixin:
             sub_goal_pos = sub_goal_sim_state["qpos"][:2]  # physical: qpos[:2] = world (x,y)
 
             action = agent.sample_action(state_input, sub_goal_pos)
+            action_scale = getattr(self.cfg, "agent_action_scale", 1.0)
+            action = action * action_scale
             return torch.from_numpy(action).float().reshape(1, -1)
         else:
             # PointMaze: PID-like controller

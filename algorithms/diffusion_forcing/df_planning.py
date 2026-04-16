@@ -871,14 +871,18 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             namespace += "_no_guidance_random_walk"
 
         task_ids = self.task_ids if self.task_ids is not None else [self.task_id]
+        successes = []
         for tid in task_ids:
             if tid != self.task_id:
                 self.task_id = tid
-                # Invalidate env cache so the new task gets freshly configured envs
-                if hasattr(self, "_cached_env_key"):
-                    del self._cached_env_key
             task_ns = f"{namespace}/task{tid}" if self.task_ids is not None else namespace
             self.interact(batch_size, conditions, task_ns)
+            if hasattr(self, '_last_interact_success'):
+                successes.append(self._last_interact_success)
+
+        if successes and self.task_ids is not None:
+            self.log(f"{namespace}/total_success_count", float(sum(successes)))
+            self.log(f"{namespace}/total_success_rate", float(sum(successes) / len(successes)))
 
     
     @staticmethod
@@ -1467,8 +1471,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 from_win = from_noise_levels[indices, b_idx]        # (1+seg, b)
                 to_win   = to_noise_levels[indices, b_idx]          # (1+seg, b)
 
+                # Keep the stored tail token unchanged, but feed sample_step a training-style
+                # init token rebuilt from the last frame of the window anchor.
+                plan_win_input = plan_win.clone()
+                plan_win_input[0] = self._repad_stacked_init_from_last_frame(plan_win[0])
+
                 sample_win = self.diffusion_model.sample_step(
-                    plan_win, conditions, from_win, to_win, guidance_fn=guidance_fn,
+                    plan_win_input, conditions, from_win, to_win, guidance_fn=guidance_fn,
                 )  # (1+seg, b, fs*c)
 
                 update_mask_win = (from_win > to_win).unsqueeze(-1)  # (1+seg, b, 1)
@@ -1738,7 +1747,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             agent = None  # Initialize agent to None; will be set for antmaze
 
             # [ENV CACHING] Check if environment is cached
-            env_cache_key = f"{self.env_id}_{self.task_id}"
+            # task_id는 set_task()로 전환하므로 캐시 키에서 제외 — 환경 구조는 task마다 동일
+            env_cache_key = f"{self.env_id}"
             if (
                 hasattr(self, "_cached_envs")
                 and hasattr(self, "_cached_env_key")
@@ -1747,6 +1757,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 # Reuse cached single environment
                 envs = self._cached_envs
                 agent = getattr(self, "_cached_agent", None)
+                if self.env_id in OGBENCH_ENVS:
+                    envs.envs[0].set_task(self.task_id)  # task 전환 (start/goal 변경)
                 envs.reset()
                 if not (self.env_id in OGBENCH_ENVS):
                     envs.seed(self.interaction_seed)
@@ -2003,10 +2015,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             selected_plan_bundle: Optional[dict] = None
             last_is_tree1: bool = True
             active_tree = bidir_tree1
-            planning_start_time: float = time.time()
-
             while not terminate and loops < self.val_max_loops and not is_meeting:
                 loops += 1
+                planning_start_time: float = time.time()
 
                 # [EXPANSION CHECK] Early termination if both trees are fully explored
                 if not bidir_tree1.root_node.is_expandable_flag and \
@@ -2220,9 +2231,10 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 _pp_images = make_trajectory_images(
                     self.env_id, _pp_plan_np, 1, start_numpy.tolist(), goal_numpy.tolist(), self.plot_end_points
                 )
+                _viz_prefix = namespace.split("/")[-1]
                 for _pp_i, _pp_img in enumerate(_pp_images):
                     self.log_image(
-                        f"{namespace}_interaction/postprocessed_plan",
+                        f"{_viz_prefix}_postprocessed_plan",
                         Image.fromarray(_pp_img),
                     )
                 _ppviz_ms = (time.time() - _ppviz_t0) * 1000
@@ -2292,7 +2304,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             self.log(f"{namespace}/episode_reward", episode_reward.mean())
             self.log(f"{namespace}/episode_reward_if_stay", episode_reward_if_stay.mean())
             self.log(f"{namespace}/first_reach", first_reach.mean())
-            self.log(f"{namespace}/success_rate", sum(episode_reward >= 1.0) / batch_size)
+            _success_rate = float(sum(episode_reward >= 1.0) / batch_size)
+            self.log(f"{namespace}/success_rate", _success_rate)
+            self._last_interact_success = _success_rate
 
             # Visualization
             _post_exec_t0 = time.time()
@@ -2313,7 +2327,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 )
                 for i, img in enumerate(images):
                     self.log_image(
-                        f"{namespace}_interaction/sample_{i}",
+                        f"{_viz_prefix}_agent_rollout/sample_{i}",
                         Image.fromarray(img),
                     )
                 _post_exec_traj_image_ms = (time.time() - _timg_t0) * 1000
@@ -2415,6 +2429,24 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             x = rearrange(x, "fs b ... -> b fs ...")
 
         return x
+
+    def _repad_stacked_init_from_last_frame(self, stacked_token: torch.Tensor) -> torch.Tensor:
+        """Rebuild a training-style init token from the last frame of a stacked token."""
+        if stacked_token.ndim != 2:
+            raise ValueError(
+                f"stacked_token must have shape (b, fs*c), got ndim={stacked_token.ndim}"
+            )
+        if stacked_token.shape[-1] != self.x_stacked_shape[0]:
+            raise ValueError(
+                f"stacked_token.shape[-1]={stacked_token.shape[-1]}, expected {self.x_stacked_shape[0]}"
+            )
+
+        last_frame_bundle = rearrange(
+            stacked_token, "b (fs c) -> b fs c", fs=self.frame_stack
+        )[:, -1].clone()
+        last_frame_bundle[:, self.non_obs_bundle_indices] = 0
+        repadded = self.pad_init(last_frame_bundle, is_start=True, batch_first=True)
+        return rearrange(repadded, "b fs c -> b (fs c)").contiguous()
 
     def split_bundle(self, bundle):
         """

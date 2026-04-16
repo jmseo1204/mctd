@@ -95,31 +95,41 @@ def preprocess_batch_jobs(folder: str) -> None:
     so one Docker container handles all tasks and pays startup cost only once.
     """
     import glob as _glob
+    import re as _re
     files = sorted(_glob.glob(os.path.join(folder, "*.json")))
     if not files:
         return
 
     # Separate out files that already have task_ids (already batched)
+    # Support both legacy "task_ids" key and new "+algorithm.task_ids" key
     groups = {}  # canonical_key -> list of (fpath, task_id, base_config)
     already_batched = []
     for fpath in files:
         with open(fpath) as f:
             config = json.load(f)
-        if "task_ids" in config:
+        if "task_ids" in config or "+algorithm.task_ids" in config:
             already_batched.append(fpath)
             continue
+        # Support both "task_id" (legacy) and "algorithm.task_id" (current) field names
         task_id = config.pop("task_id", None)
         if task_id is None:
+            task_id = config.pop("algorithm.task_id", None)
+        if task_id is None:
             continue
-        key = json.dumps(config, sort_keys=True)
+        # Build merge key: normalize "+name" to remove task-specific _T{N}_S{N} suffix
+        # so jobs differing only in task_id are treated as identical
+        key_config = dict(config)
+        if "+name" in key_config:
+            key_config["+name"] = _re.sub(r'_T\d+(_S\d+)?$', '', key_config["+name"])
+        key = json.dumps(key_config, sort_keys=True)
         groups.setdefault(key, []).append((fpath, task_id, config))
 
     merged_count = 0
     for key, items in groups.items():
-        # Restore task_id for single-job groups
+        # Restore algorithm.task_id for single-job groups (no merge needed)
         if len(items) == 1:
             fpath, task_id, config = items[0]
-            config["task_id"] = task_id
+            config["algorithm.task_id"] = task_id
             with open(fpath, "w") as f:
                 json.dump(config, f, indent=2)
             continue
@@ -127,7 +137,11 @@ def preprocess_batch_jobs(folder: str) -> None:
         # Merge: first file becomes the batched job; others are deleted
         items_sorted = sorted(items, key=lambda x: x[1])  # sort by task_id
         fpath_keep, _, base_config = items_sorted[0]
-        base_config["task_ids"] = [tid for _, tid, _ in items_sorted]
+        # Use "+algorithm.task_ids" so Hydra sets cfg.algorithm.task_ids in the algo
+        base_config["+algorithm.task_ids"] = [tid for _, tid, _ in items_sorted]
+        # Strip task-specific suffix from +name for the merged job
+        if "+name" in base_config:
+            base_config["+name"] = _re.sub(r'_T\d+(_S\d+)?$', '', base_config["+name"])
         with open(fpath_keep, "w") as f:
             json.dump(base_config, f, indent=2)
         for fpath, _, _ in items_sorted[1:]:
