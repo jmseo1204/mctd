@@ -96,6 +96,17 @@ def preprocess_batch_jobs(folder: str) -> None:
     """
     import glob as _glob
     import re as _re
+
+    def _is_benchmark_job(config: dict) -> bool:
+        tasks = config.get("experiment.tasks")
+        if tasks is None:
+            return False
+        if isinstance(tasks, str):
+            return "benchmark" in tasks
+        if isinstance(tasks, list):
+            return "benchmark" in tasks
+        return False
+
     files = sorted(_glob.glob(os.path.join(folder, "*.json")))
     if not files:
         return
@@ -107,6 +118,9 @@ def preprocess_batch_jobs(folder: str) -> None:
     for fpath in files:
         with open(fpath) as f:
             config = json.load(f)
+        if _is_benchmark_job(config):
+            already_batched.append(fpath)
+            continue
         if "task_ids" in config or "+algorithm.task_ids" in config:
             already_batched.append(fpath)
             continue

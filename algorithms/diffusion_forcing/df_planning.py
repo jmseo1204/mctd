@@ -4,6 +4,7 @@ from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 import math
 import time
+import json
 import numpy as np
 from random import random
 import torch
@@ -147,6 +148,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         # Set by run_jobs.py when multiple same-config jobs are batched together.
         raw_ids = cfg.get("task_ids", None)
         self.task_ids = list(raw_ids) if raw_ids is not None else None  # Optional[List[int]]
+        self.eval_repeat_id = cfg.get("eval_repeat_id", None)
+        self.benchmark_num_rollouts = int(cfg.get("benchmark_num_rollouts", 1))
+        self.benchmark_rollout_seed_base = int(cfg.get("benchmark_rollout_seed_base", 0))
+        self.benchmark_results_path = cfg.get("benchmark_results_path", None)
+        self.benchmark_model_id = cfg.get("benchmark_model_id", None)
         self.dql_model = cfg.get("dql_model", None)
         self.val_max_loops = cfg.get("val_max_loops", None)
         _scales = cfg.get("mctd_guidance_scales", [0.0])
@@ -881,8 +887,156 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 successes.append(self._last_interact_success)
 
         if successes and self.task_ids is not None:
-            self.log(f"{namespace}/total_success_count", float(sum(successes)))
-            self.log(f"{namespace}/total_success_rate", float(sum(successes) / len(successes)))
+            self._safe_log_metric(f"{namespace}/total_success_count", float(sum(successes)))
+            self._safe_log_metric(f"{namespace}/total_success_rate", float(sum(successes) / len(successes)))
+
+    def _safe_log_metric(self, key: str, value: Any) -> None:
+        if isinstance(value, np.generic):
+            value = value.item()
+        trainer = getattr(self, "_trainer", None)
+        if trainer is not None:
+            self.log(key, value)
+            return
+
+        logger = self._resolve_logger()
+        if logger is None or getattr(logger, "experiment", None) is None:
+            return
+
+        try:
+            logger.experiment.log({key: value})
+        except Exception:
+            pass
+
+    def _seed_interaction_envs(self, envs) -> None:
+        if self.interaction_seed is None:
+            return
+
+        seed = int(self.interaction_seed)
+        try:
+            envs.seed(seed)
+            return
+        except Exception:
+            pass
+
+        seeded = False
+        for idx, env in enumerate(getattr(envs, "envs", [])):
+            env_seed = seed + idx
+            try:
+                env.seed(env_seed)
+                seeded = True
+                continue
+            except Exception:
+                pass
+        if not seeded:
+            print(f"[WARN] Failed to apply interaction_seed={seed} to envs", flush=True)
+
+    def _write_benchmark_results(self, payload: dict) -> None:
+        if not self.benchmark_results_path:
+            raise ValueError("benchmark_results_path must be set for benchmark runs")
+
+        import os
+
+        os.makedirs(os.path.dirname(self.benchmark_results_path), exist_ok=True)
+        with open(self.benchmark_results_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+    def run_benchmark(self) -> dict:
+        task_ids = self.task_ids if self.task_ids is not None else [self.task_id]
+        task_ids = [tid for tid in task_ids if tid is not None]
+        if not task_ids:
+            raise ValueError("benchmark run requires algorithm.task_id or algorithm.task_ids")
+
+        all_task_results = []
+        original_task_id = self.task_id
+        original_seed = self.interaction_seed
+
+        for task_idx, task_id in enumerate(task_ids):
+            task_rollouts = []
+            task_seed_base = self.benchmark_rollout_seed_base + task_idx * self.benchmark_num_rollouts
+            rollout_pbar = tqdm(
+                total=self.benchmark_num_rollouts,
+                desc=f"Benchmark R{self.eval_repeat_id} T{task_id}",
+                leave=True,
+                dynamic_ncols=True,
+            )
+            for rollout_idx in range(self.benchmark_num_rollouts):
+                rollout_seed = task_seed_base + rollout_idx
+                self.task_id = int(task_id)
+                self.interaction_seed = rollout_seed
+                namespace = (
+                    f"benchmark/repeat{self.eval_repeat_id}/task{self.task_id}/rollout{rollout_idx}"
+                )
+                self.interact(
+                    batch_size=1,
+                    conditions=None,
+                    namespace=namespace,
+                    terminate_on_done=True,
+                )
+                interact_result = dict(getattr(self, "_last_interact_result", {}))
+                interact_result.update(
+                    {
+                        "rollout_id": rollout_idx,
+                        "seed": rollout_seed,
+                    }
+                )
+                task_rollouts.append(interact_result)
+                running_success = float(
+                    np.mean([rollout["success"] for rollout in task_rollouts])
+                )
+                rollout_pbar.update(1)
+                rollout_pbar.set_postfix(
+                    {
+                        "success": f"{running_success:.3f}",
+                        "last_steps": interact_result.get("steps", 0),
+                    },
+                    refresh=True,
+                )
+                self._safe_log_metric("benchmark/current_repeat_id", float(self.eval_repeat_id))
+                self._safe_log_metric("benchmark/current_task_id", float(self.task_id))
+                self._safe_log_metric("benchmark/current_rollout", float(rollout_idx + 1))
+                self._safe_log_metric("benchmark/running_task_success", running_success)
+
+            task_success_mean = float(
+                np.mean([rollout["success"] for rollout in task_rollouts])
+            ) if task_rollouts else float("nan")
+            rollout_pbar.close()
+            self._safe_log_metric(
+                f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/success_mean",
+                task_success_mean,
+            )
+            all_task_results.append(
+                {
+                    "task_id": int(task_id),
+                    "num_rollouts": len(task_rollouts),
+                    "task_success_mean": task_success_mean,
+                    "rollouts": task_rollouts,
+                }
+            )
+
+        self.task_id = original_task_id
+        self.interaction_seed = original_seed
+
+        payload = {
+            "model_id": self.benchmark_model_id,
+            "eval_repeat_id": self.eval_repeat_id,
+            "num_tasks": len(all_task_results),
+            "task_results": all_task_results,
+        }
+        if all_task_results:
+            repeat_success_mean = float(
+                np.mean([task_result["task_success_mean"] for task_result in all_task_results])
+            )
+            payload["repeat_success_mean"] = repeat_success_mean
+            self._safe_log_metric(
+                f"benchmark/repeat{self.eval_repeat_id}/overall_success",
+                repeat_success_mean,
+            )
+        if len(all_task_results) == 1:
+            payload["task_id"] = all_task_results[0]["task_id"]
+            payload["task_success_mean"] = all_task_results[0]["task_success_mean"]
+
+        self._write_benchmark_results(payload)
+        return payload
 
     
     @staticmethod
@@ -1701,6 +1855,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         batch_size: int,
         conditions: Optional[Any] = None,
         namespace: str = "validation",
+        terminate_on_done: bool = False,
     ) -> None:
         # Lazy KDE load: skip during training, load once on first eval/interact call.
         if self.kde_lam > 0.0 and not hasattr(self, "_kde_data_xy_cache"):
@@ -1759,9 +1914,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 agent = getattr(self, "_cached_agent", None)
                 if self.env_id in OGBENCH_ENVS:
                     envs.envs[0].set_task(self.task_id)  # task 전환 (start/goal 변경)
+                self._seed_interaction_envs(envs)
                 envs.reset()
-                if not (self.env_id in OGBENCH_ENVS):
-                    envs.seed(self.interaction_seed)
             else:
                 # Create single environment
                 # Use higher resolution when mujoco renderer is enabled
@@ -1885,6 +2039,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             # Method B: use stored observation_mean/std directly (no data_mean slicing)
             obs_mean = torch.tensor(self.observation_mean, dtype=torch.float32, device=self.device)
             obs_std = torch.tensor(self.observation_std, dtype=torch.float32, device=self.device)
+            self._seed_interaction_envs(envs)
             obs = envs.reset()
             # Randomize the goal for each environment
             if (
@@ -2270,6 +2425,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 # Check if episode terminated
                 if (reward_dict["reached"] >= 1.0).any():
                     terminate = True
+                elif terminate_on_done and reward_dict.get("done") is not None and reward_dict["done"].any():
+                    terminate = True
 
                 # [MEMORY CLEANUP] Clear caches after plan execution
                 gc.collect()
@@ -2299,14 +2456,24 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 global_search_pbar.close()
             print(f"[MCTD] Episode done | loops={loops} | steps={steps} | reached={bool(reached.any())} | reward={float(episode_reward.mean()):.3f}", flush=True)
 
-            self.log(f"{namespace}/task_id", float(self.task_id))
-            self.log(f"{namespace}/planning_time", np.sum(planning_time))
-            self.log(f"{namespace}/episode_reward", episode_reward.mean())
-            self.log(f"{namespace}/episode_reward_if_stay", episode_reward_if_stay.mean())
-            self.log(f"{namespace}/first_reach", first_reach.mean())
+            self._safe_log_metric(f"{namespace}/task_id", float(self.task_id))
+            self._safe_log_metric(f"{namespace}/planning_time", np.sum(planning_time))
+            self._safe_log_metric(f"{namespace}/episode_reward", episode_reward.mean())
+            self._safe_log_metric(f"{namespace}/episode_reward_if_stay", episode_reward_if_stay.mean())
+            self._safe_log_metric(f"{namespace}/first_reach", first_reach.mean())
             _success_rate = float(sum(episode_reward >= 1.0) / batch_size)
-            self.log(f"{namespace}/success_rate", _success_rate)
+            self._safe_log_metric(f"{namespace}/success_rate", _success_rate)
             self._last_interact_success = _success_rate
+            self._last_interact_result = {
+                "task_id": int(self.task_id) if self.task_id is not None else None,
+                "success": _success_rate,
+                "episode_reward": float(episode_reward.mean()),
+                "episode_reward_if_stay": float(episode_reward_if_stay.mean()),
+                "first_reach": float(first_reach.mean()),
+                "planning_time": float(np.sum(planning_time)),
+                "steps": int(steps),
+                "interaction_seed": int(self.interaction_seed) if self.interaction_seed is not None else None,
+            }
 
             # Visualization
             _post_exec_t0 = time.time()

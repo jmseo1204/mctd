@@ -10,6 +10,11 @@ plot_start_goal: True
 interaction_seed: 1
 use_random_goals_for_interaction: False
 task_id: 1
+eval_repeat_id: null
+benchmark_num_rollouts: 1
+benchmark_rollout_seed_base: 0
+benchmark_results_path: null
+benchmark_model_id: null
 dql_model: null
 mctd_skip_level_steps: 10
 time_limit: null

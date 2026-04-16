@@ -1,0 +1,62 @@
+import argparse
+import copy
+import json
+import os
+from datetime import datetime
+
+from project_config import WANDB_ENTITY, WANDB_PROJECT
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate single-checkpoint benchmark jobs."
+    )
+    parser.add_argument("--dataset", required=True, help="Hydra dataset config name")
+    parser.add_argument("--model_id", required=True, help="Checkpoint model id to load")
+    parser.add_argument("--num_tasks", type=int, default=5, help="Number of OGBench tasks/goals")
+    parser.add_argument("--num_repeats", type=int, default=3, help="Number of repeated evaluation passes")
+    parser.add_argument("--rollouts_per_task", type=int, default=50, help="Number of rollouts per (repeat, task)")
+    parser.add_argument("--results_dir", required=True, help="Directory to write benchmark JSON results into")
+    args = parser.parse_args()
+
+    os.makedirs("jobs", exist_ok=True)
+    os.makedirs(args.results_dir, exist_ok=True)
+
+    basic_job_config = {
+        "wandb.entity": WANDB_ENTITY,
+        "wandb.project": WANDB_PROJECT,
+        "wandb.group": f"BENCH-{args.model_id}",
+        "wandb.mode": "online",
+        "experiment": "base_pytorch",
+        "algorithm": "df_planning",
+        "dataset": args.dataset,
+        "load": args.model_id,
+        "experiment.tasks": ["benchmark"],
+        "algorithm.benchmark_num_rollouts": args.rollouts_per_task,
+        "algorithm.benchmark_model_id": args.model_id,
+    }
+
+    count = 0
+    for repeat_id in range(1, args.num_repeats + 1):
+        for task_id in range(1, args.num_tasks + 1):
+            job_cfg = copy.deepcopy(basic_job_config)
+            job_cfg["algorithm.task_id"] = task_id
+            job_cfg["algorithm.eval_repeat_id"] = repeat_id
+            job_cfg["algorithm.benchmark_rollout_seed_base"] = repeat_id * 100000 + task_id * 1000
+            job_cfg["algorithm.benchmark_results_path"] = os.path.join(
+                args.results_dir,
+                f"repeat_{repeat_id:02d}_task_{task_id:02d}.json",
+            )
+            job_cfg["+name"] = f"BENCH_{args.model_id}_R{repeat_id}_T{task_id}"
+
+            filename = f"jobs/{datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')}.json"
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(job_cfg, f, indent=2)
+            count += 1
+
+    print(f"Successfully generated {count} benchmark jobs in 'jobs/'.")
+    print(f"Results will be written under: {args.results_dir}")
+
+
+if __name__ == "__main__":
+    main()

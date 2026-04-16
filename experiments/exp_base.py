@@ -503,6 +503,34 @@ class BaseLightningExperiment(BaseExperiment):
             print(f"[WARNING] Tracer initialization failed: {e}. Running validation without logging.")
             self._validation_impl()
 
+    def benchmark(self) -> None:
+        """
+        Run env-only benchmark evaluation without a validation dataloader.
+        """
+        import datetime as _dt
+
+        if not self.ckpt_path:
+            raise ValueError("benchmark task requires ckpt_path/load to be set")
+
+        print(
+            f"[LIFECYCLE {_dt.datetime.now().strftime('%H:%M:%S')}] benchmark() start  "
+            f"(checkpoint={self.ckpt_path})",
+            flush=True,
+        )
+        self._prepare_algo_for_eval(compile_model=False)
+        self.algo._benchmark_logger = self.logger
+        self._load_checkpoint_into_algo()
+        self.algo.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.algo.to(device)
+        result = self.algo.run_benchmark()
+        print(
+            f"[LIFECYCLE {_dt.datetime.now().strftime('%H:%M:%S')}] benchmark() complete  "
+            f"(results={getattr(self.algo, 'benchmark_results_path', 'n/a')})",
+            flush=True,
+        )
+        return result
+
     def _run_validation_with_tracer(self, tracer) -> None:
         """Internal helper to run validation within tracer context."""
         with tracer:
@@ -520,6 +548,17 @@ class BaseLightningExperiment(BaseExperiment):
                 })
         except Exception:
             pass
+
+    def _load_checkpoint_into_algo(self) -> None:
+        if not self.ckpt_path:
+            raise ValueError("No checkpoint path available to load")
+        ckpt = torch.load(str(self.ckpt_path), map_location="cpu", weights_only=False)
+        if hasattr(self.algo, "on_load_checkpoint"):
+            self.algo.on_load_checkpoint(ckpt)
+        state_dict = ckpt.get("state_dict")
+        if state_dict is None:
+            raise KeyError(f"Checkpoint at {self.ckpt_path} does not contain a state_dict")
+        self.algo.load_state_dict(state_dict, strict=True)
 
     @staticmethod
     def _load_ckpt_training_hparams(ckpt_path) -> dict:
@@ -640,12 +679,7 @@ class BaseLightningExperiment(BaseExperiment):
                     OmegaConf.update(self.root_cfg, f"algorithm.{key}", val, merge=True)
                     print(f"[Info] Synced algorithm.{key} from dataset config (old checkpoint fallback).")
 
-
-    def _validation_impl(self) -> None:
-        """Actual validation implementation (extracted from original validation())."""
-        import time as _time, datetime as _dt
-        _impl_t0 = _time.time()
-        print(f"[LIFECYCLE {_dt.datetime.now().strftime('%H:%M:%S')}] _validation_impl start  (building algo/loading ckpt...)", flush=True)
+    def _prepare_algo_for_eval(self, compile_model: bool = False) -> None:
         if not self.algo:
             # Load ckpt-bound params only when they haven't been pre-populated by CLI args.
             # generate_jobs_generalized.py always embeds ALL of the following in the job spec,
@@ -691,8 +725,16 @@ class BaseLightningExperiment(BaseExperiment):
             # Last resort: fill any remaining null schema stubs
             self._ensure_algo_cfg_fallbacks()
             self.algo = self._build_algo()
-        if self.cfg.validation.compile:
+        if compile_model:
             self.algo = torch.compile(self.algo)
+
+
+    def _validation_impl(self) -> None:
+        """Actual validation implementation (extracted from original validation())."""
+        import time as _time, datetime as _dt
+        _impl_t0 = _time.time()
+        print(f"[LIFECYCLE {_dt.datetime.now().strftime('%H:%M:%S')}] _validation_impl start  (building algo/loading ckpt...)", flush=True)
+        self._prepare_algo_for_eval(compile_model=self.cfg.validation.compile)
 
         _algo_built_elapsed = _time.time() - _impl_t0
         print(f"[LIFECYCLE {_dt.datetime.now().strftime('%H:%M:%S')}] algo built  ({_algo_built_elapsed:.1f}s since impl start)  — starting pl.Trainer.validate()", flush=True)

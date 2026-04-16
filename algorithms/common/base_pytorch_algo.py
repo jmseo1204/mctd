@@ -94,10 +94,21 @@ class BasePytorchAlgo(pl.LightningModule, ABC):
         parameters = self.parameters()
         return torch.optim.Adam(parameters, lr=self.cfg.lr)
 
+    def _resolve_logger(self):
+        logger = None
+        try:
+            logger = self.logger
+        except Exception:
+            logger = None
+        if logger is None:
+            logger = getattr(self, "_benchmark_logger", None)
+        return logger
+
     def get_safe_wandb_step(self, min_step: Optional[int] = None) -> int:
         step_candidates = [int(getattr(self, "global_step", 0))]
 
-        run = getattr(self.logger, "experiment", None)
+        logger = self._resolve_logger()
+        run = getattr(logger, "experiment", None)
         run_step = getattr(run, "step", None)
         if run_step is not None:
             step_candidates.append(int(run_step))
@@ -154,7 +165,11 @@ class BasePytorchAlgo(pl.LightningModule, ABC):
             video = np.clip(video, a_min=0, a_max=1) * 255
             video = video.astype(np.uint8)
 
-        self.logger.experiment.log(
+        logger = self._resolve_logger()
+        if logger is None or getattr(logger, "experiment", None) is None:
+            return
+
+        logger.experiment.log(
             {
                 key: wandb.Video(video, fps=fps, format=format),
             },
@@ -212,7 +227,11 @@ class BasePytorchAlgo(pl.LightningModule, ABC):
                 image = image.astype(np.uint8)
                 image = [img for img in image]
 
-        self.logger.log_image(key=key, images=image, **kwargs)
+        logger = self._resolve_logger()
+        if logger is None:
+            return
+
+        logger.log_image(key=key, images=image, **kwargs)
 
     def log_gradient_stats(self):
         """Log gradient statistics such as the mean or std of norm."""

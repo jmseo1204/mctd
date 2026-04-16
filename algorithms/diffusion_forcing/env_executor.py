@@ -156,6 +156,7 @@ class PlanExecutorMixin:
         episode_reward = np.zeros(batch_size)
         episode_reward_if_stay = np.zeros(batch_size)
         first_reach = np.zeros(batch_size)
+        done_flags = np.zeros(batch_size, dtype=bool)
 
         # Initialize sub_goal for antmaze
         plan_slice_np = None
@@ -265,6 +266,7 @@ class PlanExecutorMixin:
 
             _step_t0 = time.time()
             obs_numpy, reward, done, _ = envs.step(np.nan_to_num(action_np))
+            done_flags = np.logical_or(done_flags, done)
             _env_step_ms.append((time.time() - _step_t0) * 1000)
 
             # Ensure obs_numpy is 2D: (batch_size, obs_dim)
@@ -360,6 +362,7 @@ class PlanExecutorMixin:
             "episode_reward": episode_reward,
             "episode_reward_if_stay": episode_reward_if_stay,
             "first_reach": first_reach,
+            "done": done_flags,
         }
 
         rollout_viz = {
