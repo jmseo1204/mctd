@@ -4,6 +4,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DATASET_DIR="$PROJECT_DIR/configurations/dataset"
+LOCAL_OGBENCH_DIR="$(cd "$PROJECT_DIR/../ogbench" 2>/dev/null && pwd || true)"
 
 MCTD_PROJECT_DIR="$PROJECT_DIR"
 # shellcheck source=scripts/mctd_ckpt_lib.sh
@@ -28,6 +29,13 @@ if ! docker ps > /dev/null 2>&1; then
     exit 1
 fi
 echo "Docker is available and running"
+echo ""
+
+if [ -z "$LOCAL_OGBENCH_DIR" ] || [ ! -d "$LOCAL_OGBENCH_DIR" ]; then
+    echo "ERROR: Benchmark pipeline requires local ogbench checkout at $PROJECT_DIR/../ogbench"
+    exit 1
+fi
+echo "Using local ogbench source for benchmark jobs: $LOCAL_OGBENCH_DIR"
 echo ""
 
 echo "Cleaning up existing benchmark job files..."
@@ -158,17 +166,26 @@ echo ""
 
 export AVAILABLE_GPUS
 PIPELINE_LOG="/tmp/mctd_eval_all_${SELECTED_MODEL_ID}.log"
-nohup bash "$PROJECT_DIR/scripts/run_benchmark_pipeline.sh" \
+PIPELINE_PID_FILE="/tmp/mctd_eval_all_${SELECTED_MODEL_ID}.pid"
+nohup setsid bash "$PROJECT_DIR/scripts/run_benchmark_pipeline.sh" \
     "$RESULTS_RUN_DIR" \
     "$NUM_REPEATS" \
     "$NUM_TASKS" \
     "$ROLLOUTS_PER_TASK" > "$PIPELINE_LOG" 2>&1 &
 PIPELINE_PID=$!
+echo "$PIPELINE_PID" > "$PIPELINE_PID_FILE"
 
 echo "Jobs launched in background (PID: $PIPELINE_PID)"
 echo "  Log: $PIPELINE_LOG"
 echo "  Monitor: tail -f $PIPELINE_LOG"
 echo "  Containers: docker ps --filter 'name=exp_gpu'"
+echo "  PID file: $PIPELINE_PID_FILE"
+echo ""
+echo "Stop guide:"
+echo "  Stop scheduler group : kill -- -\$(cat \"$PIPELINE_PID_FILE\")"
+echo "  Check scheduler pid  : ps -fp \$(cat \"$PIPELINE_PID_FILE\")"
+echo "  Stop running containers too:"
+echo "    docker ps --filter 'name=exp_gpu' -q | xargs -r docker rm -f"
 echo ""
 echo "WandB group: BENCH-$SELECTED_MODEL_ID"
 echo "Results directory: $PROJECT_DIR/$RESULTS_RUN_DIR"

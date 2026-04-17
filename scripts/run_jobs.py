@@ -63,6 +63,18 @@ running_experiments = {gpu: None for gpu in available_gpus}
 last_log_line_count = {}
 last_log_time = {}       # exp_name -> time.time() of last log line seen
 log_streamer_threads = {}  # exp_name -> Thread
+local_ogbench_dir = os.path.abspath(os.path.join(project_dir, "..", "ogbench"))
+
+
+def is_benchmark_job(config: dict) -> bool:
+    tasks = config.get("experiment.tasks")
+    if tasks is None:
+        return False
+    if isinstance(tasks, str):
+        return "benchmark" in tasks
+    if isinstance(tasks, list):
+        return "benchmark" in tasks
+    return False
 
 
 def _stream_logs_worker(exp_name, server):
@@ -97,16 +109,6 @@ def preprocess_batch_jobs(folder: str) -> None:
     import glob as _glob
     import re as _re
 
-    def _is_benchmark_job(config: dict) -> bool:
-        tasks = config.get("experiment.tasks")
-        if tasks is None:
-            return False
-        if isinstance(tasks, str):
-            return "benchmark" in tasks
-        if isinstance(tasks, list):
-            return "benchmark" in tasks
-        return False
-
     files = sorted(_glob.glob(os.path.join(folder, "*.json")))
     if not files:
         return
@@ -118,7 +120,7 @@ def preprocess_batch_jobs(folder: str) -> None:
     for fpath in files:
         with open(fpath) as f:
             config = json.load(f)
-        if _is_benchmark_job(config):
+        if is_benchmark_job(config):
             already_batched.append(fpath)
             continue
         if "task_ids" in config or "+algorithm.task_ids" in config:
@@ -196,6 +198,21 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         prefix = "+" if key in _EXTRA_KEYS else ""
         command_args += f"{shlex.quote(f'{prefix}{key}={val_str}')} "
 
+    is_benchmark = is_benchmark_job(config)
+    extra_env = ""
+    extra_mounts = ""
+    if is_benchmark:
+        if not os.path.isdir(local_ogbench_dir):
+            raise FileNotFoundError(
+                f"Benchmark job requires local ogbench checkout at {local_ogbench_dir}"
+            )
+        extra_env = (
+            f"-e PYTHONPATH=/home/{docker_user}/ogbench_local:${{PYTHONPATH:-}} "
+            f"-e MCTD_USE_LOCAL_OGBENCH=1 "
+            f"-e MCTD_LOCAL_OGBENCH_ROOT=/home/{docker_user}/ogbench_local "
+        )
+        extra_mounts = f"-v {local_ogbench_dir}:/home/{docker_user}/ogbench_local:ro "
+
     if server == "localhost":
         command = f"""
         docker run -d --gpus all --user root --name {exp_name} --shm-size=50g \
@@ -207,6 +224,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -e LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/{docker_user}/.mujoco/mujoco210/bin \
         -e WANDB_ENTITY={wandb_entity} \
         -e WANDB_PROJECT={wandb_project} \
+        {extra_env}\
         -v /usr/lib/wsl:/usr/lib/wsl \
         -v {project_dir}:/home/{docker_user}/mctd \
         -v {output_dir}:/home/{docker_user}/mctd_outputs \
@@ -216,6 +234,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -v {ogbench_data_dir}:/home/{docker_user}/.ogbench/data \
         -v {hilp_dir}:/home/{docker_user}/HILP \
         -v {jax_cache_dir}:/home/{docker_user}/.jax_cache \
+        {extra_mounts}\
         {docker_image} /bin/bash \
         -c "git config --global --add safe.directory /home/{docker_user}/mctd && cd /home/{docker_user}/mctd && python3 main.py hostname={server} gpu_id={gpu_id} {command_args}"
         """
@@ -227,6 +246,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -e MUJOCO_GL=osmesa \
         -e HYDRA_FULL_ERROR=1 \
         -e CUDA_VISIBLE_DEVICES=0 \
+        {extra_env}\
         -v {project_dir}:/home/{docker_user}/mctd \
         -v {output_dir}:/home/{docker_user}/mctd_outputs \
         -e MCTD_OUTPUT_DIR=/home/{docker_user}/mctd_outputs \
@@ -235,6 +255,7 @@ def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
         -v {ogbench_data_dir}:/home/{docker_user}/.ogbench/data \
         -v {hilp_dir}:/home/{docker_user}/HILP \
         -v {jax_cache_dir}:/home/{docker_user}/.jax_cache \
+        {extra_mounts}\
         {docker_image} /bin/bash \
         -c 'git config --global --add safe.directory /home/{docker_user}/mctd && cd /home/{docker_user}/mctd && python3 main.py hostname={server} gpu_id={gpu_id} {command_args}'"
         """

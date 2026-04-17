@@ -5,8 +5,10 @@ from tqdm import tqdm
 import math
 import time
 import json
+import os
 import numpy as np
 from random import random
+import random as py_random
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat, reduce
@@ -930,6 +932,134 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         if not seeded:
             print(f"[WARN] Failed to apply interaction_seed={seed} to envs", flush=True)
 
+    def _seed_benchmark_rollout_rng(self, seed: int) -> None:
+        np.random.seed(seed)
+        py_random.seed(seed)
+
+    def _verify_local_ogbench_runtime(self) -> None:
+        if os.environ.get("MCTD_USE_LOCAL_OGBENCH") != "1":
+            return
+
+        import ogbench
+
+        expected_root = os.path.realpath(os.environ.get("MCTD_LOCAL_OGBENCH_ROOT", ""))
+        actual_file = os.path.realpath(getattr(ogbench, "__file__", ""))
+        if not expected_root or not actual_file.startswith(expected_root):
+            raise RuntimeError(
+                f"Benchmark job expected local ogbench under {expected_root}, got {actual_file}"
+            )
+        print(f"[BENCHMARK] Using local ogbench source: {actual_file}", flush=True)
+
+    def _get_ogbench_make_maze_env(self):
+        """Resolve OGBench's maze factory across both installed and local source layouts."""
+        import importlib
+        import ogbench
+
+        maze_module = getattr(getattr(ogbench, "locomaze", None), "maze", None)
+        if maze_module is not None and hasattr(maze_module, "make_maze_env"):
+            return maze_module.make_maze_env
+        return importlib.import_module("ogbench.locomaze.maze").make_maze_env
+
+    def _ensure_ogbench_set_task_compat(self, env) -> None:
+        if hasattr(env, "set_task"):
+            return
+        if getattr(env, "_mctd_set_task_compat", False):
+            return
+        if not hasattr(env, "task_infos") or not hasattr(env, "reset"):
+            raise RuntimeError("Env does not expose task_infos/reset for OGBench task compatibility shim")
+
+        original_reset = env.reset
+
+        def _set_task(task_id):
+            assert 1 <= task_id <= env.num_tasks, f"Task ID must be in [1, {env.num_tasks}]."
+            env._mctd_pending_task_id = int(task_id)
+            env.cur_task_id = int(task_id)
+            env.cur_task_info = env.task_infos[int(task_id) - 1]
+            print(f"Task {task_id} is set: {env.cur_task_info}", flush=True)
+
+        def _reset(*args, **kwargs):
+            options = kwargs.pop("options", None)
+            if options is None:
+                options = {}
+            else:
+                options = dict(options)
+            pending_task_id = getattr(env, "_mctd_pending_task_id", None)
+            if pending_task_id is not None and "task_id" not in options:
+                options["task_id"] = pending_task_id
+            return original_reset(*args, options=options, **kwargs)
+
+        env._mctd_pending_task_id = None
+        env.set_task = _set_task
+        env.reset = _reset
+        env._mctd_set_task_compat = True
+
+    def _make_single_ogbench_env(self, maze_type: str):
+        make_maze_env = self._get_ogbench_make_maze_env()
+
+        if "pointmaze" in self.env_id:
+            env = make_maze_env(
+                "point",
+                "maze",
+                maze_type=maze_type,
+                width=200,
+                height=200,
+            )
+        elif "antmaze" in self.env_id:
+            env = make_maze_env(
+                "ant",
+                "maze",
+                maze_type=maze_type,
+                width=200,
+                height=200,
+            )
+        else:
+            raise RuntimeError(f"Unsupported OGBench env for benchmark preflight: {self.env_id}")
+        self._ensure_ogbench_set_task_compat(env)
+        return env
+
+    def _benchmark_preflight_check(self, task_id: int) -> None:
+        if getattr(self, "_benchmark_preflight_done", False):
+            return
+        if self.env_id not in OGBENCH_ENVS:
+            raise RuntimeError(f"benchmark preflight only supports OGBench envs, got {self.env_id}")
+
+        self._verify_local_ogbench_runtime()
+        maze_type = self.env_id.split("-")[1]
+        env = self._make_single_ogbench_env(maze_type)
+        rounded_starts = []
+        rounded_goals = []
+
+        try:
+            for offset in range(5):
+                reset_seed = self.benchmark_rollout_seed_base + offset
+                self._seed_benchmark_rollout_rng(reset_seed)
+                ob, info = env.reset(options=dict(task_id=int(task_id)))
+                start_xy = tuple(round(float(v), 4) for v in np.asarray(ob)[:2])
+                goal_xy = tuple(round(float(v), 4) for v in np.asarray(info["goal"])[:2])
+                rounded_starts.append(start_xy)
+                rounded_goals.append(goal_xy)
+        finally:
+            env.close()
+
+        unique_starts = len(set(rounded_starts))
+        unique_goals = len(set(rounded_goals))
+        print(
+            f"[BENCHMARK] Preflight perturbation check | task={task_id} "
+            f"starts={rounded_starts} goals={rounded_goals}",
+            flush=True,
+        )
+        if unique_starts < 2:
+            raise RuntimeError(
+                f"Benchmark preflight failed: start perturbation not observed for task {task_id}. "
+                f"Samples={rounded_starts}"
+            )
+        if unique_goals < 2:
+            raise RuntimeError(
+                f"Benchmark preflight failed: goal perturbation not observed for task {task_id}. "
+                f"Samples={rounded_goals}"
+            )
+        self._benchmark_preflight_done = True
+
     def _write_benchmark_results(self, payload: dict) -> None:
         if not self.benchmark_results_path:
             raise ValueError("benchmark_results_path must be set for benchmark runs")
@@ -951,6 +1081,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         original_seed = self.interaction_seed
 
         for task_idx, task_id in enumerate(task_ids):
+            self._benchmark_preflight_check(int(task_id))
             task_rollouts = []
             task_seed_base = self.benchmark_rollout_seed_base + task_idx * self.benchmark_num_rollouts
             rollout_pbar = tqdm(
@@ -961,6 +1092,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             )
             for rollout_idx in range(self.benchmark_num_rollouts):
                 rollout_seed = task_seed_base + rollout_idx
+                self._seed_benchmark_rollout_rng(rollout_seed)
                 self.task_id = int(task_id)
                 self.interaction_seed = rollout_seed
                 namespace = (
@@ -1913,6 +2045,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 envs = self._cached_envs
                 agent = getattr(self, "_cached_agent", None)
                 if self.env_id in OGBENCH_ENVS:
+                    self._ensure_ogbench_set_task_compat(envs.envs[0])
                     envs.envs[0].set_task(self.task_id)  # task 전환 (start/goal 변경)
                 self._seed_interaction_envs(envs)
                 envs.reset()
@@ -1921,16 +2054,17 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 # Use higher resolution when mujoco renderer is enabled
                 _render_size = 480 if (self.viz_agent_rollout and self.viz_mujoco_renderer) else 200
                 if self.env_id in OGBENCH_ENVS:
+                    _make_maze_env = self._get_ogbench_make_maze_env()
                     if "pointmaze" in self.env_id:
                         _maze_type = self.env_id.split("-")[1]
-                        env_fn = lambda: ogbench.locomaze.maze.make_maze_env(
+                        env_fn = lambda: _make_maze_env(
                             "point", "maze", maze_type=_maze_type,
                             width=_render_size, height=_render_size,
                         )
                         use_diffused_action = True
                     elif "antmaze" in self.env_id:
                         _maze_type = self.env_id.split("-")[1]
-                        env_fn = lambda: ogbench.locomaze.maze.make_maze_env(
+                        env_fn = lambda: _make_maze_env(
                             "ant", "maze", maze_type=_maze_type,
                             width=_render_size, height=_render_size,
                         )
@@ -1996,6 +2130,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 # Create single DummyVecEnv and set task
                 envs = DummyVecEnv([env_fn])
                 if self.env_id in OGBENCH_ENVS:
+                    self._ensure_ogbench_set_task_compat(envs.envs[0])
                     envs.envs[0].set_task(self.task_id)
                 elif self.use_random_goals_for_interaction:
                     envs.envs[0].set_target()

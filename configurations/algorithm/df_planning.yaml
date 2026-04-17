@@ -41,7 +41,7 @@ segment_episode_len: 200 # raw episode length per segment (pre-jump); effective 
 #     td_models/<same-stem>.json  →  {"aggregator": "inner_prod"}
 #   If no sidecar exists, inner_prod is used (matches training default).
 # For legacy .pt checkpoints: hilp_obs_dim / hilp_skill_dim are still needed.
-hilp_checkpoint_path: "td_models/params_1000000_20260324_002241.pkl"
+hilp_checkpoint_path: "td_models/params_1000000_20260416_112010.pkl" # navigate: "td_models/params_1000000_20260324_002241.pkl", stitch: "td_models/params_1000000_20260416_112010.pkl"
 mctd_guidance_scales: [0.8, 0.4, 0.0] # HILP gradient scale for near-target positions (TD_thres or above)
 rmse_guidance_scale: 0.2 # RMSE direction scale for far-target positions (below TD_thres)
 anchor_guidance_scale_ratio: 1.2
@@ -68,7 +68,7 @@ viz_compare_expanded_to_value: false
 viz_mujoco_renderer: false
 viz_subplan_denoising: false # set True to upload plan/plan_at_* to wandb (slow)
 viz_replanning: false # set True to also log replanned stage denoising video (requires mcts_use_replan)
-viz_uncertain_next_subplan_last_obs: false
+viz_uncertain_next_subplan_last_obs: true
 profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
 frame_sampling_way: "linear" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
 
