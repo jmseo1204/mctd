@@ -29,6 +29,7 @@ from utils.logging_utils import (
 )
 from utils.tracer import Tracer, set_default_tracer, get_tracer
 from utils.planning_utils import episode_len_to_plan_tokens
+from utils.task_override_loader import apply_task_overrides_to_env, inject_task_metadata_into_reset_info, resolve_task_override_path
 from .tree_node import TreeNode
 from . import guidance
 from .hilp_loader import HILPMemoizedWrapper, get_hilp_fn
@@ -75,6 +76,62 @@ def _find_hilp_matches(td_models_dir: str, tokens: List[str]) -> List[str]:
         if any(token in filename for token in tokens):
             matches.append(path)
     return matches
+
+
+def _find_dql_result_dirs(results_root: str, dataset_name: str, ckpt_id: int = 200) -> List[str]:
+    if not dataset_name or not os.path.isdir(results_root):
+        return []
+
+    prefix = f"{dataset_name}|"
+    required_files = (
+        f"actor_{ckpt_id}.pth",
+        f"critic_{ckpt_id}.pth",
+        f"critic_target_{ckpt_id}.pth",
+    )
+    matches: List[Tuple[float, str]] = []
+
+    for entry in os.listdir(results_root):
+        full_path = os.path.join(results_root, entry)
+        if not os.path.isdir(full_path) or not entry.startswith(prefix):
+            continue
+        if not all(os.path.isfile(os.path.join(full_path, fname)) for fname in required_files):
+            continue
+        actor_path = os.path.join(full_path, required_files[0])
+        try:
+            mtime = os.path.getmtime(actor_path)
+        except OSError:
+            mtime = 0.0
+        matches.append((mtime, full_path))
+
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in matches]
+
+
+def _resolve_dql_result_dir(results_root: str, dataset_name: str, ckpt_id: int = 200) -> Tuple[str, str]:
+    exact_matches = _find_dql_result_dirs(results_root, dataset_name, ckpt_id=ckpt_id)
+    if exact_matches:
+        return exact_matches[0], "exact"
+
+    fallback_datasets: List[str] = []
+    if dataset_name.endswith("-stitch-v0"):
+        fallback_datasets.append(dataset_name.replace("-stitch-v0", "-navigate-v0"))
+
+    for fallback_dataset in fallback_datasets:
+        fallback_matches = _find_dql_result_dirs(results_root, fallback_dataset, ckpt_id=ckpt_id)
+        if fallback_matches:
+            return fallback_matches[0], f"fallback:{fallback_dataset}"
+
+    available_dirs = []
+    if os.path.isdir(results_root):
+        available_dirs = sorted(
+            name for name in os.listdir(results_root)
+            if os.path.isdir(os.path.join(results_root, name))
+        )
+    raise FileNotFoundError(
+        f"No DQL checkpoint directory found for dataset '{dataset_name}' under {results_root}. "
+        f"Need actor_{ckpt_id}.pth/critic_{ckpt_id}.pth/critic_target_{ckpt_id}.pth. "
+        f"Available dirs: {available_dirs}"
+    )
 
 
 def _load_dataset_name_from_config(dataset_config_name: str) -> Optional[str]:
@@ -241,6 +298,16 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.interaction_seed = cfg.get("interaction_seed", None)
         self.use_random_goals_for_interaction = cfg.get("use_random_goals_for_interaction", False)
         self.task_id = cfg.get("task_id", None)
+        self.task_override_path = cfg.get("task_override_path", None)
+        self.task_override_waypoint_group_idx = cfg.get("task_override_waypoint_group_idx", None)
+        self.task_override_resolved_path = resolve_task_override_path(
+            self.task_override_path,
+            repo_root=_repo_root(),
+        ) if self.task_override_path not in (None, "") else None
+        self._current_task_start_xy = None
+        self._current_task_goal_xy = None
+        self._current_task_waypoints = None
+        self._current_task_names = None
         # task_ids: list of task IDs to evaluate sequentially in one process.
         # Set by run_jobs.py when multiple same-config jobs are batched together.
         raw_ids = cfg.get("task_ids", None)
@@ -1120,7 +1187,15 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             env._mctd_pending_task_id = int(task_id)
             env.cur_task_id = int(task_id)
             env.cur_task_info = env.task_infos[int(task_id) - 1]
-            print(f"Task {task_id} is set: {env.cur_task_info}", flush=True)
+            cur_task_info = dict(env.cur_task_info or {})
+            waypoint_group = cur_task_info.get("waypoint_ij_group", cur_task_info.get("waypoint_ijs", []))
+            task_summary = {
+                "init_ij": cur_task_info.get("init_ij"),
+                "goal_ij": cur_task_info.get("goal_ij"),
+                "active_waypoint_group_idx": cur_task_info.get("active_waypoint_group_idx"),
+                "waypoint_ij_group": waypoint_group,
+            }
+            print(f"Task {task_id} is set: {task_summary}", flush=True)
 
         def _reset(*args, **kwargs):
             options = kwargs.pop("options", None)
@@ -1137,6 +1212,77 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         env.set_task = _set_task
         env.reset = _reset
         env._mctd_set_task_compat = True
+
+    def _maybe_apply_ogbench_task_overrides(self, env) -> None:
+        if self.task_override_resolved_path is None:
+            return
+        already_applied = getattr(env, "_mctd_task_override_path", None)
+        if already_applied == self.task_override_resolved_path:
+            return
+        applied_path = apply_task_overrides_to_env(
+            env,
+            self.task_override_resolved_path,
+            expected_env_id=self.env_id,
+            repo_root=_repo_root(),
+            waypoint_group_idx_override=self.task_override_waypoint_group_idx,
+        )
+        env._mctd_task_override_path = applied_path
+        print(f"[OGBENCH] Applied task override: {applied_path}", flush=True)
+
+    def _ensure_ogbench_task_metadata_compat(self, env) -> None:
+        if self.task_override_resolved_path is None:
+            return
+        if getattr(env, "_mctd_task_metadata_compat", False):
+            return
+
+        original_reset = env.reset
+
+        def _reset(*args, **kwargs):
+            ob, info = original_reset(*args, **kwargs)
+            info = inject_task_metadata_into_reset_info(ob, info, getattr(env, "cur_task_info", None))
+            return ob, info
+
+        env.reset = _reset
+        env._mctd_task_metadata_compat = True
+
+    def _prepare_ogbench_env(self, env) -> None:
+        self._ensure_ogbench_set_task_compat(env)
+        self._maybe_apply_ogbench_task_overrides(env)
+        self._ensure_ogbench_task_metadata_compat(env)
+
+    def _capture_current_task_metadata(self, obs: torch.Tensor, goal: torch.Tensor, reset_infos: list[dict]) -> None:
+        if self.task_override_resolved_path is None:
+            self._current_task_start_xy = None
+            self._current_task_goal_xy = None
+            self._current_task_waypoints = None
+            self._current_task_names = None
+            return
+
+        obs_np = obs.detach().cpu().numpy()[:, self.pos_dim_indices]
+        goal_np = goal.detach().cpu().numpy()[:, self.pos_dim_indices]
+        start_xy_list = []
+        goal_xy_list = []
+        waypoint_list = []
+        task_name_list = []
+
+        for idx, info in enumerate(reset_infos):
+            info = info or {}
+            start_xy = np.asarray(info.get("start_xy", obs_np[idx]), dtype=np.float32).reshape(-1)[:2]
+            goal_xy = np.asarray(info.get("goal_xy", goal_np[idx]), dtype=np.float32).reshape(-1)[:2]
+            waypoints_xy = np.asarray(info.get("waypoints_xy", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+            if waypoints_xy.size == 0:
+                waypoints_xy = np.zeros((0, 2), dtype=np.float32)
+            else:
+                waypoints_xy = waypoints_xy.reshape(-1, 2)
+            start_xy_list.append(start_xy)
+            goal_xy_list.append(goal_xy)
+            waypoint_list.append(waypoints_xy)
+            task_name_list.append(info.get("task_name"))
+
+        self._current_task_start_xy = np.stack(start_xy_list, axis=0) if start_xy_list else None
+        self._current_task_goal_xy = np.stack(goal_xy_list, axis=0) if goal_xy_list else None
+        self._current_task_waypoints = waypoint_list
+        self._current_task_names = task_name_list
 
     def _make_single_ogbench_env(self, maze_type: str):
         make_maze_env = self._get_ogbench_make_maze_env()
@@ -1159,7 +1305,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             )
         else:
             raise RuntimeError(f"Unsupported OGBench env for benchmark preflight: {self.env_id}")
-        self._ensure_ogbench_set_task_compat(env)
+        self._prepare_ogbench_env(env)
         return env
 
     def _benchmark_preflight_check(self, task_id: int) -> None:
@@ -2180,7 +2326,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
             # [ENV CACHING] Check if environment is cached
             # task_id는 set_task()로 전환하므로 캐시 키에서 제외 — 환경 구조는 task마다 동일
-            env_cache_key = f"{self.env_id}"
+            env_cache_key = f"{self.env_id}|task_override={self.task_override_resolved_path or 'none'}"
             if (
                 hasattr(self, "_cached_envs")
                 and hasattr(self, "_cached_env_key")
@@ -2190,7 +2336,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 envs = self._cached_envs
                 agent = getattr(self, "_cached_agent", None)
                 if self.env_id in OGBENCH_ENVS:
-                    self._ensure_ogbench_set_task_compat(envs.envs[0])
+                    self._prepare_ogbench_env(envs.envs[0])
                     envs.envs[0].set_task(self.task_id)  # task 전환 (start/goal 변경)
                 self._seed_interaction_envs(envs)
                 envs.reset()
@@ -2229,7 +2375,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                             state_dim=state_dim * 2,
                             action_dim=action_dim,
                             max_action=max_action,
-                            device=0,
+                            device=self.device,
                             discount=0.99,
                             tau=0.005,
                             max_q_backup=params["max_q_backup"],
@@ -2243,31 +2389,17 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                             goal_dim=2,
                             lcb_coef=4.0,
                         )
-                        # pretrained agent loading
-                        if (
-                            self.dataset == "antmaze-medium-navigate-v0"
-                            or self.dataset == "antmaze-medium-stitch-v0"
-                        ):
-                            dql_folder = "antmaze-medium-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
-                        elif (
-                            self.dataset == "antmaze-large-navigate-v0"
-                            or self.dataset == "antmaze-large-stitch-v0"
-                        ):
-                            dql_folder = "antmaze-large-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
-                        elif (
-                            self.dataset == "antmaze-giant-navigate-v0"
-                            or self.dataset == "antmaze-giant-stitch-v0"
-                        ):
-                            dql_folder = "antmaze-giant-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
-                        else:
-                            raise ValueError(f"Dataset {self.dataset} not supported")
-
-                        import os
-
-                        agent.load_model(
-                            os.path.join(os.getcwd(), "dql", "results", dql_folder), id=200
+                        dql_results_root = os.path.join(os.getcwd(), "dql", "results")
+                        dql_dir, dql_match_kind = _resolve_dql_result_dir(
+                            dql_results_root,
+                            self.dataset,
+                            ckpt_id=200,
                         )
-                        print(f"[INIT] DQL agent loaded: {dql_folder}", flush=True)
+                        agent.load_model(dql_dir, id=200)
+                        print(
+                            f"[INIT] DQL agent loaded ({dql_match_kind}): {os.path.basename(dql_dir)}",
+                            flush=True,
+                        )
                 else:
                     env_fn = lambda: gym.make(self.env_id)
                     agent = None
@@ -2275,7 +2407,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 # Create single DummyVecEnv and set task
                 envs = DummyVecEnv([env_fn])
                 if self.env_id in OGBENCH_ENVS:
-                    self._ensure_ogbench_set_task_compat(envs.envs[0])
+                    self._prepare_ogbench_env(envs.envs[0])
                     envs.envs[0].set_task(self.task_id)
                 elif self.use_random_goals_for_interaction:
                     envs.envs[0].set_target()
@@ -2331,6 +2463,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     for env in envs.envs:
                         env.set_target()
 
+            self._current_task_start_xy = None
+            self._current_task_goal_xy = None
+            self._current_task_waypoints = None
+            self._current_task_names = None
+
             obs = torch.from_numpy(obs).float().to(self.device)
             start = obs.detach()
             obs_normalized = (
@@ -2347,6 +2484,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             goal = torch.cat([goal, torch.zeros_like(goal)], -1)
             goal = goal[:, self.obs_dim_indices]  # select obs dims from raw env goal
             goal_normalized = ((goal - obs_mean[None]) / obs_std[None]).detach()
+            self._capture_current_task_metadata(obs, goal, list(envs.reset_infos))
 
             steps = 0
             loops = 0  # Loop counter for bidirectional MCTS planning
@@ -2666,7 +2804,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 _ppviz_t0 = time.time()
                 _pp_plan_np = postprocessed_plan[:, :, self.pos_dim_indices].detach().cpu().numpy()  # (K, 1, pos_dim)
                 _pp_images = make_trajectory_images(
-                    self.env_id, _pp_plan_np, 1, start_numpy.tolist(), goal_numpy.tolist(), self.plot_end_points
+                    self.env_id,
+                    _pp_plan_np,
+                    1,
+                    start_numpy.tolist(),
+                    goal_numpy.tolist(),
+                    self.plot_end_points,
+                    waypoints=self._current_task_waypoints,
                 )
                 _viz_prefix = namespace.split("/")[-1]
                 for _pp_i, _pp_img in enumerate(_pp_images):
@@ -2756,6 +2900,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 "steps": int(steps),
                 "interaction_seed": int(self.interaction_seed) if self.interaction_seed is not None else None,
             }
+            if self._current_task_start_xy is not None and self._current_task_goal_xy is not None:
+                self._last_interact_result["start_xy"] = self._current_task_start_xy.tolist()
+                self._last_interact_result["goal_xy"] = self._current_task_goal_xy.tolist()
+                self._last_interact_result["waypoints_xy"] = [
+                    waypoint_set.tolist() for waypoint_set in (self._current_task_waypoints or [])
+                ]
+                if self._current_task_names is not None:
+                    self._last_interact_result["task_names"] = list(self._current_task_names)
 
             # Visualization
             _post_exec_t0 = time.time()
@@ -2772,7 +2924,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
                 _timg_t0 = time.time()
                 images = make_trajectory_images(
-                    self.env_id, trajectory[:, -samples:], samples, start, goal, self.plot_end_points
+                    self.env_id,
+                    trajectory[:, -samples:],
+                    samples,
+                    start,
+                    goal,
+                    self.plot_end_points,
+                    waypoints=self._current_task_waypoints,
                 )
                 for i, img in enumerate(images):
                     self.log_image(
@@ -2798,6 +2956,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         max_frames=self.validation_video_max_frames,
                         path_stride=self.validation_video_path_stride,
                         postprocessed_plan_per_frame=pp_plan_per_frame,
+                        waypoints=self._current_task_waypoints,
                     )
                     for i, video in enumerate(videos):
                         if video.shape[0] > 0:
@@ -2999,6 +3158,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             starts,
             goals,
             self.plot_end_points,
+            waypoints=self._current_task_waypoints,
         )
         for i in range(len(plan_images)):
             img = plan_images[i]
@@ -3039,10 +3199,22 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         value_obs = _to_obs_np(value_plans)
 
         expanded_images = make_trajectory_images(
-            self.env_id, expanded_obs, batch_size, starts, goals, self.plot_end_points
+            self.env_id,
+            expanded_obs,
+            batch_size,
+            starts,
+            goals,
+            self.plot_end_points,
+            waypoints=self._current_task_waypoints,
         )
         value_images = make_trajectory_images(
-            self.env_id, value_obs, batch_size, starts, goals, self.plot_end_points
+            self.env_id,
+            value_obs,
+            batch_size,
+            starts,
+            goals,
+            self.plot_end_points,
+            waypoints=self._current_task_waypoints,
         )
 
         for i in range(batch_size):

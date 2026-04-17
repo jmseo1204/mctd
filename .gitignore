@@ -19,6 +19,9 @@ td_models/*.pkl
 outputs
 symlink_to_outputs/
 .gitattributes
+benchmark_results/
+debug/
+visualizations/
 
 # agent_config
 .claude/

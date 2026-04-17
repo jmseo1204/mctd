@@ -49,6 +49,13 @@ chmod -R 777 ~/.jax_cache
 echo "✓ JAX cache reset complete"
 echo ""
 
+echo "Preparing outputs directory permissions..."
+if ! mctd_prepare_output_permissions; then
+    exit 1
+fi
+echo "✓ Outputs directory ready: $MCTD_OUTPUT_MOUNT_DIR"
+echo ""
+
 # GPU selection + availability check (after container cleanup to avoid false positives)
 mctd_select_gpus
 mctd_check_gpu_availability
@@ -167,12 +174,16 @@ echo "====================================================="
 echo ""
 
 export AVAILABLE_GPUS
-nohup python3 scripts/run_jobs.py > /tmp/mctd_run_jobs.log 2>&1 &
+RUN_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+SCHEDULER_LOG="$PROJECT_DIR/logs/run_${RUN_TIMESTAMP}.log"
+nohup env MCTD_RUN_TIMESTAMP="$RUN_TIMESTAMP" PYTHONUNBUFFERED=1 python3 scripts/run_jobs.py > /tmp/mctd_run_jobs.log 2>&1 &
 RUN_JOBS_PID=$!
 
 echo "✓ Jobs launched in background (PID: $RUN_JOBS_PID)"
 echo "  Log: /tmp/mctd_run_jobs.log"
 echo "  Monitor: tail -f /tmp/mctd_run_jobs.log"
+echo "  Scheduler log: $SCHEDULER_LOG"
+echo "  Monitor scheduler: tail -f $SCHEDULER_LOG"
 echo "  Containers: docker ps --filter 'name=exp_gpu'"
 echo ""
 echo "====================================================="

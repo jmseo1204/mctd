@@ -49,6 +49,11 @@ chmod -R 777 ~/.jax_cache
 echo "JAX cache reset complete"
 echo ""
 
+echo "Preparing outputs directory permissions..."
+mctd_prepare_output_permissions
+echo "Outputs directory ready: $MCTD_OUTPUT_MOUNT_DIR"
+echo ""
+
 mctd_select_gpus
 mctd_check_gpu_availability
 
@@ -161,8 +166,11 @@ echo "====================================================="
 echo ""
 
 export AVAILABLE_GPUS
-PIPELINE_LOG="/tmp/mctd_eval_all_${SELECTED_DATASET}_${RUN_TIMESTAMP}.log"
-PIPELINE_PID_FILE="/tmp/mctd_eval_all_${SELECTED_MODEL_ID}.pid"
+LOG_DIR="$PROJECT_DIR/logs"
+mkdir -p "$LOG_DIR"
+PIPELINE_LOG="$LOG_DIR/eval_all_${SELECTED_DATASET}_${RUN_TIMESTAMP}.log"
+SCHEDULER_LOG="$LOG_DIR/run_${RUN_TIMESTAMP}.log"
+PIPELINE_PID_FILE="$LOG_DIR/eval_all_${SELECTED_MODEL_ID}_${RUN_TIMESTAMP}.pid"
 nohup setsid bash "$PROJECT_DIR/scripts/run_benchmark_pipeline.sh" \
     "$RESULTS_RUN_DIR" \
     "$NUM_REPEATS" \
@@ -175,8 +183,10 @@ PIPELINE_PID=$!
 echo "$PIPELINE_PID" > "$PIPELINE_PID_FILE"
 
 echo "Jobs launched in background (PID: $PIPELINE_PID)"
-echo "  Log: $PIPELINE_LOG"
-echo "  Monitor: tail -f $PIPELINE_LOG"
+echo "  Primary log: $SCHEDULER_LOG"
+echo "  Monitor: tail -f $SCHEDULER_LOG"
+echo "  Pipeline log: $PIPELINE_LOG"
+echo "  Monitor pipeline: tail -f $PIPELINE_LOG"
 echo "  Containers: docker ps --filter 'name=exp_gpu'"
 echo "  PID file: $PIPELINE_PID_FILE"
 echo ""

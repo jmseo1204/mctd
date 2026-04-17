@@ -601,7 +601,13 @@ class PlanVizMixin:
                 'node_unc_label': node_unc_label,
             }
             img = make_trajectory_images(
-                self.env_id, td, 1, start_np, goal_np, self.plot_end_points
+                self.env_id,
+                td,
+                1,
+                start_np,
+                goal_np,
+                self.plot_end_points,
+                waypoints=getattr(self, "_current_task_waypoints", None),
             )[0]
             frame_rgb = img[:, :, :3].copy()
             if _dn_step_indices is not None and m < len(_dn_step_indices):

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import numbers
 import numpy as np
 import torch
 import torch.nn as nn
@@ -374,7 +375,7 @@ class Diffusion_QL(object):
         torch.save(training_state, state_path)
 
     def load_model(self, dir, id=None, load_training_state=True):
-        map_location = self.device
+        map_location = self._normalize_map_location(self.device)
         if id is not None:
             self.actor.load_state_dict(
                 torch.load(f"{dir}/actor_{id}.pth", map_location=map_location)
@@ -428,3 +429,15 @@ class Diffusion_QL(object):
             self.ema_model.load_state_dict(self.actor.state_dict())
 
         return training_state_loaded
+
+    @staticmethod
+    def _normalize_map_location(device):
+        if isinstance(device, torch.device):
+            return device
+        if isinstance(device, str):
+            return torch.device(device)
+        if isinstance(device, numbers.Integral):
+            if torch.cuda.is_available():
+                return torch.device(f"cuda:{int(device)}")
+            return torch.device("cpu")
+        return device

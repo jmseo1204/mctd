@@ -20,8 +20,9 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 export AVAILABLE_GPUS="${AVAILABLE_GPUS:-}"
+export MCTD_RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
 
-python3 scripts/run_jobs.py
+PYTHONUNBUFFERED=1 python3 scripts/run_jobs.py
 
 COLLECT_ARGS=(
     --results_dir "$RESULTS_DIR"
@@ -40,7 +41,7 @@ if [ -n "$RUN_TIMESTAMP" ]; then
     COLLECT_ARGS+=(--run_timestamp "$RUN_TIMESTAMP")
 fi
 
-python3 scripts/collect_benchmark_results.py \
+PYTHONUNBUFFERED=1 python3 scripts/collect_benchmark_results.py \
     "${COLLECT_ARGS[@]}"
 
 echo ""

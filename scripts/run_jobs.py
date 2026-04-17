@@ -15,7 +15,7 @@ from project_config import DOCKER_USER as _cfg_docker_user, WANDB_ENTITY as _cfg
 # Logging setup
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
-current_time_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+current_time_str = os.environ.get("MCTD_RUN_TIMESTAMP") or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 log_file_path = os.path.join(LOG_DIR, f"run_{current_time_str}.log")
 log_file = open(log_file_path, "w", buffering=1)
 
@@ -23,15 +23,42 @@ def log_write(message):
     timestamp = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
     # Mirror to log file
     log_file.write(f"{timestamp} {message}\n")
+    log_file.flush()
     # Output to pbar/terminal
-    if 'pbar' in globals() and pbar is not None:
+    if 'pbar' in globals() and pbar is not None and sys.stdout.isatty():
         pbar.write(message)
     else:
-        print(message)
+        print(message, flush=True)
 
 
 def log_finished(step_name):
     log_write(f"##### {step_name} finished! #####")
+
+
+def ensure_writable_dir(path: str, label: str) -> None:
+    """Make sure a directory exists and is writable by the current user."""
+    try:
+        os.makedirs(path, exist_ok=True)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"{label} directory '{path}' could not be created. "
+            "Run the launcher again so the Docker permission preflight can repair it."
+        ) from exc
+
+    if os.access(path, os.W_OK | os.X_OK):
+        return
+
+    try:
+        current_mode = os.stat(path).st_mode & 0o777
+        os.chmod(path, current_mode | 0o777)
+    except PermissionError as exc:
+        if os.access(path, os.W_OK | os.X_OK):
+            return
+        raise PermissionError(
+            f"{label} directory '{path}' is not writable by the current user, "
+            "and chmod could not repair it. Run the launcher again so the Docker "
+            "permission preflight can repair it."
+        ) from exc
 
 available_gpus = _cfg_available_gpus
 # each server available gpus
@@ -51,12 +78,14 @@ jax_cache_dir = os.path.expanduser("~/.jax_cache")
 os.makedirs(jax_cache_dir, exist_ok=True)
 os.makedirs(os.path.join(jax_cache_dir, "xla_gpu_per_fusion_autotune_cache_dir"), exist_ok=True)
 output_dir = os.path.join(home_dir, "mctd", "outputs")
-os.makedirs(output_dir, exist_ok=True)
-os.system(f"chmod 777 {output_dir}")
-# Ensure today's date dir is writable by Docker (uid 1020) if already created by host user
-today_dir = os.path.join(output_dir, datetime.datetime.now().strftime("%Y-%m-%d"))
-os.makedirs(today_dir, exist_ok=True)
-os.system(f"chmod 777 {today_dir}")
+try:
+    ensure_writable_dir(output_dir, "Output root")
+    # Ensure today's date dir is writable for this run without assuming ownership.
+    today_dir = os.path.join(output_dir, datetime.datetime.now().strftime("%Y-%m-%d"))
+    ensure_writable_dir(today_dir, "Today's output")
+except PermissionError as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
+    sys.exit(1)
 
 # Dictionary to keep track of running experiments.
 running_experiments = {gpu: None for gpu in available_gpus}
@@ -90,9 +119,10 @@ def _stream_logs_worker(exp_name, server):
                 continue
             ts = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
             log_file.write(f"{ts} [{exp_name}] {line}\n")
+            log_file.flush()
             last_log_time[exp_name] = time.time()
             msg = f"[{exp_name[:30]}] {line}"
-            if 'pbar' in globals() and pbar is not None:
+            if 'pbar' in globals() and pbar is not None and sys.stdout.isatty():
                 pbar.write(msg)
             else:
                 print(msg, flush=True)
@@ -342,7 +372,8 @@ log_finished("job batching")
 
 # Get initial total number of jobs
 total_jobs = len([f for f in os.listdir(jobs_folder) if f.endswith('.json')])
-pbar = tqdm(total=total_jobs, desc="Processing Jobs")
+log_write(f"[Scheduler] Loaded {total_jobs} job(s) across {len(available_gpus)} GPU slot(s).")
+pbar = tqdm(total=total_jobs, desc="Processing Jobs", disable=not sys.stdout.isatty())
 
 # Check the jobs folder is empty or not
 queue_is_empty = False

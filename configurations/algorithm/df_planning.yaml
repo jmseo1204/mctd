@@ -10,6 +10,8 @@ plot_start_goal: True
 interaction_seed: 1
 use_random_goals_for_interaction: False
 task_id: 1
+task_override_path: null # optional repo-relative YAML/JSON overriding OGBench task init/goal/waypoints
+task_override_waypoint_group_idx: null # optional 0-based waypoint group index override when a task override file stores multiple waypoint groups
 eval_repeat_id: null
 benchmark_num_rollouts: 1
 benchmark_rollout_seed_base: 0
@@ -31,7 +33,7 @@ open_loop_horizon: 1300 #fixme -> best: int(eval_episode_len * horizon_scale) //
 val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
 sub_goal_interval: 1
 sub_goal_blend_steps: 0 # steps to blend old/new sub_goal actions after a sub_goal switch (antmaze only)
-sequence_dividing_factor: 8
+sequence_dividing_factor: 10
 parallel_search_node: 3 # parallel_search_num = parallel_search_node * len(mctd_guidance_scales)
 segment_episode_len: 200 # raw episode length per segment (pre-jump); effective = segment_episode_len * sequence_dividing_factor; n_tokens = (effective // jump) // frame_stack + 1
 
@@ -67,7 +69,7 @@ viz_compare_expanded_to_value: false
 viz_mujoco_renderer: false
 viz_subplan_denoising: false # set True to upload plan/plan_at_* to wandb (slow)
 viz_replanning: false # set True to also log replanned stage denoising video (requires mcts_use_replan)
-viz_uncertain_next_subplan_last_obs: true
+viz_uncertain_next_subplan_last_obs: false
 profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
 frame_sampling_way: "linear" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
 
@@ -85,6 +87,10 @@ kde_lam: 0.0 # scale for ∇log p term
 regularize_goal_guidance: true # if true: re-normalize (unit_hilp + kde_lam·kde_score) to unit vector before applying guidance_scale
 kde_sample_ratio: 0.1 # fraction of dataset to use for KDE (1.0 = full dataset)
 kde_save_dir: "~/.ogbench/data" # dataset npz directory for KDE positions
+sampled_graph_sample_ratio: 0.001 # fraction of dataset states to sample for cached visualization graph
+sampled_graph_edge_radius: 3.0 # connect undirected graph edges when Euclidean distance <= this radius
+sampled_graph_seed: 42 # RNG seed for reproducible sampled-state graph construction
+sampled_graph_save_dir: "~/.ogbench/data" # cache directory for sampled-state graph pkl files
 
 # REPLANNING
 mcts_use_replan: false

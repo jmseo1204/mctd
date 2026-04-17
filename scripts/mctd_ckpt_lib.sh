@@ -57,6 +57,43 @@ mctd_normalize_dataset_name() {
     fi
 }
 
+# ── mctd_prepare_output_permissions ──────────────────────────────────────────
+# Ensure the shared outputs mount and today's run directory are writable.
+# If the host user cannot repair permissions directly, use a short-lived root
+# Docker container to make the bind mount world-writable.
+#
+# Usage: mctd_prepare_output_permissions
+mctd_prepare_output_permissions() {
+    local _today_dir
+    _today_dir="$(date +%Y-%m-%d)"
+
+    mkdir -p "$MCTD_OUTPUT_MOUNT_DIR" 2>/dev/null || true
+    mkdir -p "$MCTD_OUTPUT_MOUNT_DIR/$_today_dir" 2>/dev/null || true
+
+    if [ -d "$MCTD_OUTPUT_MOUNT_DIR" ] && [ -d "$MCTD_OUTPUT_MOUNT_DIR/$_today_dir" ] && \
+       [ -w "$MCTD_OUTPUT_MOUNT_DIR" ] && [ -x "$MCTD_OUTPUT_MOUNT_DIR" ] && \
+       [ -w "$MCTD_OUTPUT_MOUNT_DIR/$_today_dir" ] && [ -x "$MCTD_OUTPUT_MOUNT_DIR/$_today_dir" ]; then
+        return 0
+    fi
+
+    echo "[outputs] Repairing permissions via root Docker helper..."
+    docker run --rm --user root \
+        -v "$MCTD_OUTPUT_MOUNT_DIR":"$MCTD_DOCKER_OUTPUTS" \
+        "$MCTD_DOCKER_IMAGE" \
+        /bin/bash -lc "mkdir -p \"$MCTD_DOCKER_OUTPUTS/$_today_dir\" && chmod 777 \"$MCTD_DOCKER_OUTPUTS\" \"$MCTD_DOCKER_OUTPUTS/$_today_dir\" >/dev/null 2>&1 || true"
+
+    mkdir -p "$MCTD_OUTPUT_MOUNT_DIR/$_today_dir" 2>/dev/null || true
+
+    if [ ! -d "$MCTD_OUTPUT_MOUNT_DIR" ] || [ ! -w "$MCTD_OUTPUT_MOUNT_DIR" ] || [ ! -x "$MCTD_OUTPUT_MOUNT_DIR" ]; then
+        echo "❌ ERROR: Outputs directory is still not writable: $MCTD_OUTPUT_MOUNT_DIR" >&2
+        return 1
+    fi
+    if [ ! -d "$MCTD_OUTPUT_MOUNT_DIR/$_today_dir" ] || [ ! -w "$MCTD_OUTPUT_MOUNT_DIR/$_today_dir" ] || [ ! -x "$MCTD_OUTPUT_MOUNT_DIR/$_today_dir" ]; then
+        echo "❌ ERROR: Today's outputs directory is still not writable: $MCTD_OUTPUT_MOUNT_DIR/$_today_dir" >&2
+        return 1
+    fi
+}
+
 # ── mctd_select_gpus ──────────────────────────────────────────────────────────
 # Display a table of all detected GPUs (status, VRAM, running processes with
 # user / PID / uptime), prompt the user to pick GPU index(es), then override
@@ -408,6 +445,8 @@ mctd_ckpt_menu() {
 
 # ── mctd_ensure_eval_symlink <host_ckpt_path> <model_id> ─────────────────────
 # Ensures MCTD_DOWNLOADED_DIR/<model_id>/model.ckpt exists.
+# Also mirrors training_config.yaml when it exists next to the selected
+# checkpoint symlink or the real checkpoint file.
 # If the checkpoint is already under MCTD_DOWNLOADED_DIR/<model_id>/, nothing
 # is done (downloaded ckpts are already in the right place).
 # For local (non-downloaded) checkpoints, creates a RELATIVE symlink so the
@@ -420,14 +459,26 @@ mctd_ensure_eval_symlink() {
     real_ckpt=$(realpath "$host_ckpt" 2>/dev/null || echo "$host_ckpt")
     target_dir="$MCTD_DOWNLOADED_DIR/$model_id"
 
-    # Already in the canonical downloaded location — nothing to do
-    if [ "$(realpath "$target_dir/model.ckpt" 2>/dev/null)" = "$real_ckpt" ]; then
-        return 0
-    fi
-
     # Local checkpoint: create symlink inside downloaded dir
     mkdir -p "$target_dir"
-    local rel_path
-    rel_path=$(realpath --relative-to="$target_dir" "$real_ckpt")
-    ln -sf "$rel_path" "$target_dir/model.ckpt"
+    if [ "$(realpath "$target_dir/model.ckpt" 2>/dev/null)" != "$real_ckpt" ]; then
+        local rel_path
+        rel_path=$(realpath --relative-to="$target_dir" "$real_ckpt")
+        ln -sf "$rel_path" "$target_dir/model.ckpt"
+    fi
+
+    local host_cfg real_cfg cfg_src cfg_rel
+    host_cfg="$(dirname "$host_ckpt")/training_config.yaml"
+    real_cfg="$(dirname "$real_ckpt")/training_config.yaml"
+    cfg_src=""
+    if [ -f "$host_cfg" ]; then
+        cfg_src="$host_cfg"
+    elif [ -f "$real_cfg" ]; then
+        cfg_src="$real_cfg"
+    fi
+
+    if [ -n "$cfg_src" ]; then
+        cfg_rel=$(realpath --relative-to="$target_dir" "$cfg_src")
+        ln -sf "$cfg_rel" "$target_dir/training_config.yaml"
+    fi
 }

@@ -262,7 +262,42 @@ def plot_maze_layout(ax, maze_grid):
     ax.grid(True, color="white", which="minor", linewidth=4)
 
 
-def plot_start_goal(ax, start_goal: None):
+def _select_waypoints_for_batch(waypoints, batch_idx):
+    if waypoints is None:
+        return None
+
+    if isinstance(waypoints, np.ndarray):
+        if waypoints.size == 0:
+            return None
+        if waypoints.ndim == 2:
+            selected = waypoints
+        elif waypoints.ndim == 3:
+            if batch_idx >= waypoints.shape[0]:
+                return None
+            selected = waypoints[batch_idx]
+        else:
+            return None
+    elif isinstance(waypoints, (list, tuple)):
+        if len(waypoints) == 0:
+            return None
+        first = np.asarray(waypoints[0])
+        if first.ndim >= 2:
+            if batch_idx >= len(waypoints):
+                return None
+            selected = np.asarray(waypoints[batch_idx])
+        else:
+            selected = np.asarray(waypoints)
+    else:
+        selected = np.asarray(waypoints)
+
+    if selected.size == 0:
+        return None
+    if selected.ndim == 1:
+        selected = selected[None, :]
+    return np.asarray(selected, dtype=np.float32)
+
+
+def plot_start_goal(ax, start_goal: None, waypoints=None):
     def draw_star(center, radius, num_points=5, color="black"):
         angles = np.linspace(0.0, 2 * np.pi, num_points, endpoint=False) + 5 * np.pi / (2 * num_points)
         inner_radius = radius / 2.0
@@ -291,6 +326,30 @@ def plot_start_goal(ax, start_goal: None):
     goal_outer_circle = plt.Circle((goal_x, goal_y), 0.16, facecolor="white", edgecolor="black")
     ax.add_patch(goal_outer_circle)
     draw_star((goal_x, goal_y), radius=0.08)
+
+    if waypoints is not None and len(waypoints) > 0:
+        for idx, waypoint in enumerate(np.asarray(waypoints)):
+            waypoint_x, waypoint_y = waypoint[:2]
+            ax.scatter(
+                waypoint_x,
+                waypoint_y,
+                marker="D",
+                s=110,
+                facecolors="white",
+                edgecolors="seagreen",
+                linewidths=1.5,
+                zorder=14,
+                label="Waypoint" if idx == 0 else "_nolegend_",
+            )
+            ax.scatter(
+                waypoint_x,
+                waypoint_y,
+                marker="o",
+                s=20,
+                c="seagreen",
+                zorder=15,
+                label="_nolegend_",
+            )
 
 
 def _maybe_add_batch_dim(points):
@@ -372,7 +431,7 @@ def _parse_trajectory_plot_inputs(trajectory):
     return plot_data
 
 
-def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, plot_end_points=True):
+def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, plot_end_points=True, waypoints=None):
     plan_trajectory = plot_data.get("plan")
     node_trajectory = plot_data.get("node_path")
     target_node_trajectory = plot_data.get("target_node_path")
@@ -541,7 +600,10 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
     if plot_end_points:
         start_goal = (_to_plot_coords(env_id, np.asarray(start[batch_idx])[:2]),
                       _to_plot_coords(env_id, np.asarray(goal[batch_idx])[:2]))
-        plot_start_goal(ax, start_goal)
+        batch_waypoints = _select_waypoints_for_batch(waypoints, batch_idx)
+        if batch_waypoints is not None:
+            batch_waypoints = _to_plot_coords(env_id, batch_waypoints[:, :2])
+        plot_start_goal(ax, start_goal, batch_waypoints)
 
     if best_node_target is not None:
         pos = _to_plot_coords(env_id, np.asarray(best_node_target).flatten()[:2])
@@ -773,7 +835,7 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
         ax.legend(loc="upper right", fontsize=5)
 
 
-def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end_points=True):
+def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end_points=True, waypoints=None):
     """
     Create trajectory visualization images.
 
@@ -788,7 +850,17 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
 
     for batch_idx in range(batch_size):
         fig, ax = plt.subplots()
-        _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, plot_end_points)
+        _render_trajectory_plot(
+            fig,
+            ax,
+            env_id,
+            plot_data,
+            batch_idx,
+            start,
+            goal,
+            plot_end_points,
+            waypoints=waypoints,
+        )
         fig.tight_layout()
         fig.canvas.draw()
         img_shape = fig.canvas.get_width_height()[::-1] + (4,)
@@ -801,7 +873,7 @@ def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end
 
 def make_trajectory_videos(env_id, trajectory, batch_size, start, goal, rollout_agent_history,
                            rollout_subgoal_history, plot_end_points=True, max_frames=200,
-                           path_stride=4, postprocessed_plan_per_frame=None):
+                           path_stride=4, postprocessed_plan_per_frame=None, waypoints=None):
     plot_data = _parse_trajectory_plot_inputs(trajectory)
     rollout_agent_history = _maybe_add_batch_dim(rollout_agent_history)
     rollout_subgoal_history = _maybe_add_batch_dim(rollout_subgoal_history)
@@ -833,7 +905,17 @@ def make_trajectory_videos(env_id, trajectory, batch_size, start, goal, rollout_
             else:
                 frame_plot_data["postprocessed_plan"] = None
 
-            _render_trajectory_plot(fig, ax, env_id, frame_plot_data, batch_idx, start, goal, plot_end_points)
+            _render_trajectory_plot(
+                fig,
+                ax,
+                env_id,
+                frame_plot_data,
+                batch_idx,
+                start,
+                goal,
+                plot_end_points,
+                waypoints=waypoints,
+            )
             fig.tight_layout()
             fig.canvas.draw()
             img_shape = fig.canvas.get_width_height()[::-1] + (4,)
