@@ -3978,6 +3978,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         setattr(root_node, "_root_uncertainty_vinfo", root_vinfo)
         return root_vinfo
 
+    """DEPRECATED"""
     def _run_mcts_search(
         self,
         tree: MCTSTreeState,
