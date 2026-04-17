@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-if [ "$#" -ne 4 ]; then
-    echo "Usage: $0 <results_dir> <num_repeats> <num_tasks> <rollouts_per_task>" >&2
+if [ "$#" -lt 4 ] || [ "$#" -gt 7 ]; then
+    echo "Usage: $0 <results_dir> <num_repeats> <num_tasks> <rollouts_per_task> [summary_output] [dataset_name] [run_timestamp]" >&2
     exit 1
 fi
 
@@ -11,6 +11,9 @@ RESULTS_DIR="$1"
 NUM_REPEATS="$2"
 NUM_TASKS="$3"
 ROLLOUTS_PER_TASK="$4"
+SUMMARY_OUTPUT="${5:-}"
+DATASET_NAME="${6:-}"
+RUN_TIMESTAMP="${7:-}"
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -20,11 +23,28 @@ export AVAILABLE_GPUS="${AVAILABLE_GPUS:-}"
 
 python3 scripts/run_jobs.py
 
-python3 scripts/collect_benchmark_results.py \
-    --results_dir "$RESULTS_DIR" \
-    --expected_repeats "$NUM_REPEATS" \
-    --expected_tasks "$NUM_TASKS" \
+COLLECT_ARGS=(
+    --results_dir "$RESULTS_DIR"
+    --expected_repeats "$NUM_REPEATS"
+    --expected_tasks "$NUM_TASKS"
     --expected_rollouts "$ROLLOUTS_PER_TASK"
+)
+
+if [ -n "$SUMMARY_OUTPUT" ]; then
+    COLLECT_ARGS+=(--summary_output "$SUMMARY_OUTPUT")
+fi
+if [ -n "$DATASET_NAME" ]; then
+    COLLECT_ARGS+=(--dataset_name "$DATASET_NAME")
+fi
+if [ -n "$RUN_TIMESTAMP" ]; then
+    COLLECT_ARGS+=(--run_timestamp "$RUN_TIMESTAMP")
+fi
+
+python3 scripts/collect_benchmark_results.py \
+    "${COLLECT_ARGS[@]}"
 
 echo ""
 echo "Benchmark results stored under: $PROJECT_DIR/$RESULTS_DIR"
+if [ -n "$SUMMARY_OUTPUT" ]; then
+    echo "Benchmark summary JSON: $PROJECT_DIR/$SUMMARY_OUTPUT"
+fi

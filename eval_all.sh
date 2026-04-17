@@ -107,28 +107,21 @@ if [ ! -f "$DATASET_YAML" ]; then
 fi
 
 echo ""
-echo "Select rollouts per task:"
-echo "  1) 50"
-echo "  2) 20"
+echo "Enter rollouts per task (positive integer, default: ${ROLLOUTS_PER_TASK}):"
 while true; do
-    read -r -p "Choose [1-2] (default: 1): " _rollouts_input
-    _rollouts_input="${_rollouts_input:-1}"
-    case "$_rollouts_input" in
-        1)
-            ROLLOUTS_PER_TASK="50"
-            break
-            ;;
-        2)
-            ROLLOUTS_PER_TASK="20"
-            break
-            ;;
-        *)
-            echo "Please enter 1 or 2."
-            ;;
-    esac
+    read -r -p "Rollouts per task: " _rollouts_input
+    _rollouts_input="${_rollouts_input:-$ROLLOUTS_PER_TASK}"
+    if [[ "$_rollouts_input" =~ ^[1-9][0-9]*$ ]]; then
+        ROLLOUTS_PER_TASK="$_rollouts_input"
+        break
+    fi
+    echo "Please enter a positive integer."
 done
 
-RESULTS_RUN_DIR="benchmark_results/${SELECTED_MODEL_ID}/run_$(date +%Y%m%d-%H%M%S)"
+RUN_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+RESULTS_FILE_PREFIX="${SELECTED_DATASET}_${RUN_TIMESTAMP}"
+RESULTS_RUN_DIR="benchmark_results/${SELECTED_MODEL_ID}/${RESULTS_FILE_PREFIX}"
+SUMMARY_JSON_REL="${RESULTS_RUN_DIR}/${RESULTS_FILE_PREFIX}_summary.json"
 mkdir -p "$PROJECT_DIR/$RESULTS_RUN_DIR"
 
 echo ""
@@ -139,6 +132,8 @@ echo "  Repeats           : $NUM_REPEATS"
 echo "  Tasks             : $NUM_TASKS"
 echo "  Rollouts per task : $ROLLOUTS_PER_TASK"
 echo "  Results dir       : $RESULTS_RUN_DIR"
+echo "  Task result files : $RESULTS_RUN_DIR/${RESULTS_FILE_PREFIX}_repeat_<repeat>_task_<task>.json"
+echo "  Summary JSON      : $SUMMARY_JSON_REL"
 echo ""
 
 echo "Generating benchmark jobs..."
@@ -148,7 +143,8 @@ python3 "$PROJECT_DIR/scripts/generate_benchmark_jobs.py" \
     --num_tasks "$NUM_TASKS" \
     --num_repeats "$NUM_REPEATS" \
     --rollouts_per_task "$ROLLOUTS_PER_TASK" \
-    --results_dir "$RESULTS_RUN_DIR"
+    --results_dir "$RESULTS_RUN_DIR" \
+    --results_file_prefix "$RESULTS_FILE_PREFIX"
 
 echo ""
 echo "====================================================="
@@ -157,12 +153,15 @@ echo "====================================================="
 echo ""
 
 export AVAILABLE_GPUS
-PIPELINE_LOG="/tmp/mctd_eval_all_${SELECTED_MODEL_ID}.log"
+PIPELINE_LOG="/tmp/mctd_eval_all_${SELECTED_DATASET}_${RUN_TIMESTAMP}.log"
 nohup bash "$PROJECT_DIR/scripts/run_benchmark_pipeline.sh" \
     "$RESULTS_RUN_DIR" \
     "$NUM_REPEATS" \
     "$NUM_TASKS" \
-    "$ROLLOUTS_PER_TASK" > "$PIPELINE_LOG" 2>&1 &
+    "$ROLLOUTS_PER_TASK" \
+    "$SUMMARY_JSON_REL" \
+    "$SELECTED_DATASET" \
+    "$RUN_TIMESTAMP" > "$PIPELINE_LOG" 2>&1 &
 PIPELINE_PID=$!
 
 echo "Jobs launched in background (PID: $PIPELINE_PID)"
@@ -172,6 +171,8 @@ echo "  Containers: docker ps --filter 'name=exp_gpu'"
 echo ""
 echo "WandB group: BENCH-$SELECTED_MODEL_ID"
 echo "Results directory: $PROJECT_DIR/$RESULTS_RUN_DIR"
+echo "Task result files: $PROJECT_DIR/$RESULTS_RUN_DIR/${RESULTS_FILE_PREFIX}_repeat_<repeat>_task_<task>.json"
+echo "Summary JSON: $PROJECT_DIR/$SUMMARY_JSON_REL"
 echo ""
 echo "====================================================="
 echo "  Benchmark Pipeline Running in Background"

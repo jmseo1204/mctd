@@ -65,6 +65,15 @@ GUIDANCE_COMPONENT_SPECS = {
 }
 
 
+def _normalize_vector_field(U: np.ndarray, V: np.ndarray, eps: float = 1e-8) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize each 2D vector to unit length while keeping zero vectors zero."""
+    mag = np.sqrt(U ** 2 + V ** 2)
+    safe_mag = np.where(mag > eps, mag, 1.0)
+    U_n = np.where(mag > eps, U / safe_mag, 0.0)
+    V_n = np.where(mag > eps, V / safe_mag, 0.0)
+    return U_n, V_n
+
+
 # FIXME: clean up & check this util
 def log_video(
     observation_hat,
@@ -501,12 +510,7 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
             X_p, Y_p = X_w, Y_w
         U = hilp_grads[:, :, 0]
         V = hilp_grads[:, :, 1]
-        mag = np.sqrt(U ** 2 + V ** 2)
-        mean_mag = float(mag.mean()) if mag.size > 0 else 1.0
-        std_mag = float(mag.std()) if mag.size > 0 else 0.0
-        scale_denom = max(mean_mag, 1e-8)
-        U_n = U / scale_denom
-        V_n = V / scale_denom
+        U_n, V_n = _normalize_vector_field(U, V)
 
         if far_mask_grid is None:
             far_mask_grid = np.zeros_like(U_n, dtype=bool)

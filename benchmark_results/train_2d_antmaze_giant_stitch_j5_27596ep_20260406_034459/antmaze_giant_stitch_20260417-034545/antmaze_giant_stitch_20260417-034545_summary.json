@@ -1,0 +1,123 @@
+{
+  "status": "complete",
+  "dataset": "antmaze_giant_stitch",
+  "run_timestamp": "20260417-034545",
+  "results_dir": "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545",
+  "result_files": [
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_01_task_01.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_01_task_02.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_01_task_03.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_01_task_04.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_01_task_05.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_02_task_01.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_02_task_02.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_02_task_03.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_02_task_04.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_02_task_05.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_03_task_01.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_03_task_02.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_03_task_03.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_03_task_04.json",
+    "/home/junjolp2026spring/mctd/benchmark_results/train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459/antmaze_giant_stitch_20260417-034545/antmaze_giant_stitch_20260417-034545_repeat_03_task_05.json"
+  ],
+  "model_ids": [
+    "train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459"
+  ],
+  "expected_repeats": 3,
+  "expected_tasks": 5,
+  "expected_rollouts_per_task": 1,
+  "repeat_results": [
+    {
+      "repeat_id": 1,
+      "success_count": 4,
+      "num_rollouts": 5,
+      "success_mean": 0.8
+    },
+    {
+      "repeat_id": 2,
+      "success_count": 5,
+      "num_rollouts": 5,
+      "success_mean": 1.0
+    },
+    {
+      "repeat_id": 3,
+      "success_count": 4,
+      "num_rollouts": 5,
+      "success_mean": 0.8
+    }
+  ],
+  "task_results": [
+    {
+      "task_id": 1,
+      "success_count": 3,
+      "num_rollouts": 3,
+      "success_mean": 1.0,
+      "success_std_over_repeats": 0.0,
+      "repeat_scores": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "task_id": 2,
+      "success_count": 3,
+      "num_rollouts": 3,
+      "success_mean": 1.0,
+      "success_std_over_repeats": 0.0,
+      "repeat_scores": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "task_id": 3,
+      "success_count": 1,
+      "num_rollouts": 3,
+      "success_mean": 0.3333333333333333,
+      "success_std_over_repeats": 0.4714045207910317,
+      "repeat_scores": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "task_id": 4,
+      "success_count": 3,
+      "num_rollouts": 3,
+      "success_mean": 1.0,
+      "success_std_over_repeats": 0.0,
+      "repeat_scores": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "task_id": 5,
+      "success_count": 3,
+      "num_rollouts": 3,
+      "success_mean": 1.0,
+      "success_std_over_repeats": 0.0,
+      "repeat_scores": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    }
+  ],
+  "repeat_scores": [
+    0.8,
+    1.0,
+    0.8
+  ],
+  "total_success_count": 13,
+  "total_num_rollouts": 15,
+  "total_success_mean": 0.8666666666666667,
+  "total_success_std": 0.09428090415820632,
+  "total_success_std_over_repeats": 0.09428090415820632,
+  "missing_pairs": [],
+  "warnings": []
+}

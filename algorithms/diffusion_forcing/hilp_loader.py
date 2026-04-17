@@ -301,7 +301,7 @@ def _load_memo_from_cache(cache_path: str, device) -> HILPMemoizedWrapper:
         x_max=float(data["x_max"]),
         y_min=float(data["y_min"]),
         y_max=float(data["y_max"]),
-        aggregator=str(data["aggregator"]),
+        aggregator="neg_l2",
         device=device,
     )
 
@@ -311,7 +311,7 @@ def _save_memo_cache(wrapper: HILPMemoizedWrapper, cache_path: str) -> None:
     save_dict = {
         "psi_grid_0":   wrapper._psi_grids[0],
         "phi_g_grid_0": wrapper._phi_g_grids[0],
-        "aggregator":   np.array(wrapper._aggregator),
+        "aggregator":   np.array("neg_l2"),
         "x_min": np.float32(wrapper._x_min),
         "x_max": np.float32(wrapper._x_max),
         "y_min": np.float32(wrapper._y_min),

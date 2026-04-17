@@ -235,6 +235,7 @@ class PlanVizMixin:
         obs_std_np: np.ndarray,
         loops: int,
         log_prefix: str = "plan",
+        log_namespace: Optional[str] = None,
         plan_hist_override=None,
         is_uncertainty_viz: bool = False,
     ) -> None:
@@ -367,8 +368,12 @@ class PlanVizMixin:
         cand_grad_field = None
         if tgt_pos is not None and hilp_fn is not None:
             tgt_name = getattr(target_node, 'name', None)
-            if tgt_name is not None and tgt_name in tgt_vis_cache:
-                cand_heatmap, cand_grad_field = tgt_vis_cache[tgt_name]
+            tgt_cache_key = (
+                tgt_name,
+                tuple(np.asarray(tgt_pos).reshape(-1).tolist()),
+            )
+            if tgt_name is not None and tgt_cache_key in tgt_vis_cache:
+                cand_heatmap, cand_grad_field = tgt_vis_cache[tgt_cache_key]
             else:
                 try:
                     cand_heatmap = self._compute_hilp_heatmap(
@@ -383,7 +388,7 @@ class PlanVizMixin:
                 except Exception:
                     pass
                 if tgt_name is not None:
-                    tgt_vis_cache[tgt_name] = (cand_heatmap, cand_grad_field)
+                    tgt_vis_cache[tgt_cache_key] = (cand_heatmap, cand_grad_field)
 
         # ------------------------------------------------------------------
         # Prepare per-frame text labels
@@ -620,10 +625,20 @@ class PlanVizMixin:
             if selection_count is not None
             else label
         )
+        video_key_prefix = (
+            f"{log_namespace}/{log_prefix}"
+            if log_namespace
+            else log_prefix
+        )
         video_step = self.get_safe_wandb_step(min_step=loops)
         print(
-            f"[wandb-video-debug] key={log_prefix}/plan_at_{label_with_count} shape={video.shape} "
+            f"[wandb-video-debug] key={video_key_prefix}/plan_at_{label_with_count} shape={video.shape} "
             f"dtype={video.dtype} fps=4 step={video_step}",
             flush=True,
         )
-        self.log_video(f"{log_prefix}/plan_at_{label_with_count}", video, fps=4, step=video_step)
+        self.log_video(
+            f"{video_key_prefix}/plan_at_{label_with_count}",
+            video,
+            fps=4,
+            step=video_step,
+        )
