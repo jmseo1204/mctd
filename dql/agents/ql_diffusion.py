@@ -338,7 +338,7 @@ class Diffusion_QL(object):
         goal = torch.FloatTensor(goal.reshape(1, -1)).to(self.device)
         state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
         state = torch.cat([state, goal], dim=-1)
-        state_rpt = torch.repeat_interleave(state, repeats=50, dim=0)
+        state_rpt = torch.repeat_interleave(state, repeats=num_sample, dim=0)
         with torch.no_grad():
 
             action = self.actor.sample(state_rpt)
@@ -346,7 +346,7 @@ class Diffusion_QL(object):
             q_mean = q_value.mean(dim=1, keepdim=True).flatten()
             q_std = q_value.std(dim=1, keepdim=True).flatten()
             q_value = q_mean - self.lcb_coef * q_std
-            idx = torch.multinomial(F.softmax(q_value), 1)
+            idx = torch.multinomial(F.softmax(q_value, dim=0), 1)
         return action[idx].cpu().data.numpy().flatten()
 
     def save_model(self, dir, id=None):
@@ -354,18 +354,77 @@ class Diffusion_QL(object):
             torch.save(self.actor.state_dict(), f"{dir}/actor_{id}.pth")
             torch.save(self.critic.state_dict(), f"{dir}/critic_{id}.pth")
             torch.save(self.critic_target.state_dict(), f"{dir}/critic_target_{id}.pth")
+            state_path = f"{dir}/training_state_{id}.pt"
         else:
             torch.save(self.actor.state_dict(), f"{dir}/actor.pth")
             torch.save(self.critic.state_dict(), f"{dir}/critic.pth")
             torch.save(self.critic_target.state_dict(), f"{dir}/critic_target.pth")
+            state_path = f"{dir}/training_state.pt"
 
-    def load_model(self, dir, id=None):
+        training_state = {
+            "step": self.step,
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "ema_model": self.ema_model.state_dict(),
+            "lr_decay": self.lr_decay,
+        }
+        if self.lr_decay:
+            training_state["actor_lr_scheduler"] = self.actor_lr_scheduler.state_dict()
+            training_state["critic_lr_scheduler"] = self.critic_lr_scheduler.state_dict()
+        torch.save(training_state, state_path)
+
+    def load_model(self, dir, id=None, load_training_state=True):
+        map_location = self.device
         if id is not None:
-            self.actor.load_state_dict(torch.load(f"{dir}/actor_{id}.pth"))
-            self.critic.load_state_dict(torch.load(f"{dir}/critic_{id}.pth"))
-            self.critic_target.load_state_dict(
-                torch.load(f"{dir}/critic_target_{id}.pth")
+            self.actor.load_state_dict(
+                torch.load(f"{dir}/actor_{id}.pth", map_location=map_location)
             )
+            self.critic.load_state_dict(
+                torch.load(f"{dir}/critic_{id}.pth", map_location=map_location)
+            )
+            self.critic_target.load_state_dict(
+                torch.load(f"{dir}/critic_target_{id}.pth", map_location=map_location)
+            )
+            state_path = f"{dir}/training_state_{id}.pt"
         else:
-            self.actor.load_state_dict(torch.load(f"{dir}/actor.pth"))
-            self.critic_target.load_state_dict(torch.load(f"{dir}/critic_target.pth"))
+            self.actor.load_state_dict(
+                torch.load(f"{dir}/actor.pth", map_location=map_location)
+            )
+            self.critic.load_state_dict(
+                torch.load(f"{dir}/critic.pth", map_location=map_location)
+            )
+            self.critic_target.load_state_dict(
+                torch.load(f"{dir}/critic_target.pth", map_location=map_location)
+            )
+            state_path = f"{dir}/training_state.pt"
+
+        training_state_loaded = False
+        if load_training_state:
+            try:
+                training_state = torch.load(state_path, map_location=map_location)
+            except FileNotFoundError:
+                training_state = None
+
+            if training_state is not None:
+                self.actor_optimizer.load_state_dict(training_state["actor_optimizer"])
+                self.critic_optimizer.load_state_dict(training_state["critic_optimizer"])
+                self.step = training_state.get("step", self.step)
+                ema_state = training_state.get("ema_model")
+                if ema_state is not None:
+                    self.ema_model.load_state_dict(ema_state)
+                else:
+                    self.ema_model.load_state_dict(self.actor.state_dict())
+
+                if self.lr_decay:
+                    actor_sched = training_state.get("actor_lr_scheduler")
+                    critic_sched = training_state.get("critic_lr_scheduler")
+                    if actor_sched is not None and critic_sched is not None:
+                        self.actor_lr_scheduler.load_state_dict(actor_sched)
+                        self.critic_lr_scheduler.load_state_dict(critic_sched)
+                training_state_loaded = True
+            else:
+                self.ema_model.load_state_dict(self.actor.state_dict())
+        else:
+            self.ema_model.load_state_dict(self.actor.state_dict())
+
+        return training_state_loaded

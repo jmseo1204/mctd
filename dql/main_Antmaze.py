@@ -7,6 +7,12 @@ import numpy as np
 import os
 import torch
 import json
+import re
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 import d4rl
 import sys
@@ -99,7 +105,105 @@ hyperparameters = {
 }
 
 
-def train_agent(env, state_dim, action_dim, max_action, device, output_dir, args):
+def find_latest_checkpoint_epoch(results_dir):
+    pattern = re.compile(r"actor_(\d+)\.pth$")
+    latest_epoch = None
+    if not os.path.isdir(results_dir):
+        return None
+
+    for entry in os.listdir(results_dir):
+        match = pattern.fullmatch(entry)
+        if match is None:
+            continue
+        epoch = int(match.group(1))
+        if latest_epoch is None or epoch > latest_epoch:
+            latest_epoch = epoch
+    return latest_epoch
+
+
+def load_variant_file(results_dir):
+    variant_path = os.path.join(results_dir, "variant.json")
+    if not os.path.exists(variant_path):
+        return {}
+    with open(variant_path) as f:
+        return json.load(f)
+
+
+def load_json_file(path, default=None):
+    if default is None:
+        default = {}
+    if not os.path.exists(path):
+        return default
+    with open(path) as f:
+        return json.load(f)
+
+
+def save_json_file(path, payload):
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def setup_wandb_run(results_dir, variant, args):
+    if wandb is None:
+        utils.print_banner(
+            "wandb is not installed; continuing without WandB logging.",
+            separator="!",
+            num_star=90,
+        )
+        return None
+
+    wandb_mode = os.environ.get("WANDB_MODE", "online")
+    if wandb_mode == "disabled":
+        utils.print_banner(
+            "WANDB_MODE=disabled; continuing without WandB logging.",
+            separator="!",
+            num_star=90,
+        )
+        return None
+
+    state_path = os.path.join(results_dir, "wandb_run.json")
+    prior_state = load_json_file(state_path, default={})
+
+    init_kwargs = {
+        "project": os.environ.get("WANDB_PROJECT", "mctd_eval"),
+        "name": os.path.basename(results_dir),
+        "config": variant,
+        "dir": results_dir,
+        "group": f"dql-{args.env_name}",
+        "mode": wandb_mode,
+    }
+    entity = os.environ.get("WANDB_ENTITY")
+    if entity:
+        init_kwargs["entity"] = entity
+
+    run_id = prior_state.get("id")
+    if run_id:
+        init_kwargs["id"] = run_id
+        init_kwargs["resume"] = "allow"
+
+    run = wandb.init(**init_kwargs)
+    if run is None:
+        return None
+
+    wandb.define_metric("epoch")
+    wandb.define_metric("training_iters")
+    wandb.define_metric("train/*", step_metric="epoch")
+
+    save_json_file(
+        state_path,
+        {
+            "id": run.id,
+            "name": run.name,
+            "project": run.project,
+            "entity": run.entity,
+            "url": run.url,
+            "mode": wandb_mode,
+        },
+    )
+    return run
+
+
+def train_agent(env, state_dim, action_dim, max_action, device, output_dir, args, wandb_run=None):
     ## load hl_planner
     #class HLParser(hl_utils.Parser):
     #    dataset: str = args.env_name
@@ -145,14 +249,47 @@ def train_agent(env, state_dim, action_dim, max_action, device, output_dir, args
         lcb_coef=args.lcb_coef,
     )
 
+    start_epoch = 0
+    if args.resume_dir:
+        resume_epoch = args.resume_epoch
+        if resume_epoch is None:
+            resume_epoch = find_latest_checkpoint_epoch(args.resume_dir)
+        if resume_epoch is None:
+            raise FileNotFoundError(
+                f"No actor checkpoint found in {args.resume_dir}"
+            )
+
+        utils.print_banner(
+            f"Resuming from {args.resume_dir} at epoch {resume_epoch}",
+            separator="*",
+            num_star=90,
+        )
+        loaded_training_state = agent.load_model(args.resume_dir, resume_epoch)
+        if not loaded_training_state:
+            utils.print_banner(
+                "Checkpoint optimizer/scheduler state not found; resuming with weights only.",
+                separator="!",
+                num_star=90,
+            )
+            agent.step = resume_epoch * args.num_steps_per_epoch
+        start_epoch = resume_epoch
+
     early_stop = False
     stop_check = utils.EarlyStopping(tolerance=1, min_delta=0.0)
     writer = None  # SummaryWriter(output_dir)
 
     evaluations = []
-    training_iters = 0
+    training_iters = start_epoch * args.num_steps_per_epoch
     max_timesteps = args.num_epochs * args.num_steps_per_epoch
     metric = 100.0
+    if training_iters >= max_timesteps:
+        utils.print_banner(
+            f"Checkpoint already reached target epoch budget ({start_epoch}/{args.num_epochs}).",
+            separator="*",
+            num_star=90,
+        )
+        return
+
     utils.print_banner(f"Training Start", separator="*", num_star=90)
     i = 0
     while (training_iters < max_timesteps) and (not early_stop):
@@ -179,6 +316,23 @@ def train_agent(env, state_dim, action_dim, max_action, device, output_dir, args
         if "critic_lr" in loss_metric:
             logger.record_tabular("Critic LR", loss_metric["critic_lr"])
         logger.dump_tabular()
+
+        if wandb_run is not None:
+            wandb_payload = {
+                "epoch": curr_epoch,
+                "training_iters": training_iters,
+                "train/bc_loss": float(np.mean(loss_metric["bc_loss"])),
+                "train/ql_loss": float(np.mean(loss_metric["ql_loss"])),
+                "train/actor_loss": float(np.mean(loss_metric["actor_loss"])),
+                "train/critic_loss": float(np.mean(loss_metric["critic_loss"])),
+                "train/ql_std": float(np.mean(loss_metric["ql_std"])),
+                "train/ql_random_std": float(np.mean(loss_metric["ql_random_std"])),
+            }
+            if "actor_lr" in loss_metric:
+                wandb_payload["train/actor_lr"] = float(loss_metric["actor_lr"])
+            if "critic_lr" in loss_metric:
+                wandb_payload["train/critic_lr"] = float(loss_metric["critic_lr"])
+            wandb.log(wandb_payload, step=curr_epoch)
 
         ## Evaluation
         #with torch.no_grad():
@@ -346,7 +500,7 @@ if __name__ == "__main__":
         #"--env_name", default="antmaze-medium-diverse-v2", type=str
         "--env_name", default="antmaze-medium-navigate-v0", type=str
     )  # OpenAI gym environment name
-    parser.add_argument("--dir", default="results", type=str)  # Logging directory
+    parser.add_argument("--dir", default="dql/results", type=str)  # Logging directory
     parser.add_argument(
         "--seed", default=0, type=int
     )  # Sets Gym, PyTorch and Numpy seeds
@@ -376,10 +530,22 @@ if __name__ == "__main__":
     parser.add_argument("--lcb_coef", default=4.0, type=float)
     parser.add_argument("--target_steps", default=10, type=int)
     parser.add_argument("--reward_tune", default="cql_antmaze", type=str)
+    parser.add_argument("--resume_dir", default=None, type=str)
+    parser.add_argument("--resume_epoch", default=None, type=int)
 
     args = parser.parse_args()
-    args.dir = "dql/results"
     args.lr_decay = True
+    resume_variant = {}
+
+    if args.resume_dir is not None:
+        args.resume_dir = os.path.normpath(args.resume_dir)
+        resume_variant = load_variant_file(args.resume_dir)
+        resume_env_name = resume_variant.get("env_name")
+        if resume_env_name and args.env_name != resume_env_name:
+            print(
+                f"[resume] overriding env_name from {args.env_name} to {resume_env_name}"
+            )
+            args.env_name = resume_env_name
 
     args.device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
     args.output_dir = f"{args.dir}"
@@ -395,6 +561,20 @@ if __name__ == "__main__":
     args.gn = hyperparameters[args.env_name]["gn"]
     args.top_k = hyperparameters[args.env_name]["top_k"]
     args.p = hyperparameters[args.env_name]["p"]
+
+    if args.resume_dir and resume_variant:
+        for key, value in resume_variant.items():
+            if key in {
+                "device",
+                "dir",
+                "output_dir",
+                "state_dim",
+                "action_dim",
+                "max_action",
+            }:
+                continue
+            setattr(args, key, value)
+        args.output_dir = f"{args.dir}"
 
     # Setup Logging
     file_name = f"{args.env_name}|{args.exp}|diffusion-{args.algo}|T-{args.T}"
@@ -413,7 +593,10 @@ if __name__ == "__main__":
     file_name += f"|{args.lcb_coef}"
     file_name += f"|{args.target_steps}"
 
-    results_dir = os.path.join(args.output_dir, file_name)
+    if args.resume_dir:
+        results_dir = args.resume_dir
+    else:
+        results_dir = os.path.join(args.output_dir, file_name)
     if not os.path.exists(results_dir):
         os.makedirs(results_dir)
     utils.print_banner(f"Saving location: {results_dir}")
@@ -434,8 +617,22 @@ if __name__ == "__main__":
     variant.update(action_dim=action_dim)
     variant.update(max_action=max_action)
     setup_logger(os.path.basename(results_dir), variant=variant, log_dir=results_dir)
+    wandb_run = setup_wandb_run(results_dir, variant, args)
     utils.print_banner(
         f"Env: {args.env_name}, state_dim: {state_dim}, action_dim: {action_dim}"
     )
 
-    train_agent(env, state_dim, action_dim, max_action, args.device, results_dir, args)
+    try:
+        train_agent(
+            env,
+            state_dim,
+            action_dim,
+            max_action,
+            args.device,
+            results_dir,
+            args,
+            wandb_run=wandb_run,
+        )
+    finally:
+        if wandb_run is not None:
+            wandb.finish()
