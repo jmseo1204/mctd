@@ -59,9 +59,10 @@ class TreeNode():
         # Populated after _compute_node_uncertainty when use_cluster_subplan_as_expansion=True.
         # Each entry is a dict with keys:
         #   "plan_hist":      (fast_steps+1, plan_tokens*fs, c) tensor — full denoising history
-        #                     of the representative sample (index [0]) for this cluster.
+        #                     of the representative sample selected for this cluster.
         #   "guidance_scale": float — guidance scale used for that sample.
         #   "current_levels": (1, plan_tokens) np.ndarray — noise state for next expansion.
+        #   "feasible_score": float — optional maximin KDE score used for representative selection.
         # len(cluster_subplans) == n_clusters for this node.
         self.cluster_subplans: Optional[list] = cluster_subplans
 

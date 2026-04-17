@@ -119,6 +119,11 @@ def build_or_load_kde_grid(
 class KDEEstimatorMixin:
     """Mixin providing kernel-density-estimation helpers."""
 
+    def _ensure_kde_cache_loaded(self) -> None:
+        """Load KDE data/grid lazily on first use."""
+        if not hasattr(self, "_kde_data_xy_cache"):
+            self._load_kde_data_xy()
+
     def _load_kde_data_xy(self) -> None:
         """Preload full training positions (x,y) for KDE score computation.
 
@@ -155,6 +160,7 @@ class KDEEstimatorMixin:
         Returns:
             (N, 2) score vectors ∇log p
         """
+        self._ensure_kde_cache_loaded()
         grid = self._kde_grid_cache
         xs, ys = grid["xs"], grid["ys"]
         scores = grid["scores"]  # (res_x, res_y, 2)
@@ -176,5 +182,60 @@ class KDEEstimatorMixin:
         return (s00 * (1 - tx) * (1 - ty) + s10 * tx * (1 - ty) +
                 s01 * (1 - tx) * ty       + s11 * tx * ty)
 
+    def _get_kde_log_density_grid(
+        self,
+        query_xy: np.ndarray,
+        oob_value: float = -1e12,
+    ) -> np.ndarray:
+        """Fast KDE log-density via bilinear interpolation on precomputed grid.
+
+        Points outside the cached grid are assigned ``oob_value`` instead of being
+        clipped to the boundary, so callers can strongly penalize out-of-support
+        subplans during selection.
+
+        Args:
+            query_xy: (N, 2) world coordinates
+            oob_value: scalar fill value for out-of-bounds queries
+
+        Returns:
+            (N,) interpolated log-density values
+        """
+        self._ensure_kde_cache_loaded()
+        grid = self._kde_grid_cache
+        xs, ys = grid["xs"], grid["ys"]
+        log_dens = grid["log_dens"]  # (res_x, res_y)
+
+        qx = query_xy[:, 0]
+        qy = query_xy[:, 1]
+        in_bounds = (
+            (qx >= xs[0]) & (qx <= xs[-1]) &
+            (qy >= ys[0]) & (qy <= ys[-1])
+        )
+        out = np.full(query_xy.shape[0], oob_value, dtype=np.float32)
+        if not np.any(in_bounds):
+            return out
+
+        dx = xs[1] - xs[0]
+        dy = ys[1] - ys[0]
+        qx_in = qx[in_bounds]
+        qy_in = qy[in_bounds]
+        ix = np.clip(((qx_in - xs[0]) / dx).astype(np.int32), 0, len(xs) - 2)
+        iy = np.clip(((qy_in - ys[0]) / dy).astype(np.int32), 0, len(ys) - 2)
+        tx = (qx_in - xs[ix]) / dx
+        ty = (qy_in - ys[iy]) / dy
+
+        d00 = log_dens[ix,     iy    ]
+        d10 = log_dens[ix + 1, iy    ]
+        d01 = log_dens[ix,     iy + 1]
+        d11 = log_dens[ix + 1, iy + 1]
+        out[in_bounds] = (
+            d00 * (1 - tx) * (1 - ty) +
+            d10 * tx * (1 - ty) +
+            d01 * (1 - tx) * ty +
+            d11 * tx * ty
+        ).astype(np.float32)
+        return out
+
     def _get_kde_data_xy(self) -> np.ndarray:
+        self._ensure_kde_cache_loaded()
         return self._kde_data_xy_cache

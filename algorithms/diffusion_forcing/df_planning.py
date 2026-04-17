@@ -355,6 +355,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.uncertainty_eta: float = float(cfg.get("uncertainty_eta", 1.0))
         self.uncertainty_max_intra_cluster_dist: float = float(cfg.get("uncertainty_max_intra_cluster_dist", 20.0))
         self.use_cluster_subplan_as_expansion: bool = cfg.get("use_cluster_subplan_as_expansion", False)
+        self.use_kde_maximin_for_selecting_subplan_in_cluster: bool = cfg.get(
+            "use_kde_maximin_for_selecting_subplan_in_cluster", False
+        )
         self.viz_uncertain_next_subplan_last_obs: bool = cfg.get("viz_uncertain_next_subplan_last_obs", False)
         self.fast_sampling_multiple: int = cfg.get("fast_sampling_multiple", 5)
         self.fast_sampling_steps: int = cfg.get("fast_sampling_steps", 10)
@@ -753,6 +756,57 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             is_proximal[i] and is_not_stagnant[i] and is_far_from_prior[i]
             for i in range(batch_size)
         ]
+
+    def _compute_local_subplan_kde_maximin_scores(
+        self,
+        plan_batch: torch.Tensor,  # (plan_tokens*fs, B, c) — last denoising step
+        parent_depth: int,
+        seg_size: int,
+    ) -> np.ndarray:
+        """Score each plan by the minimum KDE log-density over its new local subplan.
+
+        The KDE cache is built on dataset world ``(x, y)`` coordinates, so plans are
+        first unnormalized back to world space and then sliced to the newly expanded
+        local segment ``[depth, depth + 1)`` before interpolation. We use log-density
+        instead of density directly because it is already cached and preserves the same
+        maximin ordering.
+        """
+        if plan_batch.ndim != 3:
+            raise ValueError(
+                f"plan_batch must have shape (T, B, c), got {tuple(plan_batch.shape)}"
+            )
+        if len(self.pos_dim_indices) < 2:
+            raise ValueError(
+                "KDE maximin subplan selection requires at least 2 positional dims"
+            )
+
+        plan_unnorm = self._unnormalize_x(plan_batch.unsqueeze(0))[0][:-1]
+        obs_raw, _, _ = self.split_bundle(plan_unnorm)
+        obs_np = obs_raw.detach().cpu().numpy()
+        if obs_np.shape[0] == 0:
+            return np.full(plan_batch.shape[1], -1e12, dtype=np.float32)
+
+        local_start = min(
+            self._get_prefix_len_frames_from_depth(parent_depth, seg_size),
+            obs_np.shape[0],
+        )
+        local_end = min(
+            self._get_prefix_len_frames_from_depth(parent_depth + 1, seg_size),
+            obs_np.shape[0],
+        )
+
+        pos_idx = self.pos_dim_indices[:2]
+        if local_end <= local_start:
+            fallback_idx = min(max(local_start - 1, 0), obs_np.shape[0] - 1)
+            local_obs_xy = obs_np[fallback_idx : fallback_idx + 1, :, pos_idx]
+        else:
+            local_obs_xy = obs_np[local_start:local_end, :, pos_idx]
+
+        query_xy = local_obs_xy.reshape(-1, 2)
+        kde_vals = self._get_kde_log_density_grid(query_xy).reshape(
+            local_obs_xy.shape[0], local_obs_xy.shape[1]
+        )
+        return np.min(kde_vals, axis=0).astype(np.float32)
 
     def _require_current_plan_tokens(self) -> int:
         """Return the planner-global plan token count for the current episode."""
@@ -2081,8 +2135,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         terminate_on_done: bool = False,
     ) -> None:
         # Lazy KDE load: skip during training, load once on first eval/interact call.
-        if self.kde_lam > 0.0 and not hasattr(self, "_kde_data_xy_cache"):
-            self._load_kde_data_xy()
+        if self.kde_lam > 0.0 or self.use_kde_maximin_for_selecting_subplan_in_cluster:
+            self._ensure_kde_cache_loaded()
 
         try:
             import gym
@@ -3412,6 +3466,10 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         cluster_subplans: list = []
         unc_results_out: list = []
         filtered_unc_hists: list = []
+        use_kde_maximin_selection = (
+            self.use_cluster_subplan_as_expansion
+            and self.use_kde_maximin_for_selecting_subplan_in_cluster
+        )
 
         for _ii in range(B_nt):
             unc_hists_i = unc_hists_per_cand[_ii]  # (fast_steps+1, plan_tokens*fs, G*K, c)
@@ -3452,6 +3510,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         "num_feasible_samples": 0,
                         "feasible_sample_indices": feasible_sample_indices,
                         "sample_guidance_scales": [],
+                        "sample_feasible_scores": np.array([], dtype=np.float32),
+                        "cluster_representative_indices": np.array([], dtype=int),
                     }
                 )
                 filtered_unc_hists.append(None)
@@ -3464,6 +3524,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 float(unc_guidance_scale_per_cand[_ii][_j])
                 for _j in feasible_sample_indices
             ]
+            sample_feasible_scores_i = None
+            if use_kde_maximin_selection:
+                sample_feasible_scores_i = self._compute_local_subplan_kde_maximin_scores(
+                    plan_batch=filtered_unc_hists_i[-1],
+                    parent_depth=curr_depth_i,
+                    seg_size=seg_size,
+                )
 
             tail_obs_i = self._extract_obs_at_boundary(
                 filtered_unc_hists_i[-1],  # (plan_tokens*fs, N_survive, c)
@@ -3480,6 +3547,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             unc_result["num_feasible_samples"] = int(feasible_sample_indices.size)
             unc_result["feasible_sample_indices"] = feasible_sample_indices
             unc_result["sample_guidance_scales"] = filtered_guidance_scales_i
+            unc_result["sample_feasible_scores"] = (
+                sample_feasible_scores_i.copy()
+                if sample_feasible_scores_i is not None
+                else np.array([], dtype=np.float32)
+            )
             values.append(-unc_result["U"])
             unc_results_out.append(unc_result)
 
@@ -3488,8 +3560,17 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 _cl_labels = unc_result["cluster_labels"]
                 _n_cl = unc_result["n_clusters"]
                 _csp_list = []
+                _cluster_rep_indices = []
                 for _c in range(_n_cl):
-                    _rep_j = int(np.where(_cl_labels == _c)[0][0])
+                    _cluster_member_indices = np.where(_cl_labels == _c)[0]
+                    if sample_feasible_scores_i is not None:
+                        _best_local_idx = int(
+                            np.argmax(sample_feasible_scores_i[_cluster_member_indices])
+                        )
+                        _rep_j = int(_cluster_member_indices[_best_local_idx])
+                    else:
+                        _rep_j = int(_cluster_member_indices[0])
+                    _cluster_rep_indices.append(_rep_j)
                     _ph_j = filtered_unc_hists_i[:, :, _rep_j, :]  # (fast_steps+1, plan_tokens*fs, c)
                     _gs_j = float(filtered_guidance_scales_i[_rep_j])
                     _lvl_j = filtered_noise_levels_i[_rep_j : _rep_j + 1, -1, :]
@@ -3498,9 +3579,18 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         "plan_hist":      _ph_j,
                         "guidance_scale": _gs_j,
                         "current_levels": np.asarray(_lvl_j, dtype=np.int64),
+                        "feasible_score": (
+                            float(sample_feasible_scores_i[_rep_j])
+                            if sample_feasible_scores_i is not None
+                            else None
+                        ),
                     })
+                unc_result["cluster_representative_indices"] = np.asarray(
+                    _cluster_rep_indices, dtype=int
+                )
                 cluster_subplans.append(_csp_list)
             else:
+                unc_result["cluster_representative_indices"] = np.array([], dtype=int)
                 cluster_subplans.append(None)
 
         return {

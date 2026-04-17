@@ -95,10 +95,11 @@ use_uncertainty_as_value: true
 uncertainty_mode: 'cluster' # 'entropy' | 'variance' | 'cluster'
 uncertainty_lambda: 1.0 # entropy: weight on angular entropy surrogate; variance: weight on V_ext_g
 uncertainty_eta: 1.0 # entropy: weight on geometry correction; variance: weight on V_ext_c
-fast_sampling_multiple: 3 # number of fast samples per candidate
+fast_sampling_multiple: 4 # number of fast samples per candidate
 fast_sampling_steps: 25 # denoising steps for fast uncertainty sampling (< sampling_timesteps)
 uncertainty_max_intra_cluster_dist: 30.0 # max temporal distance (steps) within a cluster for complete-linkage cut
 use_cluster_subplan_as_expansion: true # if true: reuse per-cluster subplans from uncertainty sampling as child expansions
+use_kde_maximin_for_selecting_subplan_in_cluster: true # if true: pick each cluster representative by maximin KDE score over the newly expanded local subplan
 
 # [MPC-style agent control]
 agent_action_scale: 0.7 # scale factor for DQL agent action torque (antmaze only); reduces flipping
