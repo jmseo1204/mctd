@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 import math
+import os
 import time
 import json
 import os
@@ -53,6 +54,100 @@ OGBENCH_ENVS = [
     "antmaze-giant-v0",
     "antmaze-teleport-v0",
 ]
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _find_hilp_matches(td_models_dir: str, tokens: List[str]) -> List[str]:
+    tokens = [str(token) for token in tokens if token]
+    if not tokens:
+        return []
+    pkl_paths = sorted(
+        os.path.join(td_models_dir, name)
+        for name in os.listdir(td_models_dir)
+        if name.endswith(".pkl")
+    )
+    matches = []
+    for path in pkl_paths:
+        filename = os.path.basename(path)
+        if any(token in filename for token in tokens):
+            matches.append(path)
+    return matches
+
+
+def _load_dataset_name_from_config(dataset_config_name: str) -> Optional[str]:
+    dataset_cfg_path = os.path.join(
+        _repo_root(),
+        "configurations",
+        "dataset",
+        f"{dataset_config_name}.yaml",
+    )
+    if not os.path.isfile(dataset_cfg_path):
+        return None
+    try:
+        dataset_cfg = OmegaConf.load(dataset_cfg_path)
+    except Exception:
+        return None
+    dataset_name = dataset_cfg.get("dataset", None)
+    return str(dataset_name) if dataset_name is not None else None
+
+
+def _detect_hilp_checkpoint_path(cfg: DictConfig) -> str:
+    td_models_dir = os.path.join(_repo_root(), "td_models")
+    assert os.path.isdir(td_models_dir), f"HILP auto-detection failed: td_models directory not found: {td_models_dir}"
+
+    pkl_files = sorted(
+        os.path.join(td_models_dir, name)
+        for name in os.listdir(td_models_dir)
+        if name.endswith(".pkl")
+    )
+    assert pkl_files, f"HILP auto-detection failed: no .pkl files found in {td_models_dir}"
+
+    dataset_config_name = cfg.get("train_dataset_config", None)
+    if dataset_config_name is None:
+        dataset_config_name = cfg.get("dataset_config", None)
+    dataset_config_name = str(dataset_config_name) if dataset_config_name is not None else None
+
+    primary_groups: List[Tuple[str, List[str]]] = []
+    if dataset_config_name:
+        dataset_name = _load_dataset_name_from_config(dataset_config_name)
+        if dataset_name:
+            primary_groups.append(("dataset yaml `dataset`", [dataset_name]))
+        primary_groups.append((
+            "dataset config name",
+            [dataset_config_name, dataset_config_name.replace("_", "-")],
+        ))
+
+    fallback_groups: List[Tuple[str, List[str]]] = []
+    dataset_name_from_cfg = cfg.get("dataset", None)
+    if dataset_name_from_cfg is not None:
+        dataset_name_from_cfg = str(dataset_name_from_cfg)
+        fallback_groups.append(("algorithm.dataset", [dataset_name_from_cfg]))
+
+    search_groups = primary_groups + fallback_groups
+    assert search_groups, (
+        "HILP auto-detection failed: neither algorithm.train_dataset_config nor "
+        "algorithm.dataset_config nor algorithm.dataset is available."
+    )
+
+    for label, tokens in search_groups:
+        matches = sorted(set(_find_hilp_matches(td_models_dir, tokens)))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            match_names = [os.path.basename(path) for path in matches]
+            raise AssertionError(
+                f"HILP auto-detection ambiguous via {label}: tokens={tokens} matched {match_names}"
+            )
+
+    available = [os.path.basename(path) for path in pkl_files]
+    raise AssertionError(
+        "HILP auto-detection failed: no td_models/*.pkl matched "
+        f"dataset_config={dataset_config_name!r}, dataset={cfg.get('dataset', None)!r}. "
+        f"Available files: {available}"
+    )
 
 
 
@@ -235,13 +330,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.noise_level_building_way = cfg.get("noise_level_building_way", "pyramid")
 
         # HILP value function guidance
-        hilp_path = cfg.get("hilp_checkpoint_path", "td_models/hilp_ckpt_latest.pt")
-        # Resolve path relative to repo root if relative
-        import os
-        if not os.path.isabs(hilp_path):
-            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            hilp_path = os.path.join(repo_root, hilp_path)
-        self.hilp_checkpoint_path = hilp_path
+        self.hilp_checkpoint_path = None  # auto-detected lazily on first HILP use
         self.hilp_obs_dim = cfg.get("hilp_obs_dim", 29)    # used only for legacy .pt checkpoints
         self.hilp_skill_dim = cfg.get("hilp_skill_dim", 256)  # used only for legacy .pt checkpoints
         # HILP value function instance will be loaded lazily and stored in _hilp_value_fn_instance
@@ -362,6 +451,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         from env_id (grid envs) or data_mean/std (continuous envs).
         """
         if not hasattr(self, '_hilp_value_fn_instance') or self._hilp_value_fn_instance is None:
+            if self.hilp_checkpoint_path is None:
+                self.hilp_checkpoint_path = _detect_hilp_checkpoint_path(self.cfg)
             use_memo = bool(self.cfg.get("use_hilp_memoization", False))
             G = int(self.cfg.get("hilp_memoization_grid_size", 100))
 
@@ -2288,6 +2379,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         start,
                         goal,
                         loops,
+                        namespace=namespace,
                     )
             
             # Flag: 0 → expand tree1 next, 1 → expand tree2 next
@@ -2357,6 +2449,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         start,
                         goal,
                         loops,
+                        namespace=namespace,
                     )
 
                     round_selection = self._select_round_plan_candidate(
@@ -5813,6 +5906,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         start: torch.Tensor,
         goal: torch.Tensor,
         loops: int,
+        namespace: Optional[str] = None,
     ) -> None:
         """Run tree-local backprop, state rollout, and visualization after mixed expansion."""
         original_step_captures = getattr(self, "_expansion_step_captures_by_name", {})
@@ -5855,6 +5949,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         start,
                         goal,
                         loops,
+                        namespace=namespace,
                     )
                 self._visualize_tree_final_plans(
                     tree,
@@ -5938,11 +6033,17 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         start: torch.Tensor,
         goal: torch.Tensor,
         loops: int,
+        namespace: Optional[str] = None,
     ) -> None:
         """Log root fast-sampling uncertainty videos before the first expansion round."""
         if not self.viz_uncertain_next_subplan_last_obs or not root_uncertainty_infos:
             return
 
+        _viz_namespace = (
+            namespace.split("/", 1)[1]
+            if namespace and namespace.startswith("validation/")
+            else namespace
+        )
         trees_by_tag = {tree.tag: tree for tree in trees}
         _v_start_np = start.cpu().numpy()[:, self.pos_dim_indices]
         _v_goal_np = goal.cpu().numpy()[:, self.pos_dim_indices]
@@ -5972,6 +6073,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 _v_obs_std_np,
                 loops,
                 log_prefix="uncertainty_estimate",
+                log_namespace=_viz_namespace,
                 plan_hist_override=_unc_hist,
                 is_uncertainty_viz=True,
             )
@@ -5983,8 +6085,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         start: torch.Tensor,
         goal: torch.Tensor,
         loops: int,
+        namespace: Optional[str] = None,
     ) -> None:
         """Log per-candidate denoising videos for one expansion batch."""
+        _viz_namespace = (
+            namespace.split("/", 1)[1]
+            if namespace and namespace.startswith("validation/")
+            else namespace
+        )
         _v_start_np = start.cpu().numpy()[:, self.pos_dim_indices]
         _v_goal_np = goal.cpu().numpy()[:, self.pos_dim_indices]
         _v_hilp_fn = getattr(self, "_hilp_value_fn_instance", None)
@@ -6016,6 +6124,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     _v_obs_std_np,
                     loops,
                     log_prefix="expanded",
+                    log_namespace=_viz_namespace,
                     plan_hist_override=_vinfo.get("expanded_plan_hist_frame"),
                 )
                 _viz_subplan_expand_ms += (time.time() - _viz_t0) * 1000
@@ -6034,6 +6143,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     _v_obs_std_np,
                     loops,
                     log_prefix="replanned",
+                    log_namespace=_viz_namespace,
                     plan_hist_override=_vinfo.get("replanned_plan_hist_frame"),
                 )
                 _viz_subplan_replan_ms += (time.time() - _viz_t0) * 1000
@@ -6058,6 +6168,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     _v_obs_std_np,
                     loops,
                     log_prefix="uncertainty_estimate",
+                    log_namespace=_viz_namespace,
                     plan_hist_override=_vinfo["uncertainty_plan_hist_frame"],
                     is_uncertainty_viz=True,
                 )

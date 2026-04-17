@@ -37,11 +37,10 @@ segment_episode_len: 200 # raw episode length per segment (pre-jump); effective 
 
 # HILP value function guidance
 # For .pkl checkpoints (JAX/Flax): all hyper-params are auto-detected from the file.
-#   Aggregator (inner_prod vs neg_l2) is read from a sidecar JSON:
-#     td_models/<same-stem>.json  →  {"aggregator": "inner_prod"}
-#   If no sidecar exists, inner_prod is used (matches training default).
+#   The checkpoint is auto-detected at runtime from algorithm.train_dataset_config
+#   / algorithm.dataset_config by matching td_models/*.pkl filenames.
+#   Missing or ambiguous matches fail fast with an assertion.
 # For legacy .pt checkpoints: hilp_obs_dim / hilp_skill_dim are still needed.
-hilp_checkpoint_path: "td_models/params_1000000_20260416_112010.pkl" # navigate: "td_models/params_1000000_20260324_002241.pkl", stitch: "td_models/params_1000000_20260416_112010.pkl"
 mctd_guidance_scales: [0.8, 0.4, 0.0] # HILP gradient scale for near-target positions (TD_thres or above)
 rmse_guidance_scale: 0.2 # RMSE direction scale for far-target positions (below TD_thres)
 anchor_guidance_scale_ratio: 1.2

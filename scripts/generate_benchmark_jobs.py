@@ -17,6 +17,11 @@ def main():
     parser.add_argument("--num_repeats", type=int, default=3, help="Number of repeated evaluation passes")
     parser.add_argument("--rollouts_per_task", type=int, default=50, help="Number of rollouts per (repeat, task)")
     parser.add_argument("--results_dir", required=True, help="Directory to write benchmark JSON results into")
+    parser.add_argument(
+        "--results_file_prefix",
+        default="benchmark",
+        help="Filename prefix for per-task benchmark JSON results",
+    )
     args = parser.parse_args()
 
     os.makedirs("jobs", exist_ok=True)
@@ -45,7 +50,7 @@ def main():
             job_cfg["algorithm.benchmark_rollout_seed_base"] = repeat_id * 100000 + task_id * 1000
             job_cfg["algorithm.benchmark_results_path"] = os.path.join(
                 args.results_dir,
-                f"repeat_{repeat_id:02d}_task_{task_id:02d}.json",
+                f"{args.results_file_prefix}_repeat_{repeat_id:02d}_task_{task_id:02d}.json",
             )
             job_cfg["+name"] = f"BENCH_{args.model_id}_R{repeat_id}_T{task_id}"
 

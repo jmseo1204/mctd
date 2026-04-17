@@ -1,0 +1,29 @@
+{
+  "model_id": "train_2d_antmaze_giant_stitch_j5_27596ep_20260406_034459",
+  "eval_repeat_id": 3,
+  "num_tasks": 1,
+  "task_results": [
+    {
+      "task_id": 5,
+      "num_rollouts": 1,
+      "task_success_mean": 1.0,
+      "rollouts": [
+        {
+          "task_id": 5,
+          "success": 1.0,
+          "episode_reward": 1.0,
+          "episode_reward_if_stay": 1.0,
+          "first_reach": 531.0,
+          "planning_time": 3.663095712661743,
+          "steps": 532,
+          "interaction_seed": 305000,
+          "rollout_id": 0,
+          "seed": 305000
+        }
+      ]
+    }
+  ],
+  "repeat_success_mean": 1.0,
+  "task_id": 5,
+  "task_success_mean": 1.0
+}

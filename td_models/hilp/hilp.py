@@ -204,35 +204,14 @@ def _find_hilp_gcrl_path(pkl_path: str) -> str:
     )
 
 
-def _read_pkl_meta(pkl_path: str) -> dict:
-    """Read a sidecar JSON (same stem as pkl) for non-structural config.
-
-    e.g. params_1000000_20260324_002241.pkl  →  params_1000000_20260324_002241.json
-    Returns {} if the sidecar does not exist.
-    """
-    import os, json
-    stem = os.path.splitext(pkl_path)[0]
-    sidecar = stem + ".json"
-    if os.path.isfile(sidecar):
-        with open(sidecar) as f:
-            return json.load(f)
-    return {}
-
-
 class HILPJax:
     """Wraps the HILP DualHILP JAX/Flax agent using hilp_gcrl source directly.
 
     All structural hyper-parameters (obs_dim, skill_dim, action_dim,
     share_encoder) are auto-detected from the pkl weights.
 
-    The only parameter that cannot be inferred from weights alone is
-    ``aggregator`` (inner_prod vs neg_l2).  HILPJax reads it from a
-    sidecar JSON placed next to the pkl file:
-
-        td_models/params_<step>_<ts>.json  →  {"aggregator": "inner_prod"}
-
-    If the sidecar is absent, ``inner_prod`` is used as the default
-    (matching the training-script default in train_dual_ogbench.py).
+    This repository uses neg_l2 for all HILP checkpoints, so the loader
+    always restores JAX checkpoints with ``aggregator="neg_l2"``.
 
     Interface is compatible with the original HILP class:
       ``value(obs, goal) -> (v, v)``  (duplicate for ensemble compatibility)
@@ -274,9 +253,8 @@ class HILPJax:
         # share_encoder: separate psi key exists only when share_encoder=False
         share_encoder = "psi" not in net_params["networks_value"]
 
-        # ---- 3. Read aggregator from sidecar JSON (default: inner_prod) --
-        meta = _read_pkl_meta(pkl_path)
-        aggregator = meta.get("aggregator", "inner_prod")
+        # ---- 3. All repository HILP checkpoints use neg_l2 ---------------
+        aggregator = "neg_l2"
 
         # ---- 4. Build dummy agent and restore weights --------------------
         dummy_obs = np.zeros((1, obs_dim), dtype=np.float32)
@@ -294,8 +272,7 @@ class HILPJax:
 
         print(f"[HILPJax] loaded  obs_dim={obs_dim}  skill_dim={skill_dim}"
               f"  action_dim={action_dim}  share_encoder={share_encoder}"
-              f"  aggregator={aggregator}"
-              + ("  (from sidecar)" if "aggregator" in meta else "  (default)"))
+              f"  aggregator={aggregator}")
 
     # ------------------------------------------------------------------
     # PyTorch-compatible interface
