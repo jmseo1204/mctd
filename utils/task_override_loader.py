@@ -26,6 +26,16 @@ def resolve_task_override_path(override_path: Optional[str], repo_root: Optional
     return resolved
 
 
+def load_task_override_payload(
+    override_path: Optional[str],
+    repo_root: Optional[str] = None,
+) -> tuple[Optional[str], dict[str, Any]]:
+    resolved_path = resolve_task_override_path(override_path, repo_root=repo_root)
+    if resolved_path is None:
+        return None, {}
+    return resolved_path, _load_override_payload(resolved_path)
+
+
 def _load_override_payload(resolved_path: str) -> dict[str, Any]:
     _, ext = os.path.splitext(resolved_path)
     with open(resolved_path, "r", encoding="utf-8") as f:

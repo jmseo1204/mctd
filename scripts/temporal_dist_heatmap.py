@@ -392,7 +392,7 @@ def _resolve_sampled_graph_cfg(algo, args) -> dict[str, float | int | Path]:
     edge_radius = float(
         args.edge_radius
         if args.edge_radius is not None
-        else cfg.get("sampled_graph_edge_radius", 3.0)
+        else cfg.get("sampled_graph_edge_radius", 1.0)
     )
     graph_seed = int(
         args.graph_seed

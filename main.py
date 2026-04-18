@@ -28,6 +28,45 @@ from utils.cluster_utils import submit_slurm_job
 from utils.distributed_utils import is_rank_zero
 
 
+def _cli_algorithm_override_paths(argv: list[str]) -> list[str]:
+    override_paths: set[str] = set()
+    for arg in argv[1:]:
+        if "=" not in arg:
+            continue
+        key = arg.split("=", 1)[0].lstrip("+")
+        if not key.startswith("algorithm."):
+            continue
+        override_paths.add(key[len("algorithm."):])
+    return sorted(override_paths)
+
+
+def _maybe_apply_algorithm_snapshot(cfg: DictConfig) -> None:
+    snapshot_path = cfg.get("algorithm_snapshot_path", None)
+    if not snapshot_path:
+        return
+
+    snapshot_path = Path(snapshot_path)
+    if not snapshot_path.is_absolute():
+        snapshot_path = Path.cwd() / snapshot_path
+    snapshot_path = snapshot_path.resolve()
+    if not snapshot_path.exists():
+        raise FileNotFoundError(f"Algorithm config snapshot not found: {snapshot_path}")
+
+    snapshot_cfg = OmegaConf.load(snapshot_path)
+    if not isinstance(snapshot_cfg, DictConfig):
+        snapshot_cfg = OmegaConf.create(snapshot_cfg)
+
+    current_algorithm_cfg = cfg.algorithm
+    for dotpath in _cli_algorithm_override_paths(sys.argv):
+        value = OmegaConf.select(current_algorithm_cfg, dotpath)
+        OmegaConf.update(snapshot_cfg, dotpath, value, merge=True)
+
+    with open_dict(cfg):
+        cfg.algorithm = snapshot_cfg
+
+    print(cyan("Loaded algorithm config snapshot:"), snapshot_path)
+
+
 def run_local(cfg: DictConfig):
     # delay some imports in case they are not needed in non-local envs for submission
     from experiments import build_experiment
@@ -173,6 +212,8 @@ def run_slurm(cfg: DictConfig):
     config_name="config",
 )
 def run(cfg: DictConfig):
+    _maybe_apply_algorithm_snapshot(cfg)
+
     if "_on_compute_node" in cfg and cfg.cluster.is_compute_node_offline:
         with open_dict(cfg):
             if cfg.cluster.is_compute_node_offline and cfg.wandb.mode == "online":

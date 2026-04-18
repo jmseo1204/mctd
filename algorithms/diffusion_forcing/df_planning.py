@@ -33,9 +33,15 @@ from utils.tracer import Tracer, set_default_tracer, get_tracer
 from utils.planning_utils import episode_len_to_plan_tokens
 from utils.route_metric_utils import (
     anchor_short_label,
+    solve_fixed_endpoint_hamiltonian_path,
     solve_fixed_endpoint_hamiltonian_path_with_forced_adjacency,
 )
-from utils.task_override_loader import apply_task_overrides_to_env, inject_task_metadata_into_reset_info, resolve_task_override_path
+from utils.task_override_loader import (
+    apply_task_overrides_to_env,
+    inject_task_metadata_into_reset_info,
+    load_task_override_payload,
+    resolve_task_override_path,
+)
 from .tree_node import TreeNode
 from . import guidance
 from .hilp_loader import HILPMemoizedWrapper, get_hilp_fn
@@ -44,6 +50,12 @@ from .plan_postproc import PlanPostprocMixin
 from .kde_estimator import KDEEstimatorMixin
 from .noise_schedule import NoiseScheduleMixin
 from .plan_viz import PlanVizMixin
+from .sampled_graph_estimator import (
+    SampledGraphEstimatorMixin,
+    extract_shortest_path_submatrix,
+    query_distinct_nearest_nodes,
+    query_shortest_path_between_node_indices,
+)
 from .uncertainty_estimator import compute_uncertainty_from_embeddings, compute_uncertainty_variance, cluster_tail_by_temporal_dist
 
 # Module-level process start time for lifecycle elapsed-time logging.
@@ -262,7 +274,15 @@ class MCTSTreeState:
         return nodes
 
 
-class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMixin, PlanExecutorMixin, PlanPostprocMixin, DiffusionForcingBase):
+class DiffusionForcingPlanning(
+    KDEEstimatorMixin,
+    SampledGraphEstimatorMixin,
+    NoiseScheduleMixin,
+    PlanVizMixin,
+    PlanExecutorMixin,
+    PlanPostprocMixin,
+    DiffusionForcingBase,
+):
     def __init__(self, cfg: DictConfig):
         # [INSTRUMENTATION] Initialize tracer (will be set later in interact() or on-demand in parallel_plan())
         self.tracer = None
@@ -326,6 +346,12 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.benchmark_rollout_seed_base = int(cfg.get("benchmark_rollout_seed_base", 0))
         self.benchmark_results_path = cfg.get("benchmark_results_path", None)
         self.benchmark_model_id = cfg.get("benchmark_model_id", None)
+        _benchmark_top_n = cfg.get("benchmark_waypoint_top_n", None)
+        self.benchmark_waypoint_top_n = (
+            int(_benchmark_top_n) if _benchmark_top_n is not None else None
+        )
+        self._benchmark_override_payload_cache: Optional[dict] = None
+        self._current_wandb_visual_prefix: Optional[str] = None
         self.dql_model = cfg.get("dql_model", None)
         self.val_max_loops = cfg.get("val_max_loops", None)
         _scales = cfg.get("mctd_guidance_scales", [0.0])
@@ -423,6 +449,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.regularize_goal_guidance = cfg.get("regularize_goal_guidance", False)
         self.kde_sample_ratio = cfg.get("kde_sample_ratio", 0.1)
         self._kde_save_dir = os.path.expanduser(cfg.get("kde_save_dir", "~/.ogbench/data"))
+        self.sampled_graph_sample_ratio = float(cfg.get("sampled_graph_sample_ratio", 0.005))
+        self.sampled_graph_edge_radius = float(cfg.get("sampled_graph_edge_radius", 1.0))
+        self.sampled_graph_seed = int(cfg.get("sampled_graph_seed", 42))
+        self._sampled_graph_cache_dir = os.path.expanduser(
+            cfg.get("sampled_graph_save_dir", cfg.get("kde_save_dir", "~/.ogbench/data"))
+        )
+        self._sampled_graph_data_dir = self._kde_save_dir
         self.mcts_use_replan = cfg.get("mcts_use_replan", False)
         self.viz_replanning: bool = cfg.get("viz_replanning", True)
         self.use_uncertainty_as_value: bool = cfg.get("use_uncertainty_as_value", False)
@@ -793,6 +826,256 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         )
         planner_state["tentative_solver_result"] = solver_result
         return solver_result
+
+    def _load_benchmark_override_payload(self) -> dict:
+        if self._benchmark_override_payload_cache is None:
+            _, payload = load_task_override_payload(
+                self.task_override_resolved_path,
+                repo_root=_repo_root(),
+            )
+            self._benchmark_override_payload_cache = payload or {}
+        return self._benchmark_override_payload_cache
+
+    def _get_benchmark_waypoint_groups_for_task(self, task_id: int) -> list[tuple[int, list]]:
+        payload = self._load_benchmark_override_payload()
+        tasks = payload.get("tasks", {}) if isinstance(payload, dict) else {}
+        if not isinstance(tasks, dict):
+            raise ValueError("Task override payload must contain a mapping at 'tasks'")
+        task_override = tasks.get(int(task_id))
+        if task_override is None:
+            task_override = tasks.get(str(task_id))
+        if task_override is None:
+            raise ValueError(
+                f"Task override payload does not define task {task_id}: {self.task_override_resolved_path}"
+            )
+        if not isinstance(task_override, dict):
+            raise ValueError(f"Task override for task {task_id} must be a mapping")
+        waypoint_groups = task_override.get("waypoint_ij_groups", [])
+        if not isinstance(waypoint_groups, list):
+            raise ValueError(f"task {task_id} waypoint_ij_groups must be a list")
+        return [(idx, group) for idx, group in enumerate(waypoint_groups)]
+
+    @staticmethod
+    def _build_groundtruth_anchor_queries(
+        start_xy: np.ndarray,
+        goal_xy: np.ndarray,
+        waypoints_xy: np.ndarray,
+    ) -> dict[str, Any]:
+        waypoints_xy = np.asarray(waypoints_xy, dtype=np.float32)
+        if waypoints_xy.size == 0:
+            waypoints_xy = np.zeros((0, 2), dtype=np.float32)
+        else:
+            waypoints_xy = waypoints_xy.reshape(-1, 2)
+
+        anchor_xys = np.concatenate(
+            [
+                np.asarray(start_xy, dtype=np.float32).reshape(1, 2),
+                waypoints_xy,
+                np.asarray(goal_xy, dtype=np.float32).reshape(1, 2),
+            ],
+            axis=0,
+        )
+        n_waypoints = int(len(waypoints_xy))
+        anchor_labels = ["start"] + [f"waypoint_{idx}" for idx in range(1, n_waypoints + 1)] + ["goal"]
+        priority_order = np.asarray([0, n_waypoints + 1] + list(range(1, n_waypoints + 1)), dtype=np.int32)
+        return {
+            "anchor_xys": anchor_xys,
+            "anchor_labels": anchor_labels,
+            "priority_order": priority_order,
+        }
+
+    def _expand_groundtruth_route_segments(
+        self,
+        graph_cache: dict,
+        anchor_node_indices: np.ndarray,
+        anchor_order: np.ndarray,
+    ) -> dict[str, Any]:
+        anchor_order = np.asarray(anchor_order, dtype=np.int32).reshape(-1)
+        if len(anchor_order) < 2:
+            return {
+                "reachable": False,
+                "segments": [],
+                "total_distance": np.inf,
+            }
+
+        segments = []
+        total_distance = 0.0
+        reachable = True
+        for segment_idx, (src_anchor_idx, dst_anchor_idx) in enumerate(
+            zip(anchor_order[:-1].tolist(), anchor_order[1:].tolist()),
+            start=1,
+        ):
+            segment = query_shortest_path_between_node_indices(
+                graph_cache,
+                src_node_index=int(anchor_node_indices[src_anchor_idx]),
+                dst_node_index=int(anchor_node_indices[dst_anchor_idx]),
+            )
+            segment["segment_index"] = segment_idx
+            segment["src_anchor_index"] = int(src_anchor_idx)
+            segment["dst_anchor_index"] = int(dst_anchor_idx)
+            segments.append(segment)
+            if not bool(segment["reachable"]):
+                reachable = False
+            else:
+                total_distance += float(segment["shortest_distance"])
+
+        if not reachable:
+            total_distance = np.inf
+
+        return {
+            "reachable": reachable,
+            "segments": segments,
+            "total_distance": float(total_distance),
+        }
+
+    @staticmethod
+    def _compute_plan_polyline_length(plan_xy: np.ndarray) -> float:
+        pts = np.asarray(plan_xy, dtype=np.float32)
+        if pts.size == 0:
+            return 0.0
+        if pts.ndim == 3:
+            pts = pts[:, 0, :]
+        if len(pts) < 2:
+            return 0.0
+        diffs = np.diff(pts, axis=0)
+        return float(np.linalg.norm(diffs, axis=-1).sum(dtype=np.float64))
+
+    def _compute_groundtruth_hamiltonian_info(
+        self,
+        start_xy: np.ndarray,
+        goal_xy: np.ndarray,
+        waypoints_xy: np.ndarray,
+        task_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        graph_cache = self._get_sampled_graph_cache()
+        anchor_bundle = self._build_groundtruth_anchor_queries(
+            start_xy=start_xy,
+            goal_xy=goal_xy,
+            waypoints_xy=waypoints_xy,
+        )
+        anchor_assignment = query_distinct_nearest_nodes(
+            graph_cache,
+            query_xys=np.asarray(anchor_bundle["anchor_xys"], dtype=np.float32),
+            priority_order=np.asarray(anchor_bundle["priority_order"], dtype=np.int32),
+            query_labels=list(anchor_bundle["anchor_labels"]),
+        )
+        anchor_node_indices = np.asarray(anchor_assignment["node_indices"], dtype=np.int32)
+        anchor_node_xys = np.asarray(anchor_assignment["node_xys"], dtype=np.float32)
+        anchor_node_dists = np.asarray(anchor_assignment["node_euclidean_dists"], dtype=np.float32)
+
+        graph_anchor_dists = extract_shortest_path_submatrix(graph_cache, anchor_node_indices)
+        graph_route_solution = solve_fixed_endpoint_hamiltonian_path(graph_anchor_dists)
+        if bool(graph_route_solution.get("feasible", False)):
+            graph_route_segments = self._expand_groundtruth_route_segments(
+                graph_cache,
+                anchor_node_indices=anchor_node_indices,
+                anchor_order=np.asarray(graph_route_solution["anchor_order"], dtype=np.int32),
+            )
+        else:
+            graph_route_segments = {
+                "reachable": False,
+                "segments": [],
+                "total_distance": np.inf,
+            }
+
+        sampled_xy = np.asarray(graph_cache["points_xy"], dtype=np.float32)
+        n_total = int(graph_cache["n_total"])
+        goal_node_index = int(anchor_node_indices[-1])
+        goal_shortest_dists = np.asarray(
+            graph_cache["shortest_dists"][goal_node_index],
+            dtype=np.float32,
+        )
+        return {
+            "task_name": task_name,
+            "anchor_bundle": anchor_bundle,
+            "anchor_assignment": anchor_assignment,
+            "anchor_node_indices": anchor_node_indices,
+            "anchor_node_xys": anchor_node_xys,
+            "anchor_node_dists": anchor_node_dists,
+            "route_solution": graph_route_solution,
+            "route_segments": graph_route_segments,
+            "sampled_xy": sampled_xy,
+            "goal_shortest_dists": goal_shortest_dists,
+            "goal_node_index": goal_node_index,
+            "n_total": n_total,
+            "n_reachable": int(np.isfinite(goal_shortest_dists).sum()),
+        }
+
+    def _render_groundtruth_hamiltonian_image(self, groundtruth_info: dict[str, Any]) -> Optional[Image.Image]:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from scripts.temporal_dist_heatmap import _plot_sample_panel
+        except Exception as exc:
+            print(f"[WARNING] Could not import ground-truth Hamiltonian plotting stack: {exc}", flush=True)
+            return None
+
+        fig = None
+        try:
+            fig, ax = plt.subplots(1, 1, figsize=(9, 8))
+            anchor_bundle = groundtruth_info["anchor_bundle"]
+            _plot_sample_panel(
+                ax,
+                fig,
+                self.env_id,
+                np.asarray(groundtruth_info["sampled_xy"], dtype=np.float32),
+                shortest_dists=np.asarray(groundtruth_info["goal_shortest_dists"], dtype=np.float32),
+                anchor_xys=np.asarray(anchor_bundle["anchor_xys"], dtype=np.float32),
+                anchor_node_xys=np.asarray(groundtruth_info["anchor_node_xys"], dtype=np.float32),
+                anchor_node_dists=np.asarray(groundtruth_info["anchor_node_dists"], dtype=np.float32),
+                sample_ratio=float(self.sampled_graph_sample_ratio),
+                edge_radius=float(self.sampled_graph_edge_radius),
+                n_total=int(groundtruth_info["n_total"]),
+                n_reachable=int(groundtruth_info["n_reachable"]),
+                route_solution=dict(groundtruth_info["route_solution"]),
+                route_segments=dict(groundtruth_info["route_segments"]),
+                task_name=groundtruth_info.get("task_name"),
+            )
+            fig.tight_layout()
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=220, bbox_inches="tight")
+            buf.seek(0)
+            with Image.open(buf) as image:
+                return image.convert("RGB")
+        except Exception as exc:
+            print(f"[WARNING] Failed to render ground-truth Hamiltonian plot: {exc}", flush=True)
+            return None
+        finally:
+            if fig is not None:
+                plt.close(fig)
+
+    def _augment_interact_result_with_hamiltonian_groundtruth(
+        self,
+        interact_result: dict,
+        groundtruth_info: dict[str, Any],
+    ) -> dict:
+        route_solution = groundtruth_info["route_solution"]
+        route_segments = groundtruth_info["route_segments"]
+        gt_anchor_order = np.asarray(route_solution.get("anchor_order", []), dtype=np.int32).tolist()
+        pred_anchor_order = [
+            int(idx) for idx in interact_result.get("predicted_anchor_order", [])
+        ]
+        gt_reachable = bool(route_solution.get("feasible", False)) and bool(route_segments.get("reachable", False))
+        hamiltonian_success = bool(gt_reachable and pred_anchor_order == gt_anchor_order)
+        gt_min_distance = float(route_segments.get("total_distance", np.inf))
+        pred_plan_length = interact_result.get("postprocessed_plan_length", None)
+        rel_error = None
+        if pred_plan_length is not None and np.isfinite(gt_min_distance) and gt_min_distance > 0.0:
+            rel_error = abs(float(pred_plan_length) - gt_min_distance) / gt_min_distance
+
+        interact_result["groundtruth_anchor_order"] = gt_anchor_order
+        interact_result["groundtruth_route_text"] = str(route_solution.get("route_text", ""))
+        interact_result["groundtruth_min_distance"] = gt_min_distance
+        interact_result["groundtruth_snap_distances"] = [
+            float(v) for v in np.asarray(groundtruth_info["anchor_node_dists"], dtype=np.float32).tolist()
+        ]
+        interact_result["groundtruth_reachable"] = gt_reachable
+        interact_result["hamiltonian_path_success"] = hamiltonian_success
+        interact_result["postprocessed_plan_length_rel_error"] = (
+            float(rel_error) if rel_error is not None else None
+        )
+        return interact_result
 
     def _get_tentative_neighbor_indices(self, planner_state: dict, anchor_idx: int) -> list[int]:
         solver_result = planner_state.get("tentative_solver_result", {})
@@ -1500,8 +1783,12 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
     def _maybe_apply_ogbench_task_overrides(self, env) -> None:
         if self.task_override_resolved_path is None:
             return
-        already_applied = getattr(env, "_mctd_task_override_path", None)
-        if already_applied == self.task_override_resolved_path:
+        override_signature = (
+            self.task_override_resolved_path,
+            None if self.task_override_waypoint_group_idx is None else int(self.task_override_waypoint_group_idx),
+        )
+        already_applied = getattr(env, "_mctd_task_override_signature", None)
+        if already_applied == override_signature:
             return
         applied_path = apply_task_overrides_to_env(
             env,
@@ -1510,8 +1797,12 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             repo_root=_repo_root(),
             waypoint_group_idx_override=self.task_override_waypoint_group_idx,
         )
-        env._mctd_task_override_path = applied_path
-        print(f"[OGBENCH] Applied task override: {applied_path}", flush=True)
+        env._mctd_task_override_signature = override_signature
+        print(
+            f"[OGBENCH] Applied task override: {applied_path} "
+            f"(group_idx={override_signature[1]})",
+            flush=True,
+        )
 
     def _ensure_ogbench_task_metadata_compat(self, env) -> None:
         if self.task_override_resolved_path is None:
@@ -1645,12 +1936,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         with open(self.benchmark_results_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
 
-    def run_benchmark(self) -> dict:
-        task_ids = self.task_ids if self.task_ids is not None else [self.task_id]
-        task_ids = [tid for tid in task_ids if tid is not None]
-        if not task_ids:
-            raise ValueError("benchmark run requires algorithm.task_id or algorithm.task_ids")
-
+    def _run_standard_benchmark(self, task_ids: list[int]) -> dict:
         all_task_results = []
         original_task_id = self.task_id
         original_seed = self.interaction_seed
@@ -1744,6 +2030,248 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         self._write_benchmark_results(payload)
         return payload
+
+    def _run_hamiltonian_benchmark(self, task_ids: list[int]) -> dict:
+        if self.task_override_resolved_path is None:
+            raise ValueError("Hamiltonian benchmark requires algorithm.task_override_path")
+        if self.benchmark_waypoint_top_n is None or self.benchmark_waypoint_top_n <= 0:
+            raise ValueError("Hamiltonian benchmark requires algorithm.benchmark_waypoint_top_n > 0")
+
+        all_task_results = []
+        original_task_id = self.task_id
+        original_seed = self.interaction_seed
+        original_group_idx = self.task_override_waypoint_group_idx
+        original_visual_prefix = self._current_wandb_visual_prefix
+
+        try:
+            for task_idx, task_id in enumerate(task_ids):
+                self._benchmark_preflight_check(int(task_id))
+                ranked_groups = self._get_benchmark_waypoint_groups_for_task(int(task_id))
+                selected_groups = ranked_groups[: self.benchmark_waypoint_top_n]
+                if not selected_groups:
+                    raise ValueError(
+                        f"No waypoint groups available for Hamiltonian benchmark task {task_id} "
+                        f"in {self.task_override_resolved_path}"
+                    )
+
+                task_group_results = []
+                task_seed_base = self.benchmark_rollout_seed_base + task_idx * max(1, len(selected_groups))
+                group_pbar = tqdm(
+                    total=len(selected_groups),
+                    desc=f"HBench R{self.eval_repeat_id} T{task_id}",
+                    leave=True,
+                    dynamic_ncols=True,
+                )
+
+                for local_group_rank, (group_idx, waypoint_ij_group) in enumerate(selected_groups):
+                    group_seed = task_seed_base + local_group_rank
+                    self._seed_benchmark_rollout_rng(group_seed)
+                    self.task_id = int(task_id)
+                    self.interaction_seed = group_seed
+                    self.task_override_waypoint_group_idx = int(group_idx)
+                    self._current_wandb_visual_prefix = str(group_idx)
+                    namespace = (
+                        f"benchmark/repeat{self.eval_repeat_id}/task{self.task_id}/group{group_idx}"
+                    )
+                    self.interact(
+                        batch_size=1,
+                        conditions=None,
+                        namespace=namespace,
+                        terminate_on_done=True,
+                    )
+                    interact_result = dict(getattr(self, "_last_interact_result", {}))
+                    interact_result.update(
+                        {
+                            "waypoint_group_idx": int(group_idx),
+                            "waypoint_ij_group": waypoint_ij_group,
+                            "seed": int(group_seed),
+                        }
+                    )
+
+                    start_xy = np.asarray(interact_result.get("start_xy", []), dtype=np.float32).reshape(-1, 2)
+                    goal_xy = np.asarray(interact_result.get("goal_xy", []), dtype=np.float32).reshape(-1, 2)
+                    waypoints_xy = np.asarray(interact_result.get("waypoints_xy", []), dtype=np.float32)
+                    if waypoints_xy.size == 0:
+                        waypoints_xy = np.zeros((0, 2), dtype=np.float32)
+                    else:
+                        waypoints_xy = waypoints_xy.reshape(-1, 2)
+                    if len(start_xy) == 0 or len(goal_xy) == 0:
+                        raise RuntimeError(
+                            "Hamiltonian benchmark requires interact() to expose start_xy and goal_xy"
+                        )
+                    task_name = None
+                    if interact_result.get("task_names"):
+                        task_name = str(interact_result["task_names"][0])
+
+                    groundtruth_info = self._compute_groundtruth_hamiltonian_info(
+                        start_xy=start_xy[0],
+                        goal_xy=goal_xy[0],
+                        waypoints_xy=waypoints_xy,
+                        task_name=task_name,
+                    )
+                    interact_result = self._augment_interact_result_with_hamiltonian_groundtruth(
+                        interact_result,
+                        groundtruth_info,
+                    )
+
+                    gt_image = self._render_groundtruth_hamiltonian_image(groundtruth_info)
+                    if gt_image is not None:
+                        self.log_image(
+                            f"{group_idx}/groundtruth_hemiltonian_path",
+                            gt_image,
+                        )
+
+                    task_group_results.append(interact_result)
+                    running_agent_success = float(
+                        np.mean([group["success"] for group in task_group_results])
+                    )
+                    running_hamiltonian_success = float(
+                        np.mean([group["hamiltonian_path_success"] for group in task_group_results])
+                    )
+                    valid_rel_errors = [
+                        float(group["postprocessed_plan_length_rel_error"])
+                        for group in task_group_results
+                        if group.get("postprocessed_plan_length_rel_error") is not None
+                    ]
+                    running_rel_error = (
+                        float(np.mean(valid_rel_errors))
+                        if valid_rel_errors else float("nan")
+                    )
+                    group_pbar.update(1)
+                    group_pbar.set_postfix(
+                        {
+                            "agent": f"{running_agent_success:.3f}",
+                            "route": f"{running_hamiltonian_success:.3f}",
+                            "relerr": (
+                                f"{running_rel_error:.3f}"
+                                if np.isfinite(running_rel_error)
+                                else "nan"
+                            ),
+                        },
+                        refresh=True,
+                    )
+
+                    self._safe_log_metric("benchmark/current_repeat_id", float(self.eval_repeat_id))
+                    self._safe_log_metric("benchmark/current_task_id", float(self.task_id))
+                    self._safe_log_metric("benchmark/current_group_idx", float(group_idx))
+                    self._safe_log_metric(
+                        f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/group{group_idx}/agent_success",
+                        float(interact_result["success"]),
+                    )
+                    self._safe_log_metric(
+                        f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/group{group_idx}/hamiltonian_path_success",
+                        float(interact_result["hamiltonian_path_success"]),
+                    )
+                    if interact_result.get("postprocessed_plan_length_rel_error") is not None:
+                        self._safe_log_metric(
+                            f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/group{group_idx}/postprocessed_plan_length_rel_error",
+                            float(interact_result["postprocessed_plan_length_rel_error"]),
+                        )
+
+                group_pbar.close()
+                task_agent_success_mean = float(
+                    np.mean([group["success"] for group in task_group_results])
+                )
+                task_hamiltonian_success_mean = float(
+                    np.mean([group["hamiltonian_path_success"] for group in task_group_results])
+                )
+                task_rel_errors = [
+                    float(group["postprocessed_plan_length_rel_error"])
+                    for group in task_group_results
+                    if group.get("postprocessed_plan_length_rel_error") is not None
+                ]
+                task_length_error_mean = (
+                    float(np.mean(task_rel_errors)) if task_rel_errors else None
+                )
+                self._safe_log_metric(
+                    f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/agent_success_mean",
+                    task_agent_success_mean,
+                )
+                self._safe_log_metric(
+                    f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/hamiltonian_path_success_mean",
+                    task_hamiltonian_success_mean,
+                )
+                if task_length_error_mean is not None:
+                    self._safe_log_metric(
+                        f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/postprocessed_plan_length_rel_error_mean",
+                        task_length_error_mean,
+                    )
+                all_task_results.append(
+                    {
+                        "task_id": int(task_id),
+                        "requested_top_n": int(self.benchmark_waypoint_top_n),
+                        "num_groups": len(task_group_results),
+                        "task_agent_success_mean": task_agent_success_mean,
+                        "task_hamiltonian_path_success_mean": task_hamiltonian_success_mean,
+                        "task_postprocessed_plan_length_rel_error_mean": task_length_error_mean,
+                        "group_results": task_group_results,
+                    }
+                )
+        finally:
+            self.task_id = original_task_id
+            self.interaction_seed = original_seed
+            self.task_override_waypoint_group_idx = original_group_idx
+            self._current_wandb_visual_prefix = original_visual_prefix
+
+        payload = {
+            "mode": "hamiltonian_benchmark",
+            "model_id": self.benchmark_model_id,
+            "eval_repeat_id": self.eval_repeat_id,
+            "requested_top_n": int(self.benchmark_waypoint_top_n),
+            "num_tasks": len(all_task_results),
+            "task_results": all_task_results,
+        }
+        if all_task_results:
+            payload["repeat_agent_success_mean"] = float(
+                np.mean([task_result["task_agent_success_mean"] for task_result in all_task_results])
+            )
+            payload["repeat_hamiltonian_path_success_mean"] = float(
+                np.mean([task_result["task_hamiltonian_path_success_mean"] for task_result in all_task_results])
+            )
+            repeat_rel_errors = [
+                float(task_result["task_postprocessed_plan_length_rel_error_mean"])
+                for task_result in all_task_results
+                if task_result.get("task_postprocessed_plan_length_rel_error_mean") is not None
+            ]
+            payload["repeat_postprocessed_plan_length_rel_error_mean"] = (
+                float(np.mean(repeat_rel_errors)) if repeat_rel_errors else None
+            )
+            self._safe_log_metric(
+                f"benchmark/repeat{self.eval_repeat_id}/overall_agent_success",
+                payload["repeat_agent_success_mean"],
+            )
+            self._safe_log_metric(
+                f"benchmark/repeat{self.eval_repeat_id}/overall_hamiltonian_path_success",
+                payload["repeat_hamiltonian_path_success_mean"],
+            )
+            if payload["repeat_postprocessed_plan_length_rel_error_mean"] is not None:
+                self._safe_log_metric(
+                    f"benchmark/repeat{self.eval_repeat_id}/overall_postprocessed_plan_length_rel_error",
+                    float(payload["repeat_postprocessed_plan_length_rel_error_mean"]),
+                )
+        if len(all_task_results) == 1:
+            payload["task_id"] = all_task_results[0]["task_id"]
+            payload["task_agent_success_mean"] = all_task_results[0]["task_agent_success_mean"]
+            payload["task_hamiltonian_path_success_mean"] = all_task_results[0]["task_hamiltonian_path_success_mean"]
+            payload["task_postprocessed_plan_length_rel_error_mean"] = all_task_results[0][
+                "task_postprocessed_plan_length_rel_error_mean"
+            ]
+
+        self._write_benchmark_results(payload)
+        return payload
+
+    def run_benchmark(self) -> dict:
+        task_ids = self.task_ids if self.task_ids is not None else [self.task_id]
+        task_ids = [tid for tid in task_ids if tid is not None]
+        if not task_ids:
+            raise ValueError("benchmark run requires algorithm.task_id or algorithm.task_ids")
+        if (
+            self.multi_tree_hemiltonian
+            and self.task_override_resolved_path is not None
+            and self.benchmark_waypoint_top_n is not None
+        ):
+            return self._run_hamiltonian_benchmark(task_ids)
+        return self._run_standard_benchmark(task_ids)
 
     
     @staticmethod
@@ -2752,6 +3280,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             self._current_task_waypoints = None
             self._current_task_names = None
 
+            reset_infos = list(getattr(envs, "reset_infos", []))
+
             obs = torch.from_numpy(obs).float().to(self.device)
             start = obs.detach()
             obs_normalized = (
@@ -2760,7 +3290,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
             if self.env_id in OGBENCH_ENVS:  # OGBench
                 goal = np.vstack(
-                    [envs.reset_infos[i]["goal"] for i in range(len(envs.reset_infos))]
+                    [reset_infos[i]["goal"] for i in range(len(reset_infos))]
                 )
             else:
                 goal = np.concatenate([[env.env._target] for env in envs.envs])
@@ -2768,7 +3298,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             goal = torch.cat([goal, torch.zeros_like(goal)], -1)
             goal = goal[:, self.obs_dim_indices]  # select obs dims from raw env goal
             goal_normalized = ((goal - obs_mean[None]) / obs_std[None]).detach()
-            self._capture_current_task_metadata(obs, goal, list(envs.reset_infos))
+            self._capture_current_task_metadata(obs, goal, reset_infos)
 
             steps = 0
             loops = 0  # Loop counter for bidirectional MCTS planning
@@ -2830,6 +3360,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 f"goal={[round(x,1) for x in _goal_pos]} | horizon={horizon} | max_loops={self.val_max_loops}",
                 flush=True,
             )
+            _visual_prefix_override = self._current_wandb_visual_prefix
+            _viz_prefix = namespace.split("/")[-1]
 
             waypoint_xys = None
             if self._current_task_waypoints:
@@ -3122,6 +3654,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 # Visualize postprocessed plan
                 _ppviz_t0 = time.time()
                 _pp_plan_np = postprocessed_plan[:, :, self.pos_dim_indices].detach().cpu().numpy()  # (K, 1, pos_dim)
+                _postprocessed_plan_length = self._compute_plan_polyline_length(_pp_plan_np)
                 _pp_images = make_trajectory_images(
                     self.env_id,
                     _pp_plan_np,
@@ -3131,10 +3664,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     self.plot_end_points,
                     waypoints=self._current_task_waypoints,
                 )
-                _viz_prefix = namespace.split("/")[-1]
+                _postprocessed_image_key = (
+                    f"{_visual_prefix_override}/postprocessed_plan"
+                    if _visual_prefix_override is not None
+                    else f"{_viz_prefix}_postprocessed_plan"
+                )
                 for _pp_i, _pp_img in enumerate(_pp_images):
                     self.log_image(
-                        f"{_viz_prefix}_postprocessed_plan",
+                        _postprocessed_image_key,
                         Image.fromarray(_pp_img),
                     )
                 _ppviz_ms = (time.time() - _ppviz_t0) * 1000
@@ -3218,7 +3755,25 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 "planning_time": float(np.sum(planning_time)),
                 "steps": int(steps),
                 "interaction_seed": int(self.interaction_seed) if self.interaction_seed is not None else None,
+                "wandb_visual_prefix": self._current_wandb_visual_prefix,
             }
+            if selected_plan_bundle is not None:
+                _pred_anchor_order = np.asarray(
+                    selected_plan_bundle.get(
+                        "completed_anchor_order",
+                        selected_plan_bundle.get("anchor_order", []),
+                    ),
+                    dtype=np.int32,
+                ).tolist()
+                self._last_interact_result["predicted_anchor_order"] = [
+                    int(idx) for idx in _pred_anchor_order
+                ]
+                self._last_interact_result["predicted_route_text"] = str(
+                    selected_plan_bundle.get("route_text", "")
+                )
+                self._last_interact_result["postprocessed_plan_length"] = float(
+                    _postprocessed_plan_length
+                )
             if self._current_task_start_xy is not None and self._current_task_goal_xy is not None:
                 self._last_interact_result["start_xy"] = self._current_task_start_xy.tolist()
                 self._last_interact_result["goal_xy"] = self._current_task_goal_xy.tolist()
@@ -3227,6 +3782,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 ]
                 if self._current_task_names is not None:
                     self._last_interact_result["task_names"] = list(self._current_task_names)
+            if reset_infos:
+                _reset_info0 = reset_infos[0] or {}
+                if "active_waypoint_group_idx" in _reset_info0:
+                    self._last_interact_result["active_waypoint_group_idx"] = _reset_info0.get(
+                        "active_waypoint_group_idx"
+                    )
+                if "task_info" in _reset_info0:
+                    self._last_interact_result["task_info"] = _reset_info0.get("task_info")
 
             # Visualization
             _post_exec_t0 = time.time()
@@ -3252,8 +3815,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     waypoints=self._current_task_waypoints,
                 )
                 for i, img in enumerate(images):
+                    _agent_rollout_image_key = (
+                        f"{_visual_prefix_override}/agent_rollout/sample_{i}"
+                        if _visual_prefix_override is not None
+                        else f"{_viz_prefix}_agent_rollout/sample_{i}"
+                    )
                     self.log_image(
-                        f"{_viz_prefix}_agent_rollout/sample_{i}",
+                        _agent_rollout_image_key,
                         Image.fromarray(img),
                     )
                 _post_exec_traj_image_ms = (time.time() - _timg_t0) * 1000
@@ -3280,14 +3848,19 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     for i, video in enumerate(videos):
                         if video.shape[0] > 0:
                             _video_step = self.reserve_wandb_step()
+                            _agent_rollout_video_key = (
+                                f"{_visual_prefix_override}/agent_rollout/sample_{i}_video"
+                                if _visual_prefix_override is not None
+                                else f"{namespace}_interaction/sample_{i}_video"
+                            )
                             print(
-                                f"[wandb-video-debug] key={namespace}_interaction/sample_{i}_video "
+                                f"[wandb-video-debug] key={_agent_rollout_video_key} "
                                 f"shape={video.shape} dtype={video.dtype} fps={self.validation_video_fps} "
                                 f"step={_video_step}",
                                 flush=True,
                             )
                             self.log_video(
-                                f"{namespace}_interaction/sample_{i}_video",
+                                _agent_rollout_video_key,
                                 video,
                                 fps=self.validation_video_fps,
                                 step=_video_step,
@@ -3307,14 +3880,19 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     _mj_sampled = _mj_all[_mj_indices]  # (N, H, W, 3)
                     _mj_video = _mj_sampled.transpose(0, 3, 1, 2)  # (N, C, H, W)
                     _mj_step = self.reserve_wandb_step()
+                    _mujoco_video_key = (
+                        f"{_visual_prefix_override}/agent_rollout/mujoco_render"
+                        if _visual_prefix_override is not None
+                        else f"{namespace}_interaction/mujoco_render"
+                    )
                     print(
-                        f"[wandb-video-debug] key={namespace}_interaction/mujoco_render "
+                        f"[wandb-video-debug] key={_mujoco_video_key} "
                         f"shape={_mj_video.shape} dtype={_mj_video.dtype} fps={self.validation_video_fps} "
                         f"step={_mj_step}",
                         flush=True,
                     )
                     self.log_video(
-                        f"{namespace}_interaction/mujoco_render",
+                        _mujoco_video_key,
                         _mj_video,
                         fps=self.validation_video_fps,
                         step=_mj_step,

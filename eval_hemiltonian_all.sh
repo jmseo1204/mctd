@@ -11,12 +11,13 @@ MCTD_PROJECT_DIR="$PROJECT_DIR"
 source "$PROJECT_DIR/scripts/mctd_ckpt_lib.sh"
 
 OUTPUT_DOWNLOADED_DIR="$MCTD_DOWNLOADED_DIR"
-NUM_REPEATS=3
 NUM_TASKS=5
-ROLLOUTS_PER_TASK=50
+NUM_REPEATS=3
+WAYPOINT_TOP_N=10
+DEFAULT_OVERRIDE_PATH="configurations/task_overrides/antmaze_giant_waypoints_example.yaml"
 
 echo "===================================================="
-echo "  MCTD Single-Checkpoint Benchmark Launcher"
+echo "  MCTD Hamiltonian Benchmark Launcher"
 echo "===================================================="
 
 echo "Checking Docker availability..."
@@ -32,7 +33,7 @@ echo "Docker is available and running"
 echo ""
 
 if [ -z "$LOCAL_OGBENCH_DIR" ] || [ ! -d "$LOCAL_OGBENCH_DIR" ]; then
-    echo "ERROR: Benchmark pipeline requires local ogbench checkout at $PROJECT_DIR/../ogbench"
+    echo "ERROR: Hamiltonian benchmark requires local ogbench checkout at $PROJECT_DIR/../ogbench"
     exit 1
 fi
 echo "Using local ogbench source for benchmark jobs: $LOCAL_OGBENCH_DIR"
@@ -120,70 +121,102 @@ if [ ! -f "$DATASET_YAML" ]; then
 fi
 
 echo ""
-echo "Enter rollouts per task (positive integer, default: ${ROLLOUTS_PER_TASK}):"
+echo "Enter number of eval repeats (positive integer, default: ${NUM_REPEATS}):"
 while true; do
-    read -r -p "Rollouts per task: " _rollouts_input
-    _rollouts_input="${_rollouts_input:-$ROLLOUTS_PER_TASK}"
-    if [[ "$_rollouts_input" =~ ^[1-9][0-9]*$ ]]; then
-        ROLLOUTS_PER_TASK="$_rollouts_input"
+    read -r -p "Eval repeats: " _repeat_input
+    _repeat_input="${_repeat_input:-$NUM_REPEATS}"
+    if [[ "$_repeat_input" =~ ^[1-9][0-9]*$ ]]; then
+        NUM_REPEATS="$_repeat_input"
+        break
+    fi
+    echo "Please enter a positive integer."
+done
+
+echo ""
+read -r -p "Task override path [Enter=${DEFAULT_OVERRIDE_PATH}]: " TASK_OVERRIDE_PATH
+TASK_OVERRIDE_PATH="${TASK_OVERRIDE_PATH:-${DEFAULT_OVERRIDE_PATH}}"
+if [[ "$TASK_OVERRIDE_PATH" = /* ]]; then
+    if [[ "$TASK_OVERRIDE_PATH" == "${PROJECT_DIR}/"* ]]; then
+        TASK_OVERRIDE_PATH="${TASK_OVERRIDE_PATH#${PROJECT_DIR}/}"
+    else
+        echo "ERROR: Task override path must be inside ${PROJECT_DIR}"
+        exit 1
+    fi
+fi
+if [ ! -f "${PROJECT_DIR}/${TASK_OVERRIDE_PATH}" ]; then
+    echo "ERROR: Task override file not found: ${PROJECT_DIR}/${TASK_OVERRIDE_PATH}"
+    exit 1
+fi
+
+echo ""
+echo "Enter top N ranked waypoint groups per task (positive integer, default: ${WAYPOINT_TOP_N}):"
+while true; do
+    read -r -p "Top N waypoint groups: " _topn_input
+    _topn_input="${_topn_input:-$WAYPOINT_TOP_N}"
+    if [[ "$_topn_input" =~ ^[1-9][0-9]*$ ]]; then
+        WAYPOINT_TOP_N="$_topn_input"
         break
     fi
     echo "Please enter a positive integer."
 done
 
 RUN_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-RESULTS_FILE_PREFIX="${SELECTED_DATASET}_${RUN_TIMESTAMP}"
+RESULTS_FILE_PREFIX="${SELECTED_DATASET}_hamiltonian_${RUN_TIMESTAMP}"
 RESULTS_RUN_DIR="benchmark_results/${SELECTED_MODEL_ID}/${RESULTS_FILE_PREFIX}"
 SUMMARY_JSON_REL="${RESULTS_RUN_DIR}/${RESULTS_FILE_PREFIX}_summary.json"
 PLANNING_CONFIG_SRC="$PROJECT_DIR/configurations/algorithm/df_planning.yaml"
 PLANNING_CONFIG_REL="${RESULTS_RUN_DIR}/df_planning.yaml"
+TASK_OVERRIDE_SNAPSHOT_REL="${RESULTS_RUN_DIR}/$(basename "$TASK_OVERRIDE_PATH")"
 mkdir -p "$PROJECT_DIR/$RESULTS_RUN_DIR"
 cp -f "$PLANNING_CONFIG_SRC" "$PROJECT_DIR/$PLANNING_CONFIG_REL"
+cp -f "$PROJECT_DIR/$TASK_OVERRIDE_PATH" "$PROJECT_DIR/$TASK_OVERRIDE_SNAPSHOT_REL"
 
 echo ""
 echo "Configuration summary:"
-echo "  Dataset           : $SELECTED_DATASET (obs_dim=${STATE_DIM})"
-echo "  Model             : $SELECTED_MODEL_ID"
-echo "  Repeats           : $NUM_REPEATS"
-echo "  Tasks             : $NUM_TASKS"
-echo "  Rollouts per task : $ROLLOUTS_PER_TASK"
-echo "  Results dir       : $RESULTS_RUN_DIR"
-echo "  Task result files : $RESULTS_RUN_DIR/${RESULTS_FILE_PREFIX}_repeat_<repeat>_task_<task>.json"
-echo "  Summary JSON      : $SUMMARY_JSON_REL"
-echo "  Planning config   : $PLANNING_CONFIG_REL"
+echo "  Dataset             : $SELECTED_DATASET (obs_dim=${STATE_DIM})"
+echo "  Model               : $SELECTED_MODEL_ID"
+echo "  Repeats             : $NUM_REPEATS"
+echo "  Tasks               : $NUM_TASKS"
+echo "  Top N groups / task : $WAYPOINT_TOP_N"
+echo "  Results dir         : $RESULTS_RUN_DIR"
+echo "  Summary JSON        : $SUMMARY_JSON_REL"
+echo "  Planning config     : $PLANNING_CONFIG_REL"
+echo "  Task override       : $TASK_OVERRIDE_SNAPSHOT_REL"
 echo ""
 
-echo "Generating benchmark jobs..."
-python3 "$PROJECT_DIR/scripts/generate_benchmark_jobs.py" \
+echo "Generating Hamiltonian benchmark jobs..."
+python3 "$PROJECT_DIR/scripts/generate_hamiltonian_benchmark_jobs.py" \
     --dataset "$SELECTED_DATASET" \
     --model_id "$SELECTED_MODEL_ID" \
     --num_tasks "$NUM_TASKS" \
     --num_repeats "$NUM_REPEATS" \
-    --rollouts_per_task "$ROLLOUTS_PER_TASK" \
+    --waypoint_top_n "$WAYPOINT_TOP_N" \
+    --task_override_path "$TASK_OVERRIDE_SNAPSHOT_REL" \
     --planning_config_snapshot "$PLANNING_CONFIG_REL" \
     --results_dir "$RESULTS_RUN_DIR" \
     --results_file_prefix "$RESULTS_FILE_PREFIX"
 
 echo ""
 echo "====================================================="
-echo "  Running benchmark jobs"
+echo "  Running Hamiltonian Benchmark Jobs"
 echo "====================================================="
 echo ""
 
 export AVAILABLE_GPUS
 LOG_DIR="$PROJECT_DIR/logs"
 mkdir -p "$LOG_DIR"
-PIPELINE_LOG="$LOG_DIR/eval_all_${SELECTED_DATASET}_${RUN_TIMESTAMP}.log"
+PIPELINE_LOG="$LOG_DIR/eval_hemiltonian_all_${SELECTED_DATASET}_${RUN_TIMESTAMP}.log"
 SCHEDULER_LOG="$LOG_DIR/run_${RUN_TIMESTAMP}.log"
-PIPELINE_PID_FILE="$LOG_DIR/eval_all_${SELECTED_MODEL_ID}_${RUN_TIMESTAMP}.pid"
-nohup setsid bash "$PROJECT_DIR/scripts/run_benchmark_pipeline.sh" \
+PIPELINE_PID_FILE="$LOG_DIR/eval_hemiltonian_all_${SELECTED_MODEL_ID}_${RUN_TIMESTAMP}.pid"
+nohup setsid bash "$PROJECT_DIR/scripts/run_hamiltonian_benchmark_pipeline.sh" \
     "$RESULTS_RUN_DIR" \
     "$NUM_REPEATS" \
     "$NUM_TASKS" \
-    "$ROLLOUTS_PER_TASK" \
+    "$WAYPOINT_TOP_N" \
     "$SUMMARY_JSON_REL" \
     "$SELECTED_DATASET" \
-    "$RUN_TIMESTAMP" > "$PIPELINE_LOG" 2>&1 &
+    "$RUN_TIMESTAMP" \
+    "$TASK_OVERRIDE_SNAPSHOT_REL" > "$PIPELINE_LOG" 2>&1 &
 PIPELINE_PID=$!
 echo "$PIPELINE_PID" > "$PIPELINE_PID_FILE"
 
@@ -201,12 +234,12 @@ echo "  Check scheduler pid  : ps -fp \$(cat \"$PIPELINE_PID_FILE\")"
 echo "  Stop running containers too:"
 echo "    docker ps --filter 'name=exp_gpu' -q | xargs -r docker rm -f"
 echo ""
-echo "WandB group: BENCH-$SELECTED_MODEL_ID"
+echo "WandB group: HBENCH-$SELECTED_MODEL_ID"
 echo "Results directory: $PROJECT_DIR/$RESULTS_RUN_DIR"
-echo "Task result files: $PROJECT_DIR/$RESULTS_RUN_DIR/${RESULTS_FILE_PREFIX}_repeat_<repeat>_task_<task>.json"
 echo "Summary JSON: $PROJECT_DIR/$SUMMARY_JSON_REL"
 echo "Planning config snapshot: $PROJECT_DIR/$PLANNING_CONFIG_REL"
+echo "Task override snapshot: $PROJECT_DIR/$TASK_OVERRIDE_SNAPSHOT_REL"
 echo ""
 echo "====================================================="
-echo "  Benchmark Pipeline Running in Background"
+echo "  Hamiltonian Benchmark Pipeline Running in Background"
 echo "====================================================="

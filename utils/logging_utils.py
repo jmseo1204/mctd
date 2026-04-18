@@ -439,6 +439,7 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
     is_forward_tree = plot_data.get("is_forward_tree", True)
     best_node_target = plot_data.get("best_node_target")
     meeting_target = plot_data.get("meeting_target")
+    meeting_target_label = plot_data.get("meeting_target_label") or "Meeting Target"
     hilp_heatmap = plot_data.get("hilp_heatmap")
     hilp_grad_field = plot_data.get("hilp_grad_field")
     guidance_targets = plot_data.get("guidance_targets")
@@ -624,7 +625,7 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
             edgecolors="darkgreen",
             linewidth=1.2,
             alpha=0.28,
-            label="Meeting Target",
+            label=meeting_target_label,
         )
 
     has_guidance_targets = guidance_targets is not None and len(guidance_targets) > 0

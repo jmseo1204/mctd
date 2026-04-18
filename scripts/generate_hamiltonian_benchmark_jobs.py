@@ -9,13 +9,23 @@ from project_config import WANDB_ENTITY, WANDB_PROJECT
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate single-checkpoint benchmark jobs."
+        description="Generate Hamiltonian benchmark jobs for a single checkpoint."
     )
     parser.add_argument("--dataset", required=True, help="Hydra dataset config name")
     parser.add_argument("--model_id", required=True, help="Checkpoint model id to load")
     parser.add_argument("--num_tasks", type=int, default=5, help="Number of OGBench tasks/goals")
     parser.add_argument("--num_repeats", type=int, default=3, help="Number of repeated evaluation passes")
-    parser.add_argument("--rollouts_per_task", type=int, default=50, help="Number of rollouts per (repeat, task)")
+    parser.add_argument(
+        "--waypoint_top_n",
+        type=int,
+        required=True,
+        help="Evaluate the first N ranked waypoint groups per task",
+    )
+    parser.add_argument(
+        "--task_override_path",
+        required=True,
+        help="Repo-relative task override YAML/JSON path to snapshot and evaluate",
+    )
     parser.add_argument(
         "--planning_config_snapshot",
         default=None,
@@ -24,10 +34,13 @@ def main():
     parser.add_argument("--results_dir", required=True, help="Directory to write benchmark JSON results into")
     parser.add_argument(
         "--results_file_prefix",
-        default="benchmark",
+        default="hamiltonian_benchmark",
         help="Filename prefix for per-task benchmark JSON results",
     )
     args = parser.parse_args()
+
+    if args.waypoint_top_n <= 0:
+        raise ValueError(f"--waypoint_top_n must be positive, got {args.waypoint_top_n}")
 
     os.makedirs("jobs", exist_ok=True)
     os.makedirs(args.results_dir, exist_ok=True)
@@ -35,14 +48,16 @@ def main():
     basic_job_config = {
         "wandb.entity": WANDB_ENTITY,
         "wandb.project": WANDB_PROJECT,
-        "wandb.group": f"BENCH-{args.model_id}",
+        "wandb.group": f"HBENCH-{args.model_id}",
         "wandb.mode": "online",
         "experiment": "base_pytorch",
         "algorithm": "df_planning",
         "dataset": args.dataset,
         "load": args.model_id,
         "experiment.tasks": ["benchmark"],
-        "algorithm.benchmark_num_rollouts": args.rollouts_per_task,
+        "algorithm.multi_tree_hemiltonian": True,
+        "algorithm.task_override_path": args.task_override_path,
+        "algorithm.benchmark_waypoint_top_n": int(args.waypoint_top_n),
         "algorithm.benchmark_model_id": args.model_id,
     }
     if args.planning_config_snapshot:
@@ -59,14 +74,14 @@ def main():
                 args.results_dir,
                 f"{args.results_file_prefix}_repeat_{repeat_id:02d}_task_{task_id:02d}.json",
             )
-            job_cfg["+name"] = f"BENCH_{args.model_id}_R{repeat_id}_T{task_id}"
+            job_cfg["+name"] = f"HBENCH_{args.model_id}_R{repeat_id}_T{task_id}"
 
             filename = f"jobs/{datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')}.json"
             with open(filename, "w", encoding="utf-8") as f:
                 json.dump(job_cfg, f, indent=2)
             count += 1
 
-    print(f"Successfully generated {count} benchmark jobs in 'jobs/'.")
+    print(f"Successfully generated {count} Hamiltonian benchmark jobs in 'jobs/'.")
     print(f"Results will be written under: {args.results_dir}")
 
 

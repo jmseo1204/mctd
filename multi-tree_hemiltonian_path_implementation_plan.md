@@ -1131,6 +1131,18 @@ backward-tree semantics를 일부 유지하고 있다. 특히 아래 항목들�
 수정했고, multi-tree mode에서는 새 segment를 항상 각 tree의 prefix
 `[start_len:end_len)` 기준으로 슬라이싱하도록 맞췄다.
 
+중요한 원칙:
+
+- tree 성장 semantics와 edge assembly orientation을 분리해서 본다.
+- multi-tree mode에서 각 tree는 모두 동일한 "anchor-rooted prefix-growing tree"로 취급한다.
+- 하지만 pairwise edge postprocess나 최종 full-route assembly에서는
+  `S -> ... -> G` 방향으로 경로를 반환해야 하므로, edge/segment 단위 `flip`은 여전히 필요할 수 있다.
+- 따라서 "어딘가에서 flip이 존재한다"는 사실만으로 그것을 legacy 2-tree 잔재로 간주하면 안 된다.
+- 특히 `_compute_plan_gap_to_target()`의 target-side `flip`은 legacy 2-tree 전제라기보다,
+  두 anchor-rooted prefix plan을 서로 접속 가능한 orientation으로 비교하기 위한 연산으로 유지한다.
+
+이 원칙은 waypoint가 하나도 없고 `S`, `G`만 존재하는 경우에도 그대로 유지되어야 한다.
+
 ### 17.1 다음 리팩토링 순서
 
 1. multi-tree mode에서 anchor initialization semantics 통일
@@ -1147,18 +1159,19 @@ backward-tree semantics를 일부 유지하고 있다. 특히 아래 항목들�
    - `_node_path_label()`과 `from_goal` naming을 anchor-label 기반 표기로 교체
 
 4. multi-tree postprocess / gap helper 점검
-   - `_compute_plan_gap_to_target()`의 target-side flip이 multi-tree assembly/gap 의미와 맞는지 재검토
-   - final edge builder에서 "forward tree vs backward tree" 전제 제거
+   - final edge builder에서 "forward tree vs backward tree"라는 naming / control flow 전제 제거
+   - 단, edge 연결과 최종 반환 경로의 orientation 조정 자체는 유지
 
-### 17.2 확인이 필요한 구현 질문
+### 17.2 이번 턴에서 확정된 판단
 
-1. multi-tree mode에서 `G` anchor도 다른 waypoint와 완전히 같은 semantics로 두고,
-   rollout도 항상 anchor-rooted forward expansion으로 통일할지.
-   - 내 권장: `yes`
+1. multi-tree mode에서 `G` anchor도 다른 waypoint와 완전히 같은 tree semantics로 둔다.
+   - rollout도 anchor-rooted forward expansion으로 통일한다.
 
-2. multi-tree visualization에서 현재의 `forward_part_backward_part` 식 node path label을 버리고,
-   단순히 `source_anchor_target_anchor_nodepath` 식으로 바꿀지.
-   - 내 권장: `yes`
+2. multi-tree visualization에서는 current `forward_part_backward_part` 식 label을 버리고,
+   anchor-label 기반 표기로 교체한다.
 
-3. multi-tree mode에서 `_compute_plan_gap_to_target()`의 target-side `flip`도 제거할지.
-   - 내 권장: `yes`, 다만 final edge postprocess와 함께 검토 필요
+3. `_compute_plan_gap_to_target()`의 target-side `flip`은 제거하지 않는다.
+   - 이유: 이것은 legacy 2-tree 잔재가 아니라,
+     두 anchor-rooted prefix plan을 서로 연결 가능한 orientation으로 비교하기 위한 연산이다.
+   - 같은 이유로, 최종 accepted edge concat / success-plan assembly에서도
+     `S -> ... -> G` 방향을 만들기 위한 `flip` 고려는 계속 필요하다.

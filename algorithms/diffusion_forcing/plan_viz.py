@@ -278,15 +278,6 @@ class PlanVizMixin:
         alen = self._get_denoised_frame_prefix_len(vnode.depth, seg_size, hist.shape[1])
         target_node = getattr(vnode, "target_node", None) or vinfo.get("target_node")
         meeting_target_node = vinfo.get("meeting_target_node")
-        if meeting_target_node is target_node:
-            meeting_target_node = None
-        elif (
-            meeting_target_node is not None
-            and target_node is not None
-            and getattr(meeting_target_node, "name", None) is not None
-            and getattr(meeting_target_node, "name", None) == getattr(target_node, "name", None)
-        ):
-            meeting_target_node = None
 
         if is_uncertainty_viz and plan_hist_override is not None:
             # In uncertainty mode the endpoint is the NEXT segment boundary.
@@ -378,6 +369,20 @@ class PlanVizMixin:
             and getattr(meeting_target_node, "obs", None) is not None
             else None
         )
+        meeting_target_label = None
+        if meeting_target_node is not None:
+            get_root_node = getattr(self, "_get_root_node", None)
+            meeting_target_root = (
+                get_root_node(meeting_target_node)
+                if callable(get_root_node)
+                else None
+            )
+            meeting_target_anchor = (
+                getattr(meeting_target_root, "anchor_name", None)
+                or getattr(meeting_target_node, "anchor_name", None)
+                or "?"
+            )
+            meeting_target_label = f"Meeting Target ({meeting_target_anchor})"
 
         # Heatmap & grad-field for this candidate's target, cached by target name.
         cand_heatmap = None
@@ -596,6 +601,7 @@ class PlanVizMixin:
                 'target_node_path': tgt_node_traj if tgt_node_traj is not None and len(tgt_node_traj) > 0 else None,
                 'best_node_target': tgt_pos,
                 'meeting_target': meeting_tgt_pos,
+                'meeting_target_label': meeting_target_label,
                 'guidance_targets': gpos,
                 'goal_grad_vectors': gg,
                 'prior_grad_vectors': pg,
