@@ -23,14 +23,14 @@ time_limit: null
 virtual_visit_weight: 1.0
 parallel_multiple_visits: False
 leaf_parallelization: True
-mctd_max_search_num: 20
+mctd_max_search_num: 40
 max_child_resets: 1
 DEBUG: True
 debug_memory_profile: True
 noise_level_building_way: others # smooth, causal, or others
 num_tries_for_bad_plans: 1
-open_loop_horizon: 1300 #fixme -> best: int(eval_episode_len * horizon_scale) // jump
-val_max_loops: 16 # fixme -> best: 2(bidirectional)*sequence_dividing_factor*open_loop_horizon
+open_loop_horizon: 2500 #fixme -> best: int(eval_episode_len * horizon_scale) // jump
+val_max_loops: 40 # raised for multi-tree Hamiltonian debugging; revisit after root-cause analysis
 sub_goal_interval: 1
 sub_goal_blend_steps: 0 # steps to blend old/new sub_goal actions after a sub_goal switch (antmaze only)
 sequence_dividing_factor: 10
@@ -69,7 +69,7 @@ viz_compare_expanded_to_value: false
 viz_mujoco_renderer: false
 viz_subplan_denoising: false # set True to upload plan/plan_at_* to wandb (slow)
 viz_replanning: false # set True to also log replanned stage denoising video (requires mcts_use_replan)
-viz_uncertain_next_subplan_last_obs: false
+viz_uncertain_next_subplan_last_obs: true
 profiler_snapshot_frames: 20 # Number of denoising frames to keep for video visualization
 frame_sampling_way: "linear" # 'linear': evenly-strided; 'quadratic': dense near end-of-denoising
 
@@ -98,7 +98,9 @@ replanning_target_level: 25 # 11 for linear, noise level to add when replanning 
 
 # UNCERTAINTY CHECK
 use_uncertainty_as_value: true
-uncertainty_mode: 'cluster' # 'entropy' | 'variance' | 'cluster'
+multi_tree_hemiltonian: false
+uncertainty_mode: 'expected_root_node_dist' # 'entropy' | 'variance' | 'cluster' | 'temporal_dist' | 'expected_root_node_dist'
+reliable_TD_threshold: 80.0 # if TD(current, candidate) is below this, only tentative-neighbor trees are eligible as targets
 uncertainty_lambda: 1.0 # entropy: weight on angular entropy surrogate; variance: weight on V_ext_g
 uncertainty_eta: 1.0 # entropy: weight on geometry correction; variance: weight on V_ext_c
 fast_sampling_multiple: 4 # number of fast samples per candidate

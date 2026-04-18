@@ -397,6 +397,7 @@ def _parse_trajectory_plot_inputs(trajectory):
         "node_path",
         "target_node_path",
         "best_node_target",
+        "meeting_target",
         "guidance_targets",
         "goal_grad_vectors",
         "prior_grad_vectors",
@@ -437,6 +438,7 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
     target_node_trajectory = plot_data.get("target_node_path")
     is_forward_tree = plot_data.get("is_forward_tree", True)
     best_node_target = plot_data.get("best_node_target")
+    meeting_target = plot_data.get("meeting_target")
     hilp_heatmap = plot_data.get("hilp_heatmap")
     hilp_grad_field = plot_data.get("hilp_grad_field")
     guidance_targets = plot_data.get("guidance_targets")
@@ -609,6 +611,21 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
         pos = _to_plot_coords(env_id, np.asarray(best_node_target).flatten()[:2])
         ax.scatter(pos[0], pos[1], c="green", marker="*", s=300, zorder=10,
                    edgecolors="darkgreen", linewidth=1.5, label="Target")
+
+    if meeting_target is not None:
+        pos = _to_plot_coords(env_id, np.asarray(meeting_target).flatten()[:2])
+        ax.scatter(
+            pos[0],
+            pos[1],
+            c="green",
+            marker="*",
+            s=260,
+            zorder=9,
+            edgecolors="darkgreen",
+            linewidth=1.2,
+            alpha=0.28,
+            label="Meeting Target",
+        )
 
     has_guidance_targets = guidance_targets is not None and len(guidance_targets) > 0
     if has_guidance_targets:
@@ -821,6 +838,7 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
     if ((node_trajectory is not None and len(node_trajectory) > 0)
             or (target_node_trajectory is not None and len(target_node_trajectory) > 0)
             or best_node_target is not None
+            or meeting_target is not None
             or hilp_grad_field is not None
             or has_guidance_targets
             or has_goal_grad

@@ -2,6 +2,8 @@ from typing import Optional, Any, List, Tuple, Union
 from dataclasses import dataclass, field
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
+import contextlib
+import io
 import math
 import os
 import time
@@ -29,6 +31,10 @@ from utils.logging_utils import (
 )
 from utils.tracer import Tracer, set_default_tracer, get_tracer
 from utils.planning_utils import episode_len_to_plan_tokens
+from utils.route_metric_utils import (
+    anchor_short_label,
+    solve_fixed_endpoint_hamiltonian_path_with_forced_adjacency,
+)
 from utils.task_override_loader import apply_task_overrides_to_env, inject_task_metadata_into_reset_info, resolve_task_override_path
 from .tree_node import TreeNode
 from . import guidance
@@ -225,6 +231,9 @@ class MCTSTreeState:
     # Root observation (unnormalized): start for tree1, goal for tree2.
     # Used to track agent positions across bidirectional expansion rounds.
     tree_root_obs: Optional[np.ndarray] = None  # shape (obs_dim,)
+    anchor_idx: int = 0
+    anchor_name: str = "S"
+    anchor_xy: Optional[np.ndarray] = None
     # --- Mutable search state (updated by _run_mcts_search) ---
     max_depth: int = 0
     achieved: bool = False
@@ -418,6 +427,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         self.viz_replanning: bool = cfg.get("viz_replanning", True)
         self.use_uncertainty_as_value: bool = cfg.get("use_uncertainty_as_value", False)
         self.uncertainty_mode: str = cfg.get("uncertainty_mode", "entropy")
+        self.multi_tree_hemiltonian: bool = bool(cfg.get("multi_tree_hemiltonian", False))
+        self.reliable_TD_threshold: float = float(cfg.get("reliable_TD_threshold", 30.0))
         self.uncertainty_lambda: float = float(cfg.get("uncertainty_lambda", 1.0))
         self.uncertainty_eta: float = float(cfg.get("uncertainty_eta", 1.0))
         self.uncertainty_max_intra_cluster_dist: float = float(cfg.get("uncertainty_max_intra_cluster_dist", 20.0))
@@ -683,6 +694,21 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         td_to_real_metric_ratio = 0.2
         return temporal_dist * td_to_real_metric_ratio 
 
+    def _compute_raw_state_temporal_dist_np(
+        self,
+        obs_a_np: np.ndarray,  # (N, D) float32 — unnormalized observations
+        obs_b_np: np.ndarray,  # (N, D) float32 — unnormalized observations (same shape)
+    ) -> np.ndarray:           # (N,) float32 — raw temporal distance
+        """Compute raw HILP-based temporal distance without extra metric scaling.
+
+        This must stay on the same scale as T_curr returned by
+        _compute_node_uncertainty so cumulative root-distance bookkeeping and
+        expected_root_node_dist values remain internally consistent.
+        """
+        v = self._compute_hilp_values(obs_a_np, obs_b_np)
+        temporal_dist = self.emb_dist_to_temporal_dist((-v).cpu().numpy(), gamma=0.995)
+        return np.asarray(temporal_dist, dtype=np.float32)
+
     def _compute_distance(
         self,
         state1: np.ndarray,  # (N, d) — full obs (d==obs_dim) or position-only (d==pos_dim)
@@ -724,6 +750,231 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         while root_node._parent_node is not None:
             root_node = root_node._parent_node
         return root_node.obs
+
+    def _get_root_node(self, node: Optional["TreeNode"]) -> Optional["TreeNode"]:
+        if node is None:
+            return None
+        root_node = node
+        while root_node._parent_node is not None:
+            root_node = root_node._parent_node
+        return root_node
+
+    def _normalize_obs_np(self, obs_np: np.ndarray) -> torch.Tensor:
+        return torch.tensor(
+            (np.asarray(obs_np, dtype=np.float32) - np.asarray(self.observation_mean, dtype=np.float32))
+            / np.asarray(self.observation_std, dtype=np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+    def _anchor_pair_key(self, a: int, b: int) -> Tuple[int, int]:
+        return (int(a), int(b)) if int(a) < int(b) else (int(b), int(a))
+
+    def _required_anchor_degree(self, anchor_idx: int, n_anchors: int) -> int:
+        if anchor_idx in (0, n_anchors - 1):
+            return 1
+        return 2
+
+    def _is_anchor_satisfied(self, planner_state: dict, anchor_idx: int) -> bool:
+        accepted_neighbors = planner_state["accepted_neighbors"][int(anchor_idx)]
+        return len(accepted_neighbors) >= self._required_anchor_degree(
+            int(anchor_idx),
+            len(planner_state["trees"]),
+        )
+
+    def _get_forced_adjacent_pairs(self, planner_state: dict) -> list[tuple[int, int]]:
+        return sorted(planner_state["accepted_pair_edges"].keys())
+
+    def _compute_tentative_hamiltonian_solution(self, planner_state: dict) -> dict:
+        effective_pair_cost = np.asarray(planner_state["effective_pair_cost"], dtype=np.float32)
+        solver_result = solve_fixed_endpoint_hamiltonian_path_with_forced_adjacency(
+            effective_pair_cost,
+            forced_adjacent_pairs=self._get_forced_adjacent_pairs(planner_state),
+        )
+        planner_state["tentative_solver_result"] = solver_result
+        return solver_result
+
+    def _get_tentative_neighbor_indices(self, planner_state: dict, anchor_idx: int) -> list[int]:
+        solver_result = planner_state.get("tentative_solver_result", {})
+        order = np.asarray(solver_result.get("anchor_order", []), dtype=np.int32)
+        if order.size == 0:
+            return []
+        anchor_idx = int(anchor_idx)
+        match = np.where(order == anchor_idx)[0]
+        if match.size == 0:
+            return []
+        pos = int(match[0])
+        neighbors: list[int] = []
+        if pos - 1 >= 0:
+            neighbors.append(int(order[pos - 1]))
+        if pos + 1 < len(order):
+            neighbors.append(int(order[pos + 1]))
+        return neighbors
+
+    def _select_multi_tree_target_node(
+        self,
+        planner_state: dict,
+        source_tree: "MCTSTreeState",
+        current_leaf_obs: Optional[np.ndarray] = None,
+        child_node: Optional["TreeNode"] = None,
+        use_segment_metric: bool = False,
+    ) -> Optional[dict]:
+        source_anchor_idx = int(source_tree.anchor_idx)
+        accepted_neighbors = planner_state["accepted_neighbors"][source_anchor_idx]
+        tentative_neighbor_indices = set(
+            self._get_tentative_neighbor_indices(planner_state, source_anchor_idx)
+        )
+
+        if use_segment_metric:
+            if child_node is None or child_node.obs is None:
+                return None
+            plan_tokens = self._require_current_plan_tokens()
+            segment_obs = self._extract_new_segment_obs(
+                child_node,
+                source_tree.is_tree1,
+                plan_tokens,
+            )
+            if segment_obs is None or segment_obs.size == 0:
+                return None
+            if not tentative_neighbor_indices:
+                return None
+            query_obs = np.asarray(segment_obs, dtype=np.float32).reshape(
+                -1,
+                child_node.obs.shape[0],
+            )
+        else:
+            if current_leaf_obs is None:
+                return None
+            query_obs = np.asarray(current_leaf_obs, dtype=np.float32).reshape(1, -1)
+
+        candidate_rows: list[tuple[float, int, str, "MCTSTreeState", "TreeNode"]] = []
+        for target_tree in planner_state["trees"]:
+            target_anchor_idx = int(target_tree.anchor_idx)
+            if target_anchor_idx == source_anchor_idx:
+                continue
+            if target_anchor_idx in accepted_neighbors:
+                continue
+            if self._is_anchor_satisfied(planner_state, target_anchor_idx):
+                continue
+            if use_segment_metric and target_anchor_idx not in tentative_neighbor_indices:
+                continue
+
+            if use_segment_metric:
+                target_nodes = [
+                    node
+                    for node in target_tree.get_all_nodes()
+                    if node.obs is not None
+                    and len(node.plan_history) > 0
+                    and len(node.plan_history[-1]) > 0
+                ]
+            else:
+                target_nodes = [
+                    node
+                    for node in target_tree.get_all_nodes()
+                    if node.obs is not None
+                ]
+            if not target_nodes:
+                continue
+
+            target_obs = np.stack([node.obs for node in target_nodes], axis=0).astype(np.float32)
+            query_rep = np.repeat(query_obs, len(target_nodes), axis=0)
+            tgt_rep = np.tile(target_obs, (query_obs.shape[0], 1))
+            temporal_dists = self._compute_raw_state_temporal_dist_np(query_rep, tgt_rep).reshape(
+                query_obs.shape[0],
+                len(target_nodes),
+            )
+
+            if use_segment_metric:
+                node_scores = np.min(temporal_dists, axis=0)
+            else:
+                node_scores = temporal_dists[0]
+
+            for score, node in zip(node_scores.tolist(), target_nodes):
+                candidate_rows.append(
+                    (
+                        float(score),
+                        target_anchor_idx,
+                        node.name,
+                        target_tree,
+                        node,
+                    )
+                )
+
+        if not candidate_rows:
+            return None
+
+        candidate_rows.sort(key=lambda item: (item[0], item[1], item[2]))
+        if use_segment_metric:
+            best_score, _, _, best_tree, best_node = candidate_rows[0]
+            return {
+                "target_tree": best_tree,
+                "target_node": best_node,
+                "segment_td": float(best_score),
+            }
+
+        for score, _, _, target_tree, target_node in candidate_rows:
+            target_anchor_idx = int(target_tree.anchor_idx)
+            if score < self.reliable_TD_threshold:
+                if target_anchor_idx in tentative_neighbor_indices:
+                    return {
+                        "target_tree": target_tree,
+                        "target_node": target_node,
+                        "score": float(score),
+                    }
+                continue
+            return {
+                "target_tree": target_tree,
+                "target_node": target_node,
+                "score": float(score),
+            }
+
+        fallback_score, _, _, fallback_tree, fallback_node = candidate_rows[0]
+        return {
+            "target_tree": fallback_tree,
+            "target_node": fallback_node,
+            "score": float(fallback_score),
+        }
+
+    def _get_multi_tree_for_node(
+        self,
+        planner_state: dict,
+        node: Optional["TreeNode"],
+    ) -> Optional["MCTSTreeState"]:
+        if node is None:
+            return None
+        root_node = self._get_root_node(node)
+        return next(
+            (
+                tree
+                for tree in planner_state["trees"]
+                if tree.root_node is root_node
+            ),
+            None,
+        )
+
+    def _update_multi_tree_meeting_targets_from_expansions(
+        self,
+        planner_state: dict,
+        tree_batches: dict[str, dict],
+    ) -> None:
+        for tree_batch in tree_batches.values():
+            source_tree: MCTSTreeState = tree_batch["tree"]
+            for info in tree_batch["expanded_node_infos"].values():
+                meeting_info = self._select_multi_tree_target_node(
+                    planner_state=planner_state,
+                    source_tree=source_tree,
+                    child_node=info.get("node"),
+                    use_segment_metric=True,
+                )
+                info["meeting_target_node"] = (
+                    None if meeting_info is None else meeting_info["target_node"]
+                )
+                info["meeting_target_tree"] = (
+                    None if meeting_info is None else meeting_info["target_tree"]
+                )
+                info["meeting_target_td"] = (
+                    None if meeting_info is None else float(meeting_info["segment_td"])
+                )
 
     def _check_plan_batch_feasibility(
         self,
@@ -1172,9 +1423,24 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             return maze_module.make_maze_env
         return importlib.import_module("ogbench.locomaze.maze").make_maze_env
 
+    def _print_ogbench_task_assignment_summary(self, env, task_id: int) -> None:
+        cur_task_info = dict(getattr(env, "cur_task_info", None) or {})
+        waypoint_group = cur_task_info.get(
+            "waypoint_ij_group",
+            cur_task_info.get("waypoint_ijs", []),
+        )
+        waypoint_count = len(waypoint_group) if waypoint_group is not None else 0
+        print(
+            "Task "
+            f"{task_id} is set: "
+            f"init_ij={cur_task_info.get('init_ij')} "
+            f"goal_ij={cur_task_info.get('goal_ij')} "
+            f"active_waypoint_group_idx={cur_task_info.get('active_waypoint_group_idx')} "
+            f"waypoint_count={waypoint_count}",
+            flush=True,
+        )
+
     def _ensure_ogbench_set_task_compat(self, env) -> None:
-        if hasattr(env, "set_task"):
-            return
         if getattr(env, "_mctd_set_task_compat", False):
             return
         if not hasattr(env, "task_infos") or not hasattr(env, "reset"):
@@ -1182,20 +1448,38 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
         original_reset = env.reset
 
+        if hasattr(env, "set_task"):
+            original_set_task = env.set_task
+
+            def _set_task(task_id, *args, **kwargs):
+                assert 1 <= task_id <= env.num_tasks, f"Task ID must be in [1, {env.num_tasks}]."
+                suppress_buf = io.StringIO()
+                with contextlib.redirect_stdout(suppress_buf), contextlib.redirect_stderr(suppress_buf):
+                    result = original_set_task(task_id, *args, **kwargs)
+                filtered_output = []
+                for line in suppress_buf.getvalue().splitlines():
+                    if line.startswith("Task ") and " is set:" in line:
+                        continue
+                    filtered_output.append(line)
+                for line in filtered_output:
+                    if line:
+                        print(line, flush=True)
+                if hasattr(env, "task_infos") and 1 <= int(task_id) <= len(env.task_infos):
+                    env.cur_task_id = int(task_id)
+                    env.cur_task_info = env.task_infos[int(task_id) - 1]
+                self._print_ogbench_task_assignment_summary(env, int(task_id))
+                return result
+
+            env.set_task = _set_task
+            env._mctd_set_task_compat = True
+            return
+
         def _set_task(task_id):
             assert 1 <= task_id <= env.num_tasks, f"Task ID must be in [1, {env.num_tasks}]."
             env._mctd_pending_task_id = int(task_id)
             env.cur_task_id = int(task_id)
             env.cur_task_info = env.task_infos[int(task_id) - 1]
-            cur_task_info = dict(env.cur_task_info or {})
-            waypoint_group = cur_task_info.get("waypoint_ij_group", cur_task_info.get("waypoint_ijs", []))
-            task_summary = {
-                "init_ij": cur_task_info.get("init_ij"),
-                "goal_ij": cur_task_info.get("goal_ij"),
-                "active_waypoint_group_idx": cur_task_info.get("active_waypoint_group_idx"),
-                "waypoint_ij_group": waypoint_group,
-            }
-            print(f"Task {task_id} is set: {task_summary}", flush=True)
+            self._print_ogbench_task_assignment_summary(env, int(task_id))
 
         def _reset(*args, **kwargs):
             options = kwargs.pop("options", None)
@@ -2512,6 +2796,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             ) * self.frame_stack
             self.current_plan_tokens = horizon // self.frame_stack
             self.global_search_num = 0
+            self.global_selection_count = 0
             _bidir_start_np = start.cpu().numpy()[:, self.obs_dim_indices]  # (b, obs_dim)
             _bidir_goal_np = goal.cpu().numpy()[:, self.obs_dim_indices]  # (b, obs_dim)
             # Capture initial physical state (always, regardless of use_rollout)
@@ -2528,203 +2813,227 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             )[: self.hilp_obs_dim].astype(np.float32)
             self._hilp_ref_obs = _ref_full  # used in _compute_hilp_values._pad
 
-            # Derive heuristic goal simulation state from initial state
-            goal_sim_state = {
-                "qpos": initial_sim_state["qpos"].copy(),
-                "qvel": np.zeros_like(initial_sim_state["qvel"]),  # Goal is assumed static
-            }
-            # Replace x, y coordinates with goal coordinates
-            goal_sim_state["qpos"][:2] = _bidir_goal_np[0][self.pos_dim_indices]
-
-            bidir_tree1 = self._init_mcts_tree(
-                horizon,
-                tag="bidir_mcts_from_start",
-                root_obs=_bidir_start_np[0],
-                root_sim_state=initial_sim_state,
-            )
-            bidir_tree2 = self._init_mcts_tree(
-                horizon,
-                tag="bidir_mcts_from_goal",
-                root_obs=_bidir_goal_np[0],
-                root_sim_state=goal_sim_state,
-                is_tree1=False,
-             )
-            global_search_pbar = None
-            root_uncertainty_infos: dict[str, dict] = {}
-            if self.use_uncertainty_as_value:
-                global_search_pbar = tqdm(
-                    total=self.mctd_max_search_num,
-                    desc="MCTS (mixed)",
-                    leave=True,
-                    dynamic_ncols=True,
-                )
-                if self.use_cluster_subplan_as_expansion:
-                    root_uncertainty_infos = self._ensure_uncertainty_roots_initialized(
-                        bidir_tree1,
-                        bidir_tree2,
-                        horizon,
-                        conditions,
-                    )
-                    self._log_root_uncertainty_videos(
-                        root_uncertainty_infos,
-                        [bidir_tree1, bidir_tree2],
-                        start,
-                        goal,
-                        loops,
-                        namespace=namespace,
-                    )
-            
-            # Flag: 0 → expand tree1 next, 1 → expand tree2 next
-            expanded_tree_idx: int = 0
-            # Configurable meeting threshold (Euclidean distance in unnormalized obs space)
-            _meeting_delta: float = getattr(self.cfg, "meeting_delta", 2.0)
-
-            _start_pos = _bidir_start_np[0][self.pos_dim_indices].tolist()
-            _goal_pos  = _bidir_goal_np[0][self.pos_dim_indices].tolist()
-            print(f"\n[MCTD] Episode start | start={[round(x,1) for x in _start_pos]} → goal={[round(x,1) for x in _goal_pos]} | horizon={horizon} | max_loops={self.val_max_loops}", flush=True)
-
-            # Single-shot planning state
-            is_meeting: bool = False
             best_node: Optional["TreeNode"] = None
             selected_plan_bundle: Optional[dict] = None
             last_is_tree1: bool = True
-            active_tree = bidir_tree1
-            while not terminate and loops < self.val_max_loops and not is_meeting:
-                loops += 1
-                planning_start_time: float = time.time()
+            active_tree = None
+            planner_state_result: Optional[dict] = None
+            bidir_tree1 = None
+            bidir_tree2 = None
+            global_search_pbar = None
+            planning_start_time: float = time.time()
 
-                # [EXPANSION CHECK] Early termination if both trees are fully explored
-                if not bidir_tree1.root_node.is_expandable_flag and \
-                   not bidir_tree2.root_node.is_expandable_flag:
-                    terminate = True
-                    break
-                if self.use_uncertainty_as_value and (
-                    self.global_search_num >= self.mctd_max_search_num
-                ):
-                    terminate = True
-                    break
+            _start_pos = _bidir_start_np[0][self.pos_dim_indices].tolist()
+            _goal_pos = _bidir_goal_np[0][self.pos_dim_indices].tolist()
+            print(
+                f"\n[MCTD] Episode start | start={[round(x,1) for x in _start_pos]} → "
+                f"goal={[round(x,1) for x in _goal_pos]} | horizon={horizon} | max_loops={self.val_max_loops}",
+                flush=True,
+            )
 
-                # Generate plan (start → goal)
-                # _generate_plan_between_points has been inlined here.
+            waypoint_xys = None
+            if self._current_task_waypoints:
+                waypoint_xys = self._current_task_waypoints[0]
 
-                # ------------------------------------------------------------------
-                # Bidirectional alternating MCTS planning
-                # ------------------------------------------------------------------
-                _start_np = start.cpu().numpy()[:, self.obs_dim_indices]  # (b, n_obs) — select from raw env obs
-                _goal_np = goal.cpu().numpy()  # (b, n_obs) — already indexed by obs_dim_indices
+            if self.multi_tree_hemiltonian:
+                planner_state_result = self._run_multi_tree_online_hamiltonian_planner(
+                    horizon=horizon,
+                    conditions=conditions,
+                    start=start,
+                    goal=goal,
+                    initial_sim_state=initial_sim_state,
+                    waypoint_xys=waypoint_xys,
+                    agent=agent,
+                    envs=envs,
+                    namespace=namespace,
+                )
+                loops = int(planner_state_result["loops"])
+                selected_plan_bundle = planner_state_result["selected_plan_bundle"]
+                best_node = planner_state_result.get("best_node")
+            else:
+                # Derive heuristic goal simulation state from initial state
+                goal_sim_state = {
+                    "qpos": initial_sim_state["qpos"].copy(),
+                    "qvel": np.zeros_like(initial_sim_state["qvel"]),  # Goal is assumed static
+                }
+                # Replace x, y coordinates with goal coordinates
+                goal_sim_state["qpos"][:2] = _bidir_goal_np[0][self.pos_dim_indices]
 
+                bidir_tree1 = self._init_mcts_tree(
+                    horizon,
+                    tag="bidir_mcts_from_start",
+                    root_obs=_bidir_start_np[0],
+                    root_sim_state=initial_sim_state,
+                )
+                bidir_tree2 = self._init_mcts_tree(
+                    horizon,
+                    tag="bidir_mcts_from_goal",
+                    root_obs=_bidir_goal_np[0],
+                    root_sim_state=goal_sim_state,
+                    is_tree1=False,
+                 )
+                root_uncertainty_infos: dict[str, dict] = {}
                 if self.use_uncertainty_as_value:
-                    selected_parent_infos = self._select_global_expansion_parents(
-                        bidir_tree1,
-                        bidir_tree2,
+                    global_search_pbar = tqdm(
+                        total=self.mctd_max_search_num,
+                        desc="MCTS (mixed)",
+                        leave=True,
+                        dynamic_ncols=True,
                     )
-                    if not selected_parent_infos:
+                    if self.use_cluster_subplan_as_expansion:
+                        root_uncertainty_infos = self._ensure_uncertainty_roots_initialized(
+                            bidir_tree1,
+                            bidir_tree2,
+                            horizon,
+                            conditions,
+                        )
+                        self._log_root_uncertainty_videos(
+                            root_uncertainty_infos,
+                            [bidir_tree1, bidir_tree2],
+                            start,
+                            goal,
+                            loops,
+                            namespace=namespace,
+                        )
+
+                # Flag: 0 → expand tree1 next, 1 → expand tree2 next
+                expanded_tree_idx: int = 0
+
+                # Single-shot planning state
+                is_meeting: bool = False
+                active_tree = bidir_tree1
+                while not terminate and loops < self.val_max_loops and not is_meeting:
+                    loops += 1
+                    planning_start_time = time.time()
+
+                    # [EXPANSION CHECK] Early termination if both trees are fully explored
+                    if not bidir_tree1.root_node.is_expandable_flag and \
+                       not bidir_tree2.root_node.is_expandable_flag:
+                        terminate = True
+                        break
+                    if self.use_uncertainty_as_value and (
+                        self.global_search_num >= self.mctd_max_search_num
+                    ):
                         terminate = True
                         break
 
-                    self.global_search_num += len(selected_parent_infos)
-                    if global_search_pbar is not None:
-                        global_search_pbar.update(len(selected_parent_infos))
+                    # ------------------------------------------------------------------
+                    # Bidirectional alternating MCTS planning
+                    # ------------------------------------------------------------------
+                    _start_np = start.cpu().numpy()[:, self.obs_dim_indices]
+                    _goal_np = goal.cpu().numpy()
 
-                    mixed_round_result = self._run_global_uncertainty_expansion_round(
-                        selected_parent_infos=selected_parent_infos,
-                        horizon=horizon,
-                        conditions=conditions,
-                        start=_start_np,
-                        goal=_goal_np,
-                    )
-                    combined_expanded_node_infos = mixed_round_result["expanded_node_infos"]
-                    self._postprocess_tree_local_expansions(
-                        mixed_round_result["tree_batches"],
-                        agent,
-                        envs,
-                        start,
-                        goal,
-                        loops,
-                        namespace=namespace,
-                    )
+                    if self.use_uncertainty_as_value:
+                        selected_parent_infos = self._select_global_expansion_parents(
+                            bidir_tree1,
+                            bidir_tree2,
+                        )
+                        if not selected_parent_infos:
+                            terminate = True
+                            break
 
-                    round_selection = self._select_round_plan_candidate(
-                        combined_expanded_node_infos,
-                        goal_normalized=goal_normalized,
-                    )
-                    meeting_winner = round_selection["meeting_winner"]
-                    round_fallback = round_selection["round_fallback"]
-                    _trees_exhausted = (
-                        not bidir_tree1.root_node.is_expandable_flag and
-                        not bidir_tree2.root_node.is_expandable_flag
-                    )
-                    if meeting_winner is not None:
-                        best_node = meeting_winner["node"]
-                        active_tree = meeting_winner["selected_tree"]
-                        last_is_tree1 = meeting_winner["is_tree1"]
-                        selected_plan_bundle = meeting_winner
-                        is_meeting = True
+                        self.global_search_num += len(selected_parent_infos)
+                        if global_search_pbar is not None:
+                            global_search_pbar.update(len(selected_parent_infos))
+
+                        mixed_round_result = self._run_global_uncertainty_expansion_round(
+                            selected_parent_infos=selected_parent_infos,
+                            horizon=horizon,
+                            conditions=conditions,
+                            start=_start_np,
+                            goal=_goal_np,
+                        )
+                        combined_expanded_node_infos = mixed_round_result["expanded_node_infos"]
+                        self._postprocess_tree_local_expansions(
+                            mixed_round_result["tree_batches"],
+                            agent,
+                            envs,
+                            start,
+                            goal,
+                            loops,
+                            namespace=namespace,
+                        )
+
+                        round_selection = self._select_round_plan_candidate(
+                            combined_expanded_node_infos,
+                            goal_normalized=goal_normalized,
+                        )
+                        meeting_winner = round_selection["meeting_winner"]
+                        round_fallback = round_selection["round_fallback"]
+                        _trees_exhausted = (
+                            not bidir_tree1.root_node.is_expandable_flag and
+                            not bidir_tree2.root_node.is_expandable_flag
+                        )
+                        if meeting_winner is not None:
+                            best_node = meeting_winner["node"]
+                            active_tree = meeting_winner["selected_tree"]
+                            last_is_tree1 = meeting_winner["is_tree1"]
+                            selected_plan_bundle = meeting_winner
+                            is_meeting = True
+                        else:
+                            if round_fallback is not None:
+                                best_node = round_fallback["node"]
+                                active_tree = round_fallback["selected_tree"]
+                                last_is_tree1 = round_fallback["is_tree1"]
+                                selected_plan_bundle = None
+                            is_meeting = False
+                        if _trees_exhausted:
+                            terminate = True
                     else:
-                        if round_fallback is not None:
-                            best_node = round_fallback["node"]
-                            active_tree = round_fallback["selected_tree"]
-                            last_is_tree1 = round_fallback["is_tree1"]
-                            selected_plan_bundle = None
-                        is_meeting = False
-                    if _trees_exhausted:
-                        terminate = True
-                else:
-                    active_tree, expanded_node_infos = self._run_mcts_search(
-                        bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2,
-                        bidir_tree2 if expanded_tree_idx == 0 else bidir_tree1,
-                        horizon,
-                        conditions,
-                        _start_np,
-                        _goal_np,
-                        single_step=True,
-                    )
-                    self._update_expanded_children_state(
-                        active_tree,
-                        expanded_node_infos,
-                        agent,
-                        envs,
-                    )
-                    self._log_expanded_node_videos(
-                        expanded_node_infos,
-                        active_tree,
-                        start,
-                        goal,
-                        loops,
-                    )
+                        active_tree, expanded_node_infos = self._run_mcts_search(
+                            bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2,
+                            bidir_tree2 if expanded_tree_idx == 0 else bidir_tree1,
+                            horizon,
+                            conditions,
+                            _start_np,
+                            _goal_np,
+                            single_step=True,
+                        )
+                        self._update_expanded_children_state(
+                            active_tree,
+                            expanded_node_infos,
+                            agent,
+                            envs,
+                        )
+                        self._log_expanded_node_videos(
+                            expanded_node_infos,
+                            active_tree,
+                            start,
+                            goal,
+                            loops,
+                        )
 
-                    round_selection = self._select_round_plan_candidate(
-                        expanded_node_infos,
-                        goal_normalized=goal_normalized,
-                        default_tree=active_tree,
-                    )
-                    meeting_winner = round_selection["meeting_winner"]
-                    round_fallback = round_selection["round_fallback"]
+                        round_selection = self._select_round_plan_candidate(
+                            expanded_node_infos,
+                            goal_normalized=goal_normalized,
+                            default_tree=active_tree,
+                        )
+                        meeting_winner = round_selection["meeting_winner"]
+                        round_fallback = round_selection["round_fallback"]
 
-                    _trees_exhausted = (
-                        not bidir_tree1.root_node.is_expandable_flag and
-                        not bidir_tree2.root_node.is_expandable_flag
-                    )
-                    if meeting_winner is not None:
-                        best_node = meeting_winner["node"]
-                        active_tree = meeting_winner["selected_tree"]
-                        last_is_tree1 = meeting_winner["is_tree1"]
-                        selected_plan_bundle = meeting_winner
-                        is_meeting = True
-                    else:
-                        if round_fallback is not None:
-                            best_node = round_fallback["node"]
-                            active_tree = round_fallback["selected_tree"]
-                            last_is_tree1 = round_fallback["is_tree1"]
-                            selected_plan_bundle = None
-                        is_meeting = False
-                    if _trees_exhausted:
-                        terminate = True
-                    # Alternate trees for next iteration
-                    expanded_tree_idx = (expanded_tree_idx + 1) % 2
+                        _trees_exhausted = (
+                            not bidir_tree1.root_node.is_expandable_flag and
+                            not bidir_tree2.root_node.is_expandable_flag
+                        )
+                        if meeting_winner is not None:
+                            best_node = meeting_winner["node"]
+                            active_tree = meeting_winner["selected_tree"]
+                            last_is_tree1 = meeting_winner["is_tree1"]
+                            selected_plan_bundle = meeting_winner
+                            is_meeting = True
+                        else:
+                            if round_fallback is not None:
+                                best_node = round_fallback["node"]
+                                active_tree = round_fallback["selected_tree"]
+                                last_is_tree1 = round_fallback["is_tree1"]
+                                selected_plan_bundle = None
+                            is_meeting = False
+                        if _trees_exhausted:
+                            terminate = True
+                        expanded_tree_idx = (expanded_tree_idx + 1) % 2
 
             # Single-shot plan extraction and environment execution (after MCTS search completes)
-            if best_node is not None:
+            if selected_plan_bundle is not None or best_node is not None:
                 if selected_plan_bundle is None:
                     _reorder_t0 = time.time()
                     selected_plan_bundle = self._build_postprocessed_plan_from_node(
@@ -2744,19 +3053,15 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 start_numpy = start.cpu().numpy()[:, self.pos_dim_indices]
                 goal_numpy = goal.cpu().numpy()[:, self.pos_dim_indices]
 
-                # [only for viz] Extract best_node's tree trajectory (sim_state sequence from root to leaf)
-                node_trajectory = self._extract_node_trajectory(best_node)
-
-                # Create forward trajectory image with both plan (red) and node trajectory (blue)
-
                 # Extract best_node's target_node obs (single green point)
                 best_node_target_pos = None
-                if best_node.target_node is None:
-                    pass
-                elif best_node.target_node.obs is None:
-                    pass
-                else:
-                    best_node_target_pos = best_node.target_node.obs  # (obs_dim,) world coords
+                if best_node is not None:
+                    if best_node.target_node is None:
+                        pass
+                    elif best_node.target_node.obs is None:
+                        pass
+                    else:
+                        best_node_target_pos = best_node.target_node.obs  # (obs_dim,) world coords
 
                 # Compute HILP value heatmap if model is already loaded
                 hilp_heatmap = None
@@ -2787,18 +3092,32 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 _planning_loop_ms = (planning_end_time - planning_start_time) * 1000
                 planning_time.append(planning_end_time - planning_start_time)
 
-                obs_numpy = obs.detach().cpu().numpy()
-
-                _t1_nodes = max(len(bidir_tree1.get_all_nodes()) - 1, 0)
-                _t2_nodes = max(len(bidir_tree2.get_all_nodes()) - 1, 0)
-                print(
-                    f"[MCTD] Search complete | loops={loops} | "
-                    f"parents={self.global_search_num}/{self.mctd_max_search_num} | "
-                    f"tree1_nodes={_t1_nodes} tree2_nodes={_t2_nodes} | "
-                    f"plan_frames={plan_unnormalized.shape[0]} | "
-                    f"post_frames={postprocessed_plan.shape[0]} | node={best_node.name}",
-                    flush=True,
-                )
+                if planner_state_result is not None:
+                    tree_node_counts = [
+                        max(len(tree.get_all_nodes()) - 1, 0)
+                        for tree in planner_state_result["planner_state"]["trees"]
+                    ]
+                    route_text = selected_plan_bundle.get("route_text", "multi_tree")
+                    print(
+                        f"[MCTD] Search complete | loops={loops} | "
+                        f"parents={self.global_search_num}/{self.mctd_max_search_num} | "
+                        f"tree_nodes={tree_node_counts} | "
+                        f"plan_frames={plan_unnormalized.shape[0]} | "
+                        f"post_frames={postprocessed_plan.shape[0]} | route={route_text}",
+                        flush=True,
+                    )
+                else:
+                    _t1_nodes = max(len(bidir_tree1.get_all_nodes()) - 1, 0)
+                    _t2_nodes = max(len(bidir_tree2.get_all_nodes()) - 1, 0)
+                    _node_name = best_node.name if best_node is not None else "none"
+                    print(
+                        f"[MCTD] Search complete | loops={loops} | "
+                        f"parents={self.global_search_num}/{self.mctd_max_search_num} | "
+                        f"tree1_nodes={_t1_nodes} tree2_nodes={_t2_nodes} | "
+                        f"plan_frames={plan_unnormalized.shape[0]} | "
+                        f"post_frames={postprocessed_plan.shape[0]} | node={_node_name}",
+                        flush=True,
+                    )
 
                 # Visualize postprocessed plan
                 _ppviz_t0 = time.time()
@@ -2874,9 +3193,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         validation_mujoco_frame_history.append(_mj_frames)
 
             # Close tree pbars (kept open during single_step MPC loop)
-            if bidir_tree1.pbar is not None:
+            if bidir_tree1 is not None and bidir_tree1.pbar is not None:
                 bidir_tree1.pbar.close()
-            if bidir_tree2.pbar is not None:
+            if bidir_tree2 is not None and bidir_tree2.pbar is not None:
                 bidir_tree2.pbar.close()
             if global_search_pbar is not None:
                 global_search_pbar.close()
@@ -2960,7 +3279,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     )
                     for i, video in enumerate(videos):
                         if video.shape[0] > 0:
-                            _video_step = self.get_safe_wandb_step()
+                            _video_step = self.reserve_wandb_step()
                             print(
                                 f"[wandb-video-debug] key={namespace}_interaction/sample_{i}_video "
                                 f"shape={video.shape} dtype={video.dtype} fps={self.validation_video_fps} "
@@ -2987,7 +3306,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     _mj_indices = _sample_frame_indices(_mj_n, self.validation_video_max_frames)
                     _mj_sampled = _mj_all[_mj_indices]  # (N, H, W, 3)
                     _mj_video = _mj_sampled.transpose(0, 3, 1, 2)  # (N, C, H, W)
-                    _mj_step = self.get_safe_wandb_step()
+                    _mj_step = self.reserve_wandb_step()
                     print(
                         f"[wandb-video-debug] key={namespace}_interaction/mujoco_render "
                         f"shape={_mj_video.shape} dtype={_mj_video.dtype} fps={self.validation_video_fps} "
@@ -3445,6 +3764,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 "T_curr": _t_curr,
                 "degenerate": True,
             }
+        elif self.uncertainty_mode in ("temporal_dist", "expected_root_node_dist"):
+            _emb_dist_curr = float(np.linalg.norm(z_goal - z_curr))
+            _t_curr = float(np.asarray(_temporal_dist_fn(np.asarray(_emb_dist_curr))).item())
+            result = {
+                "U": 0.0,
+                "T_curr": _t_curr,
+            }
         elif self.uncertainty_mode == "variance":
             result = compute_uncertainty_variance(
                 z_curr=z_curr,
@@ -3476,6 +3802,22 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         result.setdefault("degenerate", False)
         return result
 
+    def _compute_selection_value_for_target(
+        self,
+        source_node: "TreeNode",
+        target_node: "TreeNode",
+        t_curr: float,
+    ) -> float:
+        """Compute the scalar selection value for a source-target pair."""
+        if self.uncertainty_mode == "expected_root_node_dist":
+            source_cum = float(getattr(source_node, "cum_temporal_dist_from_root", 0.0))
+            target_cum = float(getattr(target_node, "cum_temporal_dist_from_root", 0.0))
+            return -(source_cum + float(t_curr) + target_cum)
+        if self.uncertainty_mode == "temporal_dist":
+            return -float(t_curr)
+        # Legacy uncertainty modes use -U as before.
+        return float("nan")
+
     def _run_fast_uncertainty_sampling(
         self,
         parent_nodes: List["TreeNode"],
@@ -3490,6 +3832,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         obs_mean_np: np.ndarray,
         obs_std_np: np.ndarray,
         opposite_trees: Optional[List["MCTSTreeState"]] = None,
+        target_nodes_override: Optional[List["TreeNode"]] = None,
     ) -> dict:
         """Run fast uncertainty sampling for a batch of non-terminal candidates.
 
@@ -3552,13 +3895,16 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 )[0]  # (obs_dim,)
             else:
                 _tail_obs_unnorm = _parent_node.obs
-            _opp_tree = opposite_trees[_ii] if opposite_trees is not None else opposite_tree
-            assert _opp_tree is not None, "opposite_tree must be provided for uncertainty sampling"
-            all_opposite_nodes_unc = _opp_tree.get_all_nodes()
-            _unc_target_node = self._select_dynamic_goal(
-                current_leaf_obs=_tail_obs_unnorm,
-                opposite_tree_all_nodes=all_opposite_nodes_unc,
-            )
+            if target_nodes_override is not None:
+                _unc_target_node = target_nodes_override[_ii]
+            else:
+                _opp_tree = opposite_trees[_ii] if opposite_trees is not None else opposite_tree
+                assert _opp_tree is not None, "opposite_tree must be provided for uncertainty sampling"
+                all_opposite_nodes_unc = _opp_tree.get_all_nodes()
+                _unc_target_node = self._select_dynamic_goal(
+                    current_leaf_obs=_tail_obs_unnorm,
+                    opposite_tree_all_nodes=all_opposite_nodes_unc,
+                )
             _unc_goal_norm = torch.tensor(
                 (_unc_target_node.obs - obs_mean_np) / obs_std_np,
                 dtype=torch.float32,
@@ -3724,7 +4070,19 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 if sample_feasible_scores_i is not None
                 else np.array([], dtype=np.float32)
             )
-            values.append(-unc_result["U"])
+            selection_value = None
+            if self.uncertainty_mode in ("temporal_dist", "expected_root_node_dist"):
+                selection_value = self._compute_selection_value_for_target(
+                    source_node=parent_nodes[_ii],
+                    target_node=target_nodes[_ii],
+                    t_curr=float(unc_result["T_curr"]),
+                )
+                values.append(float(selection_value))
+            else:
+                values.append(-unc_result["U"])
+            unc_result["selection_value"] = (
+                float(selection_value) if selection_value is not None else -float(unc_result["U"])
+            )
             unc_results_out.append(unc_result)
 
             # Build cluster_subplans
@@ -3779,6 +4137,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         is_tree1: bool = True,
         root_obs: Optional[np.ndarray] = None,
         root_sim_state: Optional[dict] = None,
+        anchor_idx: int = 0,
+        anchor_name: str = "S",
+        anchor_xy: Optional[np.ndarray] = None,
     ) -> "MCTSTreeState":
         """
         (A function) Initialize a single MCTS tree and return its full state.
@@ -3819,6 +4180,8 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             obs=root_obs,
             sim_state=root_sim_state,
         )
+        root_node.anchor_idx = int(anchor_idx)
+        root_node.anchor_name = str(anchor_name)
         root_node.set_value(0)  # Initialize the value of the root node
 
         pbar = None
@@ -3840,6 +4203,9 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             is_tree1=is_tree1,
             pbar=pbar,
             tree_root_obs=root_obs,
+            anchor_idx=int(anchor_idx),
+            anchor_name=str(anchor_name),
+            anchor_xy=None if anchor_xy is None else np.asarray(anchor_xy, dtype=np.float32).reshape(-1),
         )
 
     def _ensure_uncertainty_roots_initialized(
@@ -3880,12 +4246,627 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 root_uncertainty_infos[tree2.tag] = _existing
         return root_uncertainty_infos
 
+    def _init_multi_tree_planner_state(
+        self,
+        horizon: int,
+        start_obs: np.ndarray,
+        goal_obs: np.ndarray,
+        initial_sim_state: dict,
+        waypoint_xys: Optional[np.ndarray],
+    ) -> dict:
+        anchor_specs: list[dict] = [
+            {
+                "anchor_idx": 0,
+                "anchor_name": "S",
+                "tag": "multi_tree_start",
+                "root_obs": np.asarray(start_obs, dtype=np.float32).copy(),
+                "root_sim_state": initial_sim_state,
+                "is_tree1": True,
+                "anchor_xy": np.asarray(start_obs, dtype=np.float32)[self.pos_dim_indices],
+            }
+        ]
+
+        waypoint_xys = (
+            np.zeros((0, 2), dtype=np.float32)
+            if waypoint_xys is None
+            else np.asarray(waypoint_xys, dtype=np.float32).reshape(-1, 2)
+        )
+        for wp_idx, waypoint_xy in enumerate(waypoint_xys, start=1):
+            waypoint_sim_state = {
+                "qpos": initial_sim_state["qpos"].copy(),
+                "qvel": np.zeros_like(initial_sim_state["qvel"]),
+            }
+            waypoint_sim_state["qpos"][:2] = waypoint_xy
+            waypoint_obs = np.concatenate(
+                [waypoint_sim_state["qpos"], waypoint_sim_state["qvel"]]
+            )[self.obs_dim_indices].astype(np.float32)
+            anchor_specs.append(
+                {
+                    "anchor_idx": wp_idx,
+                    "anchor_name": f"W{wp_idx}",
+                    "tag": f"multi_tree_wp{wp_idx}",
+                    "root_obs": waypoint_obs,
+                    "root_sim_state": waypoint_sim_state,
+                    "is_tree1": True,
+                    "anchor_xy": np.asarray(waypoint_xy, dtype=np.float32).reshape(-1),
+                }
+            )
+
+        goal_anchor_idx = len(anchor_specs)
+        goal_sim_state = {
+            "qpos": initial_sim_state["qpos"].copy(),
+            "qvel": np.zeros_like(initial_sim_state["qvel"]),
+        }
+        goal_sim_state["qpos"][:2] = np.asarray(goal_obs, dtype=np.float32)[self.pos_dim_indices]
+        anchor_specs.append(
+            {
+                "anchor_idx": goal_anchor_idx,
+                "anchor_name": "G",
+                "tag": "multi_tree_goal",
+                "root_obs": np.asarray(goal_obs, dtype=np.float32).copy(),
+                "root_sim_state": goal_sim_state,
+                "is_tree1": False,
+                "anchor_xy": np.asarray(goal_obs, dtype=np.float32)[self.pos_dim_indices],
+            }
+        )
+
+        trees: list[MCTSTreeState] = []
+        for spec in anchor_specs:
+            trees.append(
+                self._init_mcts_tree(
+                    horizon=horizon,
+                    tag=spec["tag"],
+                    is_tree1=bool(spec["is_tree1"]),
+                    root_obs=spec["root_obs"],
+                    root_sim_state=spec["root_sim_state"],
+                    anchor_idx=int(spec["anchor_idx"]),
+                    anchor_name=str(spec["anchor_name"]),
+                    anchor_xy=spec["anchor_xy"],
+                )
+            )
+
+        n_anchors = len(trees)
+        root_cost = np.full((n_anchors, n_anchors), np.inf, dtype=np.float32)
+        np.fill_diagonal(root_cost, 0.0)
+        for i in range(n_anchors):
+            for j in range(i + 1, n_anchors):
+                td_ij = float(
+                    self._compute_raw_state_temporal_dist_np(
+                        trees[i].root_node.obs[None].astype(np.float32),
+                        trees[j].root_node.obs[None].astype(np.float32),
+                    )[0]
+                )
+                root_cost[i, j] = td_ij
+                root_cost[j, i] = td_ij
+
+        planner_state = {
+            "trees": trees,
+            "anchor_specs": anchor_specs,
+            "accepted_pair_edges": {},
+            "accepted_neighbors": {int(i): set() for i in range(n_anchors)},
+            "best_direct_bridge_raw": root_cost.copy(),
+            "best_direct_bridge_info": {},
+            "effective_pair_cost": root_cost.copy(),
+            "tentative_solver_result": {},
+        }
+        self._compute_tentative_hamiltonian_solution(planner_state)
+        return planner_state
+
+    def _ensure_uncertainty_roots_initialized_multi(
+        self,
+        planner_state: dict,
+        horizon: int,
+        conditions: Optional[Any],
+    ) -> dict[str, dict]:
+        root_uncertainty_infos: dict[str, dict] = {}
+        for tree in planner_state["trees"]:
+            if self._is_anchor_satisfied(planner_state, tree.anchor_idx):
+                continue
+            if tree.root_node.cluster_subplans is not None:
+                _existing = getattr(tree.root_node, "_root_uncertainty_vinfo", None)
+                if _existing is not None:
+                    root_uncertainty_infos[tree.tag] = _existing
+                continue
+            target_info = self._select_multi_tree_target_node(
+                planner_state=planner_state,
+                source_tree=tree,
+                current_leaf_obs=tree.root_node.obs,
+                use_segment_metric=False,
+            )
+            target_node = None if target_info is None else target_info["target_node"]
+            if target_node is None:
+                continue
+            root_uncertainty_infos[tree.tag] = self._init_root_node_uncertainty(
+                root_node=tree.root_node,
+                opposite_tree=None,
+                horizon=horizon,
+                conditions=conditions,
+                target_node_override=target_node,
+            )
+        return root_uncertainty_infos
+
+    def _select_multi_tree_expansion_parents(self, planner_state: dict) -> List[dict]:
+        remaining_budget = max(self.mctd_max_search_num - self.global_search_num, 0)
+        selection_budget = min(self._parent_selection_budget(), remaining_budget)
+        if selection_budget <= 0:
+            return []
+
+        candidate_pool: list[dict] = []
+        for tree in planner_state["trees"]:
+            if self._is_anchor_satisfied(planner_state, tree.anchor_idx):
+                continue
+            for node in tree.get_all_nodes():
+                if node.obs is None or node.is_terminal():
+                    continue
+                if not node.is_expandable(
+                    consider_virtually_visited=(not self.parallel_multiple_visits)
+                ):
+                    continue
+                target_info = self._select_multi_tree_target_node(
+                    planner_state=planner_state,
+                    source_tree=tree,
+                    current_leaf_obs=node.obs,
+                    use_segment_metric=False,
+                )
+                target_node = None if target_info is None else target_info["target_node"]
+                if target_node is None or target_node.obs is None:
+                    continue
+                target_tree = next(
+                    (
+                        other_tree for other_tree in planner_state["trees"]
+                        if self._get_root_node(target_node) is other_tree.root_node
+                    ),
+                    None,
+                )
+                if target_tree is None:
+                    continue
+                target_td = float(
+                    self._compute_raw_state_temporal_dist_np(
+                        node.obs[None].astype(np.float32),
+                        target_node.obs[None].astype(np.float32),
+                    )[0]
+                )
+                candidate_pool.append(
+                    {
+                        "node": node,
+                        "tree": tree,
+                        "opposite_tree": target_tree,
+                        "target_node": target_node,
+                        "value": self._compute_selection_value_for_target(
+                            source_node=node,
+                            target_node=target_node,
+                            t_curr=target_td,
+                        ),
+                    }
+                )
+
+        candidate_pool.sort(
+            key=lambda item: (
+                -float(item["value"]),
+                -int(item["node"].depth),
+                item["tree"].anchor_idx,
+                item["node"].name,
+            )
+        )
+        selected_parent_infos = candidate_pool[:selection_budget]
+        for parent_info in selected_parent_infos:
+            self.global_selection_count += 1
+            selection_count = self.global_selection_count
+            parent_info["selection_count"] = selection_count
+            parent_info["node"].last_selection_count = selection_count
+        return selected_parent_infos
+
+    def _update_multi_tree_direct_bridges_from_expansions(
+        self,
+        planner_state: dict,
+        tree_batches: dict[str, dict],
+    ) -> None:
+        for tree_batch in tree_batches.values():
+            source_tree: MCTSTreeState = tree_batch["tree"]
+            source_anchor_idx = int(source_tree.anchor_idx)
+            for info in tree_batch["expanded_node_infos"].values():
+                source_node = info.get("node")
+                if source_node is None or source_node.obs is None:
+                    continue
+                for target_tree in planner_state["trees"]:
+                    target_anchor_idx = int(target_tree.anchor_idx)
+                    if target_anchor_idx == source_anchor_idx:
+                        continue
+                    target_nodes = [
+                        node for node in target_tree.get_all_nodes()
+                        if node.obs is not None
+                    ]
+                    if not target_nodes:
+                        continue
+                    target_obs = np.stack([node.obs for node in target_nodes], axis=0)
+                    src_obs_rep = np.repeat(
+                        source_node.obs[None].astype(np.float32),
+                        len(target_nodes),
+                        axis=0,
+                    )
+                    tds = self._compute_raw_state_temporal_dist_np(src_obs_rep, target_obs)
+                    best_local_idx = int(np.argmin(tds))
+                    target_node = target_nodes[best_local_idx]
+                    bridge_cost = (
+                        float(getattr(source_node, "cum_temporal_dist_from_root", 0.0))
+                        + float(tds[best_local_idx])
+                        + float(getattr(target_node, "cum_temporal_dist_from_root", 0.0))
+                    )
+                    pair_key = self._anchor_pair_key(source_anchor_idx, target_anchor_idx)
+                    if bridge_cost >= float(planner_state["best_direct_bridge_raw"][pair_key]):
+                        continue
+                    planner_state["best_direct_bridge_raw"][pair_key] = bridge_cost
+                    planner_state["best_direct_bridge_raw"][pair_key[::-1]] = bridge_cost
+                    planner_state["effective_pair_cost"][pair_key] = bridge_cost
+                    planner_state["effective_pair_cost"][pair_key[::-1]] = bridge_cost
+                    planner_state["best_direct_bridge_info"][pair_key] = {
+                        "pair_key": pair_key,
+                        "source_anchor_idx": source_anchor_idx,
+                        "target_anchor_idx": target_anchor_idx,
+                        "source_node": source_node,
+                        "target_node": target_node,
+                        "bridge_cost": float(bridge_cost),
+                        "t_curr": float(tds[best_local_idx]),
+                    }
+
+    def _select_multi_tree_round_meetings(
+        self,
+        planner_state: dict,
+        expanded_node_infos: dict[str, dict],
+    ) -> dict[Tuple[int, int], dict]:
+        accepted_candidates: dict[Tuple[int, int], dict] = {}
+        plan_tokens = self._require_current_plan_tokens()
+        forced_pairs = {
+            self._anchor_pair_key(int(order[i]), int(order[i + 1]))
+            for order in [planner_state["tentative_solver_result"].get("anchor_order", np.zeros((0,), dtype=np.int32))]
+            for i in range(max(len(order) - 1, 0))
+        }
+        for info in expanded_node_infos.values():
+            node = info.get("node")
+            selected_tree = info.get("selected_tree")
+            target_tree = info.get("meeting_target_tree")
+            meeting_target_node = info.get("meeting_target_node")
+            meeting_target_td = info.get("meeting_target_td")
+            if node is None or selected_tree is None or target_tree is None:
+                continue
+            if meeting_target_node is None or meeting_target_node.obs is None:
+                continue
+            source_anchor_idx = int(selected_tree.anchor_idx)
+            target_anchor_idx = int(target_tree.anchor_idx)
+            pair_key = self._anchor_pair_key(source_anchor_idx, target_anchor_idx)
+            if pair_key not in forced_pairs:
+                continue
+            if target_anchor_idx in planner_state["accepted_neighbors"][source_anchor_idx]:
+                continue
+            if self._is_anchor_satisfied(planner_state, source_anchor_idx):
+                continue
+            if self._is_anchor_satisfied(planner_state, target_anchor_idx):
+                continue
+            gap = self._compute_plan_gap_to_target(
+                node,
+                meeting_target_node,
+                plan_tokens,
+                is_tree1=selected_tree.is_tree1,
+            )
+            if gap is None or not np.isfinite(gap) or gap >= self.meeting_delta:
+                continue
+            t_curr = float(
+                self._compute_raw_state_temporal_dist_np(
+                    node.obs[None].astype(np.float32),
+                    meeting_target_node.obs[None].astype(np.float32),
+                )[0]
+            )
+            bridge_cost = (
+                float(getattr(node, "cum_temporal_dist_from_root", 0.0))
+                + t_curr
+                + float(getattr(meeting_target_node, "cum_temporal_dist_from_root", 0.0))
+            )
+            candidate = {
+                "pair_key": pair_key,
+                "source_anchor_idx": source_anchor_idx,
+                "target_anchor_idx": target_anchor_idx,
+                "source_node": node,
+                "target_node": meeting_target_node,
+                "bridge_cost": float(bridge_cost),
+                "gap": float(gap),
+                "meeting_target_td": (
+                    float(meeting_target_td)
+                    if meeting_target_td is not None
+                    else float("inf")
+                ),
+                "selected_tree": selected_tree,
+                "target_tree": target_tree,
+            }
+            incumbent = accepted_candidates.get(pair_key)
+            if incumbent is None or (
+                candidate["bridge_cost"],
+                candidate["meeting_target_td"],
+                candidate["gap"],
+                candidate["source_node"].name,
+            ) < (
+                incumbent["bridge_cost"],
+                incumbent["meeting_target_td"],
+                incumbent["gap"],
+                incumbent["source_node"].name,
+            ):
+                accepted_candidates[pair_key] = candidate
+        return accepted_candidates
+
+    def _accept_multi_tree_round_meetings(
+        self,
+        planner_state: dict,
+        accepted_candidates: dict[Tuple[int, int], dict],
+        loops: int,
+    ) -> None:
+        for pair_key, candidate in accepted_candidates.items():
+            if pair_key in planner_state["accepted_pair_edges"]:
+                continue
+            a, b = pair_key
+            if self._is_anchor_satisfied(planner_state, a) or self._is_anchor_satisfied(planner_state, b):
+                continue
+            planner_state["accepted_pair_edges"][pair_key] = {
+                **candidate,
+                "accepted_round": int(loops),
+            }
+            planner_state["accepted_neighbors"][a].add(b)
+            planner_state["accepted_neighbors"][b].add(a)
+
+    def _all_multi_tree_anchors_satisfied(self, planner_state: dict) -> bool:
+        for anchor_idx in range(len(planner_state["trees"])):
+            if not self._is_anchor_satisfied(planner_state, anchor_idx):
+                return False
+        return True
+
+    def _get_connection_info_for_pair(
+        self,
+        planner_state: dict,
+        pair_key: Tuple[int, int],
+    ) -> Optional[dict]:
+        if pair_key in planner_state["accepted_pair_edges"]:
+            return planner_state["accepted_pair_edges"][pair_key]
+        return planner_state["best_direct_bridge_info"].get(pair_key)
+
+    def _find_restricted_anchor_walk(
+        self,
+        planner_state: dict,
+        source_anchor_idx: int,
+        target_anchor_idx: int,
+        allowed_anchor_indices: set[int],
+    ) -> Optional[list[int]]:
+        source_anchor_idx = int(source_anchor_idx)
+        target_anchor_idx = int(target_anchor_idx)
+        allowed_anchor_indices = {int(idx) for idx in allowed_anchor_indices}
+        allowed_anchor_indices.add(source_anchor_idx)
+        allowed_anchor_indices.add(target_anchor_idx)
+
+        n_anchors = len(planner_state["trees"])
+        dist = {idx: np.inf for idx in allowed_anchor_indices}
+        prev = {idx: None for idx in allowed_anchor_indices}
+        visited: set[int] = set()
+        dist[source_anchor_idx] = 0.0
+
+        while len(visited) < len(allowed_anchor_indices):
+            cur = min(
+                (idx for idx in allowed_anchor_indices if idx not in visited),
+                key=lambda idx: dist[idx],
+                default=None,
+            )
+            if cur is None or not np.isfinite(dist[cur]):
+                break
+            if cur == target_anchor_idx:
+                break
+            visited.add(cur)
+            for nxt in allowed_anchor_indices:
+                if nxt == cur or nxt in visited:
+                    continue
+                pair_key = self._anchor_pair_key(cur, nxt)
+                conn_info = self._get_connection_info_for_pair(planner_state, pair_key)
+                if conn_info is None:
+                    continue
+                edge_cost = float(conn_info["bridge_cost"])
+                cand = float(dist[cur]) + edge_cost
+                if cand < dist[nxt]:
+                    dist[nxt] = cand
+                    prev[nxt] = cur
+
+        if not np.isfinite(dist[target_anchor_idx]):
+            return None
+
+        walk = [target_anchor_idx]
+        cur = target_anchor_idx
+        while cur != source_anchor_idx:
+            cur = prev[cur]
+            if cur is None:
+                return None
+            walk.append(cur)
+        walk.reverse()
+        return walk
+
+    def _materialize_connection_segment(
+        self,
+        planner_state: dict,
+        connection_info: dict,
+        desired_source_idx: int,
+        desired_target_idx: int,
+    ) -> torch.Tensor:
+        plan_tokens = self._require_current_plan_tokens()
+        stored_source_idx = int(connection_info["source_anchor_idx"])
+        stored_target_idx = int(connection_info["target_anchor_idx"])
+        target_root_obs = planner_state["trees"][stored_target_idx].root_node.obs
+        target_root_obs_norm = self._normalize_obs_np(target_root_obs)
+        edge_bundle = self._build_postprocessed_plan_from_node_pair(
+            source_node=connection_info["source_node"],
+            target_node=connection_info["target_node"],
+            plan_tokens=plan_tokens,
+            append_target_obs_normalized=target_root_obs_norm,
+        )
+        segment = edge_bundle["postprocessed_plan"]
+        if stored_source_idx == int(desired_source_idx) and stored_target_idx == int(desired_target_idx):
+            return segment
+        if stored_source_idx == int(desired_target_idx) and stored_target_idx == int(desired_source_idx):
+            return torch.flip(segment, [0])
+        raise ValueError(
+            f"Connection orientation mismatch: stored=({stored_source_idx},{stored_target_idx}) "
+            f"desired=({desired_source_idx},{desired_target_idx})"
+        )
+
+    def _assemble_multi_tree_plan_bundle(self, planner_state: dict) -> Optional[dict]:
+        solver_result = planner_state.get("tentative_solver_result") or self._compute_tentative_hamiltonian_solution(planner_state)
+        if not solver_result.get("feasible", False):
+            return None
+
+        anchor_order = np.asarray(solver_result["anchor_order"], dtype=np.int32)
+        if anchor_order.size < 2:
+            return None
+
+        n_anchors = len(planner_state["trees"])
+        break_reason: Optional[str] = None
+
+        def _pair_text(pair_key: tuple[int, int]) -> str:
+            return (
+                f"{anchor_short_label(int(pair_key[0]), n_anchors)}-"
+                f"{anchor_short_label(int(pair_key[1]), n_anchors)}"
+            )
+
+        def _route_text(anchor_indices: np.ndarray | list[int]) -> str:
+            return " -> ".join(
+                anchor_short_label(int(idx), n_anchors)
+                for idx in list(anchor_indices)
+            )
+
+        concat_segments: list[torch.Tensor] = []
+        completed_anchor_order = [int(anchor_order[0])]
+
+        for edge_idx in range(len(anchor_order) - 1):
+            src_idx = int(anchor_order[edge_idx])
+            dst_idx = int(anchor_order[edge_idx + 1])
+            pair_key = self._anchor_pair_key(src_idx, dst_idx)
+            connection_sequence: list[dict] = []
+
+            direct_conn = self._get_connection_info_for_pair(planner_state, pair_key)
+            if direct_conn is not None:
+                connection_sequence = [direct_conn]
+            else:
+                allowed_anchor_indices = set(int(idx) for idx in anchor_order[: edge_idx + 2])
+                walk = self._find_restricted_anchor_walk(
+                    planner_state=planner_state,
+                    source_anchor_idx=src_idx,
+                    target_anchor_idx=dst_idx,
+                    allowed_anchor_indices=allowed_anchor_indices,
+                )
+                if walk is None or len(walk) < 2:
+                    break_reason = (
+                        f"missing_walk edge={anchor_short_label(src_idx, n_anchors)}->"
+                        f"{anchor_short_label(dst_idx, n_anchors)} "
+                        f"allowed={_route_text(sorted(allowed_anchor_indices))}"
+                    )
+                    break
+                walk_pairs = [
+                    self._anchor_pair_key(int(walk[i]), int(walk[i + 1]))
+                    for i in range(len(walk) - 1)
+                ]
+                connection_sequence = []
+                missing_conn = False
+                for walk_pair in walk_pairs:
+                    conn = self._get_connection_info_for_pair(planner_state, walk_pair)
+                    if conn is None:
+                        missing_conn = True
+                        break_reason = (
+                            f"walk_missing_conn edge={anchor_short_label(src_idx, n_anchors)}->"
+                            f"{anchor_short_label(dst_idx, n_anchors)} "
+                            f"walk={_route_text(walk)} missing={_pair_text(walk_pair)}"
+                        )
+                        break
+                    connection_sequence.append(conn)
+                if missing_conn:
+                    break
+
+            current_src = src_idx
+            for conn in connection_sequence:
+                stored_pair = {
+                    int(conn["source_anchor_idx"]),
+                    int(conn["target_anchor_idx"]),
+                }
+                if int(current_src) not in stored_pair:
+                    return None
+                current_dst = (
+                    int(conn["target_anchor_idx"])
+                    if int(conn["source_anchor_idx"]) == int(current_src)
+                    else int(conn["source_anchor_idx"])
+                )
+                segment = self._materialize_connection_segment(
+                    planner_state=planner_state,
+                    connection_info=conn,
+                    desired_source_idx=current_src,
+                    desired_target_idx=current_dst,
+                )
+                if len(concat_segments) > 0 and segment.shape[0] > 0:
+                    segment = segment[1:]
+                concat_segments.append(segment)
+                current_src = current_dst
+            completed_anchor_order.append(int(current_src))
+            if current_src != dst_idx:
+                if break_reason is None:
+                    break_reason = (
+                        f"partial_edge edge={anchor_short_label(src_idx, n_anchors)}->"
+                        f"{anchor_short_label(dst_idx, n_anchors)} "
+                        f"stopped_at={anchor_short_label(current_src, n_anchors)}"
+                    )
+                break
+
+        if not concat_segments:
+            return None
+
+        concatenated = torch.cat(concat_segments, dim=0)
+        completed_anchor_order = np.asarray(completed_anchor_order, dtype=np.int32)
+        if completed_anchor_order.size != anchor_order.size:
+            edge_summaries: list[str] = []
+            for i in range(len(anchor_order) - 1):
+                pair_key = self._anchor_pair_key(int(anchor_order[i]), int(anchor_order[i + 1]))
+                if pair_key in planner_state["accepted_pair_edges"]:
+                    status = "accepted"
+                    cost = float(planner_state["accepted_pair_edges"][pair_key]["bridge_cost"])
+                elif pair_key in planner_state["best_direct_bridge_info"]:
+                    status = "direct"
+                    cost = float(planner_state["best_direct_bridge_info"][pair_key]["bridge_cost"])
+                else:
+                    status = "missing"
+                    cost = float(planner_state["effective_pair_cost"][pair_key])
+                cost_text = f"{cost:.1f}" if np.isfinite(cost) else "inf"
+                edge_summaries.append(f"{_pair_text(pair_key)}:{status}@{cost_text}")
+            accepted_pairs_text = ", ".join(
+                _pair_text(pair_key)
+                for pair_key in sorted(planner_state["accepted_pair_edges"].keys())
+            ) or "none"
+            print(
+                "[MCTD debug] Incomplete multi-tree assembly | "
+                f"solver={_route_text(anchor_order)} | "
+                f"completed={_route_text(completed_anchor_order)} | "
+                f"reason={break_reason or 'unknown'} | "
+                f"accepted={accepted_pairs_text} | "
+                f"order_edges={'; '.join(edge_summaries)}",
+                flush=True,
+            )
+        return {
+            "output_plan": concatenated,
+            "plan_unnormalized": concatenated,
+            "postprocessed_plan": concatenated,
+            "postprocessed_len": int(concatenated.shape[0]),
+            "anchor_order": anchor_order,
+            "completed_anchor_order": completed_anchor_order,
+            "route_text": " -> ".join(
+                anchor_short_label(int(idx), len(planner_state["trees"]))
+                for idx in completed_anchor_order.tolist()
+            ),
+        }
+
     def _init_root_node_uncertainty(
         self,
         root_node: "TreeNode",
-        opposite_tree: "MCTSTreeState",
+        opposite_tree: Optional["MCTSTreeState"],
         horizon: int,
         conditions: Optional[Any],
+        target_node_override: Optional["TreeNode"] = None,
     ) -> dict:
         """Initialize root node uncertainty before MCTS search begins.
 
@@ -3940,14 +4921,19 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             opposite_tree=opposite_tree,
             obs_mean_np=obs_mean_np,
             obs_std_np=obs_std_np,
+            target_nodes_override=[target_node_override] if target_node_override is not None else None,
         )
 
         # 5. Select target node for uncertainty computation (based on root obs)
-        all_opposite_nodes = opposite_tree.get_all_nodes()
-        target_node = self._select_dynamic_goal(
-            current_leaf_obs=root_node.obs,
-            opposite_tree_all_nodes=all_opposite_nodes,
-        )
+        if target_node_override is not None:
+            target_node = target_node_override
+        else:
+            assert opposite_tree is not None, "opposite_tree must be provided when target_node_override is None"
+            all_opposite_nodes = opposite_tree.get_all_nodes()
+            target_node = self._select_dynamic_goal(
+                current_leaf_obs=root_node.obs,
+                opposite_tree_all_nodes=all_opposite_nodes,
+            )
 
         # 6. Compute uncertainty and cluster_subplans
         unc_compute_result = self._compute_uncertainty_and_clusters(
@@ -4134,7 +5120,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         )
                         continue
                     if self.leaf_parallelization:
-                        for i in range(len(children_node_guidance_scales)):
+                        for i in range(len(selected_node._children_nodes)):
                             # Skip slots that already have a child node (created in a previous
                             # iteration) or are already virtually visited — both mean the slot
                             # is occupied / scheduled for this round and should not be re-added.
@@ -4205,7 +5191,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         continue
 
                     if self.leaf_parallelization:
-                        for i in range(len(children_node_guidance_scales)):
+                        for i in range(len(selected_node._children_nodes)):
                             child_slot = selected_node._children_nodes[i]
                             if child_slot['node'] is not None:
                                 continue
@@ -5307,7 +6293,6 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         selected_nodes: list = []
         expanded_node_candidates: list = []
         base_tree = selected_parent_infos[0]["tree"]
-        children_node_guidance_scales = base_tree.children_node_guidance_scales
         terminal_depth = base_tree.terminal_depth
         plan_tokens = self._require_current_plan_tokens()
         seg_size = plan_tokens // self.sequence_dividing_factor
@@ -5340,7 +6325,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     and selected_node.cluster_subplans is not None
                 )
                 _sentinel_done = False
-                for i in range(len(children_node_guidance_scales)):
+                for i in range(len(selected_node._children_nodes)):
                     if _is_cluster_parent and _sentinel_done:
                         break
                     child_slot = selected_node._children_nodes[i]
@@ -5356,6 +6341,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     )
                     expanded_node_candidate["selected_tree"] = selected_tree
                     expanded_node_candidate["opposite_tree"] = opposite_tree
+                    expanded_node_candidate["target_node"] = parent_info.get("target_node")
                     expanded_node_candidate["parent_key"] = parent_key
                     selected_nodes.append(selected_node)
                     expanded_node_candidates.append(expanded_node_candidate)
@@ -5368,6 +6354,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 )
                 expanded_node_candidate["selected_tree"] = selected_tree
                 expanded_node_candidate["opposite_tree"] = opposite_tree
+                expanded_node_candidate["target_node"] = parent_info.get("target_node")
                 expanded_node_candidate["parent_key"] = parent_key
                 selected_nodes.append(selected_node)
                 expanded_node_candidates.append(expanded_node_candidate)
@@ -5398,6 +6385,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         _is_cluster_reuse_expansion = False
         _cluster_reuse_slot_map: dict[str, int] = {}
         if self.use_cluster_subplan_as_expansion:
+            _all_valid_have_cluster_subplans = (
+                len(valid_candidates) > 0
+                and all(
+                    _info["parent_node"].cluster_subplans is not None
+                    for _info in valid_candidates
+                )
+            )
             _old_sel_map: dict[str, tuple] = {}
             for _oi, _info in enumerate(expanded_node_candidates):
                 _cand_key = f"{_info['selected_tree'].tag}:{_info['name']}"
@@ -5410,11 +6404,11 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
 
             _new_valid: list = []
             _new_sel: list = []
-            for _info in valid_candidates:
-                _cand_key = f"{_info['selected_tree'].tag}:{_info['name']}"
-                _sel, _sel_tree, _opp_tree, _parent_key = _old_sel_map[_cand_key]
-                _parent = _info["parent_node"]
-                if _parent.cluster_subplans is not None:
+            if _all_valid_have_cluster_subplans:
+                for _info in valid_candidates:
+                    _cand_key = f"{_info['selected_tree'].tag}:{_info['name']}"
+                    _sel, _sel_tree, _opp_tree, _parent_key = _old_sel_map[_cand_key]
+                    _parent = _info["parent_node"]
                     _is_cluster_reuse_expansion = True
                     _n_clusters = len(_parent.cluster_subplans)
                     _gs_list = [
@@ -5425,17 +6419,13 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         _cand = _parent.get_expandable_candidate(index=_slot_i)
                         _cand["selected_tree"] = _sel_tree
                         _cand["opposite_tree"] = _opp_tree
+                        _cand["target_node"] = _info.get("target_node")
                         _cand["parent_key"] = _parent_key
                         _new_valid.append(_cand)
                         _new_sel.append(_sel)
                         _cluster_reuse_slot_map[
                             f"{_sel_tree.tag}:{_cand['name']}"
                         ] = _slot_i
-                else:
-                    _new_valid.append(_info)
-                    _new_sel.append(_sel)
-
-            if _is_cluster_reuse_expansion:
                 valid_candidates = _new_valid
                 expanded_node_candidates = _new_valid
                 selected_nodes = _new_sel
@@ -5460,12 +6450,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             ).unsqueeze(0)
             eff_obs_norm_list.append(p_norm)
 
-            all_opposite_nodes = info["opposite_tree"].get_all_nodes()
-            assert len(all_opposite_nodes) > 0, "opposite_tree has no nodes"
-            target_node = self._select_dynamic_goal(
-                current_leaf_obs=parent_obs,
-                opposite_tree_all_nodes=all_opposite_nodes,
-            )
+            target_node = info.get("target_node")
+            if target_node is None:
+                all_opposite_nodes = info["opposite_tree"].get_all_nodes()
+                assert len(all_opposite_nodes) > 0, "opposite_tree has no nodes"
+                target_node = self._select_dynamic_goal(
+                    current_leaf_obs=parent_obs,
+                    opposite_tree_all_nodes=all_opposite_nodes,
+                )
             info["target_node"] = target_node
             target_pos = target_node.obs
             g_norm = torch.tensor(
@@ -5816,6 +6808,10 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         expanded_node_candidates[i]["opposite_tree"]
                         for i in non_terminal_cand_indices
                     ],
+                    target_nodes_override=[
+                        expanded_node_candidates[i]["target_node"]
+                        for i in non_terminal_cand_indices
+                    ],
                 )
 
                 for ii, i in enumerate(non_terminal_cand_indices):
@@ -6161,6 +7157,36 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
             depth=1,
         )
 
+    def _log_tree_batch_visualizations(
+        self,
+        tree_batch: dict,
+        start: torch.Tensor,
+        goal: torch.Tensor,
+        loops: int,
+        namespace: Optional[str] = None,
+    ) -> None:
+        tree: MCTSTreeState = tree_batch["tree"]
+        expanded_node_infos = tree_batch["expanded_node_infos"]
+        self._expansion_step_captures_by_name = tree_batch.get(
+            "step_captures_by_name", {}
+        )
+        if expanded_node_infos:
+            self._log_expanded_node_videos(
+                expanded_node_infos,
+                tree,
+                start,
+                goal,
+                loops,
+                namespace=namespace,
+            )
+        self._visualize_tree_final_plans(
+            tree,
+            tree_batch,
+            start,
+            goal,
+            viz_step=self.global_search_num,
+        )
+
     def _postprocess_tree_local_expansions(
         self,
         tree_batches: dict[str, dict],
@@ -6170,6 +7196,7 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         goal: torch.Tensor,
         loops: int,
         namespace: Optional[str] = None,
+        log_videos_and_viz: bool = True,
     ) -> None:
         """Run tree-local backprop, state rollout, and visualization after mixed expansion."""
         original_step_captures = getattr(self, "_expansion_step_captures_by_name", {})
@@ -6206,21 +7233,14 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                         agent,
                         envs,
                     )
-                    self._log_expanded_node_videos(
-                        expanded_node_infos,
-                        tree,
+                if log_videos_and_viz:
+                    self._log_tree_batch_visualizations(
+                        tree_batch,
                         start,
                         goal,
                         loops,
                         namespace=namespace,
                     )
-                self._visualize_tree_final_plans(
-                    tree,
-                    tree_batch,
-                    start,
-                    goal,
-                    viz_step=self.global_search_num,
-                )
         finally:
             self._expansion_step_captures_by_name = original_step_captures
 
@@ -6266,6 +7286,16 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                 _child.obs = np.concatenate(
                     [_new_sim_state["qpos"], _new_sim_state["qvel"]]
                 )[self.obs_dim_indices]
+                _parent_td = float(
+                    self._compute_raw_state_temporal_dist_np(
+                        parent_node.obs[None].astype(np.float32),
+                        _child.obs[None].astype(np.float32),
+                    )[0]
+                )
+                _child.cum_temporal_dist_from_root = (
+                    float(getattr(parent_node, "cum_temporal_dist_from_root", 0.0))
+                    + _parent_td
+                )
         else:
             seg_size: int = self._require_current_plan_tokens() // self.sequence_dividing_factor
             for info in expanded_node_infos.values():
@@ -6288,6 +7318,16 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
                     else:
                         _child.sim_state[k] = v
                 _child.sim_state["qpos"][:2] = _child.obs[self.pos_dim_indices]
+                _parent_td = float(
+                    self._compute_raw_state_temporal_dist_np(
+                        parent_node.obs[None].astype(np.float32),
+                        _child.obs[None].astype(np.float32),
+                    )[0]
+                )
+                _child.cum_temporal_dist_from_root = (
+                    float(getattr(parent_node, "cum_temporal_dist_from_root", 0.0))
+                    + _parent_td
+                )
 
     def _log_root_uncertainty_videos(
         self,
@@ -6763,6 +7803,154 @@ class DiffusionForcingPlanning(KDEEstimatorMixin, NoiseScheduleMixin, PlanVizMix
         result["meeting_candidates"] = meeting_candidates
         result["finite_gap_candidates"] = finite_gap_candidates
         return result
+
+    def _run_multi_tree_online_hamiltonian_planner(
+        self,
+        horizon: int,
+        conditions: Optional[Any],
+        start: torch.Tensor,
+        goal: torch.Tensor,
+        initial_sim_state: dict,
+        waypoint_xys: Optional[np.ndarray],
+        agent,
+        envs,
+        namespace: str,
+    ) -> dict:
+        if not self.use_uncertainty_as_value:
+            raise NotImplementedError("multi_tree_hemiltonian currently requires use_uncertainty_as_value=True")
+
+        start_obs = start.detach().cpu().numpy()[0, self.obs_dim_indices]
+        goal_obs = goal.detach().cpu().numpy()[0]
+        planner_state = self._init_multi_tree_planner_state(
+            horizon=horizon,
+            start_obs=start_obs,
+            goal_obs=goal_obs,
+            initial_sim_state=initial_sim_state,
+            waypoint_xys=waypoint_xys,
+        )
+
+        global_search_pbar = tqdm(
+            total=self.mctd_max_search_num,
+            desc="MCTS (multi-tree)",
+            leave=True,
+            dynamic_ncols=True,
+        )
+        root_uncertainty_infos: dict[str, dict] = {}
+        if self.use_cluster_subplan_as_expansion:
+            root_uncertainty_infos = self._ensure_uncertainty_roots_initialized_multi(
+                planner_state=planner_state,
+                horizon=horizon,
+                conditions=conditions,
+            )
+            self._log_root_uncertainty_videos(
+                root_uncertainty_infos,
+                planner_state["trees"],
+                start,
+                goal,
+                loops=0,
+                namespace=namespace,
+            )
+
+        loops = 0
+        termination_reason = "unknown"
+        while loops < self.val_max_loops:
+            if self.time_limit is not None and (time.time() - self.start_time > self.time_limit):
+                termination_reason = "time_limit"
+                break
+            if self.global_search_num >= self.mctd_max_search_num:
+                termination_reason = "search_budget"
+                break
+            if self._all_multi_tree_anchors_satisfied(planner_state):
+                termination_reason = "all_anchors_satisfied"
+                break
+
+            loops += 1
+            selected_parent_infos = self._select_multi_tree_expansion_parents(planner_state)
+            if not selected_parent_infos:
+                termination_reason = "no_selected_parents"
+                break
+
+            self.global_search_num += len(selected_parent_infos)
+            global_search_pbar.update(len(selected_parent_infos))
+
+            mixed_round_result = self._run_global_uncertainty_expansion_round(
+                selected_parent_infos=selected_parent_infos,
+                horizon=horizon,
+                conditions=conditions,
+                start=None,
+                goal=None,
+            )
+            self._postprocess_tree_local_expansions(
+                mixed_round_result["tree_batches"],
+                agent,
+                envs,
+                start,
+                goal,
+                loops,
+                namespace=namespace,
+                log_videos_and_viz=False,
+            )
+            self._update_multi_tree_direct_bridges_from_expansions(
+                planner_state=planner_state,
+                tree_batches=mixed_round_result["tree_batches"],
+            )
+            self._update_multi_tree_meeting_targets_from_expansions(
+                planner_state=planner_state,
+                tree_batches=mixed_round_result["tree_batches"],
+            )
+            accepted_candidates = self._select_multi_tree_round_meetings(
+                planner_state=planner_state,
+                expanded_node_infos=mixed_round_result["expanded_node_infos"],
+            )
+            self._accept_multi_tree_round_meetings(
+                planner_state=planner_state,
+                accepted_candidates=accepted_candidates,
+                loops=loops,
+            )
+            self._compute_tentative_hamiltonian_solution(planner_state)
+            original_step_captures = getattr(self, "_expansion_step_captures_by_name", {})
+            try:
+                for tree_batch in mixed_round_result["tree_batches"].values():
+                    self._log_tree_batch_visualizations(
+                        tree_batch,
+                        start,
+                        goal,
+                        loops,
+                        namespace=namespace,
+                    )
+            finally:
+                self._expansion_step_captures_by_name = original_step_captures
+        else:
+            termination_reason = "val_max_loops"
+
+        for tree in planner_state["trees"]:
+            if tree.pbar is not None:
+                tree.pbar.close()
+        global_search_pbar.close()
+
+        selected_plan_bundle = self._assemble_multi_tree_plan_bundle(planner_state)
+        accepted_pairs_text = ", ".join(
+            f"{anchor_short_label(int(a), len(planner_state['trees']))}-"
+            f"{anchor_short_label(int(b), len(planner_state['trees']))}"
+            for a, b in sorted(planner_state["accepted_pair_edges"].keys())
+        ) or "none"
+        solver_route_text = planner_state.get("tentative_solver_result", {}).get(
+            "route_text",
+            "unknown",
+        )
+        print(
+            "[MCTD debug] Multi-tree termination | "
+            f"reason={termination_reason} | loops={loops} | "
+            f"parents={self.global_search_num}/{self.mctd_max_search_num} | "
+            f"accepted={accepted_pairs_text} | tentative={solver_route_text}",
+            flush=True,
+        )
+        return {
+            "planner_state": planner_state,
+            "loops": loops,
+            "selected_plan_bundle": selected_plan_bundle,
+            "best_node": None,
+        }
 
     def _node_path_label(
         self,

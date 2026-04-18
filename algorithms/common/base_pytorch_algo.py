@@ -118,6 +118,20 @@ class BasePytorchAlgo(pl.LightningModule, ABC):
 
         return max(step_candidates)
 
+    def reserve_wandb_step(self, min_step: Optional[int] = None) -> int:
+        """Return a monotonic WandB step suitable for immediate media commits.
+
+        Media-heavy validation logs often emit multiple videos inside the same
+        planning loop. Reusing the same explicit step can cause WandB to buffer
+        updates until a later commit or until the run finishes. Reserving a
+        unique step per media item makes the upload visible sooner in the UI.
+        """
+        safe_step = self.get_safe_wandb_step(min_step=min_step)
+        last_reserved = int(getattr(self, "_last_reserved_wandb_step", -1))
+        reserved_step = max(safe_step, last_reserved + 1)
+        self._last_reserved_wandb_step = reserved_step
+        return reserved_step
+
     def log_video(
         self,
         key: str,
@@ -127,6 +141,7 @@ class BasePytorchAlgo(pl.LightningModule, ABC):
         fps: int = 12,
         format: str = "mp4",
         step: Optional[int] = None,
+        commit: bool = True,
     ):
         """
         Log video to wandb. WandbLogger in pytorch lightning does not support video logging yet, so we call wandb directly.
@@ -174,6 +189,7 @@ class BasePytorchAlgo(pl.LightningModule, ABC):
                 key: wandb.Video(video, fps=fps, format=format),
             },
             step=step if step is not None else self.global_step,
+            commit=commit,
         )
 
     def log_image(

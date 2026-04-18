@@ -390,6 +390,12 @@ def main():
     parser.add_argument("--start_task_id", type=int, default=1, help="Starting task index (1-based)")
     parser.add_argument("--segment_episode_len", type=int, default=None,
                         help="Override segment_episode_len (raw, pre-jump). Defaults to value in df_planning.yaml.")
+    parser.add_argument("--multi_tree_hemiltonian", action="store_true",
+                        help="Enable the multi-tree online Hamiltonian planner path.")
+    parser.add_argument("--task_override_path", type=str, default=None,
+                        help="Optional task override YAML path relative to repo root.")
+    parser.add_argument("--task_override_waypoint_group_idx", type=int, default=None,
+                        help="Optional waypoint group index override for task overrides.")
 
     args = parser.parse_args()
 
@@ -571,6 +577,14 @@ def main():
         "experiment.validation.inference_mode": False,
         "experiment.validation.limit_batch": 1,
     })
+    if args.multi_tree_hemiltonian:
+        basic_job_config["algorithm.multi_tree_hemiltonian"] = True
+    if args.task_override_path:
+        basic_job_config["algorithm.task_override_path"] = args.task_override_path
+    if args.task_override_waypoint_group_idx is not None:
+        basic_job_config["algorithm.task_override_waypoint_group_idx"] = int(
+            args.task_override_waypoint_group_idx
+        )
 
     # Always embed all resolved arch params so exp_base.py can skip reloading the ckpt.
     arch_overrides = {

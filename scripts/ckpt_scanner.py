@@ -97,6 +97,36 @@ def _match_dataset_by_mean(data_mean: torch.Tensor, project_dir: Path) -> str | 
     return None
 
 
+def _load_yaml(path: Path) -> dict | None:
+    try:
+        import yaml
+    except ImportError:
+        return None
+
+    if not path.is_file():
+        return None
+
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _load_adjacent_training_config(ckpt_path: Path, real_path: Path) -> dict | None:
+    """Load training_config.yaml stored next to the ckpt symlink or real file."""
+    candidates = [ckpt_path.parent / "training_config.yaml"]
+    if real_path.parent != ckpt_path.parent:
+        candidates.append(real_path.parent / "training_config.yaml")
+
+    for cfg_path in candidates:
+        cfg = _load_yaml(cfg_path)
+        if isinstance(cfg, dict) and ("algorithm" in cfg or "dataset" in cfg):
+            return cfg
+    return None
+
+
 def _meta_to_flat(nested: dict) -> dict:
     """Convert nested training_config.yaml-style structure to flat metadata dict."""
     algo = nested.get("algorithm") or {}
@@ -129,6 +159,27 @@ def _cache_entry_to_flat(cached: dict) -> dict:
     return {k: cached.get(k) for k in ("obs_dim_indices", "jump", "dataset",
                                         "frame_stack", "network_size",
                                         "num_layers", "attn_heads")}
+
+
+def _merge_flat_metadata(*metas: dict | None) -> dict:
+    """Merge flat metadata dicts, preferring earlier non-null values."""
+    merged: dict = {}
+    for meta in metas:
+        if not isinstance(meta, dict):
+            continue
+        for key, value in meta.items():
+            if key not in merged or merged[key] in (None, _UNKNOWN):
+                if value not in (None, _UNKNOWN):
+                    merged[key] = value
+    return merged
+
+
+def _meta_score(flat: dict | None) -> int:
+    if not isinstance(flat, dict):
+        return 0
+    keys = ("obs_dim_indices", "jump", "dataset", "frame_stack",
+            "network_size", "num_layers", "attn_heads")
+    return sum(flat.get(k) not in (None, _UNKNOWN) for k in keys)
 
 
 def _is_meta_complete(flat: dict) -> bool:
@@ -281,34 +332,53 @@ def main():
             # Check model_id entry written by train.sh (works for both old- and new-style paths).
             # Provides richer metadata: pos_dim_indices, causal, dim_feedforward, episode_len, etc.
             trainsh_meta = None
+            trainsh_nested = None
             mid_cached = cache.get(model_id)
             if isinstance(mid_cached, dict) and mid_cached.get("_source") == "train_sh":
+                trainsh_nested = mid_cached
                 trainsh_meta = _meta_to_flat(mid_cached)
+
+            sidecar_nested = _load_adjacent_training_config(ckpt_path, real_path)
+            sidecar_meta = _meta_to_flat(sidecar_nested) if sidecar_nested else None
 
             cached = cache.get(real_key)
             if cached and cached.get("mtime") == mtime:
                 realpath_flat = _cache_entry_to_flat(cached)
                 epoch = cached["epoch"]
-                # Prefer train.sh metadata when complete (has pos_dim_indices etc.)
-                candidate = trainsh_meta if (trainsh_meta and _is_meta_complete(trainsh_meta)) \
-                            else realpath_flat
+                candidate = _merge_flat_metadata(trainsh_meta, sidecar_meta, realpath_flat)
                 if _is_meta_complete(candidate):
                     meta = candidate
+                    if _meta_score(sidecar_meta) > _meta_score(realpath_flat):
+                        cache[real_key] = {"mtime": mtime, "epoch": epoch, **sidecar_nested}
+                        cache_dirty = True
+                    elif _meta_score(trainsh_meta) > _meta_score(realpath_flat):
+                        cache[real_key] = {"mtime": mtime, "epoch": epoch, **trainsh_nested}
+                        cache_dirty = True
                 else:
                     # Realpath cache stale/incomplete — reload checkpoint for metadata
                     ckpt = torch.load(str(real_path), map_location="cpu", weights_only=False)
                     nested = _extract_arch_metadata(ckpt, project_dir)
-                    meta = trainsh_meta if (trainsh_meta and _is_meta_complete(trainsh_meta)) \
-                           else _meta_to_flat(nested)
-                    cache[real_key] = {"mtime": mtime, "epoch": epoch, **nested}
+                    ckpt_meta = _meta_to_flat(nested)
+                    meta = _merge_flat_metadata(trainsh_meta, sidecar_meta, realpath_flat, ckpt_meta)
+                    best_nested = nested
+                    if _meta_score(sidecar_meta) > _meta_score(ckpt_meta):
+                        best_nested = sidecar_nested
+                    elif _meta_score(trainsh_meta) > _meta_score(ckpt_meta):
+                        best_nested = trainsh_nested
+                    cache[real_key] = {"mtime": mtime, "epoch": epoch, **best_nested}
                     cache_dirty = True
             else:
                 ckpt  = torch.load(str(real_path), map_location="cpu", weights_only=False)
                 nested = _extract_arch_metadata(ckpt, project_dir)
                 epoch = int(ckpt.get("epoch", 0))
-                meta = trainsh_meta if (trainsh_meta and _is_meta_complete(trainsh_meta)) \
-                       else _meta_to_flat(nested)
-                cache[real_key] = {"mtime": mtime, "epoch": epoch, **nested}
+                ckpt_meta = _meta_to_flat(nested)
+                meta = _merge_flat_metadata(trainsh_meta, sidecar_meta, ckpt_meta)
+                best_nested = nested
+                if _meta_score(sidecar_meta) > _meta_score(ckpt_meta):
+                    best_nested = sidecar_nested
+                elif _meta_score(trainsh_meta) > _meta_score(ckpt_meta):
+                    best_nested = trainsh_nested
+                cache[real_key] = {"mtime": mtime, "epoch": epoch, **best_nested}
                 cache_dirty = True
 
             # ── Optional obs_dim filter ──────────────────────────────────────

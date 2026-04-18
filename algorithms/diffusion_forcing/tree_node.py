@@ -14,7 +14,8 @@ class TreeNode():
                  sim_state: Optional[dict] = None,
                  target_node: Optional['TreeNode'] = None,
                  selection_count: Optional[int] = None,
-                 cluster_subplans: Optional[list] = None):
+                 cluster_subplans: Optional[list] = None,
+                 cum_temporal_dist_from_root: float = 0.0):
         self.name = name
         self.depth = depth
         self._parent_node = parent_node
@@ -54,6 +55,9 @@ class TreeNode():
         # last_selection_count: latest count at which this node was selected as a parent.
         self.selection_count: Optional[int] = selection_count
         self.last_selection_count: Optional[int] = selection_count
+        # Running temporal distance from this tree's root to the node.
+        # Root nodes start at 0.0; children are updated after obs is materialized.
+        self.cum_temporal_dist_from_root: float = float(cum_temporal_dist_from_root)
 
         # Per-cluster sub-plans derived from uncertainty sampling.
         # Populated after _compute_node_uncertainty when use_cluster_subplan_as_expansion=True.

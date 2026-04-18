@@ -86,6 +86,68 @@ def solve_fixed_endpoint_hamiltonian_path(anchor_shortest_dists: np.ndarray) -> 
     }
 
 
+def solve_fixed_endpoint_hamiltonian_path_with_forced_adjacency(
+    anchor_shortest_dists: np.ndarray,
+    forced_adjacent_pairs: list[tuple[int, int]] | None = None,
+) -> dict[str, Any]:
+    anchor_shortest_dists = np.asarray(anchor_shortest_dists, dtype=np.float32)
+    n_anchors = int(anchor_shortest_dists.shape[0])
+    if anchor_shortest_dists.shape != (n_anchors, n_anchors):
+        raise ValueError("anchor_shortest_dists must be a square matrix")
+    if n_anchors < 2:
+        raise ValueError("At least start and goal anchors are required")
+
+    normalized_pairs: list[tuple[int, int]] = []
+    for pair in (forced_adjacent_pairs or []):
+        if len(pair) != 2:
+            raise ValueError("Each forced adjacency must contain exactly two anchor indices")
+        a, b = int(pair[0]), int(pair[1])
+        if a == b:
+            raise ValueError("Forced adjacency cannot contain identical endpoints")
+        normalized_pairs.append((min(a, b), max(a, b)))
+
+    waypoint_indices = list(range(1, n_anchors - 1))
+    best_order = None
+    best_cost = np.inf
+    best_step_costs = None
+
+    for waypoint_order in permutations(waypoint_indices):
+        order = np.asarray((0,) + waypoint_order + (n_anchors - 1,), dtype=np.int32)
+        order_pairs = {
+            (min(int(order[i]), int(order[i + 1])), max(int(order[i]), int(order[i + 1])))
+            for i in range(len(order) - 1)
+        }
+        if any(pair not in order_pairs for pair in normalized_pairs):
+            continue
+
+        step_costs = anchor_shortest_dists[order[:-1], order[1:]]
+        if not np.all(np.isfinite(step_costs)):
+            continue
+        total_cost = float(np.sum(step_costs, dtype=np.float64))
+        if total_cost < best_cost:
+            best_cost = total_cost
+            best_order = order
+            best_step_costs = np.asarray(step_costs, dtype=np.float32)
+
+    if best_order is None or best_step_costs is None:
+        return {
+            "feasible": False,
+            "anchor_order": np.zeros((0,), dtype=np.int32),
+            "step_costs": np.zeros((0,), dtype=np.float32),
+            "total_cost": np.inf,
+            "route_text": "no feasible Hamiltonian path",
+        }
+
+    route_text = " -> ".join(anchor_short_label(int(idx), n_anchors) for idx in best_order.tolist())
+    return {
+        "feasible": True,
+        "anchor_order": best_order,
+        "step_costs": best_step_costs,
+        "total_cost": float(best_cost),
+        "route_text": route_text,
+    }
+
+
 def batch_solve_fixed_endpoint_hamiltonian_paths(
     full_pairwise_dists: np.ndarray,
     combo_indices: np.ndarray,

@@ -7,8 +7,8 @@
 - `eval_hemiltonian.sh`는 `eval_all.sh` 스타일의 task 부여 방식을 따른다.
 - 1차 실행 분량은 task별 1회, 총 5 jobs로 제한한다.
 - `use_uncertainty_as_value=True` 경로만 지원한다.
-- `uncertainty_mode`에 `temporal_dist`를 추가한다.
-- node value는 `-T_curr`를 사용한다.
+- `uncertainty_mode`에 `expected_root_node_dist`를 추가한다.
+- 1차 구현의 기본 selection value는 `-(cum_td_i + T_curr + cum_td_j)`를 사용한다.
   - `T_curr`: 현재 expanding node와 선택된 target node 사이의 temporal distance
 - 첫 accepted connection은 고정한다.
   - 나중에 더 짧은 동일 pair connection이 나와도 accepted edge 자체는 교체하지 않는다.
@@ -20,12 +20,20 @@
 - fast uncertainty sampling / cluster-subplan reuse는 현재 config 그대로 유지한다.
 - fast uncertainty sampling에서의 target selection도 main target selection과 같은
   `reliable_TD_threshold + tentative-neighbor rule`을 따른다.
+- target node semantics는 `meeting_target_node`, `value_target_node`의 2종으로 분리한다.
+  - `meeting_target_node`: child가 실제로 expand된 뒤, 새로 생성된 segment를 기준으로 fresh하게 재선정
+  - `value_target_node`: pre-expansion parent ranking / uncertainty conditioning 단계에서 선정된 저장 target을 유지
+- cluster cache는 별도 target-provenance key로 invalidate하지 않는다.
+  - `cluster_subplans`는 parent에서 발견된 continuation mode 집합으로 해석한다.
+  - 따라서 target tree / target node가 바뀌어도 기존 cluster를 바로 폐기하지 않는다.
 - closure-based fallback에서는 future anchor를 hidden intermediate로 허용하지 않는다.
 - middle tree가 tentative path 상 두 neighbor를 모두 가질 때는 더 가까운 쪽을 우선 target한다.
 - 다만 과거 라운드에서 이미 접합된 neighbor tree 소속 후보는 target 적격성 심사에서 reject한다.
 - accepted pair reject 규칙은 target selection / meeting acceptance에만 적용한다.
 - `best_direct_bridge` / `D_direct` 관측 업데이트는 accepted pair에 대해서도 계속 수행할 수 있다.
-- 다만 accepted된 pair의 solver 입력 cost는 accepted cost로 freeze하는 것을 권장한다.
+- accepted된 pair의 solver 입력 cost는 raw direct cost를 계속 갱신해도 된다.
+- 이유: `D_direct + hard adjacency constraint` 조합에서는 accepted pair cost는 feasible path들 사이에서 상수항이므로,
+  tentative path argmin 자체에는 보통 영향을 주지 않는다.
 - waypoint root 초기화는 현재 goal root 초기화 방식과 동일하게 간다.
   - `initial_sim_state` 복사
   - `qpos[:2] = waypoint_xy`
@@ -227,7 +235,8 @@ accepted connection은 별도로 관리한다.
 - accepted 전에는 둘이 같다.
 - accepted 후에는:
   - `best_direct_bridge_raw[(i, j)]`는 계속 내려갈 수 있다.
-  - `effective_pair_cost[(i, j)]`는 accepted cost로 freeze된다.
+  - `effective_pair_cost[(i, j)]`도 raw direct cost를 따라 계속 갱신해도 된다.
+  - 다만 final execution은 여전히 `accepted_pair_edges[(i, j)]`를 사용한다.
 
 ### 4.5 Accepted segment state
 
@@ -341,7 +350,7 @@ tie-break는 기존처럼:
 - 깊은 depth 우선
 - name lexical
 
-### Round Step 2. target node selection
+### Round Step 2. pre-expansion `value_target_node` selection
 
 확장하려는 node `u in tree_i`에 대해:
 
@@ -361,9 +370,9 @@ tie-break는 기존처럼:
 
 결과:
 
-- `target_node = v`
 - `target_tree = tree_j`
-- `value(u) = -TD(u, v)`
+- `value_target_node = v`
+- parent selection 시점의 ranking value는 `u`와 `v`를 기준으로 계산한다.
 
 중요:
 
@@ -372,6 +381,38 @@ tie-break는 기존처럼:
 - tentative path 상 middle tree의 양 neighbor가 모두 후보를 제공하면, 더 가까운 쪽을 선택한다.
 - 이 reject 규칙은 “그 tree를 향한 새로운 meeting을 만들지 않도록” 하기 위한 것이다.
 - direct bridge raw observation 자체를 막기 위한 규칙은 아니다.
+- 이 단계의 `value_target_node`는 parent ranking / uncertainty conditioning용 provisional target이다.
+- 실제 child의 접합 판정에는 이 node를 그대로 재사용하지 않는다.
+
+### Round Step 3. post-expansion meeting target recomputation
+
+child `c`가 실제로 생성된 뒤에는 target semantics를 아래처럼 분리한다.
+
+- `meeting_target_node`
+  - child가 이번 라운드에 실제로 생성한 새 segment만을 기준으로 fresh하게 선택한다.
+  - 후보는:
+    - source tree 자신 제외
+    - 이미 accepted된 neighbor tree 제외
+    - 이미 satisfied된 tree 제외
+    - pre-round tentative path 상 허용된 adjacent tree만 허용
+  - segment와 node의 거리는 사용자가 지정한 정의를 따른다.
+    - `dist(segment(c), node_j) = min_i temporal_dist(state_i, node_j)`
+    - 여기서 `state_i`는 child가 이번 라운드에 생성한 새 segment 위 상태
+  - 이 값을 최소화하는 candidate node를 `meeting_target_node`로 둔다.
+
+- `value_target_node`
+  - pre-expansion에서 parent ranking / uncertainty conditioning용으로 정해진 provisional target을
+    child에 저장한 값을 그대로 유지한다.
+  - post-expansion에는 이 stored value target을 덮어쓰지 않는다.
+  - 다음 라운드에 해당 child가 다시 parent 후보가 될 때 fresh target/value는 그 시점에 transient하게
+    다시 계산한다.
+
+핵심 원칙:
+
+- `meeting_target_node`와 `value_target_node`는 같은 node일 수도 있고 다를 수도 있다.
+- cluster reuse는 exploration branching 수단으로 해석한다.
+- 따라서 “cluster가 과거 어떤 target을 보고 생성되었는가”를 이유로
+  `cluster_subplans`를 invalidate하지 않는다.
 
 ## 7. `temporal_dist` 모드와 기존 uncertainty path의 관계
 
@@ -383,11 +424,11 @@ tie-break는 기존처럼:
 - cluster_subplans
 - uncertainty-derived value
 
-하지만 `uncertainty_mode=temporal_dist`에서는 value 정의가 완전히 다르다.
+하지만 `uncertainty_mode=expected_root_node_dist`에서는 value 정의가 완전히 다르다.
 
 사용자 지시에 따라 1차 구현은 현재 `configurations/algorithm/df_planning.yaml` 세팅을 그대로 유지한다고 본다.
 
-즉, `uncertainty_mode`만 `temporal_dist`로 바뀌고 아래는 유지된다.
+즉, `uncertainty_mode`만 `expected_root_node_dist`로 바뀌고 아래는 유지된다.
 
 - `use_uncertainty_as_value: true`
 - `use_cluster_subplan_as_expansion: true`
@@ -405,7 +446,7 @@ tie-break는 기존처럼:
 하지만 실제 코드상:
 
 - `cluster_labels`는 `uncertainty_mode`와 무관하게 `cluster_tail_by_temporal_dist(...)`로 항상 계산된다.
-- 따라서 `temporal_dist` 모드에서도 fast-sampling + clustering + cluster_subplan reuse를 유지할 수 있다.
+- 따라서 `expected_root_node_dist` 모드에서도 fast-sampling + clustering + cluster_subplan reuse를 유지할 수 있다.
 
 현 시점 권장안은 아래다.
 
@@ -416,17 +457,18 @@ tie-break는 기존처럼:
 
 구체적으로:
 
-- `uncertainty_mode=temporal_dist`일 때 `_compute_node_uncertainty(...)`는
+- `uncertainty_mode=expected_root_node_dist`일 때 `_compute_node_uncertainty(...)`는
   - `cluster_labels`, `n_clusters`, `T_curr`는 계속 계산하고
-  - selection에 쓰일 scalar value는 `-T_curr`로 해석한다.
+  - selection에 쓰일 scalar value는
+    `-(cum_td_i + T_curr + cum_td_j)`로 해석한다.
 - `_compute_uncertainty_and_clusters(...)`는
   - cluster_subplans 생성 로직은 기존대로 유지하되
-  - `values.append(-unc_result["T_curr"])`를 사용한다.
+  - `values.append(float(unc_result["selection_value"]))`를 사용한다.
 
 즉:
 
 - “exploration branching은 현재 uncertainty/cluster config를 그대로 사용”
-- “parent/root selection에 쓰이는 scalar value만 temporal-distance 기반으로 바꾼다”
+- “parent/root selection에 쓰이는 scalar value만 expected-root-node-distance 기반으로 바꾼다”
 
 이 해석이 현재 config를 최대한 보존하면서도 사용자 요구와 가장 잘 맞는다.
 
@@ -447,63 +489,38 @@ tie-break는 기존처럼:
 - rollout 사용 여부와 무관하게 한 곳에서 처리 가능
 - direct bridge update 시 언제나 최신 누적 TD를 참조 가능
 
-## 8.5 selection value로 무엇을 쓸 것인가에 대한 평가
+## 8.5 selection value로 무엇을 쓸 것인가
 
 현재 확정값:
 
-- selection value는 `-T_curr`
+- `uncertainty_mode=expected_root_node_dist`일 때 selection value는
+  `-(cum_td_i + T_curr + cum_td_j)`를 사용한다.
 
-사용자가 제안한 대안:
+이 값을 채택한 이유:
 
-- `-(cum_td_i + T_curr + cum_td_j)`
+- local TD만 보는 것이 아니라, 실제 root-to-root direct bridge total cost를 바로 ranking에 반영한다.
+- online Hamiltonian planner가 계속 추적하는 tree-level direct bridge와 node-level selection objective를 일치시킨다.
 
-이 대안의 장점:
+비판적으로 보면 아래 리스크는 남아 있다.
 
-- local closeness가 아니라 “root_i에서 root_j까지 이어지는 direct bridge total cost”를 바로 최적화한다.
-- 우회가 심한 node가 단지 어떤 target tree 가까이에 있다는 이유만으로 과대평가되는 현상을 줄일 수 있다.
-- 같은 pair에 대해 나중 라운드에서 더 낮은 raw direct cost가 다시 발견될 가능성을 줄일 수는 있다.
+1. shallow-node bias
+   - `cum_td_i` 때문에 깊은 node가 불리해질 수 있다.
+2. opposite-tree maturity bias
+   - `cum_td_j` 때문에 상대 tree가 얼마나 성장했는지에 value가 좌우된다.
+3. noise accumulation
+   - 세 추정치를 합치므로 scalar variance가 커질 수 있다.
 
-하지만 1차 구현에서 이 값을 selection value로 바로 쓰는 것은 권장하지 않는다.
+하지만 1차 구현에서는 이 리스크를 감수하고도 아래 장점이 더 크다고 본다.
 
-이유:
+- raw direct bridge table update와 같은 objective를 selection도 공유하게 된다.
+- 사용자가 원하는 “나중 라운드에 더 낮은 root-to-root direct cost가 다시 발견될 확률 감소” 방향과 더 잘 맞는다.
 
-1. shallow-node bias가 강해진다.
-   - `cum_td_i`는 depth가 깊어질수록 단조 증가한다.
-   - 따라서 deeper node가 실제로는 올바른 통로를 따라 target tree에 접근하고 있어도,
-     누적 비용 때문에 root 근처 얕은 node보다 계속 불리할 수 있다.
+실험 확장 여지는 남긴다.
 
-2. opposite-tree maturity bias가 생긴다.
-   - `cum_td_j`는 target tree가 얼마나 잘 자랐는지에 좌우된다.
-   - 그러면 expanding tree의 value가 상대 tree의 성장 상태에 과도하게 종속된다.
+- `temporal_dist`: `-T_curr`
+- `expected_root_node_dist`: `-(cum_td_i + T_curr + cum_td_j)`
 
-3. estimation noise가 누적된다.
-   - `cum_td_i`, `T_curr`, `cum_td_j`는 모두 temporal-distance 추정치다.
-   - 셋을 더하면 selection scalar의 분산이 커지고, ranking 신뢰도가 떨어질 수 있다.
-
-4. 지금 구조에서는 이미 full direct cost를 따로 쓰고 있다.
-   - `best_direct_bridge_raw[(i, j)]` 갱신은 정확히 `cum_td_i + T_curr + cum_td_j`류 값을 쓴다.
-   - 즉, tree-level planner 정보는 이미 full-cost 기준으로 관리된다.
-   - selection까지 같은 값을 쓰면 “탐색용 local signal”과 “planner용 global signal”이 중복되어
-     오히려 탐색 다양성이 줄 수 있다.
-
-따라서 현재 권장안은:
-
-- selection value는 `-T_curr` 유지
-- direct bridge table update는 `cum_td_i + T_curr + cum_td_j` 사용
-
-즉:
-
-- node selection은 local attraction 기준
-- planner update는 global bridge cost 기준
-
-으로 역할을 분리한다.
-
-향후 실험 후보로는 아래가 더 안전하다.
-
-- primary key: `-T_curr`
-- secondary tie-break: `-(cum_td_i + T_curr + cum_td_j)`
-
-이 hybrid는 전면 교체보다 위험이 작다.
+이 두 모드를 모두 지원하면 이후 비교가 가능하다.
 
 ## 9. Tree-level direct bridge update
 
@@ -562,14 +579,21 @@ tie-break는 기존처럼:
 추가 원칙:
 
 - `best_direct_bridge_raw[(i, j)]`는 계속 갱신 가능
-- 하지만 accepted된 pair의 solver 입력 cost(`effective_pair_cost`)는 freeze
+- accepted된 pair의 solver 입력 cost(`effective_pair_cost`)도 raw direct cost를 계속 반영할 수 있다.
 
 ## 10. Meeting acceptance
 
-meeting 자체의 판정은 기존 코드와 동일하게 둔다.
+meeting 판정은 기존 2-tree 코드의 “preselected target만 본다”에서 벗어나,
+이번 라운드에 생성된 child segment를 기준으로 `meeting_target_node`를 fresh하게
+선정한 뒤 그 node를 대상으로 판정한다.
 
-- expanding node와 `target_node` 간 gap / achieved 판정
-- `target_node`가 아닌 제3의 node를 스쳐도 무시
+정리하면:
+
+- parent selection 단계에서 사용한 provisional `value_target_node`는 meeting 판정에 직접 쓰지 않는다.
+- child가 실제로 만든 새 segment를 기준으로 eligible node pool을 다시 훑는다.
+- `dist(segment(c), node_j) = min_i temporal_dist(state_i, node_j)`를 사용해
+  가장 가까운 eligible node를 `meeting_target_node`로 선택한다.
+- meeting acceptance는 이 `meeting_target_node`를 기준으로 수행한다.
 
 다만 accepted edge로 고정하는 조건은 바뀐다.
 
@@ -577,7 +601,7 @@ meeting 자체의 판정은 기존 코드와 동일하게 둔다.
 
 meeting candidate `{tree_i, tree_j}`를 accepted edge로 저장하려면:
 
-- 이번 라운드에서 expanding node의 `target_tree == tree_j`
+- 이번 라운드에서 fresh하게 선택된 `meeting_target_node in tree_j`
 - `{tree_i, tree_j}`가 현재 tentative path의 인접 pair여야 한다.
 
 그렇지 않으면:
@@ -589,7 +613,8 @@ meeting candidate `{tree_i, tree_j}`를 accepted edge로 저장하려면:
 
 동일 라운드에 동일 `{i, j}` pair meeting이 여러 개 생기면:
 
-- 더 짧은 경로 하나만 accepted 후보로 남긴다.
+- `bridge_cost`가 더 짧은 경로 하나만 accepted 후보로 남긴다.
+- tie-break가 필요하면 `dist(segment(c), meeting_target_node)`가 더 작은 쪽을 우선한다.
 
 ### 10.3 accepted edge 확정 후 처리
 
@@ -694,7 +719,7 @@ full success가 아니면:
 
 - `multi_tree_hemiltonian: false`
 - `reliable_TD_threshold: <default>`
-- `uncertainty_mode` 주석에 `temporal_dist` 추가
+- `uncertainty_mode` 주석에 `temporal_dist`, `expected_root_node_dist` 추가
 - 기존 `task_override_path`, `task_override_waypoint_group_idx`는 그대로 사용
 
 의도:
@@ -817,13 +842,14 @@ full success가 아니면:
 - segment orientation 포함 brute-force
 - `start`, `goal` endpoint 유지
 
-### Step 5. `temporal_dist` scalar value 경로 추가
+### Step 5. `expected_root_node_dist` scalar value 경로 추가
 
 #### `algorithms/diffusion_forcing/df_planning.py::_compute_node_uncertainty`
 
 새 branch 추가:
 
 - `self.uncertainty_mode == "temporal_dist"`
+- `self.uncertainty_mode == "expected_root_node_dist"`
 
 동작:
 
@@ -832,18 +858,21 @@ full success가 아니면:
   - `n_clusters`
   - `T_curr`
   는 계산
-- 하지만 uncertainty scalar `U` 대신 selection용 의미값을 `T_curr`로 반환
+- 추가로 필요한 경우
+  - `cum_td_i`
+  - `cum_td_j`
+  를 받아 selection value 계산
 
 권장 반환 형식:
 
 - `result["T_curr"]`
-- `result["selection_value"] = -T_curr`
+- `result["selection_value"]`
 
 #### `algorithms/diffusion_forcing/df_planning.py::_compute_uncertainty_and_clusters`
 
 수정:
 
-- `temporal_dist` 모드일 때
+- `temporal_dist` / `expected_root_node_dist` 모드일 때
   - `values.append(float(unc_result["selection_value"]))`
 - cluster_subplans 생성은 기존 그대로 유지
 
@@ -873,6 +902,7 @@ full success가 아니면:
 
 - `_rank_target_candidates_from_tree_pool(current_leaf_obs, trees, excluded_tree_tag) -> list[dict]`
 - `_select_online_hamiltonian_target_node(current_leaf_obs, source_tree, trees, tentative_adjacent_pairs, reliable_td_threshold, accepted_pairs) -> tuple[target_tree, target_node, td_value]`
+- `_select_meeting_target_from_segment(segment_states, source_tree, trees, tentative_adjacent_pairs, accepted_pairs) -> Optional[dict]`
 
 규칙:
 
@@ -881,11 +911,13 @@ full success가 아니면:
 - `TD < reliable_TD_threshold`이면 tentative neighbor tree만 허용
 - middle tree 양옆이 모두 가능하면 더 가까운 쪽
 - 처음 만나는 `TD >= reliable_TD_threshold` 후보는 tree identity 무관하게 채택
+- `meeting_target`은 child boundary obs가 아니라 이번 라운드 새 segment 전체를 사용한다.
 
 적용 지점:
 
 - main expansion target selection
 - fast uncertainty sampling target selection
+- round postprocess의 meeting target recomputation
 
 ### Step 7. Global parent selection / mixed expansion multi-tree화
 
@@ -933,7 +965,7 @@ full success가 아니면:
 
 - `selected_tree`
 - `target_tree`
-- `target_node`
+- provisional `value_target_node`
 
 를 설정하게 한다.
 
@@ -964,6 +996,7 @@ full success가 아니면:
 multi-tree branch에서 추가할 새 helper:
 
 - `_update_direct_bridge_repository_from_round(tree_batches, all_trees, distance_state)`
+- `_select_meeting_target_node_from_new_segment(child_node, source_tree, planner_state) -> Optional[dict]`
 
 역할:
 
@@ -971,11 +1004,13 @@ multi-tree branch에서 추가할 새 helper:
 - `best_direct_bridge_raw` 갱신
 - `effective_pair_cost` 갱신
 - `D_walk_global` 재계산
+- 각 child에 대해 fresh `meeting_target_node` 계산
 
 주의:
 
 - accepted pair도 raw observation은 계속 갱신할 수 있다.
-- 하지만 solver 입력에 쓰는 pair cost는 accepted되면 freeze한다.
+- accepted pair cost도 raw direct cost를 계속 갱신할 수 있다.
+- `cluster_subplans`는 target 변경만으로 invalidate하지 않는다.
 
 ### Step 9. Accepted meeting 처리
 
@@ -991,6 +1026,10 @@ multi-tree용 새 helper 제안:
 정책:
 
 - pre-round tentative adjacent pair만 accepted eligibility 가짐
+- 각 expanded child는 fresh `meeting_target_node`를 먼저 계산한 뒤에만 meeting 후보가 된다.
+- `meeting_target_node` 선정에는 child의 이번 라운드 새 segment만 사용한다.
+- `meeting_target_node` 선정 metric은
+  `min_i temporal_dist(state_i, node_j)` 이다.
 - 동일 `{i, j}` pair meeting 다수면 shortest만 채택
 - 여러 pair는 같은 pre-round tentative path 기준으로 동시에 처리
 
@@ -1047,9 +1086,17 @@ multi-tree용 새 helper 제안:
 이번 턴 기준으로 아래는 확정된 것으로 본다.
 
 - accepted edge adjacency 판정은 pre-round tentative path 기준
-- accepted된 pair의 solver 입력 cost는 accepted cost로 freeze
+- accepted된 pair의 solver 입력 cost도 raw direct cost를 계속 갱신할 수 있다.
+- `meeting_target_node` / `value_target_node` 2-target 구조를 사용한다.
 
-남은 질문은 없다. 이후 구현 단계에서 막히는 세부 사양만 추가 질의한다.
+남은 질문은 1개다.
+
+- `meeting_target_node`를 `min_i temporal_dist(state_i, node_j)`로 선정한 뒤,
+  최종 meeting acceptance threshold는 무엇으로 둘지 확정이 필요하다.
+  - 안 A: 기존처럼 `_compute_plan_gap(child_node, meeting_target_node) < meeting_delta`
+  - 안 B: 새로 정의한 `dist(segment(c), node_j) < meeting_delta`
+
+이 한 점만 확인되면 구현에 바로 들어갈 수 있다.
 
 ## 16. 최종 권장안 요약
 
@@ -1068,3 +1115,50 @@ multi-tree용 새 helper 제안:
 - accepted-edge-first fallback execution
 
 을 한 흐름으로 묶을 수 있다.
+
+## 17. Multi-Tree Directionality Cleanup Plan
+
+현재 구현은 multi-tree search를 도입했지만, `G` anchor만 여전히 legacy bidirectional
+backward-tree semantics를 일부 유지하고 있다. 특히 아래 항목들이 남아 있다.
+
+- tree init에서 `G`만 `is_tree1=False`
+- local segment extraction에서 tree 방향 분기
+- rollout에서 `is_backward=(not active_tree.is_tree1)` 사용
+- uncertainty/final-plan visualization에서 `"from_goal"` / suffix-valid-frame 가정
+- 일부 pairwise postprocess helper의 forward/backward concatenation 가정
+
+이번 턴에서는 bug fix 범위를 최소화하기 위해 `_extract_new_segment_obs()`만 먼저
+수정했고, multi-tree mode에서는 새 segment를 항상 각 tree의 prefix
+`[start_len:end_len)` 기준으로 슬라이싱하도록 맞췄다.
+
+### 17.1 다음 리팩토링 순서
+
+1. multi-tree mode에서 anchor initialization semantics 통일
+   - `S`, `W*`, `G` 모두 동일한 "anchor-rooted forward-prefix tree"로 취급
+   - legacy bidirectional mode만 `is_tree1` / backward semantics 유지
+
+2. multi-tree rollout semantics 분리
+   - `_update_expanded_children_state()`에서 multi-tree branch는
+     `is_backward` 분기를 사용하지 않도록 정리
+   - boundary obs / sim state update를 tree-prefix semantics에 맞게 통일
+
+3. multi-tree visualization semantics 분리
+   - `_get_plan_viz_valid_frame_bounds()`의 suffix valid-frame 가정을 multi-tree에는 적용하지 않음
+   - `_node_path_label()`과 `from_goal` naming을 anchor-label 기반 표기로 교체
+
+4. multi-tree postprocess / gap helper 점검
+   - `_compute_plan_gap_to_target()`의 target-side flip이 multi-tree assembly/gap 의미와 맞는지 재검토
+   - final edge builder에서 "forward tree vs backward tree" 전제 제거
+
+### 17.2 확인이 필요한 구현 질문
+
+1. multi-tree mode에서 `G` anchor도 다른 waypoint와 완전히 같은 semantics로 두고,
+   rollout도 항상 anchor-rooted forward expansion으로 통일할지.
+   - 내 권장: `yes`
+
+2. multi-tree visualization에서 현재의 `forward_part_backward_part` 식 node path label을 버리고,
+   단순히 `source_anchor_target_anchor_nodepath` 식으로 바꿀지.
+   - 내 권장: `yes`
+
+3. multi-tree mode에서 `_compute_plan_gap_to_target()`의 target-side `flip`도 제거할지.
+   - 내 권장: `yes`, 다만 final edge postprocess와 함께 검토 필요

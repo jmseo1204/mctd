@@ -248,6 +248,100 @@ class PlanPostprocMixin:
     # Gap computation
     # ------------------------------------------------------------------
 
+    def _extract_new_segment_obs(
+        self,
+        node,
+        is_tree1: bool,
+        plan_tokens: int,
+    ) -> Optional[np.ndarray]:
+        """Extract the newly created segment observations for `node`.
+
+        The returned segment contains only the frames added in the round that
+        created `node`, expressed in unnormalized observation space.
+        """
+        del is_tree1
+        if node is None or node.depth <= 0:
+            return None
+        if len(node.plan_history) == 0 or len(node.plan_history[-1]) == 0:
+            return None
+
+        seg_size: int = plan_tokens // self.sequence_dividing_factor
+        parent_depth = max(int(node.depth) - 1, 0)
+        start_len = self._get_prefix_len_frames_from_depth(parent_depth, seg_size)
+        end_len = self._get_prefix_len_frames_from_depth(int(node.depth), seg_size)
+
+        if end_len <= start_len:
+            return None
+
+        plan_full: torch.Tensor = node.plan_history[-1][-1]
+        total_frames = int(plan_full.shape[0])
+        _obs_std_np = np.array(self.observation_std)
+        _obs_mean_np = np.array(self.observation_mean)
+        plan_obs = (
+            plan_full[:, self.obs_bundle_indices].detach().cpu().numpy()
+            * _obs_std_np
+            + _obs_mean_np
+        )
+        # Multi-tree mode treats every anchor-rooted tree uniformly: the newly
+        # expanded local segment is always the prefix slice [start_len:end_len).
+        seg_obs = plan_obs[start_len:end_len]
+
+        if seg_obs.size == 0:
+            return None
+        return np.asarray(seg_obs, dtype=np.float32)
+
+    def _compute_plan_gap_to_target(
+        self,
+        best_node,
+        target_node,
+        plan_tokens: int,
+        is_tree1: bool,
+    ) -> Optional[float]:
+        """
+        Compute the minimum pairwise distance between `best_node`'s segment and
+        `target_node`'s segment in unnormalized space.
+
+        Returns None if either node lacks a plan segment.
+        """
+        del is_tree1  # The current implementation mirrors the legacy direction handling.
+        seg_size: int = plan_tokens // self.sequence_dividing_factor
+
+        if len(best_node.plan_history) == 0 or len(best_node.plan_history[-1]) == 0:
+            return None
+        if target_node is None or len(target_node.plan_history) == 0:
+            return None
+
+        plan_a_full: torch.Tensor = best_node.plan_history[-1][-1]
+        a_len: int = self._get_prefix_len_frames_from_depth(best_node.depth, seg_size)
+        t1_segments: torch.Tensor = plan_a_full[:a_len]
+
+        plan_b_full: torch.Tensor = target_node.plan_history[-1][-1]
+        b_len: int = self._get_prefix_len_frames_from_depth(target_node.depth, seg_size)
+        t2_flipped: torch.Tensor = torch.flip(plan_b_full[:b_len], [0])
+
+        if a_len == 0 or b_len == 0:
+            return None
+
+        _obs_std_np = np.array(self.observation_std)
+        _obs_mean_np = np.array(self.observation_mean)
+        _seg_a_obs = (
+            t1_segments[:, self.obs_bundle_indices].detach().cpu().numpy()
+            * _obs_std_np
+            + _obs_mean_np
+        )
+        _seg_b_obs = (
+            t2_flipped[:, self.obs_bundle_indices].detach().cpu().numpy()
+            * _obs_std_np
+            + _obs_mean_np
+        )
+
+        A, B = _seg_a_obs.shape[0], _seg_b_obs.shape[0]
+        dists = self._compute_distance(
+            np.repeat(_seg_a_obs, B, axis=0),
+            np.tile(_seg_b_obs, (A, 1)),
+        )
+        return float(dists.min())
+
     def _compute_plan_gap(
         self,
         best_node,
@@ -261,37 +355,12 @@ class PlanPostprocMixin:
         Returns None if target_node.plan_history is empty (opposite tree not yet expanded).
         Uses TD metric or Euclidean distance depending on self.use_TD_metric_as_dist.
         """
-        seg_size: int = plan_tokens // self.sequence_dividing_factor
-
-        if len(best_node.plan_history) == 0 or len(best_node.plan_history[-1]) == 0:
-            return None
-        if best_node.target_node is None or len(best_node.target_node.plan_history) == 0:
-            return None
-
-        plan_a_full: torch.Tensor = best_node.plan_history[-1][-1]
-        a_len: int = self._get_prefix_len_frames_from_depth(best_node.depth, seg_size)
-        t1_segments: torch.Tensor = plan_a_full[:a_len]
-
-        plan_b_full: torch.Tensor = best_node.target_node.plan_history[-1][-1]
-        b_len: int = self._get_prefix_len_frames_from_depth(best_node.target_node.depth, seg_size)
-        t2_flipped: torch.Tensor = torch.flip(plan_b_full[:b_len], [0])
-
-        if a_len == 0 or b_len == 0:
-            return None
-
-        # Prepare observation data
-        _obs_std_np = np.array(self.observation_std)
-        _obs_mean_np = np.array(self.observation_mean)
-        _seg_a_obs = t1_segments[:, self.obs_bundle_indices].detach().cpu().numpy() * _obs_std_np + _obs_mean_np
-        _seg_b_obs = t2_flipped[:, self.obs_bundle_indices].detach().cpu().numpy() * _obs_std_np + _obs_mean_np
-
-        # Compute pairwise distances
-        A, B = _seg_a_obs.shape[0], _seg_b_obs.shape[0]
-        dists = self._compute_distance(
-            np.repeat(_seg_a_obs, B, axis=0),
-            np.tile(_seg_b_obs, (A, 1)),
+        return self._compute_plan_gap_to_target(
+            best_node=best_node,
+            target_node=best_node.target_node,
+            plan_tokens=plan_tokens,
+            is_tree1=is_tree1,
         )
-        return float(dists.min())
 
     # ------------------------------------------------------------------
     # Output plan construction
@@ -370,6 +439,64 @@ class PlanPostprocMixin:
         assert output.shape[1] == 1, f"output.shape[1]={output.shape[1]}, expected 1"
 
         return output
+
+    def _extract_output_plan_from_node_pair(
+        self,
+        source_node,
+        target_node,
+        plan_tokens: int,
+        append_target_obs_normalized: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        seg_size: int = plan_tokens // self.sequence_dividing_factor
+
+        if len(source_node.plan_history) == 0 or len(source_node.plan_history[-1]) == 0:
+            raise ValueError("source_node.plan_history must be materialized before edge extraction")
+
+        plan_a_full: torch.Tensor = source_node.plan_history[-1][-1]
+        a_len: int = self._get_prefix_len_frames_from_depth(source_node.depth, seg_size)
+        t1_segments: torch.Tensor = plan_a_full[:a_len]
+
+        if len(target_node.plan_history) == 0:
+            combined = t1_segments
+        else:
+            plan_b_full: torch.Tensor = target_node.plan_history[-1][-1]
+            b_len: int = self._get_prefix_len_frames_from_depth(target_node.depth, seg_size)
+            t2_flipped: torch.Tensor = torch.flip(plan_b_full[:b_len], [0])
+            combined = torch.cat([t1_segments, t2_flipped], dim=0)
+
+        if append_target_obs_normalized is not None:
+            c = combined.shape[-1]
+            target_frame = torch.zeros(
+                1, c, dtype=combined.dtype, device=combined.device
+            )
+            target_frame[:, self.obs_bundle_indices] = (
+                append_target_obs_normalized.unsqueeze(0)
+            )
+            combined = torch.cat([combined, target_frame], dim=0)
+
+        return combined.unsqueeze(1)
+
+    def _build_postprocessed_plan_from_node_pair(
+        self,
+        source_node,
+        target_node,
+        plan_tokens: int,
+        append_target_obs_normalized: Optional[torch.Tensor] = None,
+    ) -> dict:
+        output_plan = self._extract_output_plan_from_node_pair(
+            source_node,
+            target_node,
+            plan_tokens=plan_tokens,
+            append_target_obs_normalized=append_target_obs_normalized,
+        )
+        plan_unnormalized = self._unnormalize_x(output_plan.unsqueeze(0))[-1]
+        postprocessed_plan = self._reorder_plan_by_proximity(plan_unnormalized)
+        return {
+            "output_plan": output_plan,
+            "plan_unnormalized": plan_unnormalized,
+            "postprocessed_plan": postprocessed_plan,
+            "postprocessed_len": int(postprocessed_plan.shape[0]),
+        }
 
     def _build_postprocessed_plan_from_node(
         self,

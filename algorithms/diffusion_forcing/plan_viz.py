@@ -277,6 +277,16 @@ class PlanVizMixin:
         seg_size = self._require_current_plan_tokens() // self.sequence_dividing_factor
         alen = self._get_denoised_frame_prefix_len(vnode.depth, seg_size, hist.shape[1])
         target_node = getattr(vnode, "target_node", None) or vinfo.get("target_node")
+        meeting_target_node = vinfo.get("meeting_target_node")
+        if meeting_target_node is target_node:
+            meeting_target_node = None
+        elif (
+            meeting_target_node is not None
+            and target_node is not None
+            and getattr(meeting_target_node, "name", None) is not None
+            and getattr(meeting_target_node, "name", None) == getattr(target_node, "name", None)
+        ):
+            meeting_target_node = None
 
         if is_uncertainty_viz and plan_hist_override is not None:
             # In uncertainty mode the endpoint is the NEXT segment boundary.
@@ -360,6 +370,12 @@ class PlanVizMixin:
         tgt_pos = (
             target_node.obs
             if target_node is not None and getattr(target_node, 'obs', None) is not None
+            else None
+        )
+        meeting_tgt_pos = (
+            meeting_target_node.obs
+            if meeting_target_node is not None
+            and getattr(meeting_target_node, "obs", None) is not None
             else None
         )
 
@@ -579,6 +595,7 @@ class PlanVizMixin:
                 'node_path': node_traj if node_traj is not None and len(node_traj) > 0 else None,
                 'target_node_path': tgt_node_traj if tgt_node_traj is not None and len(tgt_node_traj) > 0 else None,
                 'best_node_target': tgt_pos,
+                'meeting_target': meeting_tgt_pos,
                 'guidance_targets': gpos,
                 'goal_grad_vectors': gg,
                 'prior_grad_vectors': pg,
@@ -625,18 +642,39 @@ class PlanVizMixin:
             return  # skip single-frame (zero-length) video upload
         video = np.stack(frames, axis=0).transpose(0, 3, 1, 2)  # (K, 3, H, W)
         label = self._node_path_label(vnode, active_tree.is_tree1, target_node)
-        selection_count = vinfo.get("selection_count", getattr(vnode, "selection_count", None))
+        selection_count = vinfo.get(
+            "selection_count",
+            getattr(vnode, "last_selection_count", getattr(vnode, "selection_count", None)),
+        )
+        if selection_count is None:
+            selection_count = 0
+        selection_count = max(int(selection_count), 0)
+
+        get_root_node = getattr(self, "_get_root_node", None)
+        source_root = get_root_node(vnode) if callable(get_root_node) else None
+        target_root = (
+            get_root_node(target_node)
+            if callable(get_root_node) and target_node is not None
+            else None
+        )
+        source_tree_label = (
+            getattr(source_root, "anchor_name", None)
+            or getattr(active_tree, "anchor_name", None)
+            or ("S" if active_tree.is_tree1 else "G")
+        )
+        target_tree_label = (
+            getattr(target_root, "anchor_name", None)
+            or ("G" if active_tree.is_tree1 else "S")
+        )
         label_with_count = (
-            f"[{selection_count}]_{label}"
-            if selection_count is not None
-            else label
+            f"[{selection_count:03d}]_{source_tree_label}_{target_tree_label}_{label}"
         )
         video_key_prefix = (
             f"{log_namespace}/{log_prefix}"
             if log_namespace
             else log_prefix
         )
-        video_step = self.get_safe_wandb_step(min_step=loops)
+        video_step = self.reserve_wandb_step(min_step=loops)
         print(
             f"[wandb-video-debug] key={video_key_prefix}/plan_at_{label_with_count} shape={video.shape} "
             f"dtype={video.dtype} fps=4 step={video_step}",
