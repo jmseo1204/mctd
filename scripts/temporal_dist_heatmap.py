@@ -324,11 +324,26 @@ def _initialize_hilp_reference_obs(algo, task_id: int) -> Optional[dict[str, np.
 
     maze_type = algo.env_id.split("-")[1]
     make_maze_env = algo._get_ogbench_make_maze_env()
+    extra_kwargs = algo._get_ogbench_maze_env_extra_kwargs()
 
     if "pointmaze" in algo.env_id:
-        env_fn = lambda: make_maze_env("point", "maze", maze_type=maze_type, width=200, height=200)
+        env_fn = lambda: make_maze_env(
+            "point",
+            "maze",
+            maze_type=maze_type,
+            width=200,
+            height=200,
+            **extra_kwargs,
+        )
     elif "antmaze" in algo.env_id:
-        env_fn = lambda: make_maze_env("ant", "maze", maze_type=maze_type, width=200, height=200)
+        env_fn = lambda: make_maze_env(
+            "ant",
+            "maze",
+            maze_type=maze_type,
+            width=200,
+            height=200,
+            **extra_kwargs,
+        )
     else:
         raise RuntimeError(f"Unsupported OGBench env: {algo.env_id}")
 
@@ -382,7 +397,7 @@ def _initialize_hilp_reference_obs(algo, task_id: int) -> Optional[dict[str, np.
         envs.close()
 
 
-def _resolve_sampled_graph_cfg(algo, args) -> dict[str, float | int | Path]:
+def _resolve_sampled_graph_cfg(algo, args) -> dict[str, float | int | Path | str]:
     cfg = algo.cfg
     sample_ratio = float(
         args.sample_ratio
@@ -392,19 +407,20 @@ def _resolve_sampled_graph_cfg(algo, args) -> dict[str, float | int | Path]:
     edge_radius = float(
         args.edge_radius
         if args.edge_radius is not None
-        else cfg.get("sampled_graph_edge_radius", 1.0)
+        else cfg.get("sampled_graph_edge_radius", 2.0)
     )
     graph_seed = int(
         args.graph_seed
         if args.graph_seed is not None
         else cfg.get("sampled_graph_seed", 42)
     )
-    cache_dir_raw = cfg.get("sampled_graph_save_dir", cfg.get("kde_save_dir", "~/.ogbench/data"))
-    cache_dir = Path(str(cache_dir_raw)).expanduser()
+    cache_dir_raw = str(cfg.get("sampled_graph_save_dir", cfg.get("kde_save_dir", "~/.ogbench/data")))
+    cache_dir = Path(cache_dir_raw).expanduser()
     return {
         "sample_ratio": sample_ratio,
         "edge_radius": edge_radius,
         "graph_seed": graph_seed,
+        "cache_dir_raw": cache_dir_raw,
         "cache_dir": cache_dir,
     }
 

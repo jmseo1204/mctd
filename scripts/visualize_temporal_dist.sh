@@ -76,7 +76,7 @@ fi
 
 echo ""
 echo "[Step 3] Task override / waypoints"
-DEFAULT_OVERRIDE_PATH="configurations/task_overrides/antmaze_giant_waypoints_example.yaml"
+DEFAULT_OVERRIDE_PATH="configurations/task_overrides/antmaze_giant_waypoints.yaml"
 read -rp "Task override path [Enter=${DEFAULT_OVERRIDE_PATH}, none=disable]: " TASK_OVERRIDE_PATH
 TASK_OVERRIDE_PATH="${TASK_OVERRIDE_PATH:-${DEFAULT_OVERRIDE_PATH}}"
 

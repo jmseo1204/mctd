@@ -7,6 +7,15 @@ from datetime import datetime
 from project_config import WANDB_ENTITY, WANDB_PROJECT
 
 
+def _parse_bool_arg(raw: str) -> bool:
+    value = str(raw).strip().lower()
+    if value in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if value in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise ValueError(f"Invalid boolean value: {raw!r}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate Hamiltonian benchmark jobs for a single checkpoint."
@@ -37,10 +46,18 @@ def main():
         default="hamiltonian_benchmark",
         help="Filename prefix for per-task benchmark JSON results",
     )
+    parser.add_argument(
+        "--ogbench-enable-reset-perturb",
+        default=None,
+        help="Whether OGBench resets should keep start/goal perturbation during benchmark runtime (true/false).",
+    )
     args = parser.parse_args()
 
     if args.waypoint_top_n <= 0:
         raise ValueError(f"--waypoint_top_n must be positive, got {args.waypoint_top_n}")
+    ogbench_enable_reset_perturb = None
+    if args.ogbench_enable_reset_perturb is not None:
+        ogbench_enable_reset_perturb = _parse_bool_arg(args.ogbench_enable_reset_perturb)
 
     os.makedirs("jobs", exist_ok=True)
     os.makedirs(args.results_dir, exist_ok=True)
@@ -62,6 +79,8 @@ def main():
     }
     if args.planning_config_snapshot:
         basic_job_config["+algorithm_snapshot_path"] = args.planning_config_snapshot
+    if ogbench_enable_reset_perturb is not None:
+        basic_job_config["algorithm.ogbench_enable_reset_perturb"] = bool(ogbench_enable_reset_perturb)
 
     count = 0
     for repeat_id in range(1, args.num_repeats + 1):

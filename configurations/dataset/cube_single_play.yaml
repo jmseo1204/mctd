@@ -1,5 +1,4 @@
-defaults:
-  - dataset_generate_config
+jump: ${jump}  # inherited from root config
 
 # ── [Group A: Dataset Loader] ─────────────────────────────────────────────
 # Read directly by dataset.__init__() and env creation.
@@ -11,7 +10,7 @@ num_tasks: 5
 # sample_length: frames per raw episode in the npz (auto-extracted at config generation time).
 # episode_len = floor(int(sample_length * ratio) / snap_unit) * snap_unit
 #   where snap_unit = jump * frame_stack (from ckpt_df_planning.yaml).
-# Change sliding-window size via: dataset.extract_episode_ratio_from_sample=<ratio>
+# Change sliding-window size via: algorithm.extract_episode_ratio_from_sample=<ratio>
 sample_length: 1001
 episode_len: 1000  # ratio=1.0, snap_unit=50
 

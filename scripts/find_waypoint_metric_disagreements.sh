@@ -16,6 +16,19 @@ DOCKER_PROJECT="/home/${DOCKER_USER}/mctd"
 OGBENCH_DATA_DIR="$(dirname "${PROJECT_DIR}")/ogbench_data"
 OUTPUT_DOWNLOADED_DIR="${MCTD_DOWNLOADED_DIR}"
 
+normalize_env_key() {
+  local env_id="$1"
+  python3 - "$env_id" <<'PY'
+import re
+import sys
+
+env_id = sys.argv[1].strip()
+env_key = re.sub(r"[^0-9A-Za-z]+", "_", env_id).strip("_")
+env_key = re.sub(r"_v[0-9]+$", "", env_key)
+print(env_key)
+PY
+}
+
 echo "============================================"
 echo "  Waypoint Metric Disagreement Search"
 echo "============================================"
@@ -53,10 +66,30 @@ if [ ! -f "${CKPT_HOST}" ]; then
   exit 1
 fi
 
+SELECTED_DATASET="${MCTD_SELECTED_DATASET:-unknown}"
+if [ -z "${SELECTED_DATASET}" ] || [ "${SELECTED_DATASET}" = "unknown" ]; then
+  TRAINING_CFG="${OUTPUT_DOWNLOADED_DIR}/${SELECTED_MODEL_ID}/training_config.yaml"
+  if [ -f "${TRAINING_CFG}" ]; then
+    SELECTED_DATASET="$(python3 -c "import yaml; d=yaml.safe_load(open('${TRAINING_CFG}')); print((d.get('dataset') or {}).get('config', 'unknown'))" 2>/dev/null || echo unknown)"
+  fi
+fi
+SELECTED_DATASET="$(mctd_normalize_dataset_name "${SELECTED_DATASET}" "${PROJECT_DIR}/configurations/dataset")"
+DATASET_YAML="${PROJECT_DIR}/configurations/dataset/${SELECTED_DATASET}.yaml"
+if [ ! -f "${DATASET_YAML}" ]; then
+  echo "[ERROR] Dataset config not found: ${DATASET_YAML}"
+  exit 1
+fi
+ENV_ID="$(python3 -c "import yaml; d=yaml.safe_load(open('${DATASET_YAML}')); print(d.get('env_id',''))" 2>/dev/null || echo "")"
+if [ -z "${ENV_ID}" ]; then
+  echo "[ERROR] Could not determine env_id from ${DATASET_YAML}"
+  exit 1
+fi
+ENV_KEY="$(normalize_env_key "${ENV_ID}")"
+
 echo ""
 echo "[Step 2] Search settings"
-DEFAULT_FEASIBLE_PATH="configurations/task_overrides/antmaze_giant_feasible_points.yaml"
-DEFAULT_OUT_PATH="configurations/task_overrides/antmaze_giant_waypoints_example.yaml"
+DEFAULT_FEASIBLE_PATH="configurations/task_overrides/${ENV_KEY}_feasible_points.yaml"
+DEFAULT_OUT_PATH="configurations/task_overrides/${ENV_KEY}_waypoints.yaml"
 read -rp "Feasible points path [Enter=${DEFAULT_FEASIBLE_PATH}]: " FEASIBLE_PATH
 FEASIBLE_PATH="${FEASIBLE_PATH:-${DEFAULT_FEASIBLE_PATH}}"
 read -rp "Output override path [Enter=${DEFAULT_OUT_PATH}]: " OUT_PATH

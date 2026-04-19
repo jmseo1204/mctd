@@ -1,0 +1,21 @@
+jump: ${jump}  # inherited from root config
+
+# ── [Group A: Dataset Loader] ─────────────────────────────────────────────
+env_id: "pointmaze-medium-v0"
+dataset: "pointmaze-medium-navigate-v0"
+save_dir: ~/.ogbench/data
+num_tasks: 5
+# sample_length: 1001 frames per episode (1000 steps + 1)
+# episode_len = floor(1001 / snap_unit) * snap_unit, snap_unit = jump(5) * frame_stack(10) = 50
+sample_length: 1001
+episode_len: 1000  # ratio=1.0, snap_unit=50
+
+# ── [Group B: Normalization Stats] ────────────────────────────────────────
+# Computed from pointmaze-medium-navigate-v0 training data
+# (1001000 samples, obs_dim=2). Computed 2026-04-19.
+observation_mean: [10.233181953430176, 9.570230484008789]
+observation_std:  [5.834128379821777, 5.194271564483643]
+action_mean: []
+action_std:  []
+reward_mean: 0.00099900  # = n_terminals/n_samples (1000/1001000)
+reward_std:  0.03159119

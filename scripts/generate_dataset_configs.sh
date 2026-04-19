@@ -60,7 +60,7 @@ if OGBENCH_SRC and OGBENCH_SRC not in sys.path:
     sys.path.insert(0, OGBENCH_SRC)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-# extract_episode_ratio_from_sample: read from dataset_generate_config.yaml.
+# extract_episode_ratio_from_sample: read from configurations/algorithm/train_df_planning.yaml.
 # episode_len = int(sample_length * extract_episode_ratio_from_sample),
 #   then snapped DOWN to nearest SNAP_UNIT (= jump * frame_stack from
 #   ckpt_df_planning.yaml) and clamped to < sample_length.
@@ -76,7 +76,7 @@ def _read_yaml_scalar(path, key, cast=str):
     except Exception:
         return None
 
-_dataset_cfg_path = Path(sys.argv[2]) / "dataset_generate_config.yaml"
+_dataset_cfg_path = Path(sys.argv[2]).parent / "algorithm" / "train_df_planning.yaml"
 _ckpt_cfg_path    = Path(sys.argv[2]).parent / "algorithm" / "ckpt_df_planning.yaml"
 
 EXTRACT_EPISODE_RATIO = _read_yaml_scalar(_dataset_cfg_path, "extract_episode_ratio_from_sample", float) or 0.5
@@ -238,8 +238,7 @@ for npz_path in npz_files:
         episode_len = (raw_len // SNAP_UNIT) * SNAP_UNIT if SNAP_UNIT > 0 else raw_len
 
         lines = [
-            f"defaults:",
-            f"  - dataset_generate_config",
+            f"jump: ${{jump}}  # inherited from root config",
             f"",
             f"# ── [Group A: Dataset Loader] ─────────────────────────────────────────────",
             f"# Read directly by dataset.__init__() and env creation.",
@@ -251,7 +250,7 @@ for npz_path in npz_files:
             f"# sample_length: frames per raw episode in the npz (auto-extracted at config generation time).",
             f"# episode_len = floor(int(sample_length * ratio) / snap_unit) * snap_unit",
             f"#   where snap_unit = jump * frame_stack (from ckpt_df_planning.yaml).",
-            f"# Change sliding-window size via: dataset.extract_episode_ratio_from_sample=<ratio>",
+            f"# Change sliding-window size via: algorithm.extract_episode_ratio_from_sample=<ratio>",
             f"sample_length: {sample_length}",
             f"episode_len: {episode_len}  # ratio={EXTRACT_EPISODE_RATIO}, snap_unit={SNAP_UNIT}",
             f"",

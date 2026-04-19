@@ -29,13 +29,14 @@ RESUME_EPOCH=""
 EXP_TAG=""
 KILL_EXISTING=0
 EXTRA_ARGS=()
+DQL_AVAILABLE_ENVS=()
 
 usage() {
     cat <<'EOF'
 Usage: ./train_dql.sh [options] [extra main_Antmaze.py args]
 
 Options:
-  --env_name NAME         DQL dataset env name (e.g. antmaze-giant-stitch-v0)
+  --env_name NAME         DQL dataset env name (discovered from ../ogbench_data/*.npz)
   --resume-dir PATH       Resume from an existing dql/results/<run_dir>
   --resume-epoch N        Resume from a specific saved epoch in that run dir
   --exp TAG               Experiment tag for fresh runs
@@ -86,25 +87,60 @@ if [ -n "$RESUME_DIR" ]; then
     RESUME_DIR="$(realpath -m "$RESUME_DIR")"
 fi
 
+dql_discover_envs() {
+    mapfile -t DQL_AVAILABLE_ENVS < <(
+        find "$OGBENCH_DATA_DIR" -maxdepth 1 -type f -name 'antmaze-*-v0.npz' \
+            | sed 's#^.*/##' \
+            | sed 's/\.npz$//' \
+            | LC_ALL=C sort -u
+    )
+
+    if [ ${#DQL_AVAILABLE_ENVS[@]} -eq 0 ]; then
+        echo "ERROR: no antmaze dataset files found in $OGBENCH_DATA_DIR" >&2
+        echo "Expected files like antmaze-giant-stitch-v0.npz" >&2
+        exit 1
+    fi
+}
+
+dql_env_supported() {
+    local candidate="$1"
+    local _env
+    for _env in "${DQL_AVAILABLE_ENVS[@]}"; do
+        if [ "$_env" = "$candidate" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+dql_print_available_envs() {
+    local _env
+    for _env in "${DQL_AVAILABLE_ENVS[@]}"; do
+        echo "  - $_env" >&2
+    done
+}
+
 dql_dataset_menu() {
-    echo "Select DQL dataset:"
-    echo "  1) antmaze-medium-navigate-v0"
-    echo "  2) antmaze-medium-stitch-v0"
-    echo "  3) antmaze-large-navigate-v0"
-    echo "  4) antmaze-large-stitch-v0"
-    echo "  5) antmaze-giant-navigate-v0"
-    echo "  6) antmaze-giant-stitch-v0"
+    local count="${#DQL_AVAILABLE_ENVS[@]}"
+    local i
+
+    if [ "$count" -eq 1 ]; then
+        ENV_NAME="${DQL_AVAILABLE_ENVS[0]}"
+        echo "[dataset] Only one antmaze dataset found in $OGBENCH_DATA_DIR: $ENV_NAME"
+        return 0
+    fi
+
+    echo "Select DQL dataset from $OGBENCH_DATA_DIR:"
+    for i in "${!DQL_AVAILABLE_ENVS[@]}"; do
+        printf "  %d) %s\n" "$((i + 1))" "${DQL_AVAILABLE_ENVS[$i]}"
+    done
     echo ""
-    read -rp "Enter [1-6]: " _sel
-    case "$_sel" in
-        1) ENV_NAME="antmaze-medium-navigate-v0" ;;
-        2) ENV_NAME="antmaze-medium-stitch-v0" ;;
-        3) ENV_NAME="antmaze-large-navigate-v0" ;;
-        4) ENV_NAME="antmaze-large-stitch-v0" ;;
-        5) ENV_NAME="antmaze-giant-navigate-v0" ;;
-        6) ENV_NAME="antmaze-giant-stitch-v0" ;;
-        *) echo "Invalid selection '$_sel'." >&2; exit 1 ;;
-    esac
+    read -rp "Enter [1-$count]: " _sel
+    if ! [[ "$_sel" =~ ^[0-9]+$ ]] || [ "$_sel" -lt 1 ] || [ "$_sel" -gt "$count" ]; then
+        echo "Invalid selection '$_sel'." >&2
+        exit 1
+    fi
+    ENV_NAME="${DQL_AVAILABLE_ENVS[$((_sel - 1))]}"
 }
 
 dql_detect_env_from_resume_dir() {
@@ -276,6 +312,8 @@ if [ ! -d "$OGBENCH_DATA_DIR" ]; then
     exit 1
 fi
 
+dql_discover_envs
+
 echo "===================================================="
 echo "  DQL Training Launcher"
 echo "===================================================="
@@ -319,14 +357,12 @@ if [ -z "$ENV_NAME" ]; then
     dql_dataset_menu
 fi
 
-case "$ENV_NAME" in
-    antmaze-medium-navigate-v0|antmaze-medium-stitch-v0|antmaze-large-navigate-v0|antmaze-large-stitch-v0|antmaze-giant-navigate-v0|antmaze-giant-stitch-v0)
-        ;;
-    *)
-        echo "ERROR: unsupported env_name '$ENV_NAME'" >&2
-        exit 1
-        ;;
-esac
+if ! dql_env_supported "$ENV_NAME"; then
+    echo "ERROR: unsupported env_name '$ENV_NAME'" >&2
+    echo "Available antmaze datasets in $OGBENCH_DATA_DIR:" >&2
+    dql_print_available_envs
+    exit 1
+fi
 
 if [ -z "$RESUME_DIR" ]; then
     dql_resume_menu

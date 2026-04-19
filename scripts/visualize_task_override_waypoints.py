@@ -179,7 +179,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Render OGBench task overrides with waypoint markers.")
     parser.add_argument(
         "--override-path",
-        default="configurations/task_overrides/antmaze_giant_waypoints_example.yaml",
+        default="configurations/task_overrides/antmaze_giant_waypoints.yaml",
         help="Repo-relative or absolute path to task override YAML/JSON",
     )
     parser.add_argument(

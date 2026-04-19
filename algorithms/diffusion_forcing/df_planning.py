@@ -33,6 +33,7 @@ from utils.tracer import Tracer, set_default_tracer, get_tracer
 from utils.planning_utils import episode_len_to_plan_tokens
 from utils.route_metric_utils import (
     anchor_short_label,
+    compute_pairwise_temporal_distance_matrix,
     solve_fixed_endpoint_hamiltonian_path,
     solve_fixed_endpoint_hamiltonian_path_with_forced_adjacency,
 )
@@ -49,7 +50,7 @@ from .env_executor import PlanExecutorMixin
 from .plan_postproc import PlanPostprocMixin
 from .kde_estimator import KDEEstimatorMixin
 from .noise_schedule import NoiseScheduleMixin
-from .plan_viz import PlanVizMixin
+from .plan_viz import PlanVizMixin  # owns visualization-only frame/window helpers used via self.*
 from .sampled_graph_estimator import (
     SampledGraphEstimatorMixin,
     extract_shortest_path_submatrix,
@@ -74,9 +75,27 @@ OGBENCH_ENVS = [
     "antmaze-teleport-v0",
 ]
 
+GROUNDTRUTH_TEMPORAL_VIZ_GAMMA = 0.995
+GROUNDTRUTH_TEMPORAL_VIZ_GRID_RES = 100
+GROUNDTRUTH_TEMPORAL_VIZ_GRAD_GRID_STEP = 2.0
+
 
 def _repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _coerce_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "t", "yes", "y", "on"):
+            return True
+        if lowered in ("0", "false", "f", "no", "n", "off"):
+            return False
+    return bool(value)
 
 
 def _find_hilp_matches(td_models_dir: str, tokens: List[str]) -> List[str]:
@@ -239,7 +258,7 @@ class MCTSTreeState:
     children_node_guidance_scales: list
     skip_level_steps: int
     tag: str
-    is_tree1: bool = True  # True for start-rooted tree, False for goal-rooted tree
+    is_tree1: bool = True  # Legacy bidirectional semantics: True=start-rooted, False=goal-rooted
     # Root observation (unnormalized): start for tree1, goal for tree2.
     # Used to track agent positions across bidirectional expansion rounds.
     tree_root_obs: Optional[np.ndarray] = None  # shape (obs_dim,)
@@ -326,6 +345,10 @@ class DiffusionForcingPlanning(
         self.padding_mode = cfg.padding_mode
         self.interaction_seed = cfg.get("interaction_seed", None)
         self.use_random_goals_for_interaction = cfg.get("use_random_goals_for_interaction", False)
+        self.ogbench_enable_reset_perturb = _coerce_bool(
+            cfg.get("ogbench_enable_reset_perturb", True),
+            default=True,
+        )
         self.task_id = cfg.get("task_id", None)
         self.task_override_path = cfg.get("task_override_path", None)
         self.task_override_waypoint_group_idx = cfg.get("task_override_waypoint_group_idx", None)
@@ -333,6 +356,34 @@ class DiffusionForcingPlanning(
             self.task_override_path,
             repo_root=_repo_root(),
         ) if self.task_override_path not in (None, "") else None
+        self.sampled_graph_cache_path_override = None
+        if self.task_override_resolved_path is not None:
+            _, _task_override_payload = load_task_override_payload(
+                self.task_override_resolved_path,
+                repo_root=_repo_root(),
+            )
+            _cache_override = _task_override_payload.get("sampled_graph_cache_path")
+            if _cache_override not in (None, ""):
+                _expanded_cache_path = os.path.expanduser(str(_cache_override))
+                if not os.path.isabs(_expanded_cache_path):
+                    _expanded_cache_path = os.path.join(_repo_root(), _expanded_cache_path)
+                _resolved_cache_path = os.path.realpath(_expanded_cache_path)
+                if not os.path.exists(_resolved_cache_path):
+                    _cache_basename = os.path.basename(_resolved_cache_path)
+                    _sampled_graph_dir = os.path.realpath(
+                        os.path.expanduser(
+                            cfg.get("sampled_graph_save_dir", cfg.get("kde_save_dir", "~/.ogbench/data"))
+                        )
+                    )
+                    _remapped_cache_path = os.path.join(_sampled_graph_dir, _cache_basename)
+                    if os.path.exists(_remapped_cache_path):
+                        print(
+                            "[INIT] Remapped sampled graph cache override "
+                            f"from {_resolved_cache_path} to {_remapped_cache_path}",
+                            flush=True,
+                        )
+                        _resolved_cache_path = os.path.realpath(_remapped_cache_path)
+                self.sampled_graph_cache_path_override = _resolved_cache_path
         self._current_task_start_xy = None
         self._current_task_goal_xy = None
         self._current_task_waypoints = None
@@ -450,7 +501,7 @@ class DiffusionForcingPlanning(
         self.kde_sample_ratio = cfg.get("kde_sample_ratio", 0.1)
         self._kde_save_dir = os.path.expanduser(cfg.get("kde_save_dir", "~/.ogbench/data"))
         self.sampled_graph_sample_ratio = float(cfg.get("sampled_graph_sample_ratio", 0.005))
-        self.sampled_graph_edge_radius = float(cfg.get("sampled_graph_edge_radius", 1.0))
+        self.sampled_graph_edge_radius = float(cfg.get("sampled_graph_edge_radius", 2.0))
         self.sampled_graph_seed = int(cfg.get("sampled_graph_seed", 42))
         self._sampled_graph_cache_dir = os.path.expanduser(
             cfg.get("sampled_graph_save_dir", cfg.get("kde_save_dir", "~/.ogbench/data"))
@@ -462,6 +513,9 @@ class DiffusionForcingPlanning(
         self.uncertainty_mode: str = cfg.get("uncertainty_mode", "entropy")
         self.multi_tree_hemiltonian: bool = bool(cfg.get("multi_tree_hemiltonian", False))
         self.reliable_TD_threshold: float = float(cfg.get("reliable_TD_threshold", 30.0))
+        self.temporal_dist_overestimate_coeff: float = float(
+            cfg.get("temporal_dist_overestimate_coeff", 0.001)
+        )
         self.uncertainty_lambda: float = float(cfg.get("uncertainty_lambda", 1.0))
         self.uncertainty_eta: float = float(cfg.get("uncertainty_eta", 1.0))
         self.uncertainty_max_intra_cluster_dist: float = float(cfg.get("uncertainty_max_intra_cluster_dist", 20.0))
@@ -742,6 +796,10 @@ class DiffusionForcingPlanning(
         temporal_dist = self.emb_dist_to_temporal_dist((-v).cpu().numpy(), gamma=0.995)
         return np.asarray(temporal_dist, dtype=np.float32)
 
+    def _transform_temporal_dist_for_total_cost(self, temporal_dist: float) -> float:
+        temporal_dist = float(temporal_dist)
+        return temporal_dist + self.temporal_dist_overestimate_coeff * (temporal_dist ** 2)
+
     def _compute_distance(
         self,
         state1: np.ndarray,  # (N, d) — full obs (d==obs_dim) or position-only (d==pos_dim)
@@ -791,6 +849,36 @@ class DiffusionForcingPlanning(
         while root_node._parent_node is not None:
             root_node = root_node._parent_node
         return root_node
+
+    def _is_multi_tree_anchor_tag(self, tag: Optional[str]) -> bool:
+        return isinstance(tag, str) and tag.startswith("multi_tree_")
+
+    def _is_multi_tree_anchor_tree(self, tree: Optional["MCTSTreeState"]) -> bool:
+        if tree is None or not self.multi_tree_hemiltonian:
+            return False
+        return self._is_multi_tree_anchor_tag(getattr(tree, "tag", None))
+
+    def _tree_uses_forward_prefix_semantics(
+        self,
+        tree: Optional["MCTSTreeState"],
+    ) -> bool:
+        if tree is None:
+            return True
+        if self._is_multi_tree_anchor_tree(tree):
+            return True
+        return bool(getattr(tree, "is_tree1", True))
+
+    def _node_anchor_name(
+        self,
+        node: Optional["TreeNode"],
+        default: str = "?",
+    ) -> str:
+        root_node = self._get_root_node(node)
+        return str(
+            getattr(root_node, "anchor_name", None)
+            or getattr(node, "anchor_name", None)
+            or default
+        )
 
     def _normalize_obs_np(self, obs_np: np.ndarray) -> torch.Tensor:
         return torch.tensor(
@@ -947,22 +1035,69 @@ class DiffusionForcingPlanning(
         waypoints_xy: np.ndarray,
         task_name: Optional[str] = None,
     ) -> dict[str, Any]:
+        t_total = time.time()
+        print(
+            "[HBENCH] Ground-truth info start "
+            f"(task={task_name}, n_waypoints={len(waypoints_xy)})",
+            flush=True,
+        )
+        t_stage = time.time()
+        print("[HBENCH] Ground-truth stage: sampled_graph_cache", flush=True)
         graph_cache = self._get_sampled_graph_cache()
+        print(
+            "[HBENCH] Ground-truth stage done: sampled_graph_cache "
+            f"(elapsed={time.time() - t_stage:.1f}s)",
+            flush=True,
+        )
         anchor_bundle = self._build_groundtruth_anchor_queries(
             start_xy=start_xy,
             goal_xy=goal_xy,
             waypoints_xy=waypoints_xy,
         )
+        t_stage = time.time()
+        print("[HBENCH] Ground-truth stage: temporal_anchor_matrix", flush=True)
+        temporal_anchor_dists = compute_pairwise_temporal_distance_matrix(
+            self,
+            src_xys=np.asarray(anchor_bundle["anchor_xys"], dtype=np.float32),
+            dst_xys=np.asarray(anchor_bundle["anchor_xys"], dtype=np.float32),
+            gamma=GROUNDTRUTH_TEMPORAL_VIZ_GAMMA,
+        )
+        print(
+            "[HBENCH] Ground-truth stage done: temporal_anchor_matrix "
+            f"(elapsed={time.time() - t_stage:.1f}s)",
+            flush=True,
+        )
+        temporal_route_solution = solve_fixed_endpoint_hamiltonian_path(temporal_anchor_dists)
+        if bool(temporal_route_solution.get("feasible", False)):
+            temporal_route_segments = self._build_groundtruth_straight_anchor_route_segments(
+                anchor_xys=np.asarray(anchor_bundle["anchor_xys"], dtype=np.float32),
+                anchor_order=np.asarray(temporal_route_solution["anchor_order"], dtype=np.int32),
+            )
+        else:
+            temporal_route_segments = {
+                "reachable": False,
+                "segments": [],
+                "total_distance": np.inf,
+            }
+        t_stage = time.time()
+        print("[HBENCH] Ground-truth stage: sampled_graph_anchor_assignment", flush=True)
         anchor_assignment = query_distinct_nearest_nodes(
             graph_cache,
             query_xys=np.asarray(anchor_bundle["anchor_xys"], dtype=np.float32),
             priority_order=np.asarray(anchor_bundle["priority_order"], dtype=np.int32),
             query_labels=list(anchor_bundle["anchor_labels"]),
         )
+        print(
+            "[HBENCH] Ground-truth stage done: sampled_graph_anchor_assignment "
+            f"(elapsed={time.time() - t_stage:.1f}s)",
+            flush=True,
+        )
         anchor_node_indices = np.asarray(anchor_assignment["node_indices"], dtype=np.int32)
         anchor_node_xys = np.asarray(anchor_assignment["node_xys"], dtype=np.float32)
         anchor_node_dists = np.asarray(anchor_assignment["node_euclidean_dists"], dtype=np.float32)
 
+        t_stage = time.time()
+        print("[HBENCH] Ground-truth stage: sampled_graph_route", flush=True)
         graph_anchor_dists = extract_shortest_path_submatrix(graph_cache, anchor_node_indices)
         graph_route_solution = solve_fixed_endpoint_hamiltonian_path(graph_anchor_dists)
         if bool(graph_route_solution.get("feasible", False)):
@@ -977,6 +1112,11 @@ class DiffusionForcingPlanning(
                 "segments": [],
                 "total_distance": np.inf,
             }
+        print(
+            "[HBENCH] Ground-truth stage done: sampled_graph_route "
+            f"(elapsed={time.time() - t_stage:.1f}s)",
+            flush=True,
+        )
 
         sampled_xy = np.asarray(graph_cache["points_xy"], dtype=np.float32)
         n_total = int(graph_cache["n_total"])
@@ -985,9 +1125,14 @@ class DiffusionForcingPlanning(
             graph_cache["shortest_dists"][goal_node_index],
             dtype=np.float32,
         )
-        return {
+        result = {
             "task_name": task_name,
+            "start_xy": np.asarray(start_xy, dtype=np.float32).reshape(2),
+            "goal_xy": np.asarray(goal_xy, dtype=np.float32).reshape(2),
+            "waypoints_xy": np.asarray(waypoints_xy, dtype=np.float32).reshape(-1, 2),
             "anchor_bundle": anchor_bundle,
+            "temporal_route_solution": temporal_route_solution,
+            "temporal_route_segments": temporal_route_segments,
             "anchor_assignment": anchor_assignment,
             "anchor_node_indices": anchor_node_indices,
             "anchor_node_xys": anchor_node_xys,
@@ -1000,6 +1145,111 @@ class DiffusionForcingPlanning(
             "n_total": n_total,
             "n_reachable": int(np.isfinite(goal_shortest_dists).sum()),
         }
+        print(
+            "[HBENCH] Ground-truth info done "
+            f"(task={task_name}, elapsed={time.time() - t_total:.1f}s)",
+            flush=True,
+        )
+        return result
+
+    def _build_groundtruth_straight_anchor_route_segments(
+        self,
+        anchor_xys: np.ndarray,
+        anchor_order: np.ndarray,
+    ) -> dict[str, Any]:
+        anchor_xys = np.asarray(anchor_xys, dtype=np.float32).reshape(-1, 2)
+        anchor_order = np.asarray(anchor_order, dtype=np.int32).reshape(-1)
+        if len(anchor_order) < 2:
+            return {
+                "reachable": False,
+                "segments": [],
+                "total_distance": np.inf,
+            }
+
+        segments = []
+        total_distance = 0.0
+        for segment_idx, (src_anchor_idx, dst_anchor_idx) in enumerate(
+            zip(anchor_order[:-1].tolist(), anchor_order[1:].tolist()),
+            start=1,
+        ):
+            path_xy = np.asarray(
+                [anchor_xys[int(src_anchor_idx)], anchor_xys[int(dst_anchor_idx)]],
+                dtype=np.float32,
+            )
+            step_distance = float(np.linalg.norm(path_xy[1] - path_xy[0], ord=2))
+            segments.append(
+                {
+                    "segment_index": segment_idx,
+                    "src_anchor_index": int(src_anchor_idx),
+                    "dst_anchor_index": int(dst_anchor_idx),
+                    "path_xy": path_xy,
+                    "shortest_distance": step_distance,
+                    "reachable": True,
+                }
+            )
+            total_distance += step_distance
+
+        return {
+            "reachable": True,
+            "segments": segments,
+            "total_distance": float(total_distance),
+        }
+
+    def _render_groundtruth_temporal_distance_image(
+        self,
+        groundtruth_info: dict[str, Any],
+    ) -> Optional[Image.Image]:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from scripts.temporal_dist_heatmap import (
+                _compute_temporal_distance_heatmap,
+                _plot_temporal_panel,
+            )
+        except Exception as exc:
+            print(f"[WARNING] Could not import ground-truth temporal plotting stack: {exc}", flush=True)
+            return None
+
+        fig = None
+        try:
+            goal_xy = np.asarray(groundtruth_info["goal_xy"], dtype=np.float32).reshape(2)
+            heatmap = _compute_temporal_distance_heatmap(
+                self,
+                goal_xy=goal_xy,
+                grid_res=GROUNDTRUTH_TEMPORAL_VIZ_GRID_RES,
+                gamma=GROUNDTRUTH_TEMPORAL_VIZ_GAMMA,
+            )
+            grad_field = self._compute_guidance_grad_fields(
+                goal_xy.astype(np.float32),
+                grid_step=GROUNDTRUTH_TEMPORAL_VIZ_GRAD_GRID_STEP,
+            )
+            fig, ax = plt.subplots(1, 1, figsize=(9, 8))
+            _plot_temporal_panel(
+                ax,
+                fig,
+                self.env_id,
+                heatmap,
+                grad_field,
+                start_xy=np.asarray(groundtruth_info["start_xy"], dtype=np.float32).reshape(2),
+                goal_xy=goal_xy,
+                waypoints_xy=np.asarray(groundtruth_info["waypoints_xy"], dtype=np.float32).reshape(-1, 2),
+                route_solution=dict(groundtruth_info["temporal_route_solution"]),
+                route_segments=dict(groundtruth_info["temporal_route_segments"]),
+                task_name=groundtruth_info.get("task_name"),
+            )
+            fig.tight_layout()
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=220, bbox_inches="tight")
+            buf.seek(0)
+            with Image.open(buf) as image:
+                return image.convert("RGB")
+        except Exception as exc:
+            print(f"[WARNING] Failed to render ground-truth temporal plot: {exc}", flush=True)
+            return None
+        finally:
+            if fig is not None:
+                plt.close(fig)
 
     def _render_groundtruth_hamiltonian_image(self, groundtruth_info: dict[str, Any]) -> Optional[Image.Image]:
         try:
@@ -1114,7 +1364,6 @@ class DiffusionForcingPlanning(
             plan_tokens = self._require_current_plan_tokens()
             segment_obs = self._extract_new_segment_obs(
                 child_node,
-                source_tree.is_tree1,
                 plan_tokens,
             )
             if segment_obs is None or segment_obs.size == 0:
@@ -1706,6 +1955,69 @@ class DiffusionForcingPlanning(
             return maze_module.make_maze_env
         return importlib.import_module("ogbench.locomaze.maze").make_maze_env
 
+    def _get_ogbench_maze_env_extra_kwargs(self) -> dict[str, Any]:
+        extra_kwargs: dict[str, Any] = {}
+        if not self.ogbench_enable_reset_perturb and "antmaze" in self.env_id:
+            # Disable Ant base reset noise so benchmark reset positions stay deterministic.
+            extra_kwargs["reset_noise_scale"] = 0.0
+        return extra_kwargs
+
+    @staticmethod
+    def _get_single_env_sim_state(env) -> Optional[dict[str, np.ndarray]]:
+        data = getattr(env, "data", None)
+        if data is None:
+            return None
+        return {
+            "qpos": np.asarray(data.qpos, dtype=np.float64).copy(),
+            "qvel": np.asarray(data.qvel, dtype=np.float64).copy(),
+        }
+
+    @staticmethod
+    def _set_single_env_sim_state(env, sim_state: Optional[dict[str, np.ndarray]]) -> None:
+        if sim_state is None or not hasattr(env, "set_state"):
+            return
+        env.set_state(sim_state["qpos"], sim_state["qvel"])
+
+    def _force_exact_ogbench_task_reset(
+        self,
+        env,
+        ob: Any,
+        info: Optional[dict[str, Any]],
+        task_info: Optional[dict[str, Any]],
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        info_out = dict(info or {})
+        if task_info is None:
+            return np.asarray(ob, dtype=np.float32), info_out
+        if not all(hasattr(env, attr) for attr in ("set_goal", "set_xy", "get_ob")):
+            return np.asarray(ob, dtype=np.float32), info_out
+
+        init_xy = task_info.get("init_xy")
+        goal_xy = task_info.get("goal_xy")
+        if init_xy is None or goal_xy is None:
+            return np.asarray(ob, dtype=np.float32), info_out
+
+        init_xy = np.asarray(init_xy, dtype=np.float32).reshape(-1)[:2]
+        goal_xy = np.asarray(goal_xy, dtype=np.float32).reshape(-1)[:2]
+        saved_sim_state = self._get_single_env_sim_state(env)
+        goal_ob = info_out.get("goal")
+
+        try:
+            env.set_goal(goal_xy=goal_xy)
+            env.set_xy(goal_xy)
+            goal_ob = np.asarray(env.get_ob(), dtype=np.float32).copy()
+        except Exception:
+            pass
+        finally:
+            self._set_single_env_sim_state(env, saved_sim_state)
+
+        env.set_goal(goal_xy=goal_xy)
+        env.set_xy(init_xy)
+        ob_out = np.asarray(env.get_ob(), dtype=np.float32).copy()
+        if goal_ob is not None:
+            info_out["goal"] = np.asarray(goal_ob, dtype=np.float32).copy()
+        info_out["exact_task_reset"] = True
+        return ob_out, info_out
+
     def _print_ogbench_task_assignment_summary(self, env, task_id: int) -> None:
         cur_task_info = dict(getattr(env, "cur_task_info", None) or {})
         waypoint_group = cur_task_info.get(
@@ -1814,6 +2126,13 @@ class DiffusionForcingPlanning(
 
         def _reset(*args, **kwargs):
             ob, info = original_reset(*args, **kwargs)
+            if not self.ogbench_enable_reset_perturb:
+                ob, info = self._force_exact_ogbench_task_reset(
+                    env,
+                    ob,
+                    info,
+                    getattr(env, "cur_task_info", None),
+                )
             info = inject_task_metadata_into_reset_info(ob, info, getattr(env, "cur_task_info", None))
             return ob, info
 
@@ -1861,6 +2180,7 @@ class DiffusionForcingPlanning(
 
     def _make_single_ogbench_env(self, maze_type: str):
         make_maze_env = self._get_ogbench_make_maze_env()
+        extra_kwargs = self._get_ogbench_maze_env_extra_kwargs()
 
         if "pointmaze" in self.env_id:
             env = make_maze_env(
@@ -1869,6 +2189,7 @@ class DiffusionForcingPlanning(
                 maze_type=maze_type,
                 width=200,
                 height=200,
+                **extra_kwargs,
             )
         elif "antmaze" in self.env_id:
             env = make_maze_env(
@@ -1877,6 +2198,7 @@ class DiffusionForcingPlanning(
                 maze_type=maze_type,
                 width=200,
                 height=200,
+                **extra_kwargs,
             )
         else:
             raise RuntimeError(f"Unsupported OGBench env for benchmark preflight: {self.env_id}")
@@ -1914,16 +2236,28 @@ class DiffusionForcingPlanning(
             f"starts={rounded_starts} goals={rounded_goals}",
             flush=True,
         )
-        if unique_starts < 2:
-            raise RuntimeError(
-                f"Benchmark preflight failed: start perturbation not observed for task {task_id}. "
-                f"Samples={rounded_starts}"
-            )
-        if unique_goals < 2:
-            raise RuntimeError(
-                f"Benchmark preflight failed: goal perturbation not observed for task {task_id}. "
-                f"Samples={rounded_goals}"
-            )
+        if self.ogbench_enable_reset_perturb:
+            if unique_starts < 2:
+                raise RuntimeError(
+                    f"Benchmark preflight failed: start perturbation not observed for task {task_id}. "
+                    f"Samples={rounded_starts}"
+                )
+            if unique_goals < 2:
+                raise RuntimeError(
+                    f"Benchmark preflight failed: goal perturbation not observed for task {task_id}. "
+                    f"Samples={rounded_goals}"
+                )
+        else:
+            if unique_starts != 1:
+                raise RuntimeError(
+                    f"Benchmark preflight failed: start perturbation remained enabled for task {task_id}. "
+                    f"Samples={rounded_starts}"
+                )
+            if unique_goals != 1:
+                raise RuntimeError(
+                    f"Benchmark preflight failed: goal perturbation remained enabled for task {task_id}. "
+                    f"Samples={rounded_goals}"
+                )
         self._benchmark_preflight_done = True
 
     def _write_benchmark_results(self, payload: dict) -> None:
@@ -2103,22 +2437,69 @@ class DiffusionForcingPlanning(
                     if interact_result.get("task_names"):
                         task_name = str(interact_result["task_names"][0])
 
+                    stage_prefix = (
+                        f"[HBENCH] task={self.task_id} group={group_idx} "
+                        f"seed={group_seed}"
+                    )
+                    t_stage = time.time()
+                    print(f"{stage_prefix} stage=groundtruth_info start", flush=True)
                     groundtruth_info = self._compute_groundtruth_hamiltonian_info(
                         start_xy=start_xy[0],
                         goal_xy=goal_xy[0],
                         waypoints_xy=waypoints_xy,
                         task_name=task_name,
                     )
+                    print(
+                        f"{stage_prefix} stage=groundtruth_info done "
+                        f"(elapsed={time.time() - t_stage:.1f}s)",
+                        flush=True,
+                    )
                     interact_result = self._augment_interact_result_with_hamiltonian_groundtruth(
                         interact_result,
                         groundtruth_info,
                     )
 
+                    t_stage = time.time()
+                    print(f"{stage_prefix} stage=render_groundtruth_hamiltonian start", flush=True)
                     gt_image = self._render_groundtruth_hamiltonian_image(groundtruth_info)
+                    print(
+                        f"{stage_prefix} stage=render_groundtruth_hamiltonian done "
+                        f"(elapsed={time.time() - t_stage:.1f}s, image={'yes' if gt_image is not None else 'no'})",
+                        flush=True,
+                    )
                     if gt_image is not None:
+                        t_log = time.time()
+                        print(f"{stage_prefix} stage=log_image_groundtruth_hamiltonian start", flush=True)
                         self.log_image(
                             f"{group_idx}/groundtruth_hemiltonian_path",
                             gt_image,
+                        )
+                        print(
+                            f"{stage_prefix} stage=log_image_groundtruth_hamiltonian done "
+                            f"(elapsed={time.time() - t_log:.1f}s)",
+                            flush=True,
+                        )
+                    t_stage = time.time()
+                    print(f"{stage_prefix} stage=render_groundtruth_temporal start", flush=True)
+                    gt_temporal_image = self._render_groundtruth_temporal_distance_image(
+                        groundtruth_info
+                    )
+                    print(
+                        f"{stage_prefix} stage=render_groundtruth_temporal done "
+                        f"(elapsed={time.time() - t_stage:.1f}s, image={'yes' if gt_temporal_image is not None else 'no'})",
+                        flush=True,
+                    )
+                    if gt_temporal_image is not None:
+                        t_log = time.time()
+                        print(f"{stage_prefix} stage=log_image_groundtruth_temporal start", flush=True)
+                        self.log_image(
+                            f"{group_idx}/groundtruth_temporal_distance",
+                            gt_temporal_image,
+                        )
+                        print(
+                            f"{stage_prefix} stage=log_image_groundtruth_temporal done "
+                            f"(elapsed={time.time() - t_log:.1f}s)",
+                            flush=True,
                         )
 
                     task_group_results.append(interact_result)
@@ -3138,7 +3519,10 @@ class DiffusionForcingPlanning(
 
             # [ENV CACHING] Check if environment is cached
             # task_id는 set_task()로 전환하므로 캐시 키에서 제외 — 환경 구조는 task마다 동일
-            env_cache_key = f"{self.env_id}|task_override={self.task_override_resolved_path or 'none'}"
+            env_cache_key = (
+                f"{self.env_id}|task_override={self.task_override_resolved_path or 'none'}"
+                f"|reset_perturb={int(self.ogbench_enable_reset_perturb)}"
+            )
             if (
                 hasattr(self, "_cached_envs")
                 and hasattr(self, "_cached_env_key")
@@ -3158,11 +3542,13 @@ class DiffusionForcingPlanning(
                 _render_size = 480 if (self.viz_agent_rollout and self.viz_mujoco_renderer) else 200
                 if self.env_id in OGBENCH_ENVS:
                     _make_maze_env = self._get_ogbench_make_maze_env()
+                    _ogbench_extra_kwargs = self._get_ogbench_maze_env_extra_kwargs()
                     if "pointmaze" in self.env_id:
                         _maze_type = self.env_id.split("-")[1]
                         env_fn = lambda: _make_maze_env(
                             "point", "maze", maze_type=_maze_type,
                             width=_render_size, height=_render_size,
+                            **_ogbench_extra_kwargs,
                         )
                         use_diffused_action = True
                     elif "antmaze" in self.env_id:
@@ -3170,6 +3556,7 @@ class DiffusionForcingPlanning(
                         env_fn = lambda: _make_maze_env(
                             "ant", "maze", maze_type=_maze_type,
                             width=_render_size, height=_render_size,
+                            **_ogbench_extra_kwargs,
                         )
                         from dql.main_Antmaze import hyperparameters
                         from dql.agents.ql_diffusion import Diffusion_QL as Agent
@@ -3345,7 +3732,7 @@ class DiffusionForcingPlanning(
 
             best_node: Optional["TreeNode"] = None
             selected_plan_bundle: Optional[dict] = None
-            last_is_tree1: bool = True
+            last_reverse_output: bool = False
             active_tree = None
             planner_state_result: Optional[dict] = None
             bidir_tree1 = None
@@ -3499,14 +3886,14 @@ class DiffusionForcingPlanning(
                         if meeting_winner is not None:
                             best_node = meeting_winner["node"]
                             active_tree = meeting_winner["selected_tree"]
-                            last_is_tree1 = meeting_winner["is_tree1"]
+                            last_reverse_output = meeting_winner["reverse_output"]
                             selected_plan_bundle = meeting_winner
                             is_meeting = True
                         else:
                             if round_fallback is not None:
                                 best_node = round_fallback["node"]
                                 active_tree = round_fallback["selected_tree"]
-                                last_is_tree1 = round_fallback["is_tree1"]
+                                last_reverse_output = round_fallback["reverse_output"]
                                 selected_plan_bundle = None
                             is_meeting = False
                         if _trees_exhausted:
@@ -3550,14 +3937,14 @@ class DiffusionForcingPlanning(
                         if meeting_winner is not None:
                             best_node = meeting_winner["node"]
                             active_tree = meeting_winner["selected_tree"]
-                            last_is_tree1 = meeting_winner["is_tree1"]
+                            last_reverse_output = meeting_winner["reverse_output"]
                             selected_plan_bundle = meeting_winner
                             is_meeting = True
                         else:
                             if round_fallback is not None:
                                 best_node = round_fallback["node"]
                                 active_tree = round_fallback["selected_tree"]
-                                last_is_tree1 = round_fallback["is_tree1"]
+                                last_reverse_output = round_fallback["reverse_output"]
                                 selected_plan_bundle = None
                             is_meeting = False
                         if _trees_exhausted:
@@ -3571,7 +3958,7 @@ class DiffusionForcingPlanning(
                     selected_plan_bundle = self._build_postprocessed_plan_from_node(
                         best_node,
                         plan_tokens=self._require_current_plan_tokens(),
-                        is_tree1=last_is_tree1,
+                        reverse_output=last_reverse_output,
                         goal_normalized=goal_normalized,
                     )
                     _reorder_ms = (time.time() - _reorder_t0) * 1000
@@ -4388,13 +4775,29 @@ class DiffusionForcingPlanning(
     ) -> float:
         """Compute the scalar selection value for a source-target pair."""
         if self.uncertainty_mode == "expected_root_node_dist":
-            source_cum = float(getattr(source_node, "cum_temporal_dist_from_root", 0.0))
-            target_cum = float(getattr(target_node, "cum_temporal_dist_from_root", 0.0))
-            return -(source_cum + float(t_curr) + target_cum)
+            return -self._compute_source_target_total_cost(
+                source_node=source_node,
+                target_node=target_node,
+                t_curr=t_curr,
+            )
         if self.uncertainty_mode == "temporal_dist":
             return -float(t_curr)
         # Legacy uncertainty modes use -U as before.
         return float("nan")
+
+    def _compute_source_target_total_cost(
+        self,
+        source_node: "TreeNode",
+        target_node: "TreeNode",
+        t_curr: float,
+    ) -> float:
+        source_cum = float(getattr(source_node, "cum_temporal_dist_from_root", 0.0))
+        target_cum = float(getattr(target_node, "cum_temporal_dist_from_root", 0.0))
+        return (
+            source_cum
+            + self._transform_temporal_dist_for_total_cost(t_curr)
+            + target_cum
+        )
 
     def _run_fast_uncertainty_sampling(
         self,
@@ -4883,7 +5286,7 @@ class DiffusionForcingPlanning(
                 "tag": "multi_tree_goal",
                 "root_obs": np.asarray(goal_obs, dtype=np.float32).copy(),
                 "root_sim_state": goal_sim_state,
-                "is_tree1": False,
+                "is_tree1": True,
                 "anchor_xy": np.asarray(goal_obs, dtype=np.float32)[self.pos_dim_indices],
             }
         )
@@ -4914,8 +5317,13 @@ class DiffusionForcingPlanning(
                         trees[j].root_node.obs[None].astype(np.float32),
                     )[0]
                 )
-                root_cost[i, j] = td_ij
-                root_cost[j, i] = td_ij
+                total_cost_ij = self._compute_source_target_total_cost(
+                    source_node=trees[i].root_node,
+                    target_node=trees[j].root_node,
+                    t_curr=td_ij,
+                )
+                root_cost[i, j] = total_cost_ij
+                root_cost[j, i] = total_cost_ij
 
         planner_state = {
             "trees": trees,
@@ -5065,10 +5473,10 @@ class DiffusionForcingPlanning(
                     tds = self._compute_raw_state_temporal_dist_np(src_obs_rep, target_obs)
                     best_local_idx = int(np.argmin(tds))
                     target_node = target_nodes[best_local_idx]
-                    bridge_cost = (
-                        float(getattr(source_node, "cum_temporal_dist_from_root", 0.0))
-                        + float(tds[best_local_idx])
-                        + float(getattr(target_node, "cum_temporal_dist_from_root", 0.0))
+                    bridge_cost = self._compute_source_target_total_cost(
+                        source_node=source_node,
+                        target_node=target_node,
+                        t_curr=float(tds[best_local_idx]),
                     )
                     pair_key = self._anchor_pair_key(source_anchor_idx, target_anchor_idx)
                     if bridge_cost >= float(planner_state["best_direct_bridge_raw"][pair_key]):
@@ -5124,7 +5532,6 @@ class DiffusionForcingPlanning(
                 node,
                 meeting_target_node,
                 plan_tokens,
-                is_tree1=selected_tree.is_tree1,
             )
             if gap is None or not np.isfinite(gap) or gap >= self.meeting_delta:
                 continue
@@ -5134,10 +5541,10 @@ class DiffusionForcingPlanning(
                     meeting_target_node.obs[None].astype(np.float32),
                 )[0]
             )
-            bridge_cost = (
-                float(getattr(node, "cum_temporal_dist_from_root", 0.0))
-                + t_curr
-                + float(getattr(meeting_target_node, "cum_temporal_dist_from_root", 0.0))
+            bridge_cost = self._compute_source_target_total_cost(
+                source_node=node,
+                target_node=meeting_target_node,
+                t_curr=t_curr,
             )
             candidate = {
                 "pair_key": pair_key,
@@ -5272,7 +5679,7 @@ class DiffusionForcingPlanning(
         stored_target_idx = int(connection_info["target_anchor_idx"])
         target_root_obs = planner_state["trees"][stored_target_idx].root_node.obs
         target_root_obs_norm = self._normalize_obs_np(target_root_obs)
-        edge_bundle = self._build_postprocessed_plan_from_node_pair(
+        edge_bundle = self._build_connection_plan_bundle(
             source_node=connection_info["source_node"],
             target_node=connection_info["target_node"],
             plan_tokens=plan_tokens,
@@ -6649,7 +7056,7 @@ class DiffusionForcingPlanning(
                     ]  # m (t fs) b c
                     is_achieved_plan = [True if i in achieved_indices else False for i in visualize_indices]
 
-                    is_forward_tree = "from_goal" not in tree.tag
+                    is_forward_tree = self._tree_uses_forward_prefix_semantics(tree)
                     visualize_valid_frame_bounds = [
                         self._get_plan_viz_valid_frame_bounds(
                             expanded_node_candidates[i]["depth"],
@@ -6683,7 +7090,7 @@ class DiffusionForcingPlanning(
                         terminal_value_plans = replanned_plan_hists[
                             -1, :, visualize_indices
                         ]  # (t fs) b c
-                        if "from_goal" in tree.tag:
+                        if not is_forward_tree:
                             terminal_value_plans = torch.flip(terminal_value_plans, [0])
                         self.visualize_expanded_vs_value_plans(
                             is_achieved_plan,
@@ -7678,7 +8085,7 @@ class DiffusionForcingPlanning(
                 is_achieved_plan = [
                     i in achieved_indices for i in visualize_indices
                 ]
-                is_forward_tree = "from_goal" not in tree.tag
+                is_forward_tree = self._tree_uses_forward_prefix_semantics(tree)
                 visualize_valid_frame_bounds = [
                     self._get_plan_viz_valid_frame_bounds(
                         expanded_node_candidates[i]["depth"],
@@ -7711,7 +8118,7 @@ class DiffusionForcingPlanning(
                     terminal_value_plans = replanned_plan_hists[
                         -1, :, visualize_indices
                     ]
-                    if "from_goal" in tree.tag:
+                    if not is_forward_tree:
                         terminal_value_plans = torch.flip(terminal_value_plans, [0])
                     self.visualize_expanded_vs_value_plans(
                         is_achieved_plan,
@@ -7857,7 +8264,7 @@ class DiffusionForcingPlanning(
                     agent=agent,
                     envs=envs,
                     parent_sim_state=parent_node.sim_state,
-                    is_backward=(not active_tree.is_tree1),
+                    is_backward=(not self._tree_uses_forward_prefix_semantics(active_tree)),
                 )
                 assert _new_sim_state is not None, "_new_sim_state is None"
                 _child.sim_state = _new_sim_state
@@ -8326,11 +8733,10 @@ class DiffusionForcingPlanning(
             if selected_tree is None:
                 continue
 
-            is_tree1 = selected_tree.is_tree1
+            reverse_output = not self._tree_uses_forward_prefix_semantics(selected_tree)
             gap = self._compute_plan_gap(
                 node,
                 plan_tokens,
-                is_tree1=is_tree1,
             )
             if gap is None or not np.isfinite(gap):
                 continue
@@ -8340,7 +8746,7 @@ class DiffusionForcingPlanning(
                 "info": info,
                 "node": node,
                 "selected_tree": selected_tree,
-                "is_tree1": is_tree1,
+                "reverse_output": reverse_output,
                 "gap": float(gap),
                 "total_depth": int(node.depth + target_depth),
             }
@@ -8351,7 +8757,7 @@ class DiffusionForcingPlanning(
                     self._build_postprocessed_plan_from_node(
                         node,
                         plan_tokens=plan_tokens,
-                        is_tree1=is_tree1,
+                        reverse_output=reverse_output,
                         goal_normalized=goal_normalized,
                     )
                 )
@@ -8533,36 +8939,44 @@ class DiffusionForcingPlanning(
     def _node_path_label(
         self,
         expanding_node: "TreeNode",
-        is_forward_tree: bool,
+        active_tree: Optional["MCTSTreeState"],
         target_node: Optional["TreeNode"],
     ) -> str:
         """Build a human-readable path label for plan visualization.
 
-        The label always reads forward-root → ... → backward-root, with the
-        currently-expanding node wrapped in parentheses, and the two trees
-        separated by '_'.
-
-        Examples (node names encoded as last component of the TreeNode name):
-          Backward tree expanding "0-1-3", target forward "0-2-5"
-            → "0-2-5_(3)-1-0"
-          Forward tree expanding "0-2-5", target backward "0-1-3"
-            → "0-2-(5)_3-1-0"
+        Multi-tree mode uses anchor-name-prefixed labels. Legacy bidirectional
+        mode keeps the forward/backward presentation used by existing videos.
 
         Args:
             expanding_node: The TreeNode just expanded.
-            is_forward_tree: True if expanding_node belongs to the forward (start-rooted) tree.
+            active_tree: Tree owning `expanding_node`.
             target_node: The node in the opposite tree being targeted (may be None).
 
         Returns:
-            Label string, e.g. "0-2-5_(3)-1-0".
+            Label string for video/log keys.
         """
         exp_parts = expanding_node.name.split("-")  # e.g. ["0","1","3"]
+
+        if self._is_multi_tree_anchor_tree(active_tree):
+            if exp_parts:
+                exp_parts[-1] = f"({exp_parts[-1]})"
+            expanding_label = "-".join(exp_parts) if exp_parts else "(?)"
+            source_anchor = self._node_anchor_name(
+                expanding_node,
+                getattr(active_tree, "anchor_name", "?") if active_tree is not None else "?",
+            )
+            if target_node is None:
+                return f"{source_anchor}:{expanding_label}"
+            target_anchor = self._node_anchor_name(target_node)
+            target_label = "-".join(target_node.name.split("-"))
+            return f"{source_anchor}:{expanding_label}__{target_anchor}:{target_label}"
 
         if target_node is not None:
             tgt_parts = target_node.name.split("-")  # e.g. ["0","2","5"]
         else:
             tgt_parts = ["?"]
 
+        is_forward_tree = self._tree_uses_forward_prefix_semantics(active_tree)
         if is_forward_tree:
             # Forward side: root → ... → (expanding_node)  e.g. "0-2-(5)"
             fwd_parts = exp_parts[:-1] + [f"({exp_parts[-1]})"]

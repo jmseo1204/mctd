@@ -8,8 +8,10 @@
 - 1차 실행 분량은 task별 1회, 총 5 jobs로 제한한다.
 - `use_uncertainty_as_value=True` 경로만 지원한다.
 - `uncertainty_mode`에 `expected_root_node_dist`를 추가한다.
-- 1차 구현의 기본 selection value는 `-(cum_td_i + T_curr + cum_td_j)`를 사용한다.
+- 1차 구현의 기본 selection value는 `-(cum_td_i + h(T_curr) + cum_td_j)`를 사용한다.
   - `T_curr`: 현재 expanding node와 선택된 target node 사이의 temporal distance
+  - `h(x) = x + alpha * x^2`
+  - `alpha = temporal_dist_overestimate_coeff`
 - 첫 accepted connection은 고정한다.
   - 나중에 더 짧은 동일 pair connection이 나와도 accepted edge 자체는 교체하지 않는다.
 - intermediate edge는 각 edge별 local postprocess만 적용한다.
@@ -81,7 +83,8 @@
 
 초기화:
 
-- 각 tree root observation끼리의 temporal distance
+- 각 tree root observation끼리의 total cost
+  - root의 cumulative TD는 `0.0`이므로 초기 pair cost는 `h(TD(root_i, root_j))`
 
 업데이트:
 
@@ -195,7 +198,7 @@ anchor 순서는 항상 아래로 둔다.
 - `bridge_td`
 - `cum_td_i`
 - `cum_td_j`
-- `total_td = cum_td_i + bridge_td + cum_td_j`
+- `total_td = cum_td_i + h(bridge_td) + cum_td_j`
 - `source_round`
 - `is_accepted_edge: bool`
 
@@ -460,7 +463,7 @@ child `c`가 실제로 생성된 뒤에는 target semantics를 아래처럼 분�
 - `uncertainty_mode=expected_root_node_dist`일 때 `_compute_node_uncertainty(...)`는
   - `cluster_labels`, `n_clusters`, `T_curr`는 계속 계산하고
   - selection에 쓰일 scalar value는
-    `-(cum_td_i + T_curr + cum_td_j)`로 해석한다.
+    `-(cum_td_i + h(T_curr) + cum_td_j)`로 해석한다.
 - `_compute_uncertainty_and_clusters(...)`는
   - cluster_subplans 생성 로직은 기존대로 유지하되
   - `values.append(float(unc_result["selection_value"]))`를 사용한다.
@@ -494,7 +497,11 @@ child `c`가 실제로 생성된 뒤에는 target semantics를 아래처럼 분�
 현재 확정값:
 
 - `uncertainty_mode=expected_root_node_dist`일 때 selection value는
-  `-(cum_td_i + T_curr + cum_td_j)`를 사용한다.
+  `-(cum_td_i + h(T_curr) + cum_td_j)`를 사용한다.
+- 여기서
+  - `h(x) = x + alpha * x^2`
+  - `alpha = temporal_dist_overestimate_coeff`
+  - 1차 기본값은 `0.001`
 
 이 값을 채택한 이유:
 
@@ -518,7 +525,7 @@ child `c`가 실제로 생성된 뒤에는 target semantics를 아래처럼 분�
 실험 확장 여지는 남긴다.
 
 - `temporal_dist`: `-T_curr`
-- `expected_root_node_dist`: `-(cum_td_i + T_curr + cum_td_j)`
+- `expected_root_node_dist`: `-(cum_td_i + h(T_curr) + cum_td_j)`
 
 이 두 모드를 모두 지원하면 이후 비교가 가능하다.
 
@@ -532,7 +539,7 @@ child `c`가 실제로 생성된 뒤에는 target semantics를 아래처럼 분�
 2. temporal distance가 최소인 `v* in tree_j`를 찾는다.
 3. 아래 비용을 계산한다.
 
-`candidate_total_td = cum_td_from_root(u) + TD(u, v*) + cum_td_from_root(v*)`
+`candidate_total_td = cum_td_from_root(u) + h(TD(u, v*)) + cum_td_from_root(v*)`
 
 4. 이 값이 기존 `best_direct_bridge[(i, j)]`보다 짧으면 갱신한다.
 
@@ -861,7 +868,7 @@ full success가 아니면:
 - 추가로 필요한 경우
   - `cum_td_i`
   - `cum_td_j`
-  를 받아 selection value 계산
+  를 받아 `-(cum_td_i + h(T_curr) + cum_td_j)` 형태의 selection value 계산
 
 권장 반환 형식:
 
@@ -982,6 +989,8 @@ full success가 아니면:
 새 helper 제안:
 
 - `_compute_temporal_distance(obs_a, obs_b) -> float`
+- `_transform_temporal_dist_for_total_cost(td) -> float`
+- `_compute_source_target_total_cost(source_node, target_node, t_curr) -> float`
 
 #### `algorithms/diffusion_forcing/df_planning.py::_postprocess_tree_local_expansions`
 

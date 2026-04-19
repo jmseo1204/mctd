@@ -29,6 +29,8 @@ from __future__ import annotations
 import heapq
 import os
 import pickle
+import time
+from datetime import datetime
 
 import numpy as np
 
@@ -44,14 +46,37 @@ def _graph_cache_path(
     sample_ratio: float,
     edge_radius: float,
     seed: int,
+    timestamp: str | None = None,
 ) -> str:
     filename = (
         f"{dataset}_sampled_graph_"
         f"r{_float_token(sample_ratio)}_"
         f"seed{int(seed)}_"
-        f"rad{_float_token(edge_radius)}.pkl"
+        f"rad{_float_token(edge_radius)}"
     )
+    if timestamp not in (None, ""):
+        filename += f"_ts{str(timestamp)}"
+    filename += ".pkl"
     return os.path.join(save_dir, filename)
+
+
+def build_sampled_graph_cache_path(
+    dataset: str,
+    save_dir: str,
+    sample_ratio: float,
+    edge_radius: float,
+    seed: int,
+    *,
+    timestamp: str | None = None,
+) -> str:
+    return _graph_cache_path(
+        dataset=dataset,
+        save_dir=save_dir,
+        sample_ratio=sample_ratio,
+        edge_radius=edge_radius,
+        seed=seed,
+        timestamp=timestamp,
+    )
 
 
 def _build_radius_graph(points_xy: np.ndarray, edge_radius: float) -> tuple[np.ndarray, np.ndarray, list[list[tuple[int, float]]]]:
@@ -122,6 +147,7 @@ def build_or_load_sampled_graph_cache(
     save_dir: str,
     edge_radius: float = 3.0,
     seed: int = 42,
+    cache_path: str | None = None,
 ) -> dict:
     """Build or load sampled-state radius graph cache.
 
@@ -139,15 +165,28 @@ def build_or_load_sampled_graph_cache(
     if not (0.0 < sample_ratio <= 1.0):
         raise ValueError(f"sample_ratio must be in (0, 1], got {sample_ratio}")
 
+    t_total = time.time()
     os.makedirs(save_dir, exist_ok=True)
-    cache_path = _graph_cache_path(
-        dataset=dataset,
-        save_dir=save_dir,
-        sample_ratio=sample_ratio,
-        edge_radius=edge_radius,
-        seed=seed,
+    cache_path = (
+        os.path.expanduser(str(cache_path))
+        if cache_path not in (None, "")
+        else _graph_cache_path(
+            dataset=dataset,
+            save_dir=save_dir,
+            sample_ratio=sample_ratio,
+            edge_radius=edge_radius,
+            seed=seed,
+        )
+    )
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    print(
+        "[SampledGraph] Request cache "
+        f"path={cache_path} dataset={dataset} ratio={sample_ratio:g} "
+        f"radius={edge_radius:g} seed={int(seed)}",
+        flush=True,
     )
     if os.path.exists(cache_path):
+        t_load = time.time()
         with open(cache_path, "rb") as f:
             cache = pickle.load(f)
         required_keys = {
@@ -163,10 +202,16 @@ def build_or_load_sampled_graph_cache(
             "n_total",
         }
         if required_keys.issubset(cache.keys()):
-            print(f"[SampledGraph] Loaded cache: {cache_path}", flush=True)
+            cache["cache_path"] = cache_path
+            print(
+                f"[SampledGraph] Loaded cache: {cache_path} "
+                f"(load_elapsed={time.time() - t_load:.1f}s, total={time.time() - t_total:.1f}s)",
+                flush=True,
+            )
             return cache
         print(f"[SampledGraph] Cache missing required keys, rebuilding: {cache_path}", flush=True)
 
+    t_build = time.time()
     n_total = int(len(data_xy))
     n_use = max(1, int(n_total * sample_ratio))
     rng = np.random.default_rng(seed)
@@ -187,12 +232,15 @@ def build_or_load_sampled_graph_cache(
         "edge_radius": float(edge_radius),
         "seed": int(seed),
         "n_total": n_total,
+        "cache_path": cache_path,
+        "built_at": datetime.now().strftime("%Y%m%d-%H%M%S"),
     }
     with open(cache_path, "wb") as f:
         pickle.dump(cache, f)
     print(
         f"[SampledGraph] Built and saved cache: {cache_path} "
-        f"(N={len(points_xy):,}, edges={len(edge_index):,})",
+        f"(N={len(points_xy):,}, edges={len(edge_index):,}, "
+        f"build_elapsed={time.time() - t_build:.1f}s, total={time.time() - t_total:.1f}s)",
         flush=True,
     )
     return cache
@@ -205,16 +253,29 @@ def build_or_load_sampled_graph_cache_from_npz(
     sample_ratio: float,
     edge_radius: float = 3.0,
     seed: int = 42,
+    cache_path: str | None = None,
 ) -> dict:
     """Load sampled-graph cache if present, otherwise build it from a dataset npz."""
-    cache_path = _graph_cache_path(
-        dataset=dataset,
-        save_dir=save_dir,
-        sample_ratio=sample_ratio,
-        edge_radius=edge_radius,
-        seed=seed,
+    t_total = time.time()
+    cache_path = (
+        os.path.expanduser(str(cache_path))
+        if cache_path not in (None, "")
+        else _graph_cache_path(
+            dataset=dataset,
+            save_dir=save_dir,
+            sample_ratio=sample_ratio,
+            edge_radius=edge_radius,
+            seed=seed,
+        )
+    )
+    print(
+        "[SampledGraph] Request dataset-backed cache "
+        f"path={cache_path} dataset={dataset} npz={npz_path} "
+        f"ratio={sample_ratio:g} radius={edge_radius:g} seed={int(seed)}",
+        flush=True,
     )
     if os.path.exists(cache_path):
+        t_load = time.time()
         with open(cache_path, "rb") as f:
             cache = pickle.load(f)
         required_keys = {
@@ -230,7 +291,12 @@ def build_or_load_sampled_graph_cache_from_npz(
             "n_total",
         }
         if required_keys.issubset(cache.keys()):
-            print(f"[SampledGraph] Loaded cache: {cache_path}", flush=True)
+            cache["cache_path"] = cache_path
+            print(
+                f"[SampledGraph] Loaded cache: {cache_path} "
+                f"(load_elapsed={time.time() - t_load:.1f}s, total={time.time() - t_total:.1f}s)",
+                flush=True,
+            )
             return cache
         print(f"[SampledGraph] Cache missing required keys, rebuilding: {cache_path}", flush=True)
 
@@ -243,6 +309,7 @@ def build_or_load_sampled_graph_cache_from_npz(
         save_dir=save_dir,
         edge_radius=edge_radius,
         seed=seed,
+        cache_path=cache_path,
     )
 
 
@@ -545,6 +612,13 @@ class SampledGraphEstimatorMixin:
 
     def _load_sampled_graph_cache(self) -> None:
         dataset_npz = os.path.join(self._sampled_graph_data_dir, f"{self.dataset}.npz")
+        override_path = getattr(self, "sampled_graph_cache_path_override", None)
+        print(
+            "[INIT] Sampled graph cache load requested "
+            f"(dataset={self.dataset}, override={override_path}, npz={dataset_npz})",
+            flush=True,
+        )
+        t_load = time.time()
         self._sampled_graph_cache = build_or_load_sampled_graph_cache_from_npz(
             npz_path=dataset_npz,
             dataset=self.dataset,
@@ -552,10 +626,11 @@ class SampledGraphEstimatorMixin:
             sample_ratio=self.sampled_graph_sample_ratio,
             edge_radius=self.sampled_graph_edge_radius,
             seed=self.sampled_graph_seed,
+            cache_path=getattr(self, "sampled_graph_cache_path_override", None),
         )
         print(
             f"[INIT] Sampled graph cache loaded: {len(self._sampled_graph_cache['points_xy']):,} nodes "
-            f"from {dataset_npz}",
+            f"from {dataset_npz} (elapsed={time.time() - t_load:.1f}s)",
             flush=True,
         )
 

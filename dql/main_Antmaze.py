@@ -29,80 +29,49 @@ import pdb
 
 import ogbench
 
-hyperparameters = {
-    "antmaze-medium-navigate-v0": {
-        "lr": 3e-4,
-        "eta": 1.0,
-        "max_q_backup": False,
-        "reward_tune": "cql_antmaze",
-        "eval_freq": 1,
-        "num_epochs": 200,
-        "gn": 7.0,
-        "top_k": 1,
-        "target_steps": 10,
-        "p": 0.2,
-    },
-    "antmaze-medium-stitch-v0": {
-        "lr": 3e-4,
-        "eta": 1.0,
-        "max_q_backup": False,
-        "reward_tune": "cql_antmaze",
-        "eval_freq": 1,
-        "num_epochs": 200,
-        "gn": 7.0,
-        "top_k": 1,
-        "target_steps": 10,
-        "p": 0.2,
-    },
-    "antmaze-large-navigate-v0": {
-        "lr": 3e-4,
-        "eta": 1.0,
-        "max_q_backup": False,
-        "reward_tune": "cql_antmaze",
-        "eval_freq": 1,
-        "num_epochs": 200,
-        "gn": 7.0,
-        "top_k": 1,
-        "target_steps": 10,
-        "p": 0.2,
-    },
-    "antmaze-large-stitch-v0": {
-        "lr": 3e-4,
-        "eta": 1.0,
-        "max_q_backup": False,
-        "reward_tune": "cql_antmaze",
-        "eval_freq": 1,
-        "num_epochs": 200,
-        "gn": 7.0,
-        "top_k": 1,
-        "target_steps": 10,
-        "p": 0.2,
-    },
-    "antmaze-giant-navigate-v0": {
-        "lr": 3e-4,
-        "eta": 1.0,
-        "max_q_backup": False,
-        "reward_tune": "cql_antmaze",
-        "eval_freq": 1,
-        "num_epochs": 200,
-        "gn": 7.0,
-        "top_k": 1,
-        "target_steps": 10,
-        "p": 0.2,
-    },
-    "antmaze-giant-stitch-v0": {
-        "lr": 3e-4,
-        "eta": 1.0,
-        "max_q_backup": False,
-        "reward_tune": "cql_antmaze",
-        "eval_freq": 1,
-        "num_epochs": 200,
-        "gn": 7.0,
-        "top_k": 1,
-        "target_steps": 10,
-        "p": 0.2,
-    },
+ANTMAZE_DEFAULT_HYPERPARAMETERS = {
+    "lr": 3e-4,
+    "eta": 1.0,
+    "max_q_backup": False,
+    "eval_freq": 1,
+    "num_epochs": 200,
+    "gn": 7.0,
+    "top_k": 1,
+    "p": 0.2,
 }
+
+# Current DQL defaults are shared across known maze sizes and dataset types, but
+# keep the override tables in place so newly added antmaze variants do not
+# require another hardcoded env-name list.
+ANTMAZE_MAZE_TYPE_OVERRIDES = {
+    "medium": {},
+    "large": {},
+    "giant": {},
+    "teleport": {},
+}
+
+ANTMAZE_DATASET_TYPE_OVERRIDES = {
+    "navigate": {},
+    "stitch": {},
+    "explore": {},
+}
+
+
+def parse_antmaze_env_name(env_name):
+    match = re.fullmatch(r"antmaze-([^-]+)-(.+)-v0", env_name)
+    if match is None:
+        raise ValueError(
+            f"Unsupported DQL env_name '{env_name}'. Expected antmaze-<maze_type>-<dataset_type>-v0."
+        )
+    return match.group(1), match.group(2)
+
+
+def resolve_antmaze_hyperparameters(env_name):
+    maze_type, dataset_type = parse_antmaze_env_name(env_name)
+    hyperparameters = dict(ANTMAZE_DEFAULT_HYPERPARAMETERS)
+    hyperparameters.update(ANTMAZE_MAZE_TYPE_OVERRIDES.get(maze_type, {}))
+    hyperparameters.update(ANTMAZE_DATASET_TYPE_OVERRIDES.get(dataset_type, {}))
+    return hyperparameters
 
 
 def find_latest_checkpoint_epoch(results_dir):
@@ -547,20 +516,21 @@ if __name__ == "__main__":
             )
             args.env_name = resume_env_name
 
+    maze_type, _ = parse_antmaze_env_name(args.env_name)
+    resolved_hyperparameters = resolve_antmaze_hyperparameters(args.env_name)
     args.device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
     args.output_dir = f"{args.dir}"
 
-    args.num_epochs = hyperparameters[args.env_name]["num_epochs"]
-    args.eval_freq = hyperparameters[args.env_name]["eval_freq"]
+    args.num_epochs = resolved_hyperparameters["num_epochs"]
+    args.eval_freq = resolved_hyperparameters["eval_freq"]
     args.eval_episodes = 15 if "v2" in args.env_name else 100
 
-    args.lr = hyperparameters[args.env_name]["lr"]
-    args.eta = hyperparameters[args.env_name]["eta"]
-    args.max_q_backup = hyperparameters[args.env_name]["max_q_backup"]
-    #args.reward_tune = hyperparameters[args.env_name]["reward_tune"]
-    args.gn = hyperparameters[args.env_name]["gn"]
-    args.top_k = hyperparameters[args.env_name]["top_k"]
-    args.p = hyperparameters[args.env_name]["p"]
+    args.lr = resolved_hyperparameters["lr"]
+    args.eta = resolved_hyperparameters["eta"]
+    args.max_q_backup = resolved_hyperparameters["max_q_backup"]
+    args.gn = resolved_hyperparameters["gn"]
+    args.top_k = resolved_hyperparameters["top_k"]
+    args.p = resolved_hyperparameters["p"]
 
     if args.resume_dir and resume_variant:
         for key, value in resume_variant.items():
@@ -603,7 +573,7 @@ if __name__ == "__main__":
     variant = vars(args)
 
     #env = gym.make(args.env_name)
-    env = ogbench.locomaze.maze.make_maze_env('ant','maze',maze_type=args.env_name.split("-")[1])
+    env = ogbench.locomaze.maze.make_maze_env('ant', 'maze', maze_type=maze_type)
 
     #env.seed(args.seed)
     torch.manual_seed(args.seed)

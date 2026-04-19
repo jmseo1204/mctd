@@ -30,6 +30,7 @@ lr_min_ratio: 0.1
 optimizer_beta: [0.9, 0.999]
 warmup_steps: 10000 # overrides df_base default (2000)
 noise_level: random_all
+extract_episode_ratio_from_sample: 0.5  # episode_len = int(sample_length * ratio), snapped to jump*frame_stack; read by scripts/generate_dataset_configs.sh
 
 # ── Visualization (read by train.sh; used every 10k steps in training_step) ──
 # valid_episode_len = episode_len * valid_episode_len_multiple tokens are generated

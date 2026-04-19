@@ -10,8 +10,9 @@ plot_start_goal: True
 interaction_seed: 1
 use_random_goals_for_interaction: False
 task_id: 1
-task_override_path: null # optional repo-relative YAML/JSON overriding OGBench task init/goal/waypoints
+task_override_path: null # optional repo-relative YAML/JSON overriding OGBench task init/goal/waypoints; eval_hemiltonian launchers fall back to configurations/task_overrides/{env_id}_waypoints.yaml when null
 task_override_waypoint_group_idx: null # optional 0-based waypoint group index override when a task override file stores multiple waypoint groups
+ogbench_enable_reset_perturb: true # if false, force exact OGBench task start/goal positions during waypoint search and benchmark rollout
 eval_repeat_id: null
 benchmark_num_rollouts: 1
 benchmark_rollout_seed_base: 0
@@ -89,7 +90,7 @@ regularize_goal_guidance: true # if true: re-normalize (unit_hilp + kde_lam·kde
 kde_sample_ratio: 0.1 # fraction of dataset to use for KDE (1.0 = full dataset)
 kde_save_dir: "~/.ogbench/data" # dataset npz directory for KDE positions
 sampled_graph_sample_ratio: 0.005 # fraction of dataset states to sample for cached visualization graph
-sampled_graph_edge_radius: 1.0 # connect undirected graph edges when Euclidean distance <= this radius
+sampled_graph_edge_radius: 2.0 # connect undirected graph edges when Euclidean distance <= this radius
 sampled_graph_seed: 42 # RNG seed for reproducible sampled-state graph construction
 sampled_graph_save_dir: "~/.ogbench/data" # cache directory for sampled-state graph pkl files
 
@@ -102,6 +103,7 @@ use_uncertainty_as_value: true
 multi_tree_hemiltonian: false
 uncertainty_mode: 'expected_root_node_dist' # 'entropy' | 'variance' | 'cluster' | 'temporal_dist' | 'expected_root_node_dist'
 reliable_TD_threshold: 80.0 # if TD(current, candidate) is below this, only tentative-neighbor trees are eligible as targets
+temporal_dist_overestimate_coeff: 0.0015 # h(x)=x+alpha*x^2 coefficient for expected-root-node-distance total-cost overestimation
 uncertainty_lambda: 1.0 # entropy: weight on angular entropy surrogate; variance: weight on V_ext_g
 uncertainty_eta: 1.0 # entropy: weight on geometry correction; variance: weight on V_ext_c
 fast_sampling_multiple: 4 # number of fast samples per candidate

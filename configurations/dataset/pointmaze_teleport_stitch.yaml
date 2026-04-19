@@ -1,0 +1,21 @@
+jump: ${jump}  # inherited from root config
+
+# ── [Group A: Dataset Loader] ─────────────────────────────────────────────
+env_id: "pointmaze-teleport-v0"
+dataset: "pointmaze-teleport-stitch-v0"
+save_dir: ~/.ogbench/data
+num_tasks: 5
+# sample_length: 201 frames per episode (200 steps + 1)
+# episode_len = floor(201 / snap_unit) * snap_unit, snap_unit = jump(5) * frame_stack(10) = 50
+sample_length: 201
+episode_len: 200  # ratio=1.0, snap_unit=50
+
+# ── [Group B: Normalization Stats] ────────────────────────────────────────
+# Computed from pointmaze-teleport-stitch-v0 training data
+# (1005000 samples, obs_dim=2). Computed 2026-04-19.
+observation_mean: [20.506912231445312, 9.826343536376953]
+observation_std:  [11.409735679626465, 7.50223445892334]
+action_mean: []
+action_std:  []
+reward_mean: 0.00497512  # = n_terminals/n_samples (5000/1005000)
+reward_std:  0.07035888

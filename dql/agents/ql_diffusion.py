@@ -347,7 +347,7 @@ class Diffusion_QL(object):
             q_mean = q_value.mean(dim=1, keepdim=True).flatten()
             q_std = q_value.std(dim=1, keepdim=True).flatten()
             q_value = q_mean - self.lcb_coef * q_std
-            idx = torch.multinomial(F.softmax(q_value, dim=0), 1)
+            idx = torch.argmax(q_value)
         return action[idx].cpu().data.numpy().flatten()
 
     def save_model(self, dir, id=None):

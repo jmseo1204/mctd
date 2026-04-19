@@ -2,6 +2,8 @@
 Plan visualization utilities for MCTD trajectory inspection.
 
 Provides PlanVizMixin — a mixin class whose methods handle:
+  - Denoised-prefix frame bound computation for plan rendering
+  - Visualization-only masking of frames outside valid denoised windows
   - HILP value heatmap over the maze (_compute_hilp_heatmap)
   - HILP gradient field over the maze (_compute_guidance_grad_fields)
   - MCTS node-path trajectory extraction (_extract_node_trajectory)
@@ -15,7 +17,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import matplotlib.cm as _mpl_cm
 import numpy as np
@@ -40,6 +42,45 @@ def _fmt_sci(v: float) -> str:
 
 class PlanVizMixin:
     """Mixin providing plan visualization methods."""
+
+    # ------------------------------------------------------------------
+    # Visualization frame helpers
+    # ------------------------------------------------------------------
+
+    def _get_denoised_frame_prefix_len(
+        self, depth: int, seg_size: int, total_frames: Optional[int] = None
+    ) -> int:
+        prefix_len = max(self._get_prefix_len_frames_from_depth(depth, seg_size), 0)
+        if total_frames is not None:
+            prefix_len = min(prefix_len, total_frames)
+        return prefix_len
+
+    def _get_plan_viz_valid_frame_bounds(
+        self,
+        depth: int,
+        seg_size: int,
+        total_frames: int,
+        is_forward_tree: bool,
+    ) -> Tuple[int, int]:
+        prefix_len = self._get_denoised_frame_prefix_len(depth, seg_size, total_frames)
+        if is_forward_tree:
+            return 0, prefix_len
+        return total_frames - prefix_len, total_frames
+
+    def _mask_plan_obs_outside_valid_frames(
+        self,
+        plan_obs: np.ndarray,
+        valid_frame_bounds: List[Tuple[int, int]],
+    ) -> np.ndarray:
+        total_frames = plan_obs.shape[0]
+        for i, (valid_start, valid_end) in enumerate(valid_frame_bounds):
+            valid_start = max(0, min(int(valid_start), total_frames))
+            valid_end = max(valid_start, min(int(valid_end), total_frames))
+            if valid_start > 0:
+                plan_obs[:valid_start, i, :] = np.nan
+            if valid_end < total_frames:
+                plan_obs[valid_end:, i, :] = np.nan
+        return plan_obs
 
     # ------------------------------------------------------------------
     # HILP heatmap & gradient field
@@ -352,7 +393,7 @@ class PlanVizMixin:
             tail_vis = np.array([alen - 1]) if alen > 0 else np.array([], dtype=int)
 
         node_traj = self._extract_node_trajectory(vnode)
-        is_fwd = active_tree.is_tree1
+        is_fwd = self._tree_uses_forward_prefix_semantics(active_tree)
         tgt_node_traj = (
             self._extract_node_trajectory(target_node)
             if target_node is not None
@@ -647,7 +688,7 @@ class PlanVizMixin:
         if len(frames) <= 1:
             return  # skip single-frame (zero-length) video upload
         video = np.stack(frames, axis=0).transpose(0, 3, 1, 2)  # (K, 3, H, W)
-        label = self._node_path_label(vnode, active_tree.is_tree1, target_node)
+        label = self._node_path_label(vnode, active_tree, target_node)
         selection_count = vinfo.get(
             "selection_count",
             getattr(vnode, "last_selection_count", getattr(vnode, "selection_count", None)),
@@ -666,11 +707,11 @@ class PlanVizMixin:
         source_tree_label = (
             getattr(source_root, "anchor_name", None)
             or getattr(active_tree, "anchor_name", None)
-            or ("S" if active_tree.is_tree1 else "G")
+            or self._node_anchor_name(vnode, "S" if is_fwd else "G")
         )
         target_tree_label = (
             getattr(target_root, "anchor_name", None)
-            or ("G" if active_tree.is_tree1 else "S")
+            or self._node_anchor_name(target_node, "G" if is_fwd else "S")
         )
         label_with_count = (
             f"[{selection_count:03d}]_{source_tree_label}_{target_tree_label}_{label}"

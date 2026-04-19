@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 from itertools import combinations
 from pathlib import Path
 import sys
+from datetime import datetime
 from typing import Optional
 
 import numpy as np
@@ -17,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from algorithms.diffusion_forcing.sampled_graph_estimator import (
     assign_distinct_nodes_from_rankings,
+    build_sampled_graph_cache_path,
     build_or_load_sampled_graph_cache_from_npz,
     precompute_nearest_node_rankings,
 )
@@ -30,7 +33,7 @@ from scripts.temporal_dist_heatmap import (
 from utils.route_metric_utils import (
     batch_solve_fixed_endpoint_hamiltonian_paths,
     compute_pairwise_temporal_distance_matrix,
-    solve_fixed_endpoint_hamiltonian_path,
+    solve_fixed_endpoint_hamiltonian_path_with_second_best,
 )
 
 
@@ -65,6 +68,17 @@ def _parse_task_ids(raw_value: Optional[str], num_tasks: int) -> list[int]:
     return task_ids
 
 
+def _parse_bool_arg(raw_value: Optional[str], *, default: bool) -> bool:
+    if raw_value in (None, ""):
+        return bool(default)
+    value = str(raw_value).strip().lower()
+    if value in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if value in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise ValueError(f"Invalid boolean value: {raw_value!r}")
+
+
 def _load_feasible_points_payload(path: Path) -> tuple[str, np.ndarray]:
     with open(path, "r", encoding="utf-8") as f:
         payload = yaml.safe_load(f) or {}
@@ -80,6 +94,11 @@ def _load_feasible_points_payload(path: Path) -> tuple[str, np.ndarray]:
     return str(env_id), feasible_ijs
 
 
+def _to_repo_relative_or_abs(path: Path) -> str:
+    path = path.resolve()
+    return os.path.relpath(path, REPO_ROOT)
+
+
 def _combo_waypoint_ij_groups(
     combo_local_indices: np.ndarray,
     candidate_ijs: np.ndarray,
@@ -93,20 +112,6 @@ def _combo_waypoint_ij_groups(
     return groups
 
 
-def _min_offdiag_value(matrix: np.ndarray) -> float:
-    matrix = np.asarray(matrix, dtype=np.float32)
-    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
-        raise ValueError("matrix must be square")
-    if matrix.shape[0] <= 1:
-        return float("-inf")
-    offdiag_mask = ~np.eye(matrix.shape[0], dtype=bool)
-    offdiag_vals = matrix[offdiag_mask]
-    finite_vals = offdiag_vals[np.isfinite(offdiag_vals)]
-    if finite_vals.size == 0:
-        return float("-inf")
-    return float(np.min(finite_vals))
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Find waypoint groups where temporal and graph Hamiltonian routes disagree.")
     parser.add_argument("--ckpt", required=True, help="Path to model.ckpt")
@@ -117,8 +122,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--out",
-        default="configurations/task_overrides/antmaze_giant_waypoints_example.yaml",
+        default="configurations/task_overrides/antmaze_giant_waypoints.yaml",
         help="Repo-relative or absolute YAML path to save mismatch waypoint groups",
+    )
+    parser.add_argument(
+        "--graph-cache-path",
+        default=None,
+        help="Optional repo-relative or absolute sampled-graph cache .pkl path to reuse/create",
     )
     parser.add_argument("--num-waypoints", type=int, default=3, help="Number of waypoint candidates per combination")
     parser.add_argument("--task-ids", default=None, help="Comma-separated task ids to search. Default: all tasks")
@@ -126,6 +136,11 @@ def main() -> None:
     parser.add_argument("--edge_radius", type=float, default=None, help="Optional sampled-graph edge radius override")
     parser.add_argument("--graph_seed", type=int, default=None, help="Optional sampled-graph RNG seed override")
     parser.add_argument("--gamma", type=float, default=0.995, help="Gamma for emb_dist_to_temporal_dist")
+    parser.add_argument(
+        "--ogbench-enable-reset-perturb",
+        default=None,
+        help="Whether OGBench resets should keep start/goal perturbation during waypoint search (true/false).",
+    )
     args = parser.parse_args()
 
     ckpt_path = Path(args.ckpt).expanduser().resolve()
@@ -147,6 +162,11 @@ def main() -> None:
         raise ValueError(f"--num-waypoints must be >= 1, got {args.num_waypoints}")
 
     algo_overrides, dataset_config_name, dataset_meta = _load_training_metadata(ckpt_path)
+    ogbench_enable_reset_perturb = _parse_bool_arg(
+        args.ogbench_enable_reset_perturb,
+        default=bool(algo_overrides.get("ogbench_enable_reset_perturb", True)),
+    )
+    algo_overrides["ogbench_enable_reset_perturb"] = bool(ogbench_enable_reset_perturb)
     root_cfg = _build_root_cfg(
         dataset_config_name,
         algo_overrides,
@@ -162,6 +182,21 @@ def main() -> None:
 
     sampled_graph_cfg = _resolve_sampled_graph_cfg(algo, args)
     dataset_name = str(algo.dataset)
+    if args.graph_cache_path in (None, ""):
+        graph_cache_path_for_yaml = build_sampled_graph_cache_path(
+            dataset=dataset_name,
+            save_dir=str(sampled_graph_cfg["cache_dir_raw"]),
+            sample_ratio=float(sampled_graph_cfg["sample_ratio"]),
+            edge_radius=float(sampled_graph_cfg["edge_radius"]),
+            seed=int(sampled_graph_cfg["graph_seed"]),
+            timestamp=datetime.now().strftime("%Y%m%d-%H%M%S"),
+        )
+        graph_cache_path = Path(graph_cache_path_for_yaml).expanduser()
+    else:
+        graph_cache_path_for_yaml = str(args.graph_cache_path)
+        graph_cache_path = Path(graph_cache_path_for_yaml).expanduser()
+        if not graph_cache_path.is_absolute():
+            graph_cache_path = (REPO_ROOT / graph_cache_path).resolve()
     npz_path = Path(algo._kde_save_dir).expanduser() / f"{dataset_name}.npz"
     if not npz_path.is_file():
         raise FileNotFoundError(f"Dataset npz not found: {npz_path}")
@@ -172,6 +207,7 @@ def main() -> None:
         sample_ratio=float(sampled_graph_cfg["sample_ratio"]),
         edge_radius=float(sampled_graph_cfg["edge_radius"]),
         seed=int(sampled_graph_cfg["graph_seed"]),
+        cache_path=str(graph_cache_path),
     )
 
     maze_type = algo.env_id.split("-")[1]
@@ -180,7 +216,15 @@ def main() -> None:
         task_ids = _parse_task_ids(args.task_ids, env.num_tasks)
         output_payload = {
             "env_id": str(feasible_env_id),
-            "source_feasible_points_path": str(feasible_points_path),
+            "source_feasible_points_path": _to_repo_relative_or_abs(feasible_points_path),
+            "sampled_graph_cache_path": str(graph_cache_path_for_yaml),
+            "ogbench_enable_reset_perturb": bool(ogbench_enable_reset_perturb),
+            "sampled_graph_cache_params": {
+                "dataset": dataset_name,
+                "sample_ratio": float(sampled_graph_cfg["sample_ratio"]),
+                "edge_radius": float(sampled_graph_cfg["edge_radius"]),
+                "seed": int(sampled_graph_cfg["graph_seed"]),
+            },
             "num_waypoints": int(args.num_waypoints),
             "active_waypoint_group_idx": None,
             "total_stats": {
@@ -280,7 +324,7 @@ def main() -> None:
                 )
                 selected_node_indices = np.asarray(assignment["node_indices"], dtype=np.int32)
                 graph_submatrix = graph_shortest_dists[np.ix_(selected_node_indices, selected_node_indices)]
-                graph_route = solve_fixed_endpoint_hamiltonian_path(graph_submatrix)
+                graph_route = solve_fixed_endpoint_hamiltonian_path_with_second_best(graph_submatrix)
                 if not bool(graph_route["feasible"]):
                     continue
                 graph_feasible_count += 1
@@ -292,7 +336,9 @@ def main() -> None:
                     np.asarray(graph_route["anchor_order"], dtype=np.int32)[1:-1] - 1
                 ]
                 if not np.array_equal(temporal_candidate_order, graph_candidate_order):
-                    sort_key = _min_offdiag_value(graph_submatrix)
+                    # Sort mismatches by how strongly the graph metric prefers its
+                    # best Hamiltonian ordering over the runner-up ordering.
+                    sort_key = float(graph_route["second_best_gap"])
                     mismatch_combo_with_keys.append((sort_key, combo_local.copy()))
 
             mismatch_combo_with_keys.sort(key=lambda item: item[0], reverse=True)

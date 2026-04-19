@@ -4,6 +4,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DATASET_DIR="$PROJECT_DIR/configurations/dataset"
+PLANNING_CONFIG_SRC="$PROJECT_DIR/configurations/algorithm/df_planning.yaml"
 
 MCTD_PROJECT_DIR="$PROJECT_DIR"
 # shellcheck source=scripts/mctd_ckpt_lib.sh
@@ -13,7 +14,73 @@ OUTPUT_DOWNLOADED_DIR="$MCTD_DOWNLOADED_DIR"
 NUM_TASKS=5
 NUM_SEEDS=1
 START_TASK_IDX=1
-DEFAULT_OVERRIDE_PATH="configurations/task_overrides/antmaze_giant_waypoints_example.yaml"
+
+read_yaml_value() {
+    local yaml_path="$1"
+    local dotted_key="$2"
+    python3 - "$yaml_path" "$dotted_key" <<'PY'
+import sys
+import yaml
+
+yaml_path, dotted_key = sys.argv[1], sys.argv[2]
+with open(yaml_path, "r", encoding="utf-8") as f:
+    data = yaml.safe_load(f) or {}
+value = data
+for token in dotted_key.split("."):
+    if not isinstance(value, dict) or token not in value:
+        value = None
+        break
+    value = value[token]
+if value is None:
+    print("")
+elif isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
+PY
+}
+
+normalize_env_key() {
+    local env_id="$1"
+    python3 - "$env_id" <<'PY'
+import re
+import sys
+
+env_id = sys.argv[1].strip()
+env_key = re.sub(r"[^0-9A-Za-z]+", "_", env_id).strip("_")
+env_key = re.sub(r"_v[0-9]+$", "", env_key)
+print(env_key)
+PY
+}
+
+resolve_graph_cache_host_path() {
+    local cache_path_raw="$1"
+    python3 - "$PROJECT_DIR" "$DOCKER_USER" "$cache_path_raw" <<'PY'
+import os
+import sys
+
+repo_root, docker_user, cache_path_raw = sys.argv[1], sys.argv[2], sys.argv[3]
+raw = str(cache_path_raw).strip()
+if raw in ("", "None", "null"):
+    print("")
+    raise SystemExit(0)
+docker_default = f"/home/{docker_user}/.ogbench/data"
+host_default = os.path.realpath(os.path.join(os.path.dirname(repo_root), "ogbench_data"))
+if raw == "~/.ogbench/data" or raw.startswith("~/.ogbench/data" + os.sep):
+    suffix = raw[len("~/.ogbench/data"):].lstrip(os.sep)
+    resolved = os.path.join(host_default, suffix)
+else:
+    expanded = os.path.expanduser(raw)
+    if expanded == docker_default or expanded.startswith(docker_default + os.sep):
+        suffix = expanded[len(docker_default):].lstrip(os.sep)
+        resolved = os.path.join(host_default, suffix)
+    elif not os.path.isabs(expanded):
+        resolved = os.path.join(repo_root, expanded)
+    else:
+        resolved = expanded
+print(os.path.realpath(resolved))
+PY
+}
 
 echo "===================================================="
 echo "  MCTD Hamiltonian Evaluation Launcher"
@@ -110,24 +177,53 @@ if [ ! -f "$DATASET_YAML" ]; then
     exit 1
 fi
 
-echo ""
-read -r -p "Task override path [Enter=${DEFAULT_OVERRIDE_PATH}, none=disable]: " TASK_OVERRIDE_PATH
-TASK_OVERRIDE_PATH="${TASK_OVERRIDE_PATH:-${DEFAULT_OVERRIDE_PATH}}"
-
-WAYPOINT_GROUP_IDX=""
-if [ "$TASK_OVERRIDE_PATH" != "none" ]; then
-    if [[ "$TASK_OVERRIDE_PATH" = /* ]]; then
-        if [[ "$TASK_OVERRIDE_PATH" == "${PROJECT_DIR}/"* ]]; then
-            TASK_OVERRIDE_PATH="${TASK_OVERRIDE_PATH#${PROJECT_DIR}/}"
-        else
-            echo "ERROR: Task override path must be inside ${PROJECT_DIR}"
-            exit 1
-        fi
-    fi
-    if [ ! -f "${PROJECT_DIR}/${TASK_OVERRIDE_PATH}" ]; then
-        echo "ERROR: Task override file not found: ${PROJECT_DIR}/${TASK_OVERRIDE_PATH}"
+ENV_ID="$(read_yaml_value "$DATASET_YAML" "env_id")"
+if [ -z "$ENV_ID" ]; then
+    echo "ERROR: Could not determine env_id from ${DATASET_YAML}"
+    exit 1
+fi
+ENV_KEY="$(normalize_env_key "$ENV_ID")"
+CONFIG_TASK_OVERRIDE_PATH="$(read_yaml_value "$PLANNING_CONFIG_SRC" "task_override_path")"
+DEFAULT_OVERRIDE_PATH="configurations/task_overrides/${ENV_KEY}_waypoints.yaml"
+TASK_OVERRIDE_PATH="${CONFIG_TASK_OVERRIDE_PATH:-$DEFAULT_OVERRIDE_PATH}"
+if [ "$TASK_OVERRIDE_PATH" = "null" ] || [ "$TASK_OVERRIDE_PATH" = "none" ] || [ "$TASK_OVERRIDE_PATH" = "None" ]; then
+    TASK_OVERRIDE_PATH="$DEFAULT_OVERRIDE_PATH"
+fi
+if [[ "$TASK_OVERRIDE_PATH" = /* ]]; then
+    if [[ "$TASK_OVERRIDE_PATH" == "${PROJECT_DIR}/"* ]]; then
+        TASK_OVERRIDE_PATH="${TASK_OVERRIDE_PATH#${PROJECT_DIR}/}"
+    else
+        echo "ERROR: task_override_path in ${PLANNING_CONFIG_SRC} must be inside ${PROJECT_DIR}"
         exit 1
     fi
+fi
+if [ ! -f "${PROJECT_DIR}/${TASK_OVERRIDE_PATH}" ]; then
+    echo "ERROR: Task override file not found: ${PROJECT_DIR}/${TASK_OVERRIDE_PATH}"
+    echo "       Run eval_hemiltonian_all.sh once to generate ${DEFAULT_OVERRIDE_PATH} if needed."
+    exit 1
+fi
+TASK_OVERRIDE_CACHE_PATH="$(python3 - "${PROJECT_DIR}/${TASK_OVERRIDE_PATH}" "${PROJECT_DIR}" <<'PY'
+import sys
+import yaml
+
+override_path, _repo_root = sys.argv[1], sys.argv[2]
+with open(override_path, "r", encoding="utf-8") as f:
+    payload = yaml.safe_load(f) or {}
+cache_path = payload.get("sampled_graph_cache_path")
+if cache_path in (None, ""):
+    print("")
+    raise SystemExit(0)
+print(str(cache_path))
+PY
+)"
+TASK_OVERRIDE_CACHE_PATH="$(resolve_graph_cache_host_path "$TASK_OVERRIDE_CACHE_PATH")"
+if [ -z "$TASK_OVERRIDE_CACHE_PATH" ] || [ ! -f "$TASK_OVERRIDE_CACHE_PATH" ]; then
+    echo "ERROR: Task override file is stale or missing sampled_graph_cache_path: ${PROJECT_DIR}/${TASK_OVERRIDE_PATH}"
+    echo "       Regenerate it via eval_hemiltonian_all.sh so the waypoint override is pinned to a concrete graph cache."
+    exit 1
+fi
+WAYPOINT_GROUP_IDX=""
+if [ "$TASK_OVERRIDE_PATH" != "none" ]; then
     read -r -p "Waypoint group index [Enter=active/default]: " WAYPOINT_GROUP_IDX
     if [ -n "$WAYPOINT_GROUP_IDX" ] && ! [[ "$WAYPOINT_GROUP_IDX" =~ ^[0-9]+$ ]]; then
         echo "ERROR: Waypoint group index must be a non-negative integer."

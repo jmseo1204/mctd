@@ -4,9 +4,10 @@ Plan post-processing utilities for MCTD trajectory extraction and deduplication.
 Provides PlanPostprocMixin — a mixin class whose methods handle:
   - Depth-based prefix length calculation (_get_prefix_len_frames_from_depth)
   - Plan obs extraction at a segment boundary (_extract_obs_at_boundary)
+  - Plan obs slicing for new segments / meeting-gap checks
   - Endpoint-based plan deduplication (_deduplicate_by_endpoint)
-  - Greedy proximity reordering of combined FWD+BWD plans (_reorder_plan_by_proximity)
-  - FWD-BWD gap computation (_compute_plan_gap)
+  - Greedy proximity reordering of assembled meeting/connection plans (_reorder_plan_by_proximity)
+  - Meeting-gap computation (_compute_plan_gap)
   - Final output plan construction (_extract_output_plan)
 
 Intended to be inherited by DiffusionForcingPlanning alongside DiffusionForcingBase.
@@ -15,7 +16,7 @@ All methods reference `self.*` attributes/methods provided by the base class or 
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import torch
@@ -30,41 +31,6 @@ class PlanPostprocMixin:
 
     def _get_prefix_len_frames_from_depth(self, depth: int, seg_size: int) -> int:
         return depth * seg_size * self.frame_stack
-
-    def _get_denoised_frame_prefix_len(
-        self, depth: int, seg_size: int, total_frames: Optional[int] = None
-    ) -> int:
-        prefix_len = max(self._get_prefix_len_frames_from_depth(depth, seg_size), 0)
-        if total_frames is not None:
-            prefix_len = min(prefix_len, total_frames)
-        return prefix_len
-
-    def _get_plan_viz_valid_frame_bounds(
-        self,
-        depth: int,
-        seg_size: int,
-        total_frames: int,
-        is_forward_tree: bool,
-    ) -> Tuple[int, int]:
-        prefix_len = self._get_denoised_frame_prefix_len(depth, seg_size, total_frames)
-        if is_forward_tree:
-            return 0, prefix_len
-        return total_frames - prefix_len, total_frames
-
-    def _mask_plan_obs_outside_valid_frames(
-        self,
-        plan_obs: np.ndarray,
-        valid_frame_bounds: List[Tuple[int, int]],
-    ) -> np.ndarray:
-        total_frames = plan_obs.shape[0]
-        for i, (valid_start, valid_end) in enumerate(valid_frame_bounds):
-            valid_start = max(0, min(int(valid_start), total_frames))
-            valid_end = max(valid_start, min(int(valid_end), total_frames))
-            if valid_start > 0:
-                plan_obs[:valid_start, i, :] = np.nan
-            if valid_end < total_frames:
-                plan_obs[valid_end:, i, :] = np.nan
-        return plan_obs
 
     def _extract_obs_at_boundary(
         self,
@@ -248,10 +214,54 @@ class PlanPostprocMixin:
     # Gap computation
     # ------------------------------------------------------------------
 
+    def _extract_plan_obs_frames(self, plan_frames: torch.Tensor) -> np.ndarray:
+        """Convert normalized bundle frames into unnormalized observation vectors."""
+        _obs_std_np = np.array(self.observation_std)
+        _obs_mean_np = np.array(self.observation_mean)
+        plan_obs = (
+            plan_frames[:, self.obs_bundle_indices].detach().cpu().numpy()
+            * _obs_std_np
+            + _obs_mean_np
+        )
+        return np.asarray(plan_obs, dtype=np.float32)
+
+    def _extract_node_obs_slice(
+        self,
+        node,
+        plan_tokens: int,
+        start_depth: int,
+        end_depth: int,
+        reverse: bool = False,
+    ) -> Optional[np.ndarray]:
+        """Extract an unnormalized observation slice from a node's materialized plan."""
+        if node is None:
+            return None
+        if len(node.plan_history) == 0 or len(node.plan_history[-1]) == 0:
+            return None
+
+        seg_size: int = plan_tokens // self.sequence_dividing_factor
+        start_len = self._get_prefix_len_frames_from_depth(int(start_depth), seg_size)
+        end_len = self._get_prefix_len_frames_from_depth(int(end_depth), seg_size)
+        if end_len <= start_len:
+            return None
+
+        plan_full: torch.Tensor = node.plan_history[-1][-1]
+        total_frames = int(plan_full.shape[0])
+        start_len = min(max(start_len, 0), total_frames)
+        end_len = min(max(end_len, start_len), total_frames)
+        if end_len <= start_len:
+            return None
+
+        plan_slice = plan_full[start_len:end_len]
+        if plan_slice.shape[0] == 0:
+            return None
+        if reverse:
+            plan_slice = torch.flip(plan_slice, [0])
+        return self._extract_plan_obs_frames(plan_slice)
+
     def _extract_new_segment_obs(
         self,
         node,
-        is_tree1: bool,
         plan_tokens: int,
     ) -> Optional[np.ndarray]:
         """Extract the newly created segment observations for `node`.
@@ -259,43 +269,24 @@ class PlanPostprocMixin:
         The returned segment contains only the frames added in the round that
         created `node`, expressed in unnormalized observation space.
         """
-        del is_tree1
         if node is None or node.depth <= 0:
             return None
-        if len(node.plan_history) == 0 or len(node.plan_history[-1]) == 0:
-            return None
 
-        seg_size: int = plan_tokens // self.sequence_dividing_factor
         parent_depth = max(int(node.depth) - 1, 0)
-        start_len = self._get_prefix_len_frames_from_depth(parent_depth, seg_size)
-        end_len = self._get_prefix_len_frames_from_depth(int(node.depth), seg_size)
-
-        if end_len <= start_len:
-            return None
-
-        plan_full: torch.Tensor = node.plan_history[-1][-1]
-        total_frames = int(plan_full.shape[0])
-        _obs_std_np = np.array(self.observation_std)
-        _obs_mean_np = np.array(self.observation_mean)
-        plan_obs = (
-            plan_full[:, self.obs_bundle_indices].detach().cpu().numpy()
-            * _obs_std_np
-            + _obs_mean_np
-        )
         # Multi-tree mode treats every anchor-rooted tree uniformly: the newly
-        # expanded local segment is always the prefix slice [start_len:end_len).
-        seg_obs = plan_obs[start_len:end_len]
-
-        if seg_obs.size == 0:
-            return None
-        return np.asarray(seg_obs, dtype=np.float32)
+        # expanded local segment is always the prefix slice [parent_depth:node.depth).
+        return self._extract_node_obs_slice(
+            node,
+            plan_tokens=plan_tokens,
+            start_depth=parent_depth,
+            end_depth=int(node.depth),
+        )
 
     def _compute_plan_gap_to_target(
         self,
         best_node,
         target_node,
         plan_tokens: int,
-        is_tree1: bool,
     ) -> Optional[float]:
         """
         Compute the minimum pairwise distance between `best_node`'s segment and
@@ -303,42 +294,26 @@ class PlanPostprocMixin:
 
         Returns None if either node lacks a plan segment.
         """
-        del is_tree1  # The current implementation mirrors the legacy direction handling.
-        seg_size: int = plan_tokens // self.sequence_dividing_factor
-
-        if len(best_node.plan_history) == 0 or len(best_node.plan_history[-1]) == 0:
-            return None
-        if target_node is None or len(target_node.plan_history) == 0:
-            return None
-
-        plan_a_full: torch.Tensor = best_node.plan_history[-1][-1]
-        a_len: int = self._get_prefix_len_frames_from_depth(best_node.depth, seg_size)
-        t1_segments: torch.Tensor = plan_a_full[:a_len]
-
-        plan_b_full: torch.Tensor = target_node.plan_history[-1][-1]
-        b_len: int = self._get_prefix_len_frames_from_depth(target_node.depth, seg_size)
-        t2_flipped: torch.Tensor = torch.flip(plan_b_full[:b_len], [0])
-
-        if a_len == 0 or b_len == 0:
-            return None
-
-        _obs_std_np = np.array(self.observation_std)
-        _obs_mean_np = np.array(self.observation_mean)
-        _seg_a_obs = (
-            t1_segments[:, self.obs_bundle_indices].detach().cpu().numpy()
-            * _obs_std_np
-            + _obs_mean_np
+        seg_a_obs = self._extract_node_obs_slice(
+            best_node,
+            plan_tokens=plan_tokens,
+            start_depth=0,
+            end_depth=int(best_node.depth),
         )
-        _seg_b_obs = (
-            t2_flipped[:, self.obs_bundle_indices].detach().cpu().numpy()
-            * _obs_std_np
-            + _obs_mean_np
+        seg_b_obs = self._extract_node_obs_slice(
+            target_node,
+            plan_tokens=plan_tokens,
+            start_depth=0,
+            end_depth=0 if target_node is None else int(target_node.depth),
+            reverse=True,
         )
+        if seg_a_obs is None or seg_b_obs is None:
+            return None
 
-        A, B = _seg_a_obs.shape[0], _seg_b_obs.shape[0]
+        A, B = seg_a_obs.shape[0], seg_b_obs.shape[0]
         dists = self._compute_distance(
-            np.repeat(_seg_a_obs, B, axis=0),
-            np.tile(_seg_b_obs, (A, 1)),
+            np.repeat(seg_a_obs, B, axis=0),
+            np.tile(seg_b_obs, (A, 1)),
         )
         return float(dists.min())
 
@@ -346,11 +321,10 @@ class PlanPostprocMixin:
         self,
         best_node,
         plan_tokens: int,
-        is_tree1: bool,
     ) -> Optional[float]:
         """
-        Compute the minimum pairwise distance between the FWD plan segment (best_node)
-        and the BWD plan segment (best_node.target_node), in unnormalized space.
+        Compute the minimum pairwise distance between `best_node`'s prefix segment
+        and the reversed prefix of its paired target node.
 
         Returns None if target_node.plan_history is empty (opposite tree not yet expanded).
         Uses TD metric or Euclidean distance depending on self.use_TD_metric_as_dist.
@@ -359,136 +333,57 @@ class PlanPostprocMixin:
             best_node=best_node,
             target_node=best_node.target_node,
             plan_tokens=plan_tokens,
-            is_tree1=is_tree1,
         )
 
     # ------------------------------------------------------------------
     # Output plan construction
     # ------------------------------------------------------------------
 
-    def _extract_output_plan(
-        self,
-        best_node,
-        plan_tokens: int,
-        is_tree1: bool,
-        goal_normalized: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Construct the final output plan from the best selected leaf TreeNode.
-
-        In bidirectional mode (best_node.target_node is not None):
-            - Takes plan_A from best_node (forward tree leaf) sliced by depth.
-            - Takes plan_B from best_node.target_node (backward tree leaf) sliced by depth, then flipped.
-            - Returns the concatenated plan: plan_A + flip(plan_B).
-
-        In unidirectional mode (best_node.target_node is None):
-            - Returns plan_A only (forward tree leaf sliced by depth).
-
-        Args:
-            best_node: The selected best leaf TreeNode (from _select_best_leaf).
-            plan_tokens: Total number of plan tokens for the tree (determines seg_size).
-
-        Returns:
-            output_plan: Tensor of shape (T_combined*fs, 1, c), where T = combined path length.
-        """
-        seg_size: int = plan_tokens // self.sequence_dividing_factor
-
-        # --- Plan A: forward tree leaf ---
-        assert len(best_node.plan_history) > 0, \
-            f"best_node.plan_history must be non-empty for expanded nodes, but got {best_node.plan_history}"
-        assert len(best_node.plan_history[-1]) > 0, \
-            f"best_node.plan_history[-1] must be non-empty, but got {best_node.plan_history[-1]}"
-
-        plan_a_full: torch.Tensor = best_node.plan_history[-1][-1]  # (T_total*fs, c)
-        a_len: int = self._get_prefix_len_frames_from_depth(best_node.depth, seg_size)
-        t1_segments: torch.Tensor = plan_a_full[:a_len]  # (A_len, c)
-
-        # --- Bidirectional search: target_node handling ---
-        assert best_node.target_node is not None, \
-            "target_node must be set in bidirectional MCTS (opposite tree leaf must be available)"
-        if len(best_node.target_node.plan_history) == 0:
-            # --- Early iteration or missing opposite tree: use plan_A only ---
-            combined = t1_segments
-        else:
-            # --- Bidirectional: flip plan_B and concat ---
-            plan_b_full: torch.Tensor = best_node.target_node.plan_history[-1][-1]  # (T_total*fs, c)
-            b_len: int = self._get_prefix_len_frames_from_depth(best_node.target_node.depth, seg_size)
-            t2_flipped: torch.Tensor = torch.flip(
-                plan_b_full[:b_len], [0]
-            )  # (B_len, c)
-
-            # Always combine FWD+BWD: called only when meeting condition is satisfied
-            combined = torch.cat([t1_segments, t2_flipped], dim=0)  # (A_len+B_len, c)
-
-        if not is_tree1:
-            combined = torch.flip(combined, [0])  # (A_len+B_len, c)
-
-        # Pad goal state at the end: seg_size * frame_stack frames filled with goal obs
-        if goal_normalized is not None:
-            c = combined.shape[-1]
-            n_goal_pad = 1
-            goal_frame = torch.zeros(n_goal_pad, c, dtype=combined.dtype, device=combined.device)
-            goal_obs = goal_normalized[0]  # (n_obs,) — goal_normalized is already obs-only
-            goal_frame[:, self.obs_bundle_indices] = goal_obs.unsqueeze(0).expand(n_goal_pad, -1)
-            combined = torch.cat([combined, goal_frame], dim=0)  # (A_len+B_len+n_goal_pad, c)
-
-        output = combined.unsqueeze(1)  # (T, 1, c)
-
-        # Validate output shape before returning
-        assert output.ndim == 3, f"output.ndim={output.ndim}, expected 3"
-        assert output.shape[1] == 1, f"output.shape[1]={output.shape[1]}, expected 1"
-
-        return output
-
-    def _extract_output_plan_from_node_pair(
+    def _assemble_connection_frames(
         self,
         source_node,
         target_node,
         plan_tokens: int,
-        append_target_obs_normalized: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Build the canonical source-prefix + reversed target-prefix frame stack."""
         seg_size: int = plan_tokens // self.sequence_dividing_factor
 
         if len(source_node.plan_history) == 0 or len(source_node.plan_history[-1]) == 0:
             raise ValueError("source_node.plan_history must be materialized before edge extraction")
 
-        plan_a_full: torch.Tensor = source_node.plan_history[-1][-1]
-        a_len: int = self._get_prefix_len_frames_from_depth(source_node.depth, seg_size)
-        t1_segments: torch.Tensor = plan_a_full[:a_len]
+        source_plan_full: torch.Tensor = source_node.plan_history[-1][-1]
+        source_len: int = self._get_prefix_len_frames_from_depth(source_node.depth, seg_size)
+        source_prefix: torch.Tensor = source_plan_full[:source_len]
 
-        if len(target_node.plan_history) == 0:
-            combined = t1_segments
-        else:
-            plan_b_full: torch.Tensor = target_node.plan_history[-1][-1]
-            b_len: int = self._get_prefix_len_frames_from_depth(target_node.depth, seg_size)
-            t2_flipped: torch.Tensor = torch.flip(plan_b_full[:b_len], [0])
-            combined = torch.cat([t1_segments, t2_flipped], dim=0)
+        if target_node is None or len(target_node.plan_history) == 0:
+            return source_prefix
 
-        if append_target_obs_normalized is not None:
-            c = combined.shape[-1]
-            target_frame = torch.zeros(
-                1, c, dtype=combined.dtype, device=combined.device
-            )
-            target_frame[:, self.obs_bundle_indices] = (
-                append_target_obs_normalized.unsqueeze(0)
-            )
-            combined = torch.cat([combined, target_frame], dim=0)
-
-        return combined.unsqueeze(1)
-
-    def _build_postprocessed_plan_from_node_pair(
-        self,
-        source_node,
-        target_node,
-        plan_tokens: int,
-        append_target_obs_normalized: Optional[torch.Tensor] = None,
-    ) -> dict:
-        output_plan = self._extract_output_plan_from_node_pair(
-            source_node,
-            target_node,
-            plan_tokens=plan_tokens,
-            append_target_obs_normalized=append_target_obs_normalized,
+        target_plan_full: torch.Tensor = target_node.plan_history[-1][-1]
+        target_len: int = self._get_prefix_len_frames_from_depth(target_node.depth, seg_size)
+        target_prefix_reversed: torch.Tensor = torch.flip(
+            target_plan_full[:target_len],
+            [0],
         )
+        return torch.cat([source_prefix, target_prefix_reversed], dim=0)
+
+    def _append_normalized_obs_frame(
+        self,
+        plan_frames: torch.Tensor,
+        obs_normalized: torch.Tensor,
+    ) -> torch.Tensor:
+        """Append a single observation-only frame onto a normalized plan tensor."""
+        c = plan_frames.shape[-1]
+        obs_frame = torch.zeros(
+            1, c, dtype=plan_frames.dtype, device=plan_frames.device
+        )
+        obs_frame[:, self.obs_bundle_indices] = obs_normalized.unsqueeze(0)
+        return torch.cat([plan_frames, obs_frame], dim=0)
+
+    def _build_postprocessed_plan_bundle_from_output_plan(
+        self,
+        output_plan: torch.Tensor,
+    ) -> dict:
+        """Reuse the same output-plan -> unnormalize -> reorder materialization flow."""
         plan_unnormalized = self._unnormalize_x(output_plan.unsqueeze(0))[-1]
         postprocessed_plan = self._reorder_plan_by_proximity(plan_unnormalized)
         return {
@@ -498,11 +393,104 @@ class PlanPostprocMixin:
             "postprocessed_len": int(postprocessed_plan.shape[0]),
         }
 
+    def _extract_output_plan(
+        self,
+        best_node,
+        plan_tokens: int,
+        reverse_output: bool,
+        goal_normalized: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Construct the final assembled plan from the selected leaf and its paired node.
+
+        The canonical assembly is:
+            source-root prefix + reverse(target-root prefix)
+
+        `reverse_output=True` is used by legacy bidirectional search when the chosen
+        active tree is goal-rooted and the returned execution order must be flipped.
+
+        Args:
+            best_node: The selected best leaf TreeNode (from _select_best_leaf).
+            plan_tokens: Total number of plan tokens for the tree (determines seg_size).
+            reverse_output: Whether to reverse the assembled path before returning it.
+
+        Returns:
+            output_plan: Tensor of shape (T_combined*fs, 1, c), where T = combined path length.
+        """
+        # --- Primary prefix segment from the selected node ---
+        assert len(best_node.plan_history) > 0, \
+            f"best_node.plan_history must be non-empty for expanded nodes, but got {best_node.plan_history}"
+        assert len(best_node.plan_history[-1]) > 0, \
+            f"best_node.plan_history[-1] must be non-empty, but got {best_node.plan_history[-1]}"
+
+        # --- Paired node prefix, reversed for connection ---
+        assert best_node.target_node is not None, \
+            "target_node must be set in bidirectional MCTS (opposite tree leaf must be available)"
+        combined = self._assemble_connection_frames(
+            source_node=best_node,
+            target_node=best_node.target_node,
+            plan_tokens=plan_tokens,
+        )
+
+        if reverse_output:
+            combined = torch.flip(combined, [0])
+
+        # Pad goal state at the end: seg_size * frame_stack frames filled with goal obs
+        if goal_normalized is not None:
+            goal_obs = goal_normalized[0]  # (n_obs,) — goal_normalized is already obs-only
+            combined = self._append_normalized_obs_frame(combined, goal_obs)
+
+        output = combined.unsqueeze(1)  # (T, 1, c)
+
+        # Validate output shape before returning
+        assert output.ndim == 3, f"output.ndim={output.ndim}, expected 3"
+        assert output.shape[1] == 1, f"output.shape[1]={output.shape[1]}, expected 1"
+
+        return output
+
+    def _extract_connection_plan_from_node_pair(
+        self,
+        source_node,
+        target_node,
+        plan_tokens: int,
+        append_target_obs_normalized: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Build a canonical source-root -> target-root connection plan."""
+        combined = self._assemble_connection_frames(
+            source_node=source_node,
+            target_node=target_node,
+            plan_tokens=plan_tokens,
+        )
+
+        if append_target_obs_normalized is not None:
+            combined = self._append_normalized_obs_frame(
+                combined,
+                append_target_obs_normalized,
+            )
+
+        return combined.unsqueeze(1)
+
+    def _build_connection_plan_bundle(
+        self,
+        source_node,
+        target_node,
+        plan_tokens: int,
+        append_target_obs_normalized: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Build an edge-local execution bundle for a source/target node pair."""
+        output_plan = self._extract_connection_plan_from_node_pair(
+            source_node,
+            target_node,
+            plan_tokens=plan_tokens,
+            append_target_obs_normalized=append_target_obs_normalized,
+        )
+        return self._build_postprocessed_plan_bundle_from_output_plan(output_plan)
+
     def _build_postprocessed_plan_from_node(
         self,
         best_node,
         plan_tokens: int,
-        is_tree1: bool,
+        reverse_output: bool,
         goal_normalized: Optional[torch.Tensor] = None,
     ) -> dict:
         """Materialize the final output plan and its reordered execution variant.
@@ -513,16 +501,7 @@ class PlanPostprocMixin:
         output_plan = self._extract_output_plan(
             best_node,
             plan_tokens=plan_tokens,
-            is_tree1=is_tree1,
+            reverse_output=reverse_output,
             goal_normalized=goal_normalized,
         )  # (T_combined*fs+goal_pad, 1, c)
-
-        plan_unnormalized = self._unnormalize_x(output_plan.unsqueeze(0))[-1]
-        postprocessed_plan = self._reorder_plan_by_proximity(plan_unnormalized)
-
-        return {
-            "output_plan": output_plan,
-            "plan_unnormalized": plan_unnormalized,
-            "postprocessed_plan": postprocessed_plan,
-            "postprocessed_len": int(postprocessed_plan.shape[0]),
-        }
+        return self._build_postprocessed_plan_bundle_from_output_plan(output_plan)
