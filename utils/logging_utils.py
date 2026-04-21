@@ -454,6 +454,7 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
     rollout_current_agent = plot_data.get("rollout_current_agent")
     rollout_current_subgoal = plot_data.get("rollout_current_subgoal")
     postprocessed_plan = plot_data.get("postprocessed_plan")
+    plot_title = plot_data.get("plot_title")
     unc_plans_list = plot_data.get("unc_plans_list")          # list of (T, pos_dim) arrays or None
     unc_guidance_targets = plot_data.get("unc_guidance_targets")  # (G*K, pos_dim) or None
     unc_scale_colors = plot_data.get("unc_scale_colors")          # (G*K, 3) RGB per sample or None
@@ -852,6 +853,9 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
             or rollout_current_subgoal is not None
             or postprocessed_plan is not None):
         ax.legend(loc="upper right", fontsize=5)
+
+    if plot_title:
+        ax.set_title(str(plot_title))
 
 
 def make_trajectory_images(env_id, trajectory, batch_size, start, goal, plot_end_points=True, waypoints=None):

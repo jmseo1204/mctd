@@ -388,6 +388,8 @@ def main():
     parser.add_argument("--num_tasks", type=int, default=5, help="Number of tasks to generate")
     parser.add_argument("--num_seeds", type=int, default=3, help="Number of seeds per task")
     parser.add_argument("--start_task_id", type=int, default=1, help="Starting task index (1-based)")
+    parser.add_argument("--jobs_dir", type=str, default="jobs",
+                        help="Directory to write generated evaluation job JSON files into.")
     parser.add_argument("--segment_episode_len", type=int, default=None,
                         help="Override segment_episode_len (raw, pre-jump). Defaults to value in df_planning.yaml.")
     parser.add_argument("--multi_tree_hemiltonian", action="store_true",
@@ -611,7 +613,7 @@ def main():
     basic_job_config.update(arch_overrides)
 
     # 5. Generate Jobs
-    jobs_folder = "jobs"
+    jobs_folder = args.jobs_dir
     if not os.path.exists(jobs_folder):
         os.makedirs(jobs_folder)
 

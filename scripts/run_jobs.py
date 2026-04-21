@@ -6,6 +6,7 @@ import sys
 import shlex
 import datetime
 import threading
+import re
 import yaml
 from tqdm import tqdm
 from project_config import DOCKER_USER as _cfg_docker_user, WANDB_ENTITY as _cfg_wandb_entity, \
@@ -65,7 +66,8 @@ available_gpus = _cfg_available_gpus
 # available_gpus += [f"rumelhart:{i}" for i in [0,1,2,3,4,5,6,7]]
 # available_gpus += [f"levine:{i}" for i in [0,1,2,3,4,5,6,7]]
 
-jobs_folder = "jobs"
+jobs_folder = os.path.normpath(os.environ.get("MCTD_JOBS_DIR", "jobs"))
+jobs_folder_tag = re.sub(r"[^A-Za-z0-9_.-]+", "-", jobs_folder.strip(os.sep)) or "jobs"
 docker_image = _cfg_docker_image
 docker_user = _cfg_docker_user
 wandb_entity = _cfg_wandb_entity
@@ -93,6 +95,7 @@ last_log_line_count = {}
 last_log_time = {}       # exp_name -> time.time() of last log line seen
 log_streamer_threads = {}  # exp_name -> Thread
 local_ogbench_dir = os.path.abspath(os.path.join(project_dir, "..", "ogbench"))
+reported_ignored_queue_entries = set()
 
 
 def is_benchmark_job(config: dict) -> bool:
@@ -216,6 +219,38 @@ def get_og_dataset_name(dataset_config_name):
             return None
     except Exception:
         return None
+
+
+def list_job_files(folder: str):
+    entries = sorted(os.listdir(folder))
+    ignored_entries = []
+    job_files = []
+    for entry in entries:
+        full_path = os.path.join(folder, entry)
+        if not os.path.isfile(full_path) or not entry.endswith(".json"):
+            ignored_entries.append(entry)
+            continue
+        job_files.append(entry)
+
+    new_ignored = [entry for entry in ignored_entries if entry not in reported_ignored_queue_entries]
+    if new_ignored:
+        suffix = " ..." if len(new_ignored) > 5 else ""
+        preview = ", ".join(new_ignored[:5])
+        log_write(f"[Scheduler] Ignoring non-job entries in {folder}: {preview}{suffix}")
+        reported_ignored_queue_entries.update(new_ignored)
+
+    return job_files
+
+
+def load_next_job(folder: str):
+    config_files = list_job_files(folder)
+    if not config_files:
+        return None, None, []
+
+    config_file = config_files[0]
+    with open(os.path.join(folder, config_file), "r") as f:
+        config = json.load(f)
+    return config_file, config, config_files
 
 def start_experiment(server, gpu_id, config, exp_name, current_time, pbar):
     # Properly quote arguments for Hydra/Shell compatibility
@@ -371,18 +406,15 @@ preprocess_batch_jobs(jobs_folder)
 log_finished("job batching")
 
 # Get initial total number of jobs
-total_jobs = len([f for f in os.listdir(jobs_folder) if f.endswith('.json')])
-log_write(f"[Scheduler] Loaded {total_jobs} job(s) across {len(available_gpus)} GPU slot(s).")
+total_jobs = len(list_job_files(jobs_folder))
+log_write(f"[Scheduler] Loaded {total_jobs} job(s) from {jobs_folder} across {len(available_gpus)} GPU slot(s).")
 pbar = tqdm(total=total_jobs, desc="Processing Jobs", disable=not sys.stdout.isatty())
 
 # Check the jobs folder is empty or not
 queue_is_empty = False
-config_files = sorted(os.listdir(f"{jobs_folder}/"))
-if config_files:
-    config_file = config_files[0]
-    # Read config file
-    with open(f"{jobs_folder}/{config_file}", "r") as f:
-        config = json.load(f)
+config_file, config, config_files = load_next_job(jobs_folder)
+if config_file is not None:
+    queue_is_empty = False
 else:
     queue_is_empty = True
 
@@ -442,16 +474,13 @@ try:
                 memory_ok = memory_used < 2000 or current_fail_count > 0
                 if memory_ok: # If GPU memory is free (or retrying a failed job), start a new experiment.
                     current_time_job = time.strftime("%Y%m%d-%H%M%S")
-                    exp_name = f"exp_gpu{gpu_id}_{current_time_job}-{jobs_folder}"
+                    exp_name = f"exp_gpu{gpu_id}_{current_time_job}-{jobs_folder_tag}"
                     
                     if not os.path.exists(f"{jobs_folder}/{config_file}"):
-                         config_files = sorted(os.listdir(f"{jobs_folder}/"))
-                         if not config_files:
+                         config_file, config, config_files = load_next_job(jobs_folder)
+                         if config_file is None:
                              queue_is_empty = True
                              continue
-                         config_file = config_files[0]
-                         with open(f"{jobs_folder}/{config_file}", "r") as f:
-                             config = json.load(f)
 
                     # --- Dataset Validation Check ---
                     dataset_config_name = config.get("dataset")
@@ -468,9 +497,8 @@ try:
                                 pass
                             
                             # Move to next job if available
-                            config_files = sorted(os.listdir(f"{jobs_folder}/"))
-                            if config_files:
-                                config_file = config_files[0]
+                            config_file, config, config_files = load_next_job(jobs_folder)
+                            if config_file is not None:
                                 continue
                             else:
                                 queue_is_empty = True
@@ -504,11 +532,9 @@ try:
                         else:
                             log_write(f"[WARN] Job start failed ({fail_count}/{MAX_JOB_RETRIES}). Will retry next loop.")
                             time.sleep(5)  # brief cooldown to let Docker/GPU settle
-                    config_files = sorted(os.listdir(f"{jobs_folder}/"))
-                    if config_files:
-                        config_file = config_files[0]
-                        with open(f"{jobs_folder}/{config_file}", "r") as f:
-                            config = json.load(f)
+                    config_file, config, config_files = load_next_job(jobs_folder)
+                    if config_file is not None:
+                        queue_is_empty = False
                     else:
                         queue_is_empty = True
         time.sleep(2)

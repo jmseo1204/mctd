@@ -38,17 +38,6 @@ fi
 echo "Using local ogbench source for benchmark jobs: $LOCAL_OGBENCH_DIR"
 echo ""
 
-echo "Cleaning up existing benchmark job files..."
-rm -f "$PROJECT_DIR"/jobs/*.json
-echo "Job file cleanup complete"
-
-echo "Resetting JAX cache..."
-rm -rf ~/.jax_cache
-mkdir -p ~/.jax_cache/xla_gpu_per_fusion_autotune_cache_dir
-chmod -R 777 ~/.jax_cache
-echo "JAX cache reset complete"
-echo ""
-
 echo "Preparing outputs directory permissions..."
 mctd_prepare_output_permissions
 echo "Outputs directory ready: $MCTD_OUTPUT_MOUNT_DIR"
@@ -75,11 +64,26 @@ fi
 mctd_ensure_eval_symlink "$MCTD_SELECTED_CKPT" "$SELECTED_MODEL_ID"
 echo "Selected model: $SELECTED_MODEL_ID"
 
-CKPT_PATH="${OUTPUT_DOWNLOADED_DIR}/${SELECTED_MODEL_ID}/model.ckpt"
-if [ ! -f "$CKPT_PATH" ]; then
-    echo "ERROR: Checkpoint not found at ${CKPT_PATH}"
+SELECTED_CKPT_HOST="$MCTD_SELECTED_CKPT"
+SELECTED_CKPT_REAL="$(realpath "$MCTD_SELECTED_CKPT" 2>/dev/null || true)"
+if [ ! -f "$SELECTED_CKPT_HOST" ] && { [ -z "$SELECTED_CKPT_REAL" ] || [ ! -f "$SELECTED_CKPT_REAL" ]; }; then
+    echo "ERROR: Selected checkpoint is not a readable file: ${MCTD_SELECTED_CKPT}" >&2
     exit 1
 fi
+
+CONTAINER_OUTPUT_ROOT="/home/${MCTD_DOCKER_USER}/mctd_outputs"
+CKPT_HOST_FOR_LOAD=""
+for _candidate in "$SELECTED_CKPT_HOST" "$SELECTED_CKPT_REAL"; do
+    if [ -n "$_candidate" ] && [[ "$_candidate" == "$MCTD_OUTPUT_MOUNT_DIR/"* ]]; then
+        CKPT_HOST_FOR_LOAD="$_candidate"
+        break
+    fi
+done
+if [ -z "$CKPT_HOST_FOR_LOAD" ]; then
+    echo "ERROR: Selected checkpoint is outside the Docker outputs mount: ${MCTD_SELECTED_CKPT}" >&2
+    exit 1
+fi
+CKPT_LOAD_PATH="${CKPT_HOST_FOR_LOAD/#$MCTD_OUTPUT_MOUNT_DIR/$CONTAINER_OUTPUT_ROOT}"
 
 SELECTED_DATASET="${MCTD_SELECTED_DATASET:-unknown}"
 OBS_DIM_INDICES="${MCTD_SELECTED_OBS_DIM_INDICES:-unknown}"
@@ -119,6 +123,26 @@ if [ ! -f "$DATASET_YAML" ]; then
     exit 1
 fi
 
+JOBS_DIR_REL="jobs/${SELECTED_DATASET}"
+JOBS_DIR_ABS="$PROJECT_DIR/$JOBS_DIR_REL"
+
+echo "Cleaning up existing benchmark job files for dataset queue: $JOBS_DIR_REL"
+mkdir -p "$JOBS_DIR_ABS"
+rm -f "$JOBS_DIR_ABS"/*.json
+echo "Dataset queue cleanup complete"
+
+echo ""
+echo "Enter number of evaluation repeats (positive integer, default: ${NUM_REPEATS}):"
+while true; do
+    read -r -p "Evaluation repeats: " _repeats_input
+    _repeats_input="${_repeats_input:-$NUM_REPEATS}"
+    if [[ "$_repeats_input" =~ ^[1-9][0-9]*$ ]]; then
+        NUM_REPEATS="$_repeats_input"
+        break
+    fi
+    echo "Please enter a positive integer."
+done
+
 echo ""
 echo "Enter rollouts per task (positive integer, default: ${ROLLOUTS_PER_TASK}):"
 while true; do
@@ -144,9 +168,11 @@ echo ""
 echo "Configuration summary:"
 echo "  Dataset           : $SELECTED_DATASET (obs_dim=${STATE_DIM})"
 echo "  Model             : $SELECTED_MODEL_ID"
+echo "  Checkpoint path   : $CKPT_LOAD_PATH"
 echo "  Repeats           : $NUM_REPEATS"
 echo "  Tasks             : $NUM_TASKS"
 echo "  Rollouts per task : $ROLLOUTS_PER_TASK"
+echo "  Jobs queue        : $JOBS_DIR_REL"
 echo "  Results dir       : $RESULTS_RUN_DIR"
 echo "  Task result files : $RESULTS_RUN_DIR/${RESULTS_FILE_PREFIX}_repeat_<repeat>_task_<task>.json"
 echo "  Summary JSON      : $SUMMARY_JSON_REL"
@@ -157,9 +183,11 @@ echo "Generating benchmark jobs..."
 python3 "$PROJECT_DIR/scripts/generate_benchmark_jobs.py" \
     --dataset "$SELECTED_DATASET" \
     --model_id "$SELECTED_MODEL_ID" \
+    --load_path "$CKPT_LOAD_PATH" \
     --num_tasks "$NUM_TASKS" \
     --num_repeats "$NUM_REPEATS" \
     --rollouts_per_task "$ROLLOUTS_PER_TASK" \
+    --jobs_dir "$JOBS_DIR_REL" \
     --planning_config_snapshot "$PLANNING_CONFIG_REL" \
     --results_dir "$RESULTS_RUN_DIR" \
     --results_file_prefix "$RESULTS_FILE_PREFIX"
@@ -174,7 +202,7 @@ export AVAILABLE_GPUS
 LOG_DIR="$PROJECT_DIR/logs"
 mkdir -p "$LOG_DIR"
 PIPELINE_LOG="$LOG_DIR/eval_all_${SELECTED_DATASET}_${RUN_TIMESTAMP}.log"
-SCHEDULER_LOG="$LOG_DIR/run_${RUN_TIMESTAMP}.log"
+SCHEDULER_LOG="$LOG_DIR/run_${SELECTED_DATASET}_${RUN_TIMESTAMP}.log"
 PIPELINE_PID_FILE="$LOG_DIR/eval_all_${SELECTED_MODEL_ID}_${RUN_TIMESTAMP}.pid"
 nohup setsid bash "$PROJECT_DIR/scripts/run_benchmark_pipeline.sh" \
     "$RESULTS_RUN_DIR" \
@@ -183,7 +211,8 @@ nohup setsid bash "$PROJECT_DIR/scripts/run_benchmark_pipeline.sh" \
     "$ROLLOUTS_PER_TASK" \
     "$SUMMARY_JSON_REL" \
     "$SELECTED_DATASET" \
-    "$RUN_TIMESTAMP" > "$PIPELINE_LOG" 2>&1 &
+    "$RUN_TIMESTAMP" \
+    "$JOBS_DIR_REL" > "$PIPELINE_LOG" 2>&1 &
 PIPELINE_PID=$!
 echo "$PIPELINE_PID" > "$PIPELINE_PID_FILE"
 

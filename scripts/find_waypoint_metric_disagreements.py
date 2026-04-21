@@ -336,12 +336,18 @@ def main() -> None:
                     np.asarray(graph_route["anchor_order"], dtype=np.int32)[1:-1] - 1
                 ]
                 if not np.array_equal(temporal_candidate_order, graph_candidate_order):
-                    # Sort mismatches by how strongly the graph metric prefers its
-                    # best Hamiltonian ordering over the runner-up ordering.
-                    sort_key = float(graph_route["second_best_gap"])
+                    # Sort mismatches by graph_second_best_gap_rel: how strongly the
+                    # graph metric prefers its best ordering over the runner-up,
+                    # normalised by total tour cost (relative criterion).
+                    total_cost = float(graph_route["total_cost"])
+                    sort_key = (
+                        float(graph_route["second_best_gap"]) / total_cost
+                        if total_cost > 1e-9 else 0.0
+                    )
                     mismatch_combo_with_keys.append((sort_key, combo_local.copy()))
 
             mismatch_combo_with_keys.sort(key=lambda item: item[0], reverse=True)
+            mismatch_sort_keys = [k for k, _ in mismatch_combo_with_keys]
             mismatch_combo_locals = [combo_local for _, combo_local in mismatch_combo_with_keys]
             waypoint_ij_groups = _combo_waypoint_ij_groups(
                 np.asarray(mismatch_combo_locals, dtype=np.int32).reshape(-1, int(args.num_waypoints))
@@ -357,6 +363,9 @@ def main() -> None:
                     "mismatch_combination_count": int(mismatch_count),
                 },
                 "waypoint_ij_groups": waypoint_ij_groups,
+                "waypoint_group_graph_second_best_gap_rel": _FlowStyleList(
+                    [round(k, 6) for k in mismatch_sort_keys]
+                ),
             }
             output_payload["total_stats"]["total_waypoint_combinations"] += total_waypoint_combinations
             output_payload["total_stats"]["mismatch_combination_count"] += int(mismatch_count)

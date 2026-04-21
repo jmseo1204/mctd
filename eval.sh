@@ -38,9 +38,7 @@ echo "Cleaning up existing MCTD containers..."
 docker rm -f $(docker ps -a 2>/dev/null | grep exp_gpu0 | awk '{print $1}') 2>/dev/null || true
 echo "✓ Container cleanup complete"
 
-echo "Cleaning up existing job files..."
-rm -f jobs/*.json
-echo "✓ Job files cleanup complete"
+echo "Job queue cleanup will run after dataset detection."
 
 echo "Resetting JAX cache..."
 rm -rf ~/.jax_cache
@@ -133,6 +131,13 @@ if [ ! -f "$DATASET_YAML" ]; then
     echo "❌ ERROR: Dataset config not found: ${DATASET_YAML}"
     exit 1
 fi
+JOBS_DIR_REL="jobs/${SELECTED_DATASET}"
+JOBS_DIR_ABS="$PROJECT_DIR/$JOBS_DIR_REL"
+
+echo "Cleaning up existing evaluation job files for dataset queue: $JOBS_DIR_REL"
+mkdir -p "$JOBS_DIR_ABS"
+rm -f "$JOBS_DIR_ABS"/*.json
+echo "✓ Job files cleanup complete"
 echo ""
 
 # ─────────────────────────────────────────────────────
@@ -146,6 +151,7 @@ echo "Configuration summary:"
 echo "  Dataset    : $SELECTED_DATASET (obs_dim=${STATE_DIM})"
 echo "  Model      : $SELECTED_MODEL_ID"
 echo "  Tasks      : $NUM_TASKS (start=$START_TASK_IDX)  Seeds: $NUM_SEEDS"
+echo "  Jobs queue : $JOBS_DIR_REL"
 echo ""
 
 # ─────────────────────────────────────────────────────
@@ -157,7 +163,8 @@ python3 scripts/generate_jobs_generalized.py \
     --model_id "$SELECTED_MODEL_ID" \
     --num_tasks "$NUM_TASKS" \
     --num_seeds "$NUM_SEEDS" \
-    --start_task_id "$START_TASK_IDX"
+    --start_task_id "$START_TASK_IDX" \
+    --jobs_dir "$JOBS_DIR_REL"
 
 if [ $? -ne 0 ]; then
     echo ""
@@ -175,8 +182,8 @@ echo ""
 
 export AVAILABLE_GPUS
 RUN_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-SCHEDULER_LOG="$PROJECT_DIR/logs/run_${RUN_TIMESTAMP}.log"
-nohup env MCTD_RUN_TIMESTAMP="$RUN_TIMESTAMP" PYTHONUNBUFFERED=1 python3 scripts/run_jobs.py > /tmp/mctd_run_jobs.log 2>&1 &
+SCHEDULER_LOG="$PROJECT_DIR/logs/run_${SELECTED_DATASET}_${RUN_TIMESTAMP}.log"
+nohup env MCTD_RUN_TIMESTAMP="${SELECTED_DATASET}_${RUN_TIMESTAMP}" MCTD_JOBS_DIR="$JOBS_DIR_REL" PYTHONUNBUFFERED=1 python3 scripts/run_jobs.py > /tmp/mctd_run_jobs.log 2>&1 &
 RUN_JOBS_PID=$!
 
 echo "✓ Jobs launched in background (PID: $RUN_JOBS_PID)"

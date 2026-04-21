@@ -128,8 +128,8 @@ echo ""
 DATASET_KEYWORDS=$(mctd_normalize_dataset_name "$DATASET_CONFIG" \
     | sed 's/_\(2d\|15d\|29d\|fullstate\)$//')
 MODEL_ID_PREFIX="train_${TARGET_OBS_DIM}d"
-LOG_FILE="$PROJECT_DIR/logs/train_${TARGET_OBS_DIM}d.log"
-MODEL_ID_FILE="$PROJECT_DIR/logs/current_${TARGET_OBS_DIM}d_model_id.txt"
+LOG_FILE="$PROJECT_DIR/logs/train_${TARGET_OBS_DIM}d_${DATASET_CONFIG}.log"
+MODEL_ID_FILE="$PROJECT_DIR/logs/current_${TARGET_OBS_DIM}d_${DATASET_CONFIG}_model_id.txt"
 RUN_NAME="Train_${TARGET_OBS_DIM}D_antmaze"
 
 # ────────────────────────────────────────────────────────
@@ -172,8 +172,17 @@ host_to_docker_path() {
 # ────────────────────────────────────────────────────────
 update_eval_symlink() {
     local model_id="$1"
+    local start_marker="${2:-}"
 
-    # Find latest model.ckpt in raw training outputs only (OUTPUT_MOUNT_DIR)
+    # Find the latest model.ckpt created during THIS training run only.
+    # Using -newer with the start_marker avoids picking up checkpoints from
+    # concurrent training processes running in parallel.
+    local find_args=(-regextype posix-extended
+        -regex ".*/[0-9]{4}-[0-9]{2}-[0-9]{2}/.*"
+        -name "model.ckpt")
+    [ -n "$start_marker" ] && [ -f "$start_marker" ] && \
+        find_args+=(-newer "$start_marker")
+
     local latest_ckpt="" latest_time=0
     while IFS= read -r f; do
         local ftime
@@ -182,10 +191,7 @@ update_eval_symlink() {
             latest_time=$ftime
             latest_ckpt=$f
         fi
-    done < <(find "$OUTPUT_MOUNT_DIR" \
-        -regextype posix-extended \
-        -regex ".*/[0-9]{4}-[0-9]{2}-[0-9]{2}/.*" \
-        -name "model.ckpt" 2>/dev/null)
+    done < <(find "$OUTPUT_MOUNT_DIR" "${find_args[@]}" 2>/dev/null)
 
     if [ -z "$latest_ckpt" ]; then
         echo "[symlink] No model.ckpt found in $OUTPUT_MOUNT_DIR, skipping." | tee -a "$LOG_FILE"
@@ -514,6 +520,11 @@ FULL_CMD="docker run -d --gpus all --user root ${_CUDA_VIS_FLAG} --name ${CONTAI
 
 echo "[$(date)] Docker command: $FULL_CMD" | tee -a "$LOG_FILE"
 
+# Marker file to timestamp training start — used by update_eval_symlink to
+# restrict checkpoint search to this run only (avoids picking up sibling runs).
+TRAIN_START_MARKER="$PROJECT_DIR/.train_start_$$"
+touch "$TRAIN_START_MARKER"
+
 # Start container detached — survives SSH disconnect
 set +e
 CONTAINER_ID=$(eval "$FULL_CMD" 2>&1)
@@ -541,7 +552,8 @@ wait $_STREAM_PID 2>/dev/null || true
 # Cleanup container
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
-update_eval_symlink "$MODEL_ID"
+update_eval_symlink "$MODEL_ID" "$TRAIN_START_MARKER"
+rm -f "$TRAIN_START_MARKER"
 
 if [ "$EXIT_CODE" -eq 0 ]; then
     echo "[$(date)] Training completed successfully!" | tee -a "$LOG_FILE"

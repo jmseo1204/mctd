@@ -28,6 +28,37 @@ from utils.cluster_utils import submit_slurm_job
 from utils.distributed_utils import is_rank_zero
 
 
+def _shared_wandb_ready_path(shared_id: str | None) -> Path | None:
+    if not shared_id:
+        return None
+    ready_dir = Path(__file__).resolve().parent / ".wandb_shared_ready"
+    ready_dir.mkdir(parents=True, exist_ok=True)
+    safe_shared_id = str(shared_id).replace("/", "_")
+    return ready_dir / f"{safe_shared_id}.ready"
+
+
+def _mark_shared_wandb_primary_ready(cfg: DictConfig, run) -> None:
+    wandb_cfg = cfg.get("wandb", {})
+    if not wandb_cfg or not wandb_cfg.get("shared_mode", False):
+        return
+    if not wandb_cfg.get("shared_primary", True):
+        return
+
+    ready_path = _shared_wandb_ready_path(wandb_cfg.get("shared_id", None))
+    if ready_path is None:
+        return
+
+    payload = {
+        "entity": getattr(run, "entity", None),
+        "project": getattr(run, "project", None),
+        "id": getattr(run, "id", None),
+        "url": getattr(run, "url", None),
+        "timestamp": time.time(),
+    }
+    ready_path.write_text(OmegaConf.to_yaml(payload), encoding="utf-8")
+    print(cyan("Shared WandB primary ready marker:"), ready_path)
+
+
 def _cli_algorithm_override_paths(argv: list[str]) -> list[str]:
     override_paths: set[str] = set()
     for arg in argv[1:]:
@@ -67,10 +98,50 @@ def _maybe_apply_algorithm_snapshot(cfg: DictConfig) -> None:
     print(cyan("Loaded algorithm config snapshot:"), snapshot_path)
 
 
+def _maybe_wait_for_shared_wandb_primary(cfg: DictConfig) -> None:
+    wandb_cfg = cfg.get("wandb", {})
+    if not wandb_cfg or not wandb_cfg.get("shared_mode", False):
+        return
+    if wandb_cfg.get("shared_primary", True):
+        return
+
+    shared_id = wandb_cfg.get("shared_id", None)
+    entity = wandb_cfg.get("entity", None)
+    project = wandb_cfg.get("project", None)
+    if not shared_id or not entity or not project:
+        raise ValueError(
+            "shared WandB worker requires wandb.shared_id, wandb.entity, and wandb.project"
+        )
+
+    import wandb
+
+    api = wandb.Api()
+    run_path = f"{entity}/{project}/{shared_id}"
+    ready_path = _shared_wandb_ready_path(shared_id)
+    timeout_s = 180
+    poll_interval_s = 3
+    start_t = time.time()
+    while True:
+        if ready_path is not None and ready_path.exists():
+            print(cyan("Shared WandB primary ready marker detected:"), ready_path)
+            return
+        try:
+            api.run(run_path)
+            print(cyan("Shared WandB primary detected:"), run_path)
+            return
+        except Exception:
+            if time.time() - start_t > timeout_s:
+                raise TimeoutError(
+                    f"Timed out waiting for shared WandB primary run to appear: {run_path}"
+                )
+            time.sleep(poll_interval_s)
+
+
 def run_local(cfg: DictConfig):
     # delay some imports in case they are not needed in non-local envs for submission
     from experiments import build_experiment
     from utils.wandb_utils import OfflineWandbLogger, SpaceEfficientWandbLogger
+    import wandb
 
     # Get yaml names
     hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
@@ -98,6 +169,7 @@ def run_local(cfg: DictConfig):
         "Use wandb.mode=online (default) or wandb.mode=disabled to skip logging."
     )
     if cfg.wandb.mode != "disabled":
+        _maybe_wait_for_shared_wandb_primary(cfg)
         # If resuming, merge into the existing run on wandb.
         resume = cfg.get("resume", None)
         name = f"{cfg.name} ({output_dir.parent.name}/{output_dir.name})" if resume is None else None
@@ -108,6 +180,18 @@ def run_local(cfg: DictConfig):
             logger_cls = SpaceEfficientWandbLogger
 
         offline = cfg.wandb.mode != "online"
+        logger_id = resume
+        logger_settings = None
+        if cfg.wandb.get("shared_mode", False):
+            logger_id = cfg.wandb.get("shared_id", None)
+            logger_settings = wandb.Settings(
+                mode="shared",
+                x_primary=bool(cfg.wandb.get("shared_primary", True)),
+                x_label=cfg.wandb.get("shared_label", None),
+                x_update_finish_state=bool(
+                    cfg.wandb.get("shared_update_finish_state", True)
+                ),
+            )
         logger = logger_cls(
             name=name,
             save_dir=str(output_dir),
@@ -116,10 +200,16 @@ def run_local(cfg: DictConfig):
             entity=cfg.wandb.entity,
             group=cfg.wandb.group,
             project=cfg.wandb.project,
+            job_type=cfg.wandb.get("job_type", None),
             log_model="all" if not offline else False,
             config=OmegaConf.to_container(cfg),
-            id=resume,
+            id=logger_id,
+            settings=logger_settings,
         )
+        if cfg.wandb.get("shared_mode", False):
+            shared_run = logger.experiment
+            if cfg.wandb.get("shared_primary", True):
+                _mark_shared_wandb_primary_ready(cfg, shared_run)
     else:
         logger = None
 

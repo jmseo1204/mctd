@@ -15,7 +15,7 @@ DOCKER_PROJECT="/home/${DOCKER_USER}/mctd"
 OUTPUT_DOWNLOADED_DIR="$MCTD_DOWNLOADED_DIR"
 NUM_TASKS=5
 NUM_REPEATS=3
-WAYPOINT_TOP_N=10
+N_PER_BIN=7
 
 read_yaml_value() {
     local yaml_path="$1"
@@ -323,27 +323,54 @@ while true; do
 done
 
 echo ""
-echo "Enter top N ranked waypoint groups per task (positive integer, default: ${WAYPOINT_TOP_N}):"
+echo "Enter number of waypoint groups per difficulty bin (high/mid/low) for stratified eval"
+echo "(total eval groups per task = n_per_bin × 3, default: ${N_PER_BIN}):"
 while true; do
-    read -r -p "Top N waypoint groups: " _topn_input
-    _topn_input="${_topn_input:-$WAYPOINT_TOP_N}"
-    if [[ "$_topn_input" =~ ^[1-9][0-9]*$ ]]; then
-        WAYPOINT_TOP_N="$_topn_input"
+    read -r -p "Groups per bin: " _bin_input
+    _bin_input="${_bin_input:-$N_PER_BIN}"
+    if [[ "$_bin_input" =~ ^[1-9][0-9]*$ ]]; then
+        N_PER_BIN="$_bin_input"
         break
     fi
     echo "Please enter a positive integer."
+done
+WAYPOINT_TOP_N=$((N_PER_BIN * 3))
+
+echo ""
+echo "Run fixed temporal-distance baseline simultaneously on a shared WandB run? [default: no]"
+while true; do
+    read -r -p "Run baseline model simultaneously? (y/n): " _baseline_input
+    _baseline_input="${_baseline_input:-n}"
+    case "${_baseline_input,,}" in
+        y|yes)
+            RUN_BASELINE_SIMULTANEOUS="true"
+            break
+            ;;
+        n|no)
+            RUN_BASELINE_SIMULTANEOUS="false"
+            break
+            ;;
+    esac
+    echo "Please enter y or n."
 done
 
 DEFAULT_OGBENCH_RESET_PERTURB="$(read_yaml_value "$PLANNING_CONFIG_SRC" "ogbench_enable_reset_perturb")"
 if [ -z "$DEFAULT_OGBENCH_RESET_PERTURB" ] || [ "$DEFAULT_OGBENCH_RESET_PERTURB" = "null" ] || [ "$DEFAULT_OGBENCH_RESET_PERTURB" = "None" ]; then
     DEFAULT_OGBENCH_RESET_PERTURB="true"
 fi
+if [ "${DEFAULT_OGBENCH_RESET_PERTURB,,}" = "true" ]; then
+    DEFAULT_OGBENCH_RESET_PERTURB_PROMPT="[Y/n]"
+    DEFAULT_OGBENCH_RESET_PERTURB_INPUT="y"
+else
+    DEFAULT_OGBENCH_RESET_PERTURB_PROMPT="[y/N]"
+    DEFAULT_OGBENCH_RESET_PERTURB_INPUT="n"
+fi
 
 echo ""
-echo "Enable OGBench start/goal perturbation for both waypoint search and benchmark rollout? [default: ${DEFAULT_OGBENCH_RESET_PERTURB}]"
+echo "Enable OGBench start/goal perturbation for both waypoint search and benchmark rollout? ${DEFAULT_OGBENCH_RESET_PERTURB_PROMPT}"
 while true; do
-    read -r -p "Enable perturbation (true/false): " _perturb_input
-    _perturb_input="${_perturb_input:-$DEFAULT_OGBENCH_RESET_PERTURB}"
+    read -r -p "Enable perturbation (y/n): " _perturb_input
+    _perturb_input="${_perturb_input:-$DEFAULT_OGBENCH_RESET_PERTURB_INPUT}"
     case "${_perturb_input,,}" in
         true|t|yes|y|1|on)
             OGBENCH_ENABLE_RESET_PERTURB="true"
@@ -354,7 +381,7 @@ while true; do
             break
             ;;
     esac
-    echo "Please enter true or false."
+    echo "Please enter y or n."
 done
 
 RUN_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
@@ -456,11 +483,39 @@ PY
     fi
 fi
 
+# Run stratified-sample annotation if the YAML was regenerated or if n_per_bin changed.
+EXISTING_N_PER_BIN="$(read_yaml_value "$TASK_OVERRIDE_HOST_PATH" "eval_sampling.n_per_bin")"
+if [ "$REGENERATE_TASK_OVERRIDE" -eq 1 ] || [ "$EXISTING_N_PER_BIN" != "$N_PER_BIN" ]; then
+    echo ""
+    echo "Annotating waypoint override with stratified sample (n_per_bin=${N_PER_BIN}, seed=42)..."
+    python3 "${PROJECT_DIR}/scripts/annotate_waypoint_override_with_stratified_sample.py" \
+        --waypoint-override "${TASK_OVERRIDE_HOST_PATH}" \
+        --n-per-bin "${N_PER_BIN}" \
+        --seed 42
+    echo "Stratified annotation complete."
+else
+    echo "Stratified annotation up-to-date (n_per_bin=${N_PER_BIN}), skipping re-annotation."
+fi
+
 RESULTS_FILE_PREFIX="${SELECTED_DATASET}_hamiltonian_${RUN_TIMESTAMP}"
 RESULTS_RUN_DIR="benchmark_results/${SELECTED_MODEL_ID}/${RESULTS_FILE_PREFIX}"
-SUMMARY_JSON_REL="${RESULTS_RUN_DIR}/${RESULTS_FILE_PREFIX}_summary.json"
 PLANNING_CONFIG_REL="${RESULTS_RUN_DIR}/df_planning.yaml"
 TASK_OVERRIDE_SNAPSHOT_REL="${RESULTS_RUN_DIR}/$(basename "$TASK_OVERRIDE_PATH")"
+SUMMARY_JSON_REL="${RESULTS_RUN_DIR}/${RESULTS_FILE_PREFIX}_summary.json"
+ONLINE_RESULTS_DIR="${RESULTS_RUN_DIR}"
+ONLINE_SUMMARY_JSON_REL="${SUMMARY_JSON_REL}"
+BASELINE_RESULTS_DIR=""
+BASELINE_SUMMARY_JSON_REL=""
+COMPARISON_SUMMARY_JSON_REL=""
+SHARED_RUN_ID_BASE=""
+if [ "$RUN_BASELINE_SIMULTANEOUS" = "true" ]; then
+    ONLINE_RESULTS_DIR="${RESULTS_RUN_DIR}/online"
+    BASELINE_RESULTS_DIR="${RESULTS_RUN_DIR}/fixed_temporal_dist_planner"
+    ONLINE_SUMMARY_JSON_REL="${ONLINE_RESULTS_DIR}/${RESULTS_FILE_PREFIX}_online_summary.json"
+    BASELINE_SUMMARY_JSON_REL="${BASELINE_RESULTS_DIR}/${RESULTS_FILE_PREFIX}_fixed_temporal_dist_planner_summary.json"
+    COMPARISON_SUMMARY_JSON_REL="${RESULTS_RUN_DIR}/${RESULTS_FILE_PREFIX}_comparison_summary.json"
+    SHARED_RUN_ID_BASE="${SELECTED_MODEL_ID}-${RUN_TIMESTAMP}"
+fi
 mkdir -p "$PROJECT_DIR/$RESULTS_RUN_DIR"
 cp -f "$PLANNING_CONFIG_SRC" "$PROJECT_DIR/$PLANNING_CONFIG_REL"
 cp -f "$PROJECT_DIR/$TASK_OVERRIDE_PATH" "$PROJECT_DIR/$TASK_OVERRIDE_SNAPSHOT_REL"
@@ -471,26 +526,88 @@ echo "  Dataset             : $SELECTED_DATASET (obs_dim=${STATE_DIM})"
 echo "  Model               : $SELECTED_MODEL_ID"
 echo "  Repeats             : $NUM_REPEATS"
 echo "  Tasks               : $NUM_TASKS"
-echo "  Top N groups / task : $WAYPOINT_TOP_N"
+echo "  Groups per bin      : $N_PER_BIN  (high/mid/low × ${N_PER_BIN} = ${WAYPOINT_TOP_N} total/task)"
+echo "  Run baseline        : $RUN_BASELINE_SIMULTANEOUS"
 echo "  Perturb enabled     : $OGBENCH_ENABLE_RESET_PERTURB"
 echo "  Results dir         : $RESULTS_RUN_DIR"
-echo "  Summary JSON        : $SUMMARY_JSON_REL"
+if [ "$RUN_BASELINE_SIMULTANEOUS" = "true" ]; then
+    echo "  Online results dir  : $ONLINE_RESULTS_DIR"
+    echo "  Baseline results dir: $BASELINE_RESULTS_DIR"
+    echo "  Online summary JSON : $ONLINE_SUMMARY_JSON_REL"
+    echo "  Baseline summary    : $BASELINE_SUMMARY_JSON_REL"
+    echo "  Comparison summary  : $COMPARISON_SUMMARY_JSON_REL"
+else
+    echo "  Summary JSON        : $SUMMARY_JSON_REL"
+fi
 echo "  Planning config     : $PLANNING_CONFIG_REL"
 echo "  Task override       : $TASK_OVERRIDE_SNAPSHOT_REL"
 echo ""
 
 echo "Generating Hamiltonian benchmark jobs..."
-python3 "$PROJECT_DIR/scripts/generate_hamiltonian_benchmark_jobs.py" \
-    --dataset "$SELECTED_DATASET" \
-    --model_id "$SELECTED_MODEL_ID" \
-    --num_tasks "$NUM_TASKS" \
-    --num_repeats "$NUM_REPEATS" \
-    --waypoint_top_n "$WAYPOINT_TOP_N" \
-    --task_override_path "$TASK_OVERRIDE_SNAPSHOT_REL" \
-    --planning_config_snapshot "$PLANNING_CONFIG_REL" \
-    --results_dir "$RESULTS_RUN_DIR" \
-    --results_file_prefix "$RESULTS_FILE_PREFIX" \
-    --ogbench-enable-reset-perturb "$OGBENCH_ENABLE_RESET_PERTURB"
+if [ "$RUN_BASELINE_SIMULTANEOUS" = "true" ]; then
+    for REPEAT_ID in $(seq 1 "$NUM_REPEATS"); do
+        python3 "$PROJECT_DIR/scripts/generate_hamiltonian_benchmark_jobs.py" \
+            --dataset "$SELECTED_DATASET" \
+            --model_id "$SELECTED_MODEL_ID" \
+            --num_tasks "$NUM_TASKS" \
+            --num_repeats "$NUM_REPEATS" \
+            --repeat_ids "$REPEAT_ID" \
+            --waypoint_top_n "$WAYPOINT_TOP_N" \
+            --task_override_path "$TASK_OVERRIDE_SNAPSHOT_REL" \
+            --planning_config_snapshot "$PLANNING_CONFIG_REL" \
+            --results_dir "$ONLINE_RESULTS_DIR" \
+            --results_file_prefix "${RESULTS_FILE_PREFIX}_online" \
+            --planner_variant "online_hemiltonian" \
+            --route_mode "online" \
+            --plan_only "false" \
+            --log_groundtruth_media "true" \
+            --postprocessed_plan_media_key "online_hemiltonian_postprocessed_plan" \
+            --shared_run_id_base "$SHARED_RUN_ID_BASE" \
+            --shared_primary "true" \
+            --shared_label "online" \
+            --batch_tasks_per_repeat "true" \
+            --ogbench-enable-reset-perturb "$OGBENCH_ENABLE_RESET_PERTURB"
+
+        python3 "$PROJECT_DIR/scripts/generate_hamiltonian_benchmark_jobs.py" \
+            --dataset "$SELECTED_DATASET" \
+            --model_id "$SELECTED_MODEL_ID" \
+            --num_tasks "$NUM_TASKS" \
+            --num_repeats "$NUM_REPEATS" \
+            --repeat_ids "$REPEAT_ID" \
+            --waypoint_top_n "$WAYPOINT_TOP_N" \
+            --task_override_path "$TASK_OVERRIDE_SNAPSHOT_REL" \
+            --planning_config_snapshot "$PLANNING_CONFIG_REL" \
+            --results_dir "$BASELINE_RESULTS_DIR" \
+            --results_file_prefix "${RESULTS_FILE_PREFIX}_fixed_temporal_dist_planner" \
+            --planner_variant "fixed_temporal_dist_planner" \
+            --route_mode "fixed_temporal" \
+            --plan_only "true" \
+            --log_groundtruth_media "false" \
+            --postprocessed_plan_media_key "fixed_temporal_dist_planner_postprocessed_plan" \
+            --shared_run_id_base "$SHARED_RUN_ID_BASE" \
+            --shared_primary "false" \
+            --shared_label "baseline" \
+            --batch_tasks_per_repeat "true" \
+            --ogbench-enable-reset-perturb "$OGBENCH_ENABLE_RESET_PERTURB"
+    done
+else
+    python3 "$PROJECT_DIR/scripts/generate_hamiltonian_benchmark_jobs.py" \
+        --dataset "$SELECTED_DATASET" \
+        --model_id "$SELECTED_MODEL_ID" \
+        --num_tasks "$NUM_TASKS" \
+        --num_repeats "$NUM_REPEATS" \
+        --waypoint_top_n "$WAYPOINT_TOP_N" \
+        --task_override_path "$TASK_OVERRIDE_SNAPSHOT_REL" \
+        --planning_config_snapshot "$PLANNING_CONFIG_REL" \
+        --results_dir "$RESULTS_RUN_DIR" \
+        --results_file_prefix "$RESULTS_FILE_PREFIX" \
+        --planner_variant "online_hemiltonian" \
+        --route_mode "online" \
+        --plan_only "false" \
+        --log_groundtruth_media "true" \
+        --postprocessed_plan_media_key "online_hemiltonian_postprocessed_plan" \
+        --ogbench-enable-reset-perturb "$OGBENCH_ENABLE_RESET_PERTURB"
+fi
 
 echo ""
 echo "====================================================="
@@ -504,15 +621,34 @@ mkdir -p "$LOG_DIR"
 PIPELINE_LOG="$LOG_DIR/eval_hemiltonian_all_${SELECTED_DATASET}_${RUN_TIMESTAMP}.log"
 SCHEDULER_LOG="$LOG_DIR/run_${RUN_TIMESTAMP}.log"
 PIPELINE_PID_FILE="$LOG_DIR/eval_hemiltonian_all_${SELECTED_MODEL_ID}_${RUN_TIMESTAMP}.pid"
-nohup setsid bash "$PROJECT_DIR/scripts/run_hamiltonian_benchmark_pipeline.sh" \
-    "$RESULTS_RUN_DIR" \
-    "$NUM_REPEATS" \
-    "$NUM_TASKS" \
-    "$WAYPOINT_TOP_N" \
-    "$SUMMARY_JSON_REL" \
-    "$SELECTED_DATASET" \
-    "$RUN_TIMESTAMP" \
-    "$TASK_OVERRIDE_SNAPSHOT_REL" > "$PIPELINE_LOG" 2>&1 &
+if [ "$RUN_BASELINE_SIMULTANEOUS" = "true" ]; then
+    nohup setsid bash "$PROJECT_DIR/scripts/run_hamiltonian_benchmark_pipeline.sh" \
+        dual \
+        "$ONLINE_RESULTS_DIR" \
+        "$BASELINE_RESULTS_DIR" \
+        "$NUM_REPEATS" \
+        "$NUM_TASKS" \
+        "$WAYPOINT_TOP_N" \
+        "$ONLINE_SUMMARY_JSON_REL" \
+        "$BASELINE_SUMMARY_JSON_REL" \
+        "$COMPARISON_SUMMARY_JSON_REL" \
+        "$SELECTED_DATASET" \
+        "$RUN_TIMESTAMP" \
+        "$TASK_OVERRIDE_SNAPSHOT_REL" \
+        "$N_PER_BIN" > "$PIPELINE_LOG" 2>&1 &
+else
+    nohup setsid bash "$PROJECT_DIR/scripts/run_hamiltonian_benchmark_pipeline.sh" \
+        single \
+        "$RESULTS_RUN_DIR" \
+        "$NUM_REPEATS" \
+        "$NUM_TASKS" \
+        "$WAYPOINT_TOP_N" \
+        "$SUMMARY_JSON_REL" \
+        "$SELECTED_DATASET" \
+        "$RUN_TIMESTAMP" \
+        "$TASK_OVERRIDE_SNAPSHOT_REL" \
+        "$N_PER_BIN" > "$PIPELINE_LOG" 2>&1 &
+fi
 PIPELINE_PID=$!
 echo "$PIPELINE_PID" > "$PIPELINE_PID_FILE"
 
@@ -532,7 +668,13 @@ echo "    docker ps --filter 'name=exp_gpu' -q | xargs -r docker rm -f"
 echo ""
 echo "WandB group: HBENCH-$SELECTED_MODEL_ID"
 echo "Results directory: $PROJECT_DIR/$RESULTS_RUN_DIR"
-echo "Summary JSON: $PROJECT_DIR/$SUMMARY_JSON_REL"
+if [ "$RUN_BASELINE_SIMULTANEOUS" = "true" ]; then
+    echo "Online summary JSON: $PROJECT_DIR/$ONLINE_SUMMARY_JSON_REL"
+    echo "Baseline summary JSON: $PROJECT_DIR/$BASELINE_SUMMARY_JSON_REL"
+    echo "Comparison summary JSON: $PROJECT_DIR/$COMPARISON_SUMMARY_JSON_REL"
+else
+    echo "Summary JSON: $PROJECT_DIR/$SUMMARY_JSON_REL"
+fi
 echo "Planning config snapshot: $PROJECT_DIR/$PLANNING_CONFIG_REL"
 echo "Task override snapshot: $PROJECT_DIR/$TASK_OVERRIDE_SNAPSHOT_REL"
 echo ""

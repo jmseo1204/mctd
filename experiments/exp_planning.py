@@ -31,6 +31,7 @@ class PlanningExperiment(BaseLightningExperiment):
         antmaze_giant_navigate_fullstate=OGAntMazeOfflineRLDataset,
         antmaze_giant_navigate_15d=OGAntMazeOfflineRLDataset,
         antmaze_teleport_navigate=OGAntMazeOfflineRLDataset,
+        antmaze_teleport_stitch=OGAntMazeOfflineRLDataset,
 
         antmaze_giant_stitch=OGAntMazeOfflineRLDataset,
         antmaze_large_stitch=OGAntMazeOfflineRLDataset,

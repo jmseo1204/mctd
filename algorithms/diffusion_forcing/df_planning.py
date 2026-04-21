@@ -401,6 +401,20 @@ class DiffusionForcingPlanning(
         self.benchmark_waypoint_top_n = (
             int(_benchmark_top_n) if _benchmark_top_n is not None else None
         )
+        self.benchmark_variant_name = str(
+            cfg.get("benchmark_variant_name", "online_hemiltonian")
+        )
+        self.benchmark_plan_only = _coerce_bool(
+            cfg.get("benchmark_plan_only", False),
+            default=False,
+        )
+        self.benchmark_log_groundtruth_media = _coerce_bool(
+            cfg.get("benchmark_log_groundtruth_media", True),
+            default=True,
+        )
+        self.benchmark_postprocessed_plan_media_key = str(
+            cfg.get("benchmark_postprocessed_plan_media_key", "postprocessed_plan")
+        )
         self._benchmark_override_payload_cache: Optional[dict] = None
         self._current_wandb_visual_prefix: Optional[str] = None
         self.dql_model = cfg.get("dql_model", None)
@@ -512,6 +526,7 @@ class DiffusionForcingPlanning(
         self.use_uncertainty_as_value: bool = cfg.get("use_uncertainty_as_value", False)
         self.uncertainty_mode: str = cfg.get("uncertainty_mode", "entropy")
         self.multi_tree_hemiltonian: bool = bool(cfg.get("multi_tree_hemiltonian", False))
+        self.multi_tree_route_mode: str = str(cfg.get("multi_tree_route_mode", "online"))
         self.reliable_TD_threshold: float = float(cfg.get("reliable_TD_threshold", 30.0))
         self.temporal_dist_overestimate_coeff: float = float(
             cfg.get("temporal_dist_overestimate_coeff", 0.001)
@@ -907,6 +922,13 @@ class DiffusionForcingPlanning(
         return sorted(planner_state["accepted_pair_edges"].keys())
 
     def _compute_tentative_hamiltonian_solution(self, planner_state: dict) -> dict:
+        if self.multi_tree_route_mode == "fixed_temporal":
+            solver_result = planner_state.get("fixed_tentative_solver_result")
+            if solver_result is None:
+                raise ValueError("fixed_temporal route mode requires fixed_tentative_solver_result")
+            planner_state["tentative_solver_result"] = dict(solver_result)
+            return planner_state["tentative_solver_result"]
+
         effective_pair_cost = np.asarray(planner_state["effective_pair_cost"], dtype=np.float32)
         solver_result = solve_fixed_endpoint_hamiltonian_path_with_forced_adjacency(
             effective_pair_cost,
@@ -1028,7 +1050,93 @@ class DiffusionForcingPlanning(
         diffs = np.diff(pts, axis=0)
         return float(np.linalg.norm(diffs, axis=-1).sum(dtype=np.float64))
 
-    def _compute_groundtruth_hamiltonian_info(
+    def _benchmark_metric_prefix(self) -> str:
+        return f"benchmark/{self.benchmark_variant_name}"
+
+    def _benchmark_media_key(self, leaf_key: str) -> str:
+        if self._current_wandb_visual_prefix is not None:
+            return f"{self._current_wandb_visual_prefix}/{leaf_key}"
+        return leaf_key
+
+    def _format_postprocessed_plan_title(
+        self,
+        route_text: str,
+        total_length: Optional[float],
+    ) -> str:
+        route_text = str(route_text or "unknown")
+        if total_length is None or not np.isfinite(float(total_length)):
+            total_text = "unknown"
+        else:
+            total_text = f"{float(total_length):.3f}"
+        return f"route={route_text}\ntotal={total_text}"
+
+    def _compute_fixed_temporal_route_solution(
+        self,
+        start_xy: np.ndarray,
+        goal_xy: np.ndarray,
+        waypoints_xy: np.ndarray,
+    ) -> dict[str, Any]:
+        anchor_bundle = self._build_groundtruth_anchor_queries(
+            start_xy=start_xy,
+            goal_xy=goal_xy,
+            waypoints_xy=waypoints_xy,
+        )
+        temporal_anchor_dists = compute_pairwise_temporal_distance_matrix(
+            self,
+            src_xys=np.asarray(anchor_bundle["anchor_xys"], dtype=np.float32),
+            dst_xys=np.asarray(anchor_bundle["anchor_xys"], dtype=np.float32),
+            gamma=GROUNDTRUTH_TEMPORAL_VIZ_GAMMA,
+        )
+        temporal_route_solution = solve_fixed_endpoint_hamiltonian_path(temporal_anchor_dists)
+        if bool(temporal_route_solution.get("feasible", False)):
+            temporal_route_segments = self._build_groundtruth_straight_anchor_route_segments(
+                anchor_xys=np.asarray(anchor_bundle["anchor_xys"], dtype=np.float32),
+                anchor_order=np.asarray(temporal_route_solution["anchor_order"], dtype=np.int32),
+            )
+        else:
+            temporal_route_segments = {
+                "reachable": False,
+                "segments": [],
+                "total_distance": np.inf,
+            }
+        return {
+            "anchor_bundle": anchor_bundle,
+            "temporal_route_solution": temporal_route_solution,
+            "temporal_route_segments": temporal_route_segments,
+        }
+
+    @staticmethod
+    def _extract_interact_task_geometry(
+        interact_result: dict[str, Any],
+        *,
+        include_waypoints: bool,
+    ) -> dict[str, Any]:
+        start_xy = np.asarray(interact_result.get("start_xy", []), dtype=np.float32).reshape(-1, 2)
+        goal_xy = np.asarray(interact_result.get("goal_xy", []), dtype=np.float32).reshape(-1, 2)
+        if len(start_xy) == 0 or len(goal_xy) == 0:
+            raise RuntimeError("benchmark requires interact() to expose start_xy and goal_xy")
+
+        if include_waypoints:
+            waypoints_xy = np.asarray(interact_result.get("waypoints_xy", []), dtype=np.float32)
+            if waypoints_xy.size == 0:
+                waypoints_xy = np.zeros((0, 2), dtype=np.float32)
+            else:
+                waypoints_xy = waypoints_xy.reshape(-1, 2)
+        else:
+            waypoints_xy = np.zeros((0, 2), dtype=np.float32)
+
+        task_name = None
+        if interact_result.get("task_names"):
+            task_name = str(interact_result["task_names"][0])
+
+        return {
+            "start_xy": np.asarray(start_xy[0], dtype=np.float32).reshape(2),
+            "goal_xy": np.asarray(goal_xy[0], dtype=np.float32).reshape(2),
+            "waypoints_xy": waypoints_xy,
+            "task_name": task_name,
+        }
+
+    def _compute_groundtruth_path_info(
         self,
         start_xy: np.ndarray,
         goal_xy: np.ndarray,
@@ -1037,15 +1145,15 @@ class DiffusionForcingPlanning(
     ) -> dict[str, Any]:
         t_total = time.time()
         print(
-            "[HBENCH] Ground-truth info start "
+            "[BENCH-GT] Ground-truth info start "
             f"(task={task_name}, n_waypoints={len(waypoints_xy)})",
             flush=True,
         )
         t_stage = time.time()
-        print("[HBENCH] Ground-truth stage: sampled_graph_cache", flush=True)
+        print("[BENCH-GT] Ground-truth stage: sampled_graph_cache", flush=True)
         graph_cache = self._get_sampled_graph_cache()
         print(
-            "[HBENCH] Ground-truth stage done: sampled_graph_cache "
+            "[BENCH-GT] Ground-truth stage done: sampled_graph_cache "
             f"(elapsed={time.time() - t_stage:.1f}s)",
             flush=True,
         )
@@ -1055,7 +1163,7 @@ class DiffusionForcingPlanning(
             waypoints_xy=waypoints_xy,
         )
         t_stage = time.time()
-        print("[HBENCH] Ground-truth stage: temporal_anchor_matrix", flush=True)
+        print("[BENCH-GT] Ground-truth stage: temporal_anchor_matrix", flush=True)
         temporal_anchor_dists = compute_pairwise_temporal_distance_matrix(
             self,
             src_xys=np.asarray(anchor_bundle["anchor_xys"], dtype=np.float32),
@@ -1063,7 +1171,7 @@ class DiffusionForcingPlanning(
             gamma=GROUNDTRUTH_TEMPORAL_VIZ_GAMMA,
         )
         print(
-            "[HBENCH] Ground-truth stage done: temporal_anchor_matrix "
+            "[BENCH-GT] Ground-truth stage done: temporal_anchor_matrix "
             f"(elapsed={time.time() - t_stage:.1f}s)",
             flush=True,
         )
@@ -1080,7 +1188,7 @@ class DiffusionForcingPlanning(
                 "total_distance": np.inf,
             }
         t_stage = time.time()
-        print("[HBENCH] Ground-truth stage: sampled_graph_anchor_assignment", flush=True)
+        print("[BENCH-GT] Ground-truth stage: sampled_graph_anchor_assignment", flush=True)
         anchor_assignment = query_distinct_nearest_nodes(
             graph_cache,
             query_xys=np.asarray(anchor_bundle["anchor_xys"], dtype=np.float32),
@@ -1088,7 +1196,7 @@ class DiffusionForcingPlanning(
             query_labels=list(anchor_bundle["anchor_labels"]),
         )
         print(
-            "[HBENCH] Ground-truth stage done: sampled_graph_anchor_assignment "
+            "[BENCH-GT] Ground-truth stage done: sampled_graph_anchor_assignment "
             f"(elapsed={time.time() - t_stage:.1f}s)",
             flush=True,
         )
@@ -1097,7 +1205,7 @@ class DiffusionForcingPlanning(
         anchor_node_dists = np.asarray(anchor_assignment["node_euclidean_dists"], dtype=np.float32)
 
         t_stage = time.time()
-        print("[HBENCH] Ground-truth stage: sampled_graph_route", flush=True)
+        print("[BENCH-GT] Ground-truth stage: sampled_graph_route", flush=True)
         graph_anchor_dists = extract_shortest_path_submatrix(graph_cache, anchor_node_indices)
         graph_route_solution = solve_fixed_endpoint_hamiltonian_path(graph_anchor_dists)
         if bool(graph_route_solution.get("feasible", False)):
@@ -1113,7 +1221,7 @@ class DiffusionForcingPlanning(
                 "total_distance": np.inf,
             }
         print(
-            "[HBENCH] Ground-truth stage done: sampled_graph_route "
+            "[BENCH-GT] Ground-truth stage done: sampled_graph_route "
             f"(elapsed={time.time() - t_stage:.1f}s)",
             flush=True,
         )
@@ -1146,11 +1254,25 @@ class DiffusionForcingPlanning(
             "n_reachable": int(np.isfinite(goal_shortest_dists).sum()),
         }
         print(
-            "[HBENCH] Ground-truth info done "
+            "[BENCH-GT] Ground-truth info done "
             f"(task={task_name}, elapsed={time.time() - t_total:.1f}s)",
             flush=True,
         )
         return result
+
+    def _compute_groundtruth_hamiltonian_info(
+        self,
+        start_xy: np.ndarray,
+        goal_xy: np.ndarray,
+        waypoints_xy: np.ndarray,
+        task_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return self._compute_groundtruth_path_info(
+            start_xy=start_xy,
+            goal_xy=goal_xy,
+            waypoints_xy=waypoints_xy,
+            task_name=task_name,
+        )
 
     def _build_groundtruth_straight_anchor_route_segments(
         self,
@@ -1251,14 +1373,14 @@ class DiffusionForcingPlanning(
             if fig is not None:
                 plt.close(fig)
 
-    def _render_groundtruth_hamiltonian_image(self, groundtruth_info: dict[str, Any]) -> Optional[Image.Image]:
+    def _render_groundtruth_path_image(self, groundtruth_info: dict[str, Any]) -> Optional[Image.Image]:
         try:
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
             from scripts.temporal_dist_heatmap import _plot_sample_panel
         except Exception as exc:
-            print(f"[WARNING] Could not import ground-truth Hamiltonian plotting stack: {exc}", flush=True)
+            print(f"[WARNING] Could not import ground-truth path plotting stack: {exc}", flush=True)
             return None
 
         fig = None
@@ -1289,42 +1411,95 @@ class DiffusionForcingPlanning(
             with Image.open(buf) as image:
                 return image.convert("RGB")
         except Exception as exc:
-            print(f"[WARNING] Failed to render ground-truth Hamiltonian plot: {exc}", flush=True)
+            print(f"[WARNING] Failed to render ground-truth path plot: {exc}", flush=True)
             return None
         finally:
             if fig is not None:
                 plt.close(fig)
 
-    def _augment_interact_result_with_hamiltonian_groundtruth(
+    def _render_groundtruth_hamiltonian_image(self, groundtruth_info: dict[str, Any]) -> Optional[Image.Image]:
+        return self._render_groundtruth_path_image(groundtruth_info)
+
+    def _log_groundtruth_path_media(
+        self,
+        groundtruth_info: dict[str, Any],
+        *,
+        stage_prefix: str,
+        media_leaf_key: str,
+    ) -> None:
+        if not self.benchmark_log_groundtruth_media:
+            return
+
+        t_stage = time.time()
+        print(f"{stage_prefix} stage=render_groundtruth_path start", flush=True)
+        gt_image = self._render_groundtruth_path_image(groundtruth_info)
+        print(
+            f"{stage_prefix} stage=render_groundtruth_path done "
+            f"(elapsed={time.time() - t_stage:.1f}s, image={'yes' if gt_image is not None else 'no'})",
+            flush=True,
+        )
+        if gt_image is None:
+            return
+
+        t_log = time.time()
+        print(f"{stage_prefix} stage=log_image_groundtruth_path start", flush=True)
+        self.log_image(
+            self._benchmark_media_key(media_leaf_key),
+            gt_image,
+        )
+        print(
+            f"{stage_prefix} stage=log_image_groundtruth_path done "
+            f"(elapsed={time.time() - t_log:.1f}s)",
+            flush=True,
+        )
+
+    def _augment_interact_result_with_groundtruth_path_metrics(
         self,
         interact_result: dict,
         groundtruth_info: dict[str, Any],
     ) -> dict:
         route_solution = groundtruth_info["route_solution"]
         route_segments = groundtruth_info["route_segments"]
-        gt_anchor_order = np.asarray(route_solution.get("anchor_order", []), dtype=np.int32).tolist()
-        pred_anchor_order = [
-            int(idx) for idx in interact_result.get("predicted_anchor_order", [])
-        ]
-        gt_reachable = bool(route_solution.get("feasible", False)) and bool(route_segments.get("reachable", False))
-        hamiltonian_success = bool(gt_reachable and pred_anchor_order == gt_anchor_order)
-        gt_min_distance = float(route_segments.get("total_distance", np.inf))
+        gt_reachable = bool(route_solution.get("feasible", False)) and bool(
+            route_segments.get("reachable", False)
+        )
+        gt_path_length = float(route_segments.get("total_distance", np.inf))
         pred_plan_length = interact_result.get("postprocessed_plan_length", None)
         rel_error = None
-        if pred_plan_length is not None and np.isfinite(gt_min_distance) and gt_min_distance > 0.0:
-            rel_error = abs(float(pred_plan_length) - gt_min_distance) / gt_min_distance
+        if pred_plan_length is not None and np.isfinite(gt_path_length) and gt_path_length > 0.0:
+            rel_error = abs(float(pred_plan_length) - gt_path_length) / gt_path_length
 
-        interact_result["groundtruth_anchor_order"] = gt_anchor_order
         interact_result["groundtruth_route_text"] = str(route_solution.get("route_text", ""))
-        interact_result["groundtruth_min_distance"] = gt_min_distance
+        interact_result["groundtruth_path_length"] = gt_path_length
+        interact_result["groundtruth_min_distance"] = gt_path_length
         interact_result["groundtruth_snap_distances"] = [
             float(v) for v in np.asarray(groundtruth_info["anchor_node_dists"], dtype=np.float32).tolist()
         ]
         interact_result["groundtruth_reachable"] = gt_reachable
-        interact_result["hamiltonian_path_success"] = hamiltonian_success
         interact_result["postprocessed_plan_length_rel_error"] = (
             float(rel_error) if rel_error is not None else None
         )
+        return interact_result
+
+    def _augment_interact_result_with_hamiltonian_groundtruth(
+        self,
+        interact_result: dict,
+        groundtruth_info: dict[str, Any],
+    ) -> dict:
+        interact_result = self._augment_interact_result_with_groundtruth_path_metrics(
+            interact_result,
+            groundtruth_info,
+        )
+        route_solution = groundtruth_info["route_solution"]
+        gt_anchor_order = np.asarray(route_solution.get("anchor_order", []), dtype=np.int32).tolist()
+        pred_anchor_order = [
+            int(idx) for idx in interact_result.get("predicted_anchor_order", [])
+        ]
+        gt_reachable = bool(interact_result.get("groundtruth_reachable", False))
+        hamiltonian_success = bool(gt_reachable and pred_anchor_order == gt_anchor_order)
+
+        interact_result["groundtruth_anchor_order"] = gt_anchor_order
+        interact_result["hamiltonian_path_success"] = hamiltonian_success
         return interact_result
 
     def _get_tentative_neighbor_indices(self, planner_state: dict, anchor_idx: int) -> list[int]:
@@ -1880,7 +2055,7 @@ class DiffusionForcingPlanning(
                 self.task_id = tid
             task_ns = f"{namespace}/task{tid}" if self.task_ids is not None else namespace
             self.interact(batch_size, conditions, task_ns)
-            if hasattr(self, '_last_interact_success'):
+            if hasattr(self, '_last_interact_success') and self._last_interact_success is not None:
                 successes.append(self._last_interact_success)
 
         if successes and self.task_ids is not None:
@@ -2145,15 +2320,11 @@ class DiffusionForcingPlanning(
         self._ensure_ogbench_task_metadata_compat(env)
 
     def _capture_current_task_metadata(self, obs: torch.Tensor, goal: torch.Tensor, reset_infos: list[dict]) -> None:
-        if self.task_override_resolved_path is None:
-            self._current_task_start_xy = None
-            self._current_task_goal_xy = None
-            self._current_task_waypoints = None
-            self._current_task_names = None
-            return
-
         obs_np = obs.detach().cpu().numpy()[:, self.pos_dim_indices]
         goal_np = goal.detach().cpu().numpy()[:, self.pos_dim_indices]
+        reset_infos = list(reset_infos or [])
+        if len(reset_infos) < len(obs_np):
+            reset_infos.extend({} for _ in range(len(obs_np) - len(reset_infos)))
         start_xy_list = []
         goal_xy_list = []
         waypoint_list = []
@@ -2270,79 +2441,32 @@ class DiffusionForcingPlanning(
         with open(self.benchmark_results_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
 
-    def _run_standard_benchmark(self, task_ids: list[int]) -> dict:
-        all_task_results = []
-        original_task_id = self.task_id
-        original_seed = self.interaction_seed
+    def _clear_parallel_plan_aux_state(self) -> None:
+        """Drop stale denoising-side artifacts when a round skips parallel_plan()."""
+        self._parallel_plan_step_captures = None
+        self._parallel_plan_step_indices = None
+        self._parallel_plan_step_total = None
+        self._last_guidance_losses = {}
 
-        for task_idx, task_id in enumerate(task_ids):
-            self._benchmark_preflight_check(int(task_id))
-            task_rollouts = []
-            task_seed_base = self.benchmark_rollout_seed_base + task_idx * self.benchmark_num_rollouts
-            rollout_pbar = tqdm(
-                total=self.benchmark_num_rollouts,
-                desc=f"Benchmark R{self.eval_repeat_id} T{task_id}",
-                leave=True,
-                dynamic_ncols=True,
-            )
-            for rollout_idx in range(self.benchmark_num_rollouts):
-                rollout_seed = task_seed_base + rollout_idx
-                self._seed_benchmark_rollout_rng(rollout_seed)
-                self.task_id = int(task_id)
-                self.interaction_seed = rollout_seed
-                namespace = (
-                    f"benchmark/repeat{self.eval_repeat_id}/task{self.task_id}/rollout{rollout_idx}"
-                )
-                self.interact(
-                    batch_size=1,
-                    conditions=None,
-                    namespace=namespace,
-                    terminate_on_done=True,
-                )
-                interact_result = dict(getattr(self, "_last_interact_result", {}))
-                interact_result.update(
-                    {
-                        "rollout_id": rollout_idx,
-                        "seed": rollout_seed,
-                    }
-                )
-                task_rollouts.append(interact_result)
-                running_success = float(
-                    np.mean([rollout["success"] for rollout in task_rollouts])
-                )
-                rollout_pbar.update(1)
-                rollout_pbar.set_postfix(
-                    {
-                        "success": f"{running_success:.3f}",
-                        "last_steps": interact_result.get("steps", 0),
-                    },
-                    refresh=True,
-                )
-                self._safe_log_metric("benchmark/current_repeat_id", float(self.eval_repeat_id))
-                self._safe_log_metric("benchmark/current_task_id", float(self.task_id))
-                self._safe_log_metric("benchmark/current_rollout", float(rollout_idx + 1))
-                self._safe_log_metric("benchmark/running_task_success", running_success)
+    @staticmethod
+    def _compact_saved_task_info(task_info: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        """Trim large duplicated task metadata before writing benchmark payloads."""
+        if task_info is None:
+            return None
 
-            task_success_mean = float(
-                np.mean([rollout["success"] for rollout in task_rollouts])
-            ) if task_rollouts else float("nan")
-            rollout_pbar.close()
-            self._safe_log_metric(
-                f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/success_mean",
-                task_success_mean,
-            )
-            all_task_results.append(
-                {
-                    "task_id": int(task_id),
-                    "num_rollouts": len(task_rollouts),
-                    "task_success_mean": task_success_mean,
-                    "rollouts": task_rollouts,
-                }
-            )
+        compact = dict(task_info)
+        compact.pop("waypoint_xy_groups", None)
+        compact.pop("waypoint_ij_groups", None)
 
-        self.task_id = original_task_id
-        self.interaction_seed = original_seed
+        waypoint_ij_group = compact.get("waypoint_ij_group")
+        waypoint_ijs = compact.get("waypoint_ijs")
+        if waypoint_ij_group is not None and waypoint_ijs is not None:
+            if json.loads(json.dumps(waypoint_ij_group)) == json.loads(json.dumps(waypoint_ijs)):
+                compact.pop("waypoint_ijs", None)
 
+        return compact
+
+    def _build_standard_benchmark_payload(self, all_task_results: list[dict]) -> dict:
         payload = {
             "model_id": self.benchmark_model_id,
             "eval_repeat_id": self.eval_repeat_id,
@@ -2358,10 +2482,359 @@ class DiffusionForcingPlanning(
                 f"benchmark/repeat{self.eval_repeat_id}/overall_success",
                 repeat_success_mean,
             )
+            repeat_post_lengths = [
+                float(task_result["task_postprocessed_plan_length_mean"])
+                for task_result in all_task_results
+                if task_result.get("task_postprocessed_plan_length_mean") is not None
+            ]
+            payload["repeat_postprocessed_plan_length_mean"] = (
+                float(np.mean(repeat_post_lengths))
+                if repeat_post_lengths else None
+            )
+            if payload["repeat_postprocessed_plan_length_mean"] is not None:
+                self._safe_log_metric(
+                    f"benchmark/repeat{self.eval_repeat_id}/overall_postprocessed_plan_length",
+                    float(payload["repeat_postprocessed_plan_length_mean"]),
+                )
+            repeat_groundtruth_lengths = [
+                float(task_result["task_groundtruth_path_length_mean"])
+                for task_result in all_task_results
+                if task_result.get("task_groundtruth_path_length_mean") is not None
+            ]
+            payload["repeat_groundtruth_path_length_mean"] = (
+                float(np.mean(repeat_groundtruth_lengths))
+                if repeat_groundtruth_lengths else None
+            )
+            if payload["repeat_groundtruth_path_length_mean"] is not None:
+                self._safe_log_metric(
+                    f"benchmark/repeat{self.eval_repeat_id}/overall_groundtruth_path_length",
+                    float(payload["repeat_groundtruth_path_length_mean"]),
+                )
+            repeat_rel_errors = [
+                float(task_result["task_postprocessed_plan_length_rel_error_mean"])
+                for task_result in all_task_results
+                if task_result.get("task_postprocessed_plan_length_rel_error_mean") is not None
+            ]
+            payload["repeat_postprocessed_plan_length_rel_error_mean"] = (
+                float(np.mean(repeat_rel_errors))
+                if repeat_rel_errors else None
+            )
+            if payload["repeat_postprocessed_plan_length_rel_error_mean"] is not None:
+                self._safe_log_metric(
+                    f"benchmark/repeat{self.eval_repeat_id}/overall_postprocessed_plan_length_rel_error",
+                    float(payload["repeat_postprocessed_plan_length_rel_error_mean"]),
+                )
         if len(all_task_results) == 1:
             payload["task_id"] = all_task_results[0]["task_id"]
             payload["task_success_mean"] = all_task_results[0]["task_success_mean"]
+            payload["task_postprocessed_plan_length_mean"] = all_task_results[0][
+                "task_postprocessed_plan_length_mean"
+            ]
+            payload["task_groundtruth_path_length_mean"] = all_task_results[0][
+                "task_groundtruth_path_length_mean"
+            ]
+            payload["task_postprocessed_plan_length_rel_error_mean"] = all_task_results[0][
+                "task_postprocessed_plan_length_rel_error_mean"
+            ]
+        return payload
 
+    def _build_hamiltonian_benchmark_payload(
+        self,
+        all_task_results: list[dict],
+        metric_prefix: str,
+    ) -> dict:
+        payload = {
+            "mode": "hamiltonian_benchmark",
+            "model_id": self.benchmark_model_id,
+            "planner_variant": self.benchmark_variant_name,
+            "plan_only": bool(self.benchmark_plan_only),
+            "eval_repeat_id": self.eval_repeat_id,
+            "requested_top_n": int(self.benchmark_waypoint_top_n),
+            "num_tasks": len(all_task_results),
+            "task_results": all_task_results,
+        }
+        if all_task_results:
+            repeat_success_vals = [
+                float(task_result["task_agent_success_mean"])
+                for task_result in all_task_results
+                if task_result.get("task_agent_success_mean") is not None
+            ]
+            payload["repeat_agent_success_mean"] = (
+                float(np.mean(repeat_success_vals)) if repeat_success_vals else None
+            )
+            payload["repeat_hamiltonian_path_success_mean"] = float(
+                np.mean([task_result["task_hamiltonian_path_success_mean"] for task_result in all_task_results])
+            )
+            repeat_rel_errors = [
+                float(task_result["task_postprocessed_plan_length_rel_error_mean"])
+                for task_result in all_task_results
+                if task_result.get("task_postprocessed_plan_length_rel_error_mean") is not None
+            ]
+            payload["repeat_postprocessed_plan_length_rel_error_mean"] = (
+                float(np.mean(repeat_rel_errors)) if repeat_rel_errors else None
+            )
+            if payload["repeat_agent_success_mean"] is not None:
+                self._safe_log_metric(
+                    f"{metric_prefix}/repeat{self.eval_repeat_id}/overall_agent_success",
+                    payload["repeat_agent_success_mean"],
+                )
+            self._safe_log_metric(
+                f"{metric_prefix}/repeat{self.eval_repeat_id}/overall_hamiltonian_path_success",
+                payload["repeat_hamiltonian_path_success_mean"],
+            )
+            if payload["repeat_postprocessed_plan_length_rel_error_mean"] is not None:
+                self._safe_log_metric(
+                    f"{metric_prefix}/repeat{self.eval_repeat_id}/overall_postprocessed_plan_length_rel_error",
+                    float(payload["repeat_postprocessed_plan_length_rel_error_mean"]),
+                )
+        if len(all_task_results) == 1:
+            payload["task_id"] = all_task_results[0]["task_id"]
+            payload["task_agent_success_mean"] = all_task_results[0]["task_agent_success_mean"]
+            payload["task_hamiltonian_path_success_mean"] = all_task_results[0]["task_hamiltonian_path_success_mean"]
+            payload["task_postprocessed_plan_length_rel_error_mean"] = all_task_results[0][
+                "task_postprocessed_plan_length_rel_error_mean"
+            ]
+        return payload
+
+    def _run_standard_benchmark(self, task_ids: list[int]) -> dict:
+        all_task_results = []
+        original_task_id = self.task_id
+        original_seed = self.interaction_seed
+        original_visual_prefix = self._current_wandb_visual_prefix
+
+        try:
+            for task_idx, task_id in enumerate(task_ids):
+                self._benchmark_preflight_check(int(task_id))
+                task_rollouts = []
+                task_seed_base = self.benchmark_rollout_seed_base + task_idx * self.benchmark_num_rollouts
+                rollout_pbar = tqdm(
+                    total=self.benchmark_num_rollouts,
+                    desc=f"Benchmark R{self.eval_repeat_id} T{task_id}",
+                    leave=True,
+                    dynamic_ncols=True,
+                )
+                for rollout_idx in range(self.benchmark_num_rollouts):
+                    rollout_seed = task_seed_base + rollout_idx
+                    self._seed_benchmark_rollout_rng(rollout_seed)
+                    self.task_id = int(task_id)
+                    self.interaction_seed = rollout_seed
+                    self._current_wandb_visual_prefix = f"task{self.task_id}_rollout{rollout_idx}"
+                    namespace = (
+                        f"benchmark/repeat{self.eval_repeat_id}/task{self.task_id}/rollout{rollout_idx}"
+                    )
+                    self.interact(
+                        batch_size=1,
+                        conditions=None,
+                        namespace=namespace,
+                        terminate_on_done=True,
+                    )
+                    interact_result = dict(getattr(self, "_last_interact_result", {}))
+                    interact_result.update(
+                        {
+                            "rollout_id": rollout_idx,
+                            "seed": rollout_seed,
+                        }
+                    )
+
+                    task_geometry = self._extract_interact_task_geometry(
+                        interact_result,
+                        include_waypoints=False,
+                    )
+                    stage_prefix = (
+                        f"[BENCH] task={self.task_id} rollout={rollout_idx} "
+                        f"seed={rollout_seed}"
+                    )
+                    t_stage = time.time()
+                    print(f"{stage_prefix} stage=groundtruth_info start", flush=True)
+                    groundtruth_info = self._compute_groundtruth_path_info(**task_geometry)
+                    print(
+                        f"{stage_prefix} stage=groundtruth_info done "
+                        f"(elapsed={time.time() - t_stage:.1f}s)",
+                        flush=True,
+                    )
+                    interact_result = self._augment_interact_result_with_groundtruth_path_metrics(
+                        interact_result,
+                        groundtruth_info,
+                    )
+                    self._log_groundtruth_path_media(
+                        groundtruth_info,
+                        stage_prefix=stage_prefix,
+                        media_leaf_key="groundtruth_path",
+                    )
+
+                    task_rollouts.append(interact_result)
+                    valid_successes = [
+                        float(rollout["success"])
+                        for rollout in task_rollouts
+                        if rollout.get("success") is not None
+                    ]
+                    running_success = (
+                        float(np.mean(valid_successes))
+                        if valid_successes else float("nan")
+                    )
+                    valid_post_lengths = [
+                        float(rollout["postprocessed_plan_length"])
+                        for rollout in task_rollouts
+                        if rollout.get("postprocessed_plan_length") is not None
+                    ]
+                    running_post_length = (
+                        float(np.mean(valid_post_lengths))
+                        if valid_post_lengths else float("nan")
+                    )
+                    valid_groundtruth_lengths = [
+                        float(rollout["groundtruth_path_length"])
+                        for rollout in task_rollouts
+                        if rollout.get("groundtruth_path_length") is not None
+                        and np.isfinite(float(rollout["groundtruth_path_length"]))
+                    ]
+                    running_groundtruth_length = (
+                        float(np.mean(valid_groundtruth_lengths))
+                        if valid_groundtruth_lengths else float("nan")
+                    )
+                    valid_rel_errors = [
+                        float(rollout["postprocessed_plan_length_rel_error"])
+                        for rollout in task_rollouts
+                        if rollout.get("postprocessed_plan_length_rel_error") is not None
+                    ]
+                    running_rel_error = (
+                        float(np.mean(valid_rel_errors))
+                        if valid_rel_errors else float("nan")
+                    )
+
+                    rollout_pbar.update(1)
+                    rollout_pbar.set_postfix(
+                        {
+                            "success": (
+                                f"{running_success:.3f}"
+                                if np.isfinite(running_success)
+                                else "nan"
+                            ),
+                            "post_len": (
+                                f"{running_post_length:.2f}"
+                                if np.isfinite(running_post_length)
+                                else "nan"
+                            ),
+                            "gt_len": (
+                                f"{running_groundtruth_length:.2f}"
+                                if np.isfinite(running_groundtruth_length)
+                                else "nan"
+                            ),
+                            "relerr": (
+                                f"{running_rel_error:.3f}"
+                                if np.isfinite(running_rel_error)
+                                else "nan"
+                            ),
+                            "last_steps": interact_result.get("steps", 0),
+                        },
+                        refresh=True,
+                    )
+                    self._safe_log_metric("benchmark/current_repeat_id", float(self.eval_repeat_id))
+                    self._safe_log_metric("benchmark/current_task_id", float(self.task_id))
+                    self._safe_log_metric("benchmark/current_rollout", float(rollout_idx + 1))
+                    if np.isfinite(running_success):
+                        self._safe_log_metric("benchmark/running_task_success", running_success)
+                    if interact_result.get("postprocessed_plan_length") is not None:
+                        self._safe_log_metric(
+                            f"{namespace}/postprocessed_plan_length",
+                            float(interact_result["postprocessed_plan_length"]),
+                        )
+                    self._safe_log_metric(
+                        f"{namespace}/groundtruth_path_reachable",
+                        float(bool(interact_result.get("groundtruth_reachable", False))),
+                    )
+                    if interact_result.get("groundtruth_path_length") is not None and np.isfinite(
+                        float(interact_result["groundtruth_path_length"])
+                    ):
+                        self._safe_log_metric(
+                            f"{namespace}/groundtruth_path_length",
+                            float(interact_result["groundtruth_path_length"]),
+                        )
+                    if interact_result.get("postprocessed_plan_length_rel_error") is not None:
+                        self._safe_log_metric(
+                            f"{namespace}/postprocessed_plan_length_rel_error",
+                            float(interact_result["postprocessed_plan_length_rel_error"]),
+                        )
+
+                valid_task_success = [
+                    float(rollout["success"])
+                    for rollout in task_rollouts
+                    if rollout.get("success") is not None
+                ]
+                task_success_mean = (
+                    float(np.mean(valid_task_success))
+                    if valid_task_success else float("nan")
+                )
+                valid_task_post_lengths = [
+                    float(rollout["postprocessed_plan_length"])
+                    for rollout in task_rollouts
+                    if rollout.get("postprocessed_plan_length") is not None
+                ]
+                task_postprocessed_plan_length_mean = (
+                    float(np.mean(valid_task_post_lengths))
+                    if valid_task_post_lengths else None
+                )
+                valid_task_groundtruth_lengths = [
+                    float(rollout["groundtruth_path_length"])
+                    for rollout in task_rollouts
+                    if rollout.get("groundtruth_path_length") is not None
+                    and np.isfinite(float(rollout["groundtruth_path_length"]))
+                ]
+                task_groundtruth_path_length_mean = (
+                    float(np.mean(valid_task_groundtruth_lengths))
+                    if valid_task_groundtruth_lengths else None
+                )
+                valid_task_rel_errors = [
+                    float(rollout["postprocessed_plan_length_rel_error"])
+                    for rollout in task_rollouts
+                    if rollout.get("postprocessed_plan_length_rel_error") is not None
+                ]
+                task_postprocessed_plan_length_rel_error_mean = (
+                    float(np.mean(valid_task_rel_errors))
+                    if valid_task_rel_errors else None
+                )
+
+                rollout_pbar.close()
+                self._safe_log_metric(
+                    f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/success_mean",
+                    task_success_mean,
+                )
+                if task_postprocessed_plan_length_mean is not None:
+                    self._safe_log_metric(
+                        f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/postprocessed_plan_length_mean",
+                        task_postprocessed_plan_length_mean,
+                    )
+                if task_groundtruth_path_length_mean is not None:
+                    self._safe_log_metric(
+                        f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/groundtruth_path_length_mean",
+                        task_groundtruth_path_length_mean,
+                    )
+                if task_postprocessed_plan_length_rel_error_mean is not None:
+                    self._safe_log_metric(
+                        f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/postprocessed_plan_length_rel_error_mean",
+                        task_postprocessed_plan_length_rel_error_mean,
+                    )
+                all_task_results.append(
+                    {
+                        "task_id": int(task_id),
+                        "num_rollouts": len(task_rollouts),
+                        "task_success_mean": task_success_mean,
+                        "task_postprocessed_plan_length_mean": task_postprocessed_plan_length_mean,
+                        "task_groundtruth_path_length_mean": task_groundtruth_path_length_mean,
+                        "task_postprocessed_plan_length_rel_error_mean": (
+                            task_postprocessed_plan_length_rel_error_mean
+                        ),
+                        "rollouts": task_rollouts,
+                    }
+                )
+                self._write_benchmark_results(
+                    self._build_standard_benchmark_payload(all_task_results)
+                )
+        finally:
+            self.task_id = original_task_id
+            self.interaction_seed = original_seed
+            self._current_wandb_visual_prefix = original_visual_prefix
+
+        payload = self._build_standard_benchmark_payload(all_task_results)
         self._write_benchmark_results(payload)
         return payload
 
@@ -2376,6 +2849,7 @@ class DiffusionForcingPlanning(
         original_seed = self.interaction_seed
         original_group_idx = self.task_override_waypoint_group_idx
         original_visual_prefix = self._current_wandb_visual_prefix
+        metric_prefix = self._benchmark_metric_prefix()
 
         try:
             for task_idx, task_id in enumerate(task_ids):
@@ -2403,9 +2877,9 @@ class DiffusionForcingPlanning(
                     self.task_id = int(task_id)
                     self.interaction_seed = group_seed
                     self.task_override_waypoint_group_idx = int(group_idx)
-                    self._current_wandb_visual_prefix = str(group_idx)
+                    self._current_wandb_visual_prefix = f"task{self.task_id}_group{group_idx}"
                     namespace = (
-                        f"benchmark/repeat{self.eval_repeat_id}/task{self.task_id}/group{group_idx}"
+                        f"{metric_prefix}/repeat{self.eval_repeat_id}/task{self.task_id}/group{group_idx}"
                     )
                     self.interact(
                         batch_size=1,
@@ -2422,33 +2896,17 @@ class DiffusionForcingPlanning(
                         }
                     )
 
-                    start_xy = np.asarray(interact_result.get("start_xy", []), dtype=np.float32).reshape(-1, 2)
-                    goal_xy = np.asarray(interact_result.get("goal_xy", []), dtype=np.float32).reshape(-1, 2)
-                    waypoints_xy = np.asarray(interact_result.get("waypoints_xy", []), dtype=np.float32)
-                    if waypoints_xy.size == 0:
-                        waypoints_xy = np.zeros((0, 2), dtype=np.float32)
-                    else:
-                        waypoints_xy = waypoints_xy.reshape(-1, 2)
-                    if len(start_xy) == 0 or len(goal_xy) == 0:
-                        raise RuntimeError(
-                            "Hamiltonian benchmark requires interact() to expose start_xy and goal_xy"
-                        )
-                    task_name = None
-                    if interact_result.get("task_names"):
-                        task_name = str(interact_result["task_names"][0])
-
+                    task_geometry = self._extract_interact_task_geometry(
+                        interact_result,
+                        include_waypoints=True,
+                    )
                     stage_prefix = (
                         f"[HBENCH] task={self.task_id} group={group_idx} "
                         f"seed={group_seed}"
                     )
                     t_stage = time.time()
                     print(f"{stage_prefix} stage=groundtruth_info start", flush=True)
-                    groundtruth_info = self._compute_groundtruth_hamiltonian_info(
-                        start_xy=start_xy[0],
-                        goal_xy=goal_xy[0],
-                        waypoints_xy=waypoints_xy,
-                        task_name=task_name,
-                    )
+                    groundtruth_info = self._compute_groundtruth_hamiltonian_info(**task_geometry)
                     print(
                         f"{stage_prefix} stage=groundtruth_info done "
                         f"(elapsed={time.time() - t_stage:.1f}s)",
@@ -2459,52 +2917,44 @@ class DiffusionForcingPlanning(
                         groundtruth_info,
                     )
 
-                    t_stage = time.time()
-                    print(f"{stage_prefix} stage=render_groundtruth_hamiltonian start", flush=True)
-                    gt_image = self._render_groundtruth_hamiltonian_image(groundtruth_info)
-                    print(
-                        f"{stage_prefix} stage=render_groundtruth_hamiltonian done "
-                        f"(elapsed={time.time() - t_stage:.1f}s, image={'yes' if gt_image is not None else 'no'})",
-                        flush=True,
-                    )
-                    if gt_image is not None:
-                        t_log = time.time()
-                        print(f"{stage_prefix} stage=log_image_groundtruth_hamiltonian start", flush=True)
-                        self.log_image(
-                            f"{group_idx}/groundtruth_hemiltonian_path",
-                            gt_image,
+                    if self.benchmark_log_groundtruth_media:
+                        self._log_groundtruth_path_media(
+                            groundtruth_info,
+                            stage_prefix=stage_prefix,
+                            media_leaf_key="groundtruth_hemiltonian_path",
+                        )
+                        t_stage = time.time()
+                        print(f"{stage_prefix} stage=render_groundtruth_temporal start", flush=True)
+                        gt_temporal_image = self._render_groundtruth_temporal_distance_image(
+                            groundtruth_info
                         )
                         print(
-                            f"{stage_prefix} stage=log_image_groundtruth_hamiltonian done "
-                            f"(elapsed={time.time() - t_log:.1f}s)",
+                            f"{stage_prefix} stage=render_groundtruth_temporal done "
+                            f"(elapsed={time.time() - t_stage:.1f}s, image={'yes' if gt_temporal_image is not None else 'no'})",
                             flush=True,
                         )
-                    t_stage = time.time()
-                    print(f"{stage_prefix} stage=render_groundtruth_temporal start", flush=True)
-                    gt_temporal_image = self._render_groundtruth_temporal_distance_image(
-                        groundtruth_info
-                    )
-                    print(
-                        f"{stage_prefix} stage=render_groundtruth_temporal done "
-                        f"(elapsed={time.time() - t_stage:.1f}s, image={'yes' if gt_temporal_image is not None else 'no'})",
-                        flush=True,
-                    )
-                    if gt_temporal_image is not None:
-                        t_log = time.time()
-                        print(f"{stage_prefix} stage=log_image_groundtruth_temporal start", flush=True)
-                        self.log_image(
-                            f"{group_idx}/groundtruth_temporal_distance",
-                            gt_temporal_image,
-                        )
-                        print(
-                            f"{stage_prefix} stage=log_image_groundtruth_temporal done "
-                            f"(elapsed={time.time() - t_log:.1f}s)",
-                            flush=True,
-                        )
+                        if gt_temporal_image is not None:
+                            t_log = time.time()
+                            print(f"{stage_prefix} stage=log_image_groundtruth_temporal start", flush=True)
+                            self.log_image(
+                                self._benchmark_media_key("groundtruth_temporal_distance"),
+                                gt_temporal_image,
+                            )
+                            print(
+                                f"{stage_prefix} stage=log_image_groundtruth_temporal done "
+                                f"(elapsed={time.time() - t_log:.1f}s)",
+                                flush=True,
+                            )
 
                     task_group_results.append(interact_result)
-                    running_agent_success = float(
-                        np.mean([group["success"] for group in task_group_results])
+                    valid_group_success = [
+                        float(group["success"])
+                        for group in task_group_results
+                        if group.get("success") is not None
+                    ]
+                    running_agent_success = (
+                        float(np.mean(valid_group_success))
+                        if valid_group_success else None
                     )
                     running_hamiltonian_success = float(
                         np.mean([group["hamiltonian_path_success"] for group in task_group_results])
@@ -2521,7 +2971,11 @@ class DiffusionForcingPlanning(
                     group_pbar.update(1)
                     group_pbar.set_postfix(
                         {
-                            "agent": f"{running_agent_success:.3f}",
+                            "agent": (
+                                f"{running_agent_success:.3f}"
+                                if running_agent_success is not None
+                                else "n/a"
+                            ),
                             "route": f"{running_hamiltonian_success:.3f}",
                             "relerr": (
                                 f"{running_rel_error:.3f}"
@@ -2532,26 +2986,32 @@ class DiffusionForcingPlanning(
                         refresh=True,
                     )
 
-                    self._safe_log_metric("benchmark/current_repeat_id", float(self.eval_repeat_id))
-                    self._safe_log_metric("benchmark/current_task_id", float(self.task_id))
-                    self._safe_log_metric("benchmark/current_group_idx", float(group_idx))
+                    self._safe_log_metric(f"{metric_prefix}/current_repeat_id", float(self.eval_repeat_id))
+                    self._safe_log_metric(f"{metric_prefix}/current_task_id", float(self.task_id))
+                    self._safe_log_metric(f"{metric_prefix}/current_group_idx", float(group_idx))
+                    if interact_result.get("success") is not None:
+                        self._safe_log_metric(
+                            f"{metric_prefix}/repeat{self.eval_repeat_id}/task{task_id}/group{group_idx}/agent_success",
+                            float(interact_result["success"]),
+                        )
                     self._safe_log_metric(
-                        f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/group{group_idx}/agent_success",
-                        float(interact_result["success"]),
-                    )
-                    self._safe_log_metric(
-                        f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/group{group_idx}/hamiltonian_path_success",
+                        f"{metric_prefix}/repeat{self.eval_repeat_id}/task{task_id}/group{group_idx}/hamiltonian_path_success",
                         float(interact_result["hamiltonian_path_success"]),
                     )
                     if interact_result.get("postprocessed_plan_length_rel_error") is not None:
                         self._safe_log_metric(
-                            f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/group{group_idx}/postprocessed_plan_length_rel_error",
+                            f"{metric_prefix}/repeat{self.eval_repeat_id}/task{task_id}/group{group_idx}/postprocessed_plan_length_rel_error",
                             float(interact_result["postprocessed_plan_length_rel_error"]),
                         )
 
                 group_pbar.close()
-                task_agent_success_mean = float(
-                    np.mean([group["success"] for group in task_group_results])
+                task_success_vals = [
+                    float(group["success"])
+                    for group in task_group_results
+                    if group.get("success") is not None
+                ]
+                task_agent_success_mean = (
+                    float(np.mean(task_success_vals)) if task_success_vals else None
                 )
                 task_hamiltonian_success_mean = float(
                     np.mean([group["hamiltonian_path_success"] for group in task_group_results])
@@ -2564,22 +3024,25 @@ class DiffusionForcingPlanning(
                 task_length_error_mean = (
                     float(np.mean(task_rel_errors)) if task_rel_errors else None
                 )
+                if task_agent_success_mean is not None:
+                    self._safe_log_metric(
+                        f"{metric_prefix}/repeat{self.eval_repeat_id}/task{task_id}/agent_success_mean",
+                        task_agent_success_mean,
+                    )
                 self._safe_log_metric(
-                    f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/agent_success_mean",
-                    task_agent_success_mean,
-                )
-                self._safe_log_metric(
-                    f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/hamiltonian_path_success_mean",
+                    f"{metric_prefix}/repeat{self.eval_repeat_id}/task{task_id}/hamiltonian_path_success_mean",
                     task_hamiltonian_success_mean,
                 )
                 if task_length_error_mean is not None:
                     self._safe_log_metric(
-                        f"benchmark/repeat{self.eval_repeat_id}/task{task_id}/postprocessed_plan_length_rel_error_mean",
+                        f"{metric_prefix}/repeat{self.eval_repeat_id}/task{task_id}/postprocessed_plan_length_rel_error_mean",
                         task_length_error_mean,
                     )
                 all_task_results.append(
                     {
                         "task_id": int(task_id),
+                        "planner_variant": self.benchmark_variant_name,
+                        "plan_only": bool(self.benchmark_plan_only),
                         "requested_top_n": int(self.benchmark_waypoint_top_n),
                         "num_groups": len(task_group_results),
                         "task_agent_success_mean": task_agent_success_mean,
@@ -2588,56 +3051,16 @@ class DiffusionForcingPlanning(
                         "group_results": task_group_results,
                     }
                 )
+                self._write_benchmark_results(
+                    self._build_hamiltonian_benchmark_payload(all_task_results, metric_prefix)
+                )
         finally:
             self.task_id = original_task_id
             self.interaction_seed = original_seed
             self.task_override_waypoint_group_idx = original_group_idx
             self._current_wandb_visual_prefix = original_visual_prefix
 
-        payload = {
-            "mode": "hamiltonian_benchmark",
-            "model_id": self.benchmark_model_id,
-            "eval_repeat_id": self.eval_repeat_id,
-            "requested_top_n": int(self.benchmark_waypoint_top_n),
-            "num_tasks": len(all_task_results),
-            "task_results": all_task_results,
-        }
-        if all_task_results:
-            payload["repeat_agent_success_mean"] = float(
-                np.mean([task_result["task_agent_success_mean"] for task_result in all_task_results])
-            )
-            payload["repeat_hamiltonian_path_success_mean"] = float(
-                np.mean([task_result["task_hamiltonian_path_success_mean"] for task_result in all_task_results])
-            )
-            repeat_rel_errors = [
-                float(task_result["task_postprocessed_plan_length_rel_error_mean"])
-                for task_result in all_task_results
-                if task_result.get("task_postprocessed_plan_length_rel_error_mean") is not None
-            ]
-            payload["repeat_postprocessed_plan_length_rel_error_mean"] = (
-                float(np.mean(repeat_rel_errors)) if repeat_rel_errors else None
-            )
-            self._safe_log_metric(
-                f"benchmark/repeat{self.eval_repeat_id}/overall_agent_success",
-                payload["repeat_agent_success_mean"],
-            )
-            self._safe_log_metric(
-                f"benchmark/repeat{self.eval_repeat_id}/overall_hamiltonian_path_success",
-                payload["repeat_hamiltonian_path_success_mean"],
-            )
-            if payload["repeat_postprocessed_plan_length_rel_error_mean"] is not None:
-                self._safe_log_metric(
-                    f"benchmark/repeat{self.eval_repeat_id}/overall_postprocessed_plan_length_rel_error",
-                    float(payload["repeat_postprocessed_plan_length_rel_error_mean"]),
-                )
-        if len(all_task_results) == 1:
-            payload["task_id"] = all_task_results[0]["task_id"]
-            payload["task_agent_success_mean"] = all_task_results[0]["task_agent_success_mean"]
-            payload["task_hamiltonian_path_success_mean"] = all_task_results[0]["task_hamiltonian_path_success_mean"]
-            payload["task_postprocessed_plan_length_rel_error_mean"] = all_task_results[0][
-                "task_postprocessed_plan_length_rel_error_mean"
-            ]
-
+        payload = self._build_hamiltonian_benchmark_payload(all_task_results, metric_prefix)
         self._write_benchmark_results(payload)
         return payload
 
@@ -3558,10 +3981,10 @@ class DiffusionForcingPlanning(
                             width=_render_size, height=_render_size,
                             **_ogbench_extra_kwargs,
                         )
-                        from dql.main_Antmaze import hyperparameters
+                        from dql.main_Antmaze import resolve_antmaze_hyperparameters
                         from dql.agents.ql_diffusion import Diffusion_QL as Agent
 
-                        params = hyperparameters[self.dataset]
+                        params = resolve_antmaze_hyperparameters(self.dataset)
 
                         # Create temporary env to get dimensions
                         _temp_env = DummyVecEnv([env_fn])
@@ -3754,6 +4177,19 @@ class DiffusionForcingPlanning(
             if self._current_task_waypoints:
                 waypoint_xys = self._current_task_waypoints[0]
 
+            fixed_solver_result = None
+            if self.multi_tree_hemiltonian and self.multi_tree_route_mode == "fixed_temporal":
+                fixed_route_info = self._compute_fixed_temporal_route_solution(
+                    start_xy=np.asarray(self._current_task_start_xy[0], dtype=np.float32).reshape(2),
+                    goal_xy=np.asarray(self._current_task_goal_xy[0], dtype=np.float32).reshape(2),
+                    waypoints_xy=(
+                        np.zeros((0, 2), dtype=np.float32)
+                        if waypoint_xys is None
+                        else np.asarray(waypoint_xys, dtype=np.float32).reshape(-1, 2)
+                    ),
+                )
+                fixed_solver_result = fixed_route_info["temporal_route_solution"]
+
             if self.multi_tree_hemiltonian:
                 planner_state_result = self._run_multi_tree_online_hamiltonian_planner(
                     horizon=horizon,
@@ -3762,6 +4198,7 @@ class DiffusionForcingPlanning(
                     goal=goal,
                     initial_sim_state=initial_sim_state,
                     waypoint_xys=waypoint_xys,
+                    fixed_solver_result=fixed_solver_result,
                     agent=agent,
                     envs=envs,
                     namespace=namespace,
@@ -3967,6 +4404,7 @@ class DiffusionForcingPlanning(
 
                 plan_unnormalized = selected_plan_bundle["plan_unnormalized"]
                 postprocessed_plan = selected_plan_bundle["postprocessed_plan"]
+                selected_route_text = str(selected_plan_bundle.get("route_text", ""))
 
                 # Visualization with both forward and reverse trajectories
                 start_numpy = start.cpu().numpy()[:, self.pos_dim_indices]
@@ -4016,13 +4454,12 @@ class DiffusionForcingPlanning(
                         max(len(tree.get_all_nodes()) - 1, 0)
                         for tree in planner_state_result["planner_state"]["trees"]
                     ]
-                    route_text = selected_plan_bundle.get("route_text", "multi_tree")
                     print(
                         f"[MCTD] Search complete | loops={loops} | "
                         f"parents={self.global_search_num}/{self.mctd_max_search_num} | "
                         f"tree_nodes={tree_node_counts} | "
                         f"plan_frames={plan_unnormalized.shape[0]} | "
-                        f"post_frames={postprocessed_plan.shape[0]} | route={route_text}",
+                        f"post_frames={postprocessed_plan.shape[0]} | route={selected_route_text}",
                         flush=True,
                     )
                 else:
@@ -4042,20 +4479,32 @@ class DiffusionForcingPlanning(
                 _ppviz_t0 = time.time()
                 _pp_plan_np = postprocessed_plan[:, :, self.pos_dim_indices].detach().cpu().numpy()  # (K, 1, pos_dim)
                 _postprocessed_plan_length = self._compute_plan_polyline_length(_pp_plan_np)
+                _postprocessed_plan_title = self._format_postprocessed_plan_title(
+                    route_text=selected_route_text,
+                    total_length=_postprocessed_plan_length,
+                )
                 _pp_images = make_trajectory_images(
                     self.env_id,
-                    _pp_plan_np,
+                    {
+                        "plan": _pp_plan_np,
+                        "plot_title": _postprocessed_plan_title,
+                    },
                     1,
                     start_numpy.tolist(),
                     goal_numpy.tolist(),
                     self.plot_end_points,
                     waypoints=self._current_task_waypoints,
                 )
-                _postprocessed_image_key = (
-                    f"{_visual_prefix_override}/postprocessed_plan"
-                    if _visual_prefix_override is not None
-                    else f"{_viz_prefix}_postprocessed_plan"
-                )
+                if namespace.startswith("benchmark/"):
+                    _postprocessed_image_key = self._benchmark_media_key(
+                        self.benchmark_postprocessed_plan_media_key
+                    )
+                else:
+                    _postprocessed_image_key = (
+                        f"{_visual_prefix_override}/postprocessed_plan"
+                        if _visual_prefix_override is not None
+                        else f"{_viz_prefix}_postprocessed_plan"
+                    )
                 for _pp_i, _pp_img in enumerate(_pp_images):
                     self.log_image(
                         _postprocessed_image_key,
@@ -4069,52 +4518,61 @@ class DiffusionForcingPlanning(
                     "total_ms": round(_reorder_ms + _ppviz_ms, 1),
                 }, depth=0)
 
-                # Use unified plan execution function
-                _exec_start_time = time.time()
-                trajectory_exec, reward_dict, rollout_viz = self._execute_plan_in_env(
-                    plan_frame_format=postprocessed_plan,
-                    envs=envs,
-                    agent=agent if "antmaze" in self.env_id else None,
-                    use_diffused_action=use_diffused_action,
-                )
-                _execution_loop_ms = (time.time() - _exec_start_time) * 1000
-                self._tlog("timing.mpc_loop", {
-                    "loop": loops,
-                    "planning_ms": round(_planning_loop_ms, 1),
-                    "execution_ms": round(_execution_loop_ms, 1),
-                    "total_ms": round(_planning_loop_ms + _execution_loop_ms, 1),
-                }, depth=0)
+                if self.benchmark_plan_only:
+                    _execution_loop_ms = 0.0
+                    self._tlog("timing.mpc_loop", {
+                        "loop": loops,
+                        "planning_ms": round(_planning_loop_ms, 1),
+                        "execution_ms": 0.0,
+                        "total_ms": round(_planning_loop_ms, 1),
+                    }, depth=0)
+                else:
+                    # Use unified plan execution function
+                    _exec_start_time = time.time()
+                    trajectory_exec, reward_dict, rollout_viz = self._execute_plan_in_env(
+                        plan_frame_format=postprocessed_plan,
+                        envs=envs,
+                        agent=agent if "antmaze" in self.env_id else None,
+                        use_diffused_action=use_diffused_action,
+                    )
+                    _execution_loop_ms = (time.time() - _exec_start_time) * 1000
+                    self._tlog("timing.mpc_loop", {
+                        "loop": loops,
+                        "planning_ms": round(_planning_loop_ms, 1),
+                        "execution_ms": round(_execution_loop_ms, 1),
+                        "total_ms": round(_planning_loop_ms + _execution_loop_ms, 1),
+                    }, depth=0)
 
-                # Process returned rewards and trajectory
-                reached = np.logical_or(reached, reward_dict["reached"])
-                episode_reward += reward_dict["episode_reward"]
-                episode_reward_if_stay += reward_dict["episode_reward_if_stay"]
-                first_reach += reward_dict["first_reach"]
+                    # Process returned rewards and trajectory
+                    reached = np.logical_or(reached, reward_dict["reached"])
+                    episode_reward += reward_dict["episode_reward"]
+                    episode_reward_if_stay += reward_dict["episode_reward_if_stay"]
+                    first_reach += reward_dict["first_reach"]
 
-                # Check if episode terminated
-                if (reward_dict["reached"] >= 1.0).any():
-                    terminate = True
-                elif terminate_on_done and reward_dict.get("done") is not None and reward_dict["done"].any():
-                    terminate = True
+                    # Check if episode terminated
+                    if (reward_dict["reached"] >= 1.0).any():
+                        terminate = True
+                    elif terminate_on_done and reward_dict.get("done") is not None and reward_dict["done"].any():
+                        terminate = True
 
-                # [MEMORY CLEANUP] Clear caches after plan execution
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    # [MEMORY CLEANUP] Clear caches after plan execution
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-                # Process trajectory
-                if trajectory_exec is not None:
-                    trajectory.extend(trajectory_exec)
-                    steps += len(trajectory_exec)
-                    if rollout_viz["agent_positions"].size > 0:
-                        validation_rollout_agent_history.append(rollout_viz["agent_positions"])
-                        validation_rollout_subgoal_history.append(rollout_viz["subgoal_positions"])
-                        n_steps_this_loop = rollout_viz["agent_positions"].shape[0]
-                        for _ in range(n_steps_this_loop):
-                            validation_pp_plan_history.append(_pp_plan_np)
-                    _mj_frames = rollout_viz.get("mujoco_frames")
-                    if _mj_frames is not None and len(_mj_frames) > 0:
-                        validation_mujoco_frame_history.append(_mj_frames)
+                    # Process trajectory
+                    if trajectory_exec is not None:
+                        trajectory.extend(trajectory_exec)
+                        steps += len(trajectory_exec)
+                        if rollout_viz["agent_positions"].size > 0:
+                            validation_rollout_agent_history.append(rollout_viz["agent_positions"])
+                            validation_rollout_subgoal_history.append(rollout_viz["subgoal_positions"])
+                            n_steps_this_loop = rollout_viz["agent_positions"].shape[0]
+                            for _ in range(n_steps_this_loop):
+                                validation_pp_plan_history.append(_pp_plan_np)
+                        _mj_frames = rollout_viz.get("mujoco_frames")
+                        if _mj_frames is not None and len(_mj_frames) > 0:
+                            validation_mujoco_frame_history.append(_mj_frames)
 
             # Close tree pbars (kept open during single_step MPC loop)
             if bidir_tree1 is not None and bidir_tree1.pbar is not None:
@@ -4127,22 +4585,34 @@ class DiffusionForcingPlanning(
 
             self._safe_log_metric(f"{namespace}/task_id", float(self.task_id))
             self._safe_log_metric(f"{namespace}/planning_time", np.sum(planning_time))
-            self._safe_log_metric(f"{namespace}/episode_reward", episode_reward.mean())
-            self._safe_log_metric(f"{namespace}/episode_reward_if_stay", episode_reward_if_stay.mean())
-            self._safe_log_metric(f"{namespace}/first_reach", first_reach.mean())
-            _success_rate = float(sum(episode_reward >= 1.0) / batch_size)
-            self._safe_log_metric(f"{namespace}/success_rate", _success_rate)
+            _success_rate = None
+            if not self.benchmark_plan_only:
+                self._safe_log_metric(f"{namespace}/episode_reward", episode_reward.mean())
+                self._safe_log_metric(f"{namespace}/episode_reward_if_stay", episode_reward_if_stay.mean())
+                self._safe_log_metric(f"{namespace}/first_reach", first_reach.mean())
+                _success_rate = float(sum(episode_reward >= 1.0) / batch_size)
+                self._safe_log_metric(f"{namespace}/success_rate", _success_rate)
+            else:
+                self._safe_log_metric(f"{namespace}/plan_only", 1.0)
             self._last_interact_success = _success_rate
             self._last_interact_result = {
                 "task_id": int(self.task_id) if self.task_id is not None else None,
                 "success": _success_rate,
-                "episode_reward": float(episode_reward.mean()),
-                "episode_reward_if_stay": float(episode_reward_if_stay.mean()),
-                "first_reach": float(first_reach.mean()),
+                "episode_reward": (
+                    None if self.benchmark_plan_only else float(episode_reward.mean())
+                ),
+                "episode_reward_if_stay": (
+                    None if self.benchmark_plan_only else float(episode_reward_if_stay.mean())
+                ),
+                "first_reach": (
+                    None if self.benchmark_plan_only else float(first_reach.mean())
+                ),
                 "planning_time": float(np.sum(planning_time)),
                 "steps": int(steps),
                 "interaction_seed": int(self.interaction_seed) if self.interaction_seed is not None else None,
                 "wandb_visual_prefix": self._current_wandb_visual_prefix,
+                "benchmark_variant_name": self.benchmark_variant_name,
+                "plan_only": bool(self.benchmark_plan_only),
             }
             if selected_plan_bundle is not None:
                 _pred_anchor_order = np.asarray(
@@ -4176,7 +4646,9 @@ class DiffusionForcingPlanning(
                         "active_waypoint_group_idx"
                     )
                 if "task_info" in _reset_info0:
-                    self._last_interact_result["task_info"] = _reset_info0.get("task_info")
+                    self._last_interact_result["task_info"] = self._compact_saved_task_info(
+                        _reset_info0.get("task_info")
+                    )
 
             # Visualization
             _post_exec_t0 = time.time()
@@ -5234,6 +5706,7 @@ class DiffusionForcingPlanning(
         goal_obs: np.ndarray,
         initial_sim_state: dict,
         waypoint_xys: Optional[np.ndarray],
+        fixed_solver_result: Optional[dict[str, Any]] = None,
     ) -> dict:
         anchor_specs: list[dict] = [
             {
@@ -5333,6 +5806,7 @@ class DiffusionForcingPlanning(
             "best_direct_bridge_raw": root_cost.copy(),
             "best_direct_bridge_info": {},
             "effective_pair_cost": root_cost.copy(),
+            "fixed_tentative_solver_result": None if fixed_solver_result is None else dict(fixed_solver_result),
             "tentative_solver_result": {},
         }
         self._compute_tentative_hamiltonian_solution(planner_state)
@@ -6393,6 +6867,7 @@ class DiffusionForcingPlanning(
                     expanded_node_updated_levels = np.concatenate(_cr_updated_levels_list, axis=0)  # (B, plan_tokens)
                     expanded_node_noise_levels = None      # not used in cluster-reuse path
                     expanded_node_guidance_scales = None  # not used in cluster-reuse path
+                    self._clear_parallel_plan_aux_state()
                     self._expansion_step_captures_by_name = {}  # no denoising captures
                 else:
                     # ── Standard denoising path ──────────────────────────────────
@@ -7508,6 +7983,7 @@ class DiffusionForcingPlanning(
                 expanded_node_plan_hists = torch.cat(cr_plan_hist_list, dim=2)
                 expanded_node_updated_levels = np.concatenate(cr_updated_levels_list, axis=0)
                 expanded_node_guidance_scales = None
+                self._clear_parallel_plan_aux_state()
                 self._expansion_step_captures_by_name = {}
             else:
                 expanded_node_plans = []
@@ -8796,6 +9272,7 @@ class DiffusionForcingPlanning(
         goal: torch.Tensor,
         initial_sim_state: dict,
         waypoint_xys: Optional[np.ndarray],
+        fixed_solver_result: Optional[dict[str, Any]],
         agent,
         envs,
         namespace: str,
@@ -8811,6 +9288,7 @@ class DiffusionForcingPlanning(
             goal_obs=goal_obs,
             initial_sim_state=initial_sim_state,
             waypoint_xys=waypoint_xys,
+            fixed_solver_result=fixed_solver_result,
         )
 
         global_search_pbar = tqdm(

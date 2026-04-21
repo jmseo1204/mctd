@@ -13,6 +13,12 @@ wandb:
   entity: ${oc.env:WANDB_ENTITY,jmseo1204-seoul-national-university} # set via WANDB_ENTITY env var (see scripts/project_config.sh)
   project: ${oc.env:WANDB_PROJECT,mctd_eval} # set via WANDB_PROJECT env var (see scripts/project_config.sh)
   mode: online # set wandb logging to online, offline or dryrun
+  shared_mode: false # if true, multiple benchmark processes attach to one shared WandB run
+  shared_id: null # shared-mode run id used by both primary/worker processes
+  shared_primary: true # shared-mode primary uploads config/files and owns finish state
+  shared_label: null # shared-mode process label shown in WandB logs/system metrics
+  shared_update_finish_state: true # worker should usually set this false
+  job_type: null # optional WandB job_type for filtering/saved views
 
 hostname: null # hostname to run the experiment on
 gpu_id: null # gpu id to run the experiment on

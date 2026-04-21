@@ -13,9 +13,19 @@ def main():
     )
     parser.add_argument("--dataset", required=True, help="Hydra dataset config name")
     parser.add_argument("--model_id", required=True, help="Checkpoint model id to load")
+    parser.add_argument(
+        "--load_path",
+        default=None,
+        help="Optional explicit checkpoint path/value to pass as Hydra load=...; defaults to model_id",
+    )
     parser.add_argument("--num_tasks", type=int, default=5, help="Number of OGBench tasks/goals")
     parser.add_argument("--num_repeats", type=int, default=3, help="Number of repeated evaluation passes")
     parser.add_argument("--rollouts_per_task", type=int, default=50, help="Number of rollouts per (repeat, task)")
+    parser.add_argument(
+        "--jobs_dir",
+        default="jobs",
+        help="Directory to write generated benchmark job json files into",
+    )
     parser.add_argument(
         "--planning_config_snapshot",
         default=None,
@@ -29,7 +39,7 @@ def main():
     )
     args = parser.parse_args()
 
-    os.makedirs("jobs", exist_ok=True)
+    os.makedirs(args.jobs_dir, exist_ok=True)
     os.makedirs(args.results_dir, exist_ok=True)
 
     basic_job_config = {
@@ -40,7 +50,7 @@ def main():
         "experiment": "base_pytorch",
         "algorithm": "df_planning",
         "dataset": args.dataset,
-        "load": args.model_id,
+        "load": args.load_path or args.model_id,
         "experiment.tasks": ["benchmark"],
         "algorithm.benchmark_num_rollouts": args.rollouts_per_task,
         "algorithm.benchmark_model_id": args.model_id,
@@ -61,12 +71,15 @@ def main():
             )
             job_cfg["+name"] = f"BENCH_{args.model_id}_R{repeat_id}_T{task_id}"
 
-            filename = f"jobs/{datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')}.json"
+            filename = os.path.join(
+                args.jobs_dir,
+                f"{datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')}.json",
+            )
             with open(filename, "w", encoding="utf-8") as f:
                 json.dump(job_cfg, f, indent=2)
             count += 1
 
-    print(f"Successfully generated {count} benchmark jobs in 'jobs/'.")
+    print(f"Successfully generated {count} benchmark jobs in '{args.jobs_dir}/'.")
     print(f"Results will be written under: {args.results_dir}")
 
 
