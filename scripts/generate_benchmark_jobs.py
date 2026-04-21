@@ -52,6 +52,7 @@ def main():
         "dataset": args.dataset,
         "load": args.load_path or args.model_id,
         "experiment.tasks": ["benchmark"],
+        "algorithm.use_anchor_planner": True,
         "algorithm.benchmark_num_rollouts": args.rollouts_per_task,
         "algorithm.benchmark_model_id": args.model_id,
     }

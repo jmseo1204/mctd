@@ -392,8 +392,8 @@ def main():
                         help="Directory to write generated evaluation job JSON files into.")
     parser.add_argument("--segment_episode_len", type=int, default=None,
                         help="Override segment_episode_len (raw, pre-jump). Defaults to value in df_planning.yaml.")
-    parser.add_argument("--multi_tree_hemiltonian", action="store_true",
-                        help="Enable the multi-tree online Hamiltonian planner path.")
+    parser.add_argument("--use_anchor_planner", action="store_true",
+                        help="Enable the anchor-planner path (2-anchor compat or multi-anchor native).")
     parser.add_argument("--task_override_path", type=str, default=None,
                         help="Optional task override YAML path relative to repo root.")
     parser.add_argument("--task_override_waypoint_group_idx", type=int, default=None,
@@ -579,8 +579,8 @@ def main():
         "experiment.validation.inference_mode": False,
         "experiment.validation.limit_batch": 1,
     })
-    if args.multi_tree_hemiltonian:
-        basic_job_config["algorithm.multi_tree_hemiltonian"] = True
+    if args.use_anchor_planner:
+        basic_job_config["algorithm.use_anchor_planner"] = True
     if args.task_override_path:
         basic_job_config["algorithm.task_override_path"] = args.task_override_path
     if args.task_override_waypoint_group_idx is not None:

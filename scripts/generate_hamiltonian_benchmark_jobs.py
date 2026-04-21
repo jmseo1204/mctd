@@ -141,7 +141,7 @@ def main():
         "dataset": args.dataset,
         "load": args.model_id,
         "experiment.tasks": ["benchmark"],
-        "algorithm.multi_tree_hemiltonian": True,
+        "algorithm.use_anchor_planner": True,
         "algorithm.multi_tree_route_mode": args.route_mode,
         "algorithm.task_override_path": args.task_override_path,
         "algorithm.benchmark_waypoint_top_n": int(args.waypoint_top_n),

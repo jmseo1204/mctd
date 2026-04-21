@@ -164,6 +164,7 @@ python3 scripts/generate_jobs_generalized.py \
     --num_tasks "$NUM_TASKS" \
     --num_seeds "$NUM_SEEDS" \
     --start_task_id "$START_TASK_IDX" \
+    --use_anchor_planner \
     --jobs_dir "$JOBS_DIR_REL"
 
 if [ $? -ne 0 ]; then

@@ -41,7 +41,7 @@ sub_goal_interval: 1
 sub_goal_blend_steps: 0 # steps to blend old/new sub_goal actions after a sub_goal switch (antmaze only)
 sequence_dividing_factor: 10
 parallel_search_node: 1 # parallel_search_num = parallel_search_node * len(mctd_guidance_scales)
-segment_episode_len: 100 # raw episode length per segment (pre-jump); effective = segment_episode_len * sequence_dividing_factor; n_tokens = (effective // jump) // frame_stack + 1
+segment_episode_len: 200 # raw episode length per segment (pre-jump); effective = segment_episode_len * sequence_dividing_factor; n_tokens = (effective // jump) // frame_stack + 1
 
 # HILP value function guidance
 # For .pkl checkpoints (JAX/Flax): all hyper-params are auto-detected from the file.
@@ -104,7 +104,8 @@ replanning_target_level: 25 # 11 for linear, noise level to add when replanning 
 
 # UNCERTAINTY CHECK
 use_uncertainty_as_value: true
-multi_tree_hemiltonian: false
+use_anchor_planner: false
+anchor_pairwise_policy: auto # 'auto' -> legacy_compat for 2 anchors, native_anchor when waypoints exist
 multi_tree_route_mode: online # 'online' | 'fixed_temporal'
 uncertainty_mode: 'cluster' # 'entropy' | 'variance' | 'cluster' | 'temporal_dist' | 'expected_root_node_dist'
 reliable_TD_threshold: 80.0 # if TD(current, candidate) is below this, only tentative-neighbor trees are eligible as targets

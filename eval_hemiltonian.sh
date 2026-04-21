@@ -236,7 +236,7 @@ echo "Configuration summary:"
 echo "  Dataset    : $SELECTED_DATASET (obs_dim=${STATE_DIM})"
 echo "  Model      : $SELECTED_MODEL_ID"
 echo "  Tasks      : $NUM_TASKS (start=$START_TASK_IDX)  Seeds: $NUM_SEEDS"
-echo "  Planner    : multi_tree_hemiltonian=true"
+echo "  Planner    : use_anchor_planner=true"
 if [ "$TASK_OVERRIDE_PATH" = "none" ]; then
     echo "  Override   : none"
 else
@@ -253,7 +253,7 @@ GEN_ARGS=(
     --num_tasks "$NUM_TASKS"
     --num_seeds "$NUM_SEEDS"
     --start_task_id "$START_TASK_IDX"
-    --multi_tree_hemiltonian
+    --use_anchor_planner
 )
 if [ "$TASK_OVERRIDE_PATH" != "none" ]; then
     GEN_ARGS+=(--task_override_path "$TASK_OVERRIDE_PATH")

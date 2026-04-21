@@ -35,7 +35,7 @@ extract_episode_ratio_from_sample: 0.5  # episode_len = int(sample_length * rati
 # ── Visualization (read by train.sh; used every 10k steps in training_step) ──
 # valid_episode_len = episode_len * valid_episode_len_multiple tokens are generated
 # via DDIM and logged to training_visualization/sample_* in WandB.
-valid_episode_len_multiple: 0.5
+valid_episode_len_multiple: 1.0
 episode_len: ${dataset.episode_len}
 
 # ── Training loop (read by train.sh → passed as experiment.* CLI overrides) ──

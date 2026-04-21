@@ -525,7 +525,8 @@ class DiffusionForcingPlanning(
         self.viz_replanning: bool = cfg.get("viz_replanning", True)
         self.use_uncertainty_as_value: bool = cfg.get("use_uncertainty_as_value", False)
         self.uncertainty_mode: str = cfg.get("uncertainty_mode", "entropy")
-        self.multi_tree_hemiltonian: bool = bool(cfg.get("multi_tree_hemiltonian", False))
+        self.use_anchor_planner: bool = bool(cfg.get("use_anchor_planner", False))
+        self.anchor_pairwise_policy: str = str(cfg.get("anchor_pairwise_policy", "auto"))
         self.multi_tree_route_mode: str = str(cfg.get("multi_tree_route_mode", "online"))
         self.reliable_TD_threshold: float = float(cfg.get("reliable_TD_threshold", 30.0))
         self.temporal_dist_overestimate_coeff: float = float(
@@ -869,7 +870,7 @@ class DiffusionForcingPlanning(
         return isinstance(tag, str) and tag.startswith("multi_tree_")
 
     def _is_multi_tree_anchor_tree(self, tree: Optional["MCTSTreeState"]) -> bool:
-        if tree is None or not self.multi_tree_hemiltonian:
+        if tree is None or not self.use_anchor_planner:
             return False
         return self._is_multi_tree_anchor_tag(getattr(tree, "tag", None))
 
@@ -3070,7 +3071,7 @@ class DiffusionForcingPlanning(
         if not task_ids:
             raise ValueError("benchmark run requires algorithm.task_id or algorithm.task_ids")
         if (
-            self.multi_tree_hemiltonian
+            self.use_anchor_planner
             and self.task_override_resolved_path is not None
             and self.benchmark_waypoint_top_n is not None
         ):
@@ -4157,10 +4158,7 @@ class DiffusionForcingPlanning(
             selected_plan_bundle: Optional[dict] = None
             last_reverse_output: bool = False
             active_tree = None
-            planner_state_result: Optional[dict] = None
-            bidir_tree1 = None
-            bidir_tree2 = None
-            global_search_pbar = None
+            planner_result: Optional[dict] = None
             planning_start_time: float = time.time()
 
             _start_pos = _bidir_start_np[0][self.pos_dim_indices].tolist()
@@ -4177,216 +4175,37 @@ class DiffusionForcingPlanning(
             if self._current_task_waypoints:
                 waypoint_xys = self._current_task_waypoints[0]
 
-            fixed_solver_result = None
-            if self.multi_tree_hemiltonian and self.multi_tree_route_mode == "fixed_temporal":
-                fixed_route_info = self._compute_fixed_temporal_route_solution(
-                    start_xy=np.asarray(self._current_task_start_xy[0], dtype=np.float32).reshape(2),
-                    goal_xy=np.asarray(self._current_task_goal_xy[0], dtype=np.float32).reshape(2),
-                    waypoints_xy=(
-                        np.zeros((0, 2), dtype=np.float32)
-                        if waypoint_xys is None
-                        else np.asarray(waypoint_xys, dtype=np.float32).reshape(-1, 2)
-                    ),
-                )
-                fixed_solver_result = fixed_route_info["temporal_route_solution"]
-
-            if self.multi_tree_hemiltonian:
-                planner_state_result = self._run_multi_tree_online_hamiltonian_planner(
+            if self.use_anchor_planner:
+                planner_result = self._run_anchor_planner(
                     horizon=horizon,
                     conditions=conditions,
                     start=start,
                     goal=goal,
+                    goal_normalized=goal_normalized,
                     initial_sim_state=initial_sim_state,
                     waypoint_xys=waypoint_xys,
-                    fixed_solver_result=fixed_solver_result,
                     agent=agent,
                     envs=envs,
                     namespace=namespace,
                 )
-                loops = int(planner_state_result["loops"])
-                selected_plan_bundle = planner_state_result["selected_plan_bundle"]
-                best_node = planner_state_result.get("best_node")
             else:
-                # Derive heuristic goal simulation state from initial state
-                goal_sim_state = {
-                    "qpos": initial_sim_state["qpos"].copy(),
-                    "qvel": np.zeros_like(initial_sim_state["qvel"]),  # Goal is assumed static
-                }
-                # Replace x, y coordinates with goal coordinates
-                goal_sim_state["qpos"][:2] = _bidir_goal_np[0][self.pos_dim_indices]
-
-                bidir_tree1 = self._init_mcts_tree(
-                    horizon,
-                    tag="bidir_mcts_from_start",
-                    root_obs=_bidir_start_np[0],
-                    root_sim_state=initial_sim_state,
+                planner_result = self._run_pairwise_anchor_compat_planner(
+                    horizon=horizon,
+                    conditions=conditions,
+                    start=start,
+                    goal=goal,
+                    goal_normalized=goal_normalized,
+                    initial_sim_state=initial_sim_state,
+                    agent=agent,
+                    envs=envs,
+                    namespace=namespace,
                 )
-                bidir_tree2 = self._init_mcts_tree(
-                    horizon,
-                    tag="bidir_mcts_from_goal",
-                    root_obs=_bidir_goal_np[0],
-                    root_sim_state=goal_sim_state,
-                    is_tree1=False,
-                 )
-                root_uncertainty_infos: dict[str, dict] = {}
-                if self.use_uncertainty_as_value:
-                    global_search_pbar = tqdm(
-                        total=self.mctd_max_search_num,
-                        desc="MCTS (mixed)",
-                        leave=True,
-                        dynamic_ncols=True,
-                    )
-                    if self.use_cluster_subplan_as_expansion:
-                        root_uncertainty_infos = self._ensure_uncertainty_roots_initialized(
-                            bidir_tree1,
-                            bidir_tree2,
-                            horizon,
-                            conditions,
-                        )
-                        self._log_root_uncertainty_videos(
-                            root_uncertainty_infos,
-                            [bidir_tree1, bidir_tree2],
-                            start,
-                            goal,
-                            loops,
-                            namespace=namespace,
-                        )
 
-                # Flag: 0 → expand tree1 next, 1 → expand tree2 next
-                expanded_tree_idx: int = 0
-
-                # Single-shot planning state
-                is_meeting: bool = False
-                active_tree = bidir_tree1
-                while not terminate and loops < self.val_max_loops and not is_meeting:
-                    loops += 1
-                    planning_start_time = time.time()
-
-                    # [EXPANSION CHECK] Early termination if both trees are fully explored
-                    if not bidir_tree1.root_node.is_expandable_flag and \
-                       not bidir_tree2.root_node.is_expandable_flag:
-                        terminate = True
-                        break
-                    if self.use_uncertainty_as_value and (
-                        self.global_search_num >= self.mctd_max_search_num
-                    ):
-                        terminate = True
-                        break
-
-                    # ------------------------------------------------------------------
-                    # Bidirectional alternating MCTS planning
-                    # ------------------------------------------------------------------
-                    _start_np = start.cpu().numpy()[:, self.obs_dim_indices]
-                    _goal_np = goal.cpu().numpy()
-
-                    if self.use_uncertainty_as_value:
-                        selected_parent_infos = self._select_global_expansion_parents(
-                            bidir_tree1,
-                            bidir_tree2,
-                        )
-                        if not selected_parent_infos:
-                            terminate = True
-                            break
-
-                        self.global_search_num += len(selected_parent_infos)
-                        if global_search_pbar is not None:
-                            global_search_pbar.update(len(selected_parent_infos))
-
-                        mixed_round_result = self._run_global_uncertainty_expansion_round(
-                            selected_parent_infos=selected_parent_infos,
-                            horizon=horizon,
-                            conditions=conditions,
-                            start=_start_np,
-                            goal=_goal_np,
-                        )
-                        combined_expanded_node_infos = mixed_round_result["expanded_node_infos"]
-                        self._postprocess_tree_local_expansions(
-                            mixed_round_result["tree_batches"],
-                            agent,
-                            envs,
-                            start,
-                            goal,
-                            loops,
-                            namespace=namespace,
-                        )
-
-                        round_selection = self._select_round_plan_candidate(
-                            combined_expanded_node_infos,
-                            goal_normalized=goal_normalized,
-                        )
-                        meeting_winner = round_selection["meeting_winner"]
-                        round_fallback = round_selection["round_fallback"]
-                        _trees_exhausted = (
-                            not bidir_tree1.root_node.is_expandable_flag and
-                            not bidir_tree2.root_node.is_expandable_flag
-                        )
-                        if meeting_winner is not None:
-                            best_node = meeting_winner["node"]
-                            active_tree = meeting_winner["selected_tree"]
-                            last_reverse_output = meeting_winner["reverse_output"]
-                            selected_plan_bundle = meeting_winner
-                            is_meeting = True
-                        else:
-                            if round_fallback is not None:
-                                best_node = round_fallback["node"]
-                                active_tree = round_fallback["selected_tree"]
-                                last_reverse_output = round_fallback["reverse_output"]
-                                selected_plan_bundle = None
-                            is_meeting = False
-                        if _trees_exhausted:
-                            terminate = True
-                    else:
-                        active_tree, expanded_node_infos = self._run_mcts_search(
-                            bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2,
-                            bidir_tree2 if expanded_tree_idx == 0 else bidir_tree1,
-                            horizon,
-                            conditions,
-                            _start_np,
-                            _goal_np,
-                            single_step=True,
-                        )
-                        self._update_expanded_children_state(
-                            active_tree,
-                            expanded_node_infos,
-                            agent,
-                            envs,
-                        )
-                        self._log_expanded_node_videos(
-                            expanded_node_infos,
-                            active_tree,
-                            start,
-                            goal,
-                            loops,
-                        )
-
-                        round_selection = self._select_round_plan_candidate(
-                            expanded_node_infos,
-                            goal_normalized=goal_normalized,
-                            default_tree=active_tree,
-                        )
-                        meeting_winner = round_selection["meeting_winner"]
-                        round_fallback = round_selection["round_fallback"]
-
-                        _trees_exhausted = (
-                            not bidir_tree1.root_node.is_expandable_flag and
-                            not bidir_tree2.root_node.is_expandable_flag
-                        )
-                        if meeting_winner is not None:
-                            best_node = meeting_winner["node"]
-                            active_tree = meeting_winner["selected_tree"]
-                            last_reverse_output = meeting_winner["reverse_output"]
-                            selected_plan_bundle = meeting_winner
-                            is_meeting = True
-                        else:
-                            if round_fallback is not None:
-                                best_node = round_fallback["node"]
-                                active_tree = round_fallback["selected_tree"]
-                                last_reverse_output = round_fallback["reverse_output"]
-                                selected_plan_bundle = None
-                            is_meeting = False
-                        if _trees_exhausted:
-                            terminate = True
-                        expanded_tree_idx = (expanded_tree_idx + 1) % 2
+            loops = int(planner_result["loops"])
+            selected_plan_bundle = planner_result["selected_plan_bundle"]
+            best_node = planner_result.get("best_node")
+            active_tree = planner_result.get("active_tree")
+            last_reverse_output = bool(planner_result.get("last_reverse_output", False))
 
             # Single-shot plan extraction and environment execution (after MCTS search completes)
             if selected_plan_bundle is not None or best_node is not None:
@@ -4401,6 +4220,10 @@ class DiffusionForcingPlanning(
                     _reorder_ms = (time.time() - _reorder_t0) * 1000
                 else:
                     _reorder_ms = 0.0
+                if planner_result.get("planner_kind") == "anchor_pairwise_compat":
+                    selected_plan_bundle = self._annotate_pairwise_anchor_bundle(
+                        selected_plan_bundle
+                    )
 
                 plan_unnormalized = selected_plan_bundle["plan_unnormalized"]
                 postprocessed_plan = selected_plan_bundle["postprocessed_plan"]
@@ -4449,10 +4272,11 @@ class DiffusionForcingPlanning(
                 _planning_loop_ms = (planning_end_time - planning_start_time) * 1000
                 planning_time.append(planning_end_time - planning_start_time)
 
-                if planner_state_result is not None:
+                planner_trees = list(planner_result.get("trees", [])) if planner_result else []
+                if planner_result.get("planner_state") is not None:
                     tree_node_counts = [
                         max(len(tree.get_all_nodes()) - 1, 0)
-                        for tree in planner_state_result["planner_state"]["trees"]
+                        for tree in planner_trees
                     ]
                     print(
                         f"[MCTD] Search complete | loops={loops} | "
@@ -4463,8 +4287,8 @@ class DiffusionForcingPlanning(
                         flush=True,
                     )
                 else:
-                    _t1_nodes = max(len(bidir_tree1.get_all_nodes()) - 1, 0)
-                    _t2_nodes = max(len(bidir_tree2.get_all_nodes()) - 1, 0)
+                    _t1_nodes = max(len(planner_trees[0].get_all_nodes()) - 1, 0) if len(planner_trees) > 0 else 0
+                    _t2_nodes = max(len(planner_trees[1].get_all_nodes()) - 1, 0) if len(planner_trees) > 1 else 0
                     _node_name = best_node.name if best_node is not None else "none"
                     print(
                         f"[MCTD] Search complete | loops={loops} | "
@@ -4574,13 +4398,6 @@ class DiffusionForcingPlanning(
                         if _mj_frames is not None and len(_mj_frames) > 0:
                             validation_mujoco_frame_history.append(_mj_frames)
 
-            # Close tree pbars (kept open during single_step MPC loop)
-            if bidir_tree1 is not None and bidir_tree1.pbar is not None:
-                bidir_tree1.pbar.close()
-            if bidir_tree2 is not None and bidir_tree2.pbar is not None:
-                bidir_tree2.pbar.close()
-            if global_search_pbar is not None:
-                global_search_pbar.close()
             print(f"[MCTD] Episode done | loops={loops} | steps={steps} | reached={bool(reached.any())} | reward={float(episode_reward.mean()):.3f}", flush=True)
 
             self._safe_log_metric(f"{namespace}/task_id", float(self.task_id))
@@ -6318,6 +6135,309 @@ class DiffusionForcingPlanning(
                 for idx in completed_anchor_order.tolist()
             ),
         }
+
+    def _resolve_anchor_pairwise_policy(
+        self,
+        waypoint_xys: Optional[np.ndarray],
+    ) -> str:
+        waypoint_xys = (
+            np.zeros((0, 2), dtype=np.float32)
+            if waypoint_xys is None
+            else np.asarray(waypoint_xys, dtype=np.float32).reshape(-1, 2)
+        )
+        if len(waypoint_xys) > 0:
+            return "native_anchor"
+
+        policy = str(self.anchor_pairwise_policy).strip().lower()
+        if policy not in ("auto", "legacy_compat", "native_anchor"):
+            raise ValueError(
+                f"Unsupported anchor_pairwise_policy={self.anchor_pairwise_policy!r}; "
+                "expected one of: auto, legacy_compat, native_anchor"
+            )
+        if policy == "auto":
+            return "legacy_compat"
+        return policy
+
+    def _annotate_pairwise_anchor_bundle(self, bundle: Optional[dict]) -> Optional[dict]:
+        if bundle is None:
+            return None
+        bundle.setdefault("anchor_order", np.asarray([0, 1], dtype=np.int32))
+        bundle.setdefault("completed_anchor_order", np.asarray([0, 1], dtype=np.int32))
+        bundle.setdefault("route_text", "S -> G")
+        return bundle
+
+    def _run_pairwise_anchor_compat_planner(
+        self,
+        horizon: int,
+        conditions: Optional[Any],
+        start: torch.Tensor,
+        goal: torch.Tensor,
+        goal_normalized: torch.Tensor,
+        initial_sim_state: dict,
+        agent,
+        envs,
+        namespace: str,
+    ) -> dict:
+        """Run the legacy-compatible 2-anchor policy behind the anchor-planner entry."""
+        bidir_start_np = start.cpu().numpy()[:, self.obs_dim_indices]
+        bidir_goal_np = goal.cpu().numpy()[:, self.obs_dim_indices]
+
+        goal_sim_state = {
+            "qpos": initial_sim_state["qpos"].copy(),
+            "qvel": np.zeros_like(initial_sim_state["qvel"]),
+        }
+        goal_sim_state["qpos"][:2] = bidir_goal_np[0][self.pos_dim_indices]
+
+        bidir_tree1 = self._init_mcts_tree(
+            horizon,
+            tag="anchor_pairwise_start",
+            root_obs=bidir_start_np[0],
+            root_sim_state=initial_sim_state,
+            anchor_idx=0,
+            anchor_name="S",
+            anchor_xy=bidir_start_np[0][self.pos_dim_indices],
+        )
+        bidir_tree2 = self._init_mcts_tree(
+            horizon,
+            tag="anchor_pairwise_goal",
+            root_obs=bidir_goal_np[0],
+            root_sim_state=goal_sim_state,
+            is_tree1=False,
+            anchor_idx=1,
+            anchor_name="G",
+            anchor_xy=bidir_goal_np[0][self.pos_dim_indices],
+        )
+
+        loops = 0
+        best_node: Optional["TreeNode"] = None
+        selected_plan_bundle: Optional[dict] = None
+        last_reverse_output = False
+        active_tree: Optional["MCTSTreeState"] = bidir_tree1
+        global_search_pbar = None
+
+        if self.use_uncertainty_as_value:
+            global_search_pbar = tqdm(
+                total=self.mctd_max_search_num,
+                desc="MCTS (anchor-compat)",
+                leave=True,
+                dynamic_ncols=True,
+            )
+            if self.use_cluster_subplan_as_expansion:
+                root_uncertainty_infos = self._ensure_uncertainty_roots_initialized(
+                    bidir_tree1,
+                    bidir_tree2,
+                    horizon,
+                    conditions,
+                )
+                self._log_root_uncertainty_videos(
+                    root_uncertainty_infos,
+                    [bidir_tree1, bidir_tree2],
+                    start,
+                    goal,
+                    loops,
+                    namespace=namespace,
+                )
+
+        expanded_tree_idx = 0
+        terminate = False
+        is_meeting = False
+        while not terminate and loops < self.val_max_loops and not is_meeting:
+            loops += 1
+
+            if (
+                not bidir_tree1.root_node.is_expandable_flag
+                and not bidir_tree2.root_node.is_expandable_flag
+            ):
+                terminate = True
+                break
+            if self.use_uncertainty_as_value and (
+                self.global_search_num >= self.mctd_max_search_num
+            ):
+                terminate = True
+                break
+
+            start_np = start.cpu().numpy()[:, self.obs_dim_indices]
+            goal_np = goal.cpu().numpy()
+
+            if self.use_uncertainty_as_value:
+                selected_parent_infos = self._select_global_expansion_parents(
+                    bidir_tree1,
+                    bidir_tree2,
+                )
+                if not selected_parent_infos:
+                    terminate = True
+                    break
+
+                self.global_search_num += len(selected_parent_infos)
+                if global_search_pbar is not None:
+                    global_search_pbar.update(len(selected_parent_infos))
+
+                mixed_round_result = self._run_global_uncertainty_expansion_round(
+                    selected_parent_infos=selected_parent_infos,
+                    horizon=horizon,
+                    conditions=conditions,
+                    start=start_np,
+                    goal=goal_np,
+                )
+                combined_expanded_node_infos = mixed_round_result["expanded_node_infos"]
+                self._postprocess_tree_local_expansions(
+                    mixed_round_result["tree_batches"],
+                    agent,
+                    envs,
+                    start,
+                    goal,
+                    loops,
+                    namespace=namespace,
+                )
+
+                round_selection = self._select_round_plan_candidate(
+                    combined_expanded_node_infos,
+                    goal_normalized=goal_normalized,
+                )
+                meeting_winner = round_selection["meeting_winner"]
+                round_fallback = round_selection["round_fallback"]
+                trees_exhausted = (
+                    not bidir_tree1.root_node.is_expandable_flag
+                    and not bidir_tree2.root_node.is_expandable_flag
+                )
+                if meeting_winner is not None:
+                    best_node = meeting_winner["node"]
+                    active_tree = meeting_winner["selected_tree"]
+                    last_reverse_output = meeting_winner["reverse_output"]
+                    selected_plan_bundle = self._annotate_pairwise_anchor_bundle(meeting_winner)
+                    is_meeting = True
+                else:
+                    if round_fallback is not None:
+                        best_node = round_fallback["node"]
+                        active_tree = round_fallback["selected_tree"]
+                        last_reverse_output = round_fallback["reverse_output"]
+                        selected_plan_bundle = None
+                    is_meeting = False
+                if trees_exhausted:
+                    terminate = True
+            else:
+                active_tree, expanded_node_infos = self._run_mcts_search(
+                    bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2,
+                    bidir_tree2 if expanded_tree_idx == 0 else bidir_tree1,
+                    horizon,
+                    conditions,
+                    start_np,
+                    goal_np,
+                    single_step=True,
+                )
+                self._update_expanded_children_state(
+                    active_tree,
+                    expanded_node_infos,
+                    agent,
+                    envs,
+                )
+                self._log_expanded_node_videos(
+                    expanded_node_infos,
+                    active_tree,
+                    start,
+                    goal,
+                    loops,
+                )
+
+                round_selection = self._select_round_plan_candidate(
+                    expanded_node_infos,
+                    goal_normalized=goal_normalized,
+                    default_tree=active_tree,
+                )
+                meeting_winner = round_selection["meeting_winner"]
+                round_fallback = round_selection["round_fallback"]
+                trees_exhausted = (
+                    not bidir_tree1.root_node.is_expandable_flag
+                    and not bidir_tree2.root_node.is_expandable_flag
+                )
+                if meeting_winner is not None:
+                    best_node = meeting_winner["node"]
+                    active_tree = meeting_winner["selected_tree"]
+                    last_reverse_output = meeting_winner["reverse_output"]
+                    selected_plan_bundle = self._annotate_pairwise_anchor_bundle(meeting_winner)
+                    is_meeting = True
+                else:
+                    if round_fallback is not None:
+                        best_node = round_fallback["node"]
+                        active_tree = round_fallback["selected_tree"]
+                        last_reverse_output = round_fallback["reverse_output"]
+                        selected_plan_bundle = None
+                    is_meeting = False
+                if trees_exhausted:
+                    terminate = True
+                expanded_tree_idx = (expanded_tree_idx + 1) % 2
+
+        if bidir_tree1.pbar is not None:
+            bidir_tree1.pbar.close()
+        if bidir_tree2.pbar is not None:
+            bidir_tree2.pbar.close()
+        if global_search_pbar is not None:
+            global_search_pbar.close()
+
+        return {
+            "planner_kind": "anchor_pairwise_compat",
+            "planner_state": None,
+            "trees": [bidir_tree1, bidir_tree2],
+            "loops": loops,
+            "selected_plan_bundle": selected_plan_bundle,
+            "best_node": best_node,
+            "active_tree": active_tree,
+            "last_reverse_output": last_reverse_output,
+        }
+
+    def _run_anchor_planner(
+        self,
+        horizon: int,
+        conditions: Optional[Any],
+        start: torch.Tensor,
+        goal: torch.Tensor,
+        goal_normalized: torch.Tensor,
+        initial_sim_state: dict,
+        waypoint_xys: Optional[np.ndarray],
+        agent,
+        envs,
+        namespace: str,
+    ) -> dict:
+        waypoint_xys = (
+            np.zeros((0, 2), dtype=np.float32)
+            if waypoint_xys is None
+            else np.asarray(waypoint_xys, dtype=np.float32).reshape(-1, 2)
+        )
+        pairwise_policy = self._resolve_anchor_pairwise_policy(waypoint_xys)
+        if pairwise_policy == "legacy_compat":
+            return self._run_pairwise_anchor_compat_planner(
+                horizon=horizon,
+                conditions=conditions,
+                start=start,
+                goal=goal,
+                goal_normalized=goal_normalized,
+                initial_sim_state=initial_sim_state,
+                agent=agent,
+                envs=envs,
+                namespace=namespace,
+            )
+
+        fixed_solver_result = None
+        if self.multi_tree_route_mode == "fixed_temporal":
+            fixed_route_info = self._compute_fixed_temporal_route_solution(
+                start_xy=np.asarray(self._current_task_start_xy[0], dtype=np.float32).reshape(2),
+                goal_xy=np.asarray(self._current_task_goal_xy[0], dtype=np.float32).reshape(2),
+                waypoints_xy=waypoint_xys,
+            )
+            fixed_solver_result = fixed_route_info["temporal_route_solution"]
+
+        return self._run_multi_tree_online_hamiltonian_planner(
+            horizon=horizon,
+            conditions=conditions,
+            start=start,
+            goal=goal,
+            initial_sim_state=initial_sim_state,
+            waypoint_xys=waypoint_xys,
+            fixed_solver_result=fixed_solver_result,
+            agent=agent,
+            envs=envs,
+            namespace=namespace,
+        )
 
     def _init_root_node_uncertainty(
         self,
@@ -9278,7 +9398,7 @@ class DiffusionForcingPlanning(
         namespace: str,
     ) -> dict:
         if not self.use_uncertainty_as_value:
-            raise NotImplementedError("multi_tree_hemiltonian currently requires use_uncertainty_as_value=True")
+            raise NotImplementedError("use_anchor_planner currently requires use_uncertainty_as_value=True")
 
         start_obs = start.detach().cpu().numpy()[0, self.obs_dim_indices]
         goal_obs = goal.detach().cpu().numpy()[0]
@@ -9408,10 +9528,14 @@ class DiffusionForcingPlanning(
             flush=True,
         )
         return {
+            "planner_kind": "anchor_multi_tree",
             "planner_state": planner_state,
+            "trees": planner_state["trees"],
             "loops": loops,
             "selected_plan_bundle": selected_plan_bundle,
             "best_node": None,
+            "active_tree": None,
+            "last_reverse_output": False,
         }
 
     def _node_path_label(
