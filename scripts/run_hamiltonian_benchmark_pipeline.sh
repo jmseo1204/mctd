@@ -114,9 +114,15 @@ PYTHONUNBUFFERED=1 python3 scripts/collect_hamiltonian_benchmark_comparison.py \
     --baseline_summary "$BASELINE_SUMMARY_OUTPUT" \
     --output "$COMPARISON_OUTPUT"
 
+COMPARISON_MD_OUTPUT="${COMPARISON_OUTPUT%.json}.md"
+PYTHONUNBUFFERED=1 python3 scripts/render_hamiltonian_benchmark_comparison_md.py \
+    --comparison_summary "$COMPARISON_OUTPUT" \
+    --output_md "$COMPARISON_MD_OUTPUT"
+
 echo ""
 echo "Hamiltonian online results stored under: $PROJECT_DIR/$ONLINE_RESULTS_DIR"
 echo "Hamiltonian baseline results stored under: $PROJECT_DIR/$BASELINE_RESULTS_DIR"
 echo "Hamiltonian online summary JSON: $PROJECT_DIR/$ONLINE_SUMMARY_OUTPUT"
 echo "Hamiltonian baseline summary JSON: $PROJECT_DIR/$BASELINE_SUMMARY_OUTPUT"
 echo "Hamiltonian comparison summary JSON: $PROJECT_DIR/$COMPARISON_OUTPUT"
+echo "Hamiltonian comparison markdown: $PROJECT_DIR/$COMPARISON_MD_OUTPUT"

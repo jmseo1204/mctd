@@ -42,6 +42,56 @@ else:
 PY
 }
 
+read_task_override_metadata_fast() {
+    local yaml_path="$1"
+    python3 - "$yaml_path" <<'PY'
+import sys
+
+yaml_path = sys.argv[1]
+found = {
+    "sampled_graph_cache_path": "",
+    "ogbench_enable_reset_perturb": "",
+    "eval_sampling.n_per_bin": "",
+}
+seen = {key: False for key in found}
+in_eval_sampling = False
+
+with open(yaml_path, "r", encoding="utf-8") as f:
+    for raw_line in f:
+        line = raw_line.rstrip("\n")
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        if line.startswith("sampled_graph_cache_path:"):
+            found["sampled_graph_cache_path"] = line.split(":", 1)[1].strip()
+            seen["sampled_graph_cache_path"] = True
+            continue
+
+        if line.startswith("ogbench_enable_reset_perturb:"):
+            found["ogbench_enable_reset_perturb"] = line.split(":", 1)[1].strip()
+            seen["ogbench_enable_reset_perturb"] = True
+            continue
+
+        if line.startswith("eval_sampling:"):
+            in_eval_sampling = True
+            continue
+
+        if in_eval_sampling and not raw_line[:1].isspace():
+            in_eval_sampling = False
+
+        if in_eval_sampling and stripped.startswith("n_per_bin:"):
+            found["eval_sampling.n_per_bin"] = stripped.split(":", 1)[1].strip()
+            seen["eval_sampling.n_per_bin"] = True
+
+        if all(seen.values()):
+            break
+
+for key, value in found.items():
+    print(f"{key}={value}")
+PY
+}
+
 normalize_env_key() {
     local env_id="$1"
     python3 - "$env_id" <<'PY'
@@ -393,9 +443,21 @@ TASK_OVERRIDE_HOST_PATH="$(resolve_repo_path "$TASK_OVERRIDE_PATH")"
 EXISTING_CACHE_RAW_PATH=""
 EXISTING_CACHE_HOST_PATH=""
 EXISTING_RESET_PERTURB=""
+EXISTING_N_PER_BIN=""
 if [ -f "$TASK_OVERRIDE_HOST_PATH" ]; then
-    EXISTING_CACHE_RAW_PATH="$(read_yaml_value "$TASK_OVERRIDE_HOST_PATH" "sampled_graph_cache_path")"
-    EXISTING_RESET_PERTURB="$(read_yaml_value "$TASK_OVERRIDE_HOST_PATH" "ogbench_enable_reset_perturb")"
+    while IFS='=' read -r meta_key meta_value; do
+        case "$meta_key" in
+            sampled_graph_cache_path)
+                EXISTING_CACHE_RAW_PATH="$meta_value"
+                ;;
+            ogbench_enable_reset_perturb)
+                EXISTING_RESET_PERTURB="$meta_value"
+                ;;
+            eval_sampling.n_per_bin)
+                EXISTING_N_PER_BIN="$meta_value"
+                ;;
+        esac
+    done < <(read_task_override_metadata_fast "$TASK_OVERRIDE_HOST_PATH")
     if [ -n "$EXISTING_CACHE_RAW_PATH" ] && [ "$EXISTING_CACHE_RAW_PATH" != "None" ] && [ "$EXISTING_CACHE_RAW_PATH" != "null" ]; then
         EXISTING_CACHE_HOST_PATH="$(resolve_graph_cache_host_path "$EXISTING_CACHE_RAW_PATH")"
     fi
@@ -484,7 +546,6 @@ PY
 fi
 
 # Run stratified-sample annotation if the YAML was regenerated or if n_per_bin changed.
-EXISTING_N_PER_BIN="$(read_yaml_value "$TASK_OVERRIDE_HOST_PATH" "eval_sampling.n_per_bin")"
 if [ "$REGENERATE_TASK_OVERRIDE" -eq 1 ] || [ "$EXISTING_N_PER_BIN" != "$N_PER_BIN" ]; then
     echo ""
     echo "Annotating waypoint override with stratified sample (n_per_bin=${N_PER_BIN}, seed=42)..."

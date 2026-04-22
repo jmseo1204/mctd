@@ -154,7 +154,7 @@ class PlanPostprocMixin:
 
     def _reorder_plan_by_proximity(self, plan_unnormalized: torch.Tensor) -> torch.Tensor:
         """
-        Postprocess a combined FWD+BWD plan by greedily reordering frames in euclidean space.
+        Postprocess a combined multi-segment plan by greedily reordering frames in euclidean space.
 
         Starting from frame idx=0, at each step look ahead at all remaining frames (idx > current):
           - If any fall within `meeting_delta` distance: pick the one with the highest idx.
@@ -406,8 +406,8 @@ class PlanPostprocMixin:
         The canonical assembly is:
             source-root prefix + reverse(target-root prefix)
 
-        `reverse_output=True` is used by legacy bidirectional search when the chosen
-        active tree is goal-rooted and the returned execution order must be flipped.
+        `reverse_output=True` is used when a selected tree stores its prefix in the
+        opposite execution orientation and the assembled result must be flipped.
 
         Args:
             best_node: The selected best leaf TreeNode (from _select_best_leaf).
@@ -425,7 +425,7 @@ class PlanPostprocMixin:
 
         # --- Paired node prefix, reversed for connection ---
         assert best_node.target_node is not None, \
-            "target_node must be set in bidirectional MCTS (opposite tree leaf must be available)"
+            "target_node must be set when assembling a paired-tree connection"
         combined = self._assemble_connection_frames(
             source_node=best_node,
             target_node=best_node.target_node,

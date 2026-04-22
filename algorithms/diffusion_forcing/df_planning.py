@@ -1,4 +1,4 @@
-from typing import Optional, Any, List, Tuple, Union
+from typing import Optional, Any, List, Tuple, Union, Callable
 from dataclasses import dataclass, field
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
@@ -254,13 +254,13 @@ class MCTSTreeState:
     terminal_depth: int
     noise_level: Optional[
         np.ndarray
-    ]  # always None; bidirectional dynamic schedule used
+    ]  # always None; tree-specific schedules are generated dynamically per expansion round
     children_node_guidance_scales: list
     skip_level_steps: int
     tag: str
-    is_tree1: bool = True  # Legacy bidirectional semantics: True=start-rooted, False=goal-rooted
-    # Root observation (unnormalized): start for tree1, goal for tree2.
-    # Used to track agent positions across bidirectional expansion rounds.
+    is_tree1: bool = True  # Prefix-orientation metadata; anchor trees keep forward-prefix semantics.
+    # Root observation (unnormalized) for this tree's anchor.
+    # Used to track agent positions across expansion rounds.
     tree_root_obs: Optional[np.ndarray] = None  # shape (obs_dim,)
     anchor_idx: int = 0
     anchor_name: str = "S"
@@ -525,8 +525,7 @@ class DiffusionForcingPlanning(
         self.viz_replanning: bool = cfg.get("viz_replanning", True)
         self.use_uncertainty_as_value: bool = cfg.get("use_uncertainty_as_value", False)
         self.uncertainty_mode: str = cfg.get("uncertainty_mode", "entropy")
-        self.use_anchor_planner: bool = bool(cfg.get("use_anchor_planner", False))
-        self.anchor_pairwise_policy: str = str(cfg.get("anchor_pairwise_policy", "auto"))
+        self.use_anchor_planner: bool = bool(cfg.get("use_anchor_planner", True))
         self.multi_tree_route_mode: str = str(cfg.get("multi_tree_route_mode", "online"))
         self.reliable_TD_threshold: float = float(cfg.get("reliable_TD_threshold", 30.0))
         self.temporal_dist_overestimate_coeff: float = float(
@@ -870,7 +869,7 @@ class DiffusionForcingPlanning(
         return isinstance(tag, str) and tag.startswith("multi_tree_")
 
     def _is_multi_tree_anchor_tree(self, tree: Optional["MCTSTreeState"]) -> bool:
-        if tree is None or not self.use_anchor_planner:
+        if tree is None:
             return False
         return self._is_multi_tree_anchor_tag(getattr(tree, "tag", None))
 
@@ -3071,8 +3070,7 @@ class DiffusionForcingPlanning(
         if not task_ids:
             raise ValueError("benchmark run requires algorithm.task_id or algorithm.task_ids")
         if (
-            self.use_anchor_planner
-            and self.task_override_resolved_path is not None
+            self.task_override_resolved_path is not None
             and self.benchmark_waypoint_top_n is not None
         ):
             return self._run_hamiltonian_benchmark(task_ids)
@@ -3267,7 +3265,7 @@ class DiffusionForcingPlanning(
             guidance_scale: (b,) torch.Tensor of guidance scales per parallel instance
             noise_level: (b, m, plan_tokens) numpy array of noise schedules
                 - b: batch size (number of parallel instances)
-                - m: number of denoising steps (M from bidirectional schedule)
+                - m: number of denoising steps (M from the tree-conditioned schedule)
                 - plan_tokens: horizon // frame_stack tokens to be denoised
             plans: list of b pre-built plan tensors, each shape (n_tokens, 1, fs*c)
                 - n_tokens: total tokens (including padding)
@@ -3276,7 +3274,7 @@ class DiffusionForcingPlanning(
 
         Returns:
             plan_hist: (m+1, plan_tokens*fs, b, c) tensor of denoising histories
-                - m: number of denoising steps (M from bidirectional schedule)
+                - m: number of denoising steps (M from the tree-conditioned schedule)
                 - plan_tokens*fs: horizon in frames
                 - b: batch size (number of parallel instances)
                 - c: observation dimension
@@ -4112,7 +4110,7 @@ class DiffusionForcingPlanning(
             self._capture_current_task_metadata(obs, goal, reset_infos)
 
             steps = 0
-            loops = 0  # Loop counter for bidirectional MCTS planning
+            loops = 0
             episode_reward = np.zeros(batch_size)
             episode_reward_if_stay = np.zeros(batch_size)
             reached = np.zeros(batch_size, dtype=bool)
@@ -4154,10 +4152,7 @@ class DiffusionForcingPlanning(
             )[: self.hilp_obs_dim].astype(np.float32)
             self._hilp_ref_obs = _ref_full  # used in _compute_hilp_values._pad
 
-            best_node: Optional["TreeNode"] = None
             selected_plan_bundle: Optional[dict] = None
-            last_reverse_output: bool = False
-            active_tree = None
             planner_result: Optional[dict] = None
             planning_start_time: float = time.time()
 
@@ -4175,93 +4170,39 @@ class DiffusionForcingPlanning(
             if self._current_task_waypoints:
                 waypoint_xys = self._current_task_waypoints[0]
 
-            if self.use_anchor_planner:
-                planner_result = self._run_anchor_planner(
-                    horizon=horizon,
-                    conditions=conditions,
-                    start=start,
-                    goal=goal,
-                    goal_normalized=goal_normalized,
-                    initial_sim_state=initial_sim_state,
-                    waypoint_xys=waypoint_xys,
-                    agent=agent,
-                    envs=envs,
-                    namespace=namespace,
-                )
-            else:
-                planner_result = self._run_pairwise_anchor_compat_planner(
-                    horizon=horizon,
-                    conditions=conditions,
-                    start=start,
-                    goal=goal,
-                    goal_normalized=goal_normalized,
-                    initial_sim_state=initial_sim_state,
-                    agent=agent,
-                    envs=envs,
-                    namespace=namespace,
-                )
+            planner_result = self._run_anchor_planner(
+                horizon=horizon,
+                conditions=conditions,
+                start=start,
+                goal=goal,
+                goal_normalized=goal_normalized,
+                initial_sim_state=initial_sim_state,
+                waypoint_xys=waypoint_xys,
+                agent=agent,
+                envs=envs,
+                namespace=namespace,
+            )
 
             loops = int(planner_result["loops"])
             selected_plan_bundle = planner_result["selected_plan_bundle"]
-            best_node = planner_result.get("best_node")
-            active_tree = planner_result.get("active_tree")
-            last_reverse_output = bool(planner_result.get("last_reverse_output", False))
 
             # Single-shot plan extraction and environment execution (after MCTS search completes)
-            if selected_plan_bundle is not None or best_node is not None:
-                if selected_plan_bundle is None:
-                    _reorder_t0 = time.time()
-                    selected_plan_bundle = self._build_postprocessed_plan_from_node(
-                        best_node,
-                        plan_tokens=self._require_current_plan_tokens(),
-                        reverse_output=last_reverse_output,
-                        goal_normalized=goal_normalized,
-                    )
-                    _reorder_ms = (time.time() - _reorder_t0) * 1000
-                else:
-                    _reorder_ms = 0.0
-                if planner_result.get("planner_kind") == "anchor_pairwise_compat":
-                    selected_plan_bundle = self._annotate_pairwise_anchor_bundle(
-                        selected_plan_bundle
-                    )
+            if selected_plan_bundle is not None:
+                _reorder_ms = 0.0
 
                 plan_unnormalized = selected_plan_bundle["plan_unnormalized"]
                 postprocessed_plan = selected_plan_bundle["postprocessed_plan"]
                 selected_route_text = str(selected_plan_bundle.get("route_text", ""))
 
-                # Visualization with both forward and reverse trajectories
+                # Visualization for the assembled anchor plan.
                 start_numpy = start.cpu().numpy()[:, self.pos_dim_indices]
                 goal_numpy = goal.cpu().numpy()[:, self.pos_dim_indices]
 
-                # Extract best_node's target_node obs (single green point)
-                best_node_target_pos = None
-                if best_node is not None:
-                    if best_node.target_node is None:
-                        pass
-                    elif best_node.target_node.obs is None:
-                        pass
-                    else:
-                        best_node_target_pos = best_node.target_node.obs  # (obs_dim,) world coords
-
-                # Compute HILP value heatmap if model is already loaded
+                # The assembled anchor bundle does not expose a single leaf target point.
                 hilp_heatmap = None
-                _hm_t0 = time.time()
-                if hasattr(self, '_hilp_value_fn_instance') and self._hilp_value_fn_instance is not None:
-                    try:
-                        hilp_heatmap = self._compute_hilp_heatmap(best_node_target_pos)
-                    except Exception as _hm_err:
-                        pass
-                _hm_ms = (time.time() - _hm_t0) * 1000
-
-                # Compute HILP gradient field for arrow overlay
+                _hm_ms = 0.0
                 hilp_grad_field = None
-                _gf_t0 = time.time()
-                if best_node_target_pos is not None:
-                    try:
-                        hilp_grad_field = self._compute_guidance_grad_fields(best_node_target_pos)
-                    except Exception as _gf_err:
-                        pass
-                _gf_ms = (time.time() - _gf_t0) * 1000
+                _gf_ms = 0.0
 
                 planning_end_time = time.time()
                 self._tlog("timing.hilp_viz", {
@@ -4273,31 +4214,18 @@ class DiffusionForcingPlanning(
                 planning_time.append(planning_end_time - planning_start_time)
 
                 planner_trees = list(planner_result.get("trees", [])) if planner_result else []
-                if planner_result.get("planner_state") is not None:
-                    tree_node_counts = [
-                        max(len(tree.get_all_nodes()) - 1, 0)
-                        for tree in planner_trees
-                    ]
-                    print(
-                        f"[MCTD] Search complete | loops={loops} | "
-                        f"parents={self.global_search_num}/{self.mctd_max_search_num} | "
-                        f"tree_nodes={tree_node_counts} | "
-                        f"plan_frames={plan_unnormalized.shape[0]} | "
-                        f"post_frames={postprocessed_plan.shape[0]} | route={selected_route_text}",
-                        flush=True,
-                    )
-                else:
-                    _t1_nodes = max(len(planner_trees[0].get_all_nodes()) - 1, 0) if len(planner_trees) > 0 else 0
-                    _t2_nodes = max(len(planner_trees[1].get_all_nodes()) - 1, 0) if len(planner_trees) > 1 else 0
-                    _node_name = best_node.name if best_node is not None else "none"
-                    print(
-                        f"[MCTD] Search complete | loops={loops} | "
-                        f"parents={self.global_search_num}/{self.mctd_max_search_num} | "
-                        f"tree1_nodes={_t1_nodes} tree2_nodes={_t2_nodes} | "
-                        f"plan_frames={plan_unnormalized.shape[0]} | "
-                        f"post_frames={postprocessed_plan.shape[0]} | node={_node_name}",
-                        flush=True,
-                    )
+                tree_node_counts = [
+                    max(len(tree.get_all_nodes()) - 1, 0)
+                    for tree in planner_trees
+                ]
+                print(
+                    f"[MCTD] Search complete | loops={loops} | "
+                    f"parents={self.global_search_num}/{self.mctd_max_search_num} | "
+                    f"tree_nodes={tree_node_counts} | "
+                    f"plan_frames={plan_unnormalized.shape[0]} | "
+                    f"post_frames={postprocessed_plan.shape[0]} | route={selected_route_text}",
+                    flush=True,
+                )
 
                 # Visualize postprocessed plan
                 _ppviz_t0 = time.time()
@@ -4839,7 +4767,7 @@ class DiffusionForcingPlanning(
         expanded_node_candidates: List[dict],
         final_best_plans: torch.Tensor, # (plan_tokens*fs, b, c)
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Compute per-node values for bidirectional search by pairing current plan with
+        """Compute per-node values for two-tree search by pairing current plan with
         the target opposite-tree leaf node's plan.
 
         For each expanded candidate i:
@@ -5130,7 +5058,7 @@ class DiffusionForcingPlanning(
         )
 
         # Build fast noise schedule
-        unc_noise_levels_nt = self._generate_bidirectional_schedule(
+        unc_noise_levels_nt = self._generate_tree_conditioned_schedule(
             updated_levels,
             prefix_len_per_batch=current_prefix_len_per_batch,
             num_denoising_steps_override=self.fast_sampling_steps,
@@ -5431,7 +5359,7 @@ class DiffusionForcingPlanning(
             f"Plan tokens must be <= {self.n_tokens - 1}, but got {plan_tokens}"
         )
         terminal_depth: int = self.sequence_dividing_factor
-        noise_level: Optional[np.ndarray] = None  # bidirectional uses dynamic schedule
+        noise_level: Optional[np.ndarray] = None  # dynamic schedule is generated per expansion round
 
         # current_levels: (1, plan_tokens) — excludes init/final tokens
         root_current_levels: np.ndarray = np.full(
@@ -5477,44 +5405,6 @@ class DiffusionForcingPlanning(
             anchor_name=str(anchor_name),
             anchor_xy=None if anchor_xy is None else np.asarray(anchor_xy, dtype=np.float32).reshape(-1),
         )
-
-    def _ensure_uncertainty_roots_initialized(
-        self,
-        tree1: "MCTSTreeState",
-        tree2: "MCTSTreeState",
-        horizon: int,
-        conditions: Optional[Any],
-    ) -> dict[str, dict]:
-        """Initialize uncertainty (cluster_subplans + value) for both bidirectional tree roots.
-
-        Called once before the MCTS search loop when use_cluster_subplan_as_expansion
-        and use_uncertainty_as_value are both True.  Delegates to
-        _init_root_node_uncertainty for each root individually.
-        """
-        root_uncertainty_infos: dict[str, dict] = {}
-        if tree1.root_node.cluster_subplans is None:
-            root_uncertainty_infos[tree1.tag] = self._init_root_node_uncertainty(
-                root_node=tree1.root_node,
-                opposite_tree=tree2,
-                horizon=horizon,
-                conditions=conditions,
-            )
-        else:
-            _existing = getattr(tree1.root_node, "_root_uncertainty_vinfo", None)
-            if _existing is not None:
-                root_uncertainty_infos[tree1.tag] = _existing
-        if tree2.root_node.cluster_subplans is None:
-            root_uncertainty_infos[tree2.tag] = self._init_root_node_uncertainty(
-                root_node=tree2.root_node,
-                opposite_tree=tree1,
-                horizon=horizon,
-                conditions=conditions,
-            )
-        else:
-            _existing = getattr(tree2.root_node, "_root_uncertainty_vinfo", None)
-            if _existing is not None:
-                root_uncertainty_infos[tree2.tag] = _existing
-        return root_uncertainty_infos
 
     def _init_multi_tree_planner_state(
         self,
@@ -5624,6 +5514,52 @@ class DiffusionForcingPlanning(
             "best_direct_bridge_info": {},
             "effective_pair_cost": root_cost.copy(),
             "fixed_tentative_solver_result": None if fixed_solver_result is None else dict(fixed_solver_result),
+            "tentative_solver_result": {},
+        }
+        self._compute_tentative_hamiltonian_solution(planner_state)
+        return planner_state
+
+    def _build_pairwise_anchor_selection_state(
+        self,
+        tree1: "MCTSTreeState",
+        tree2: "MCTSTreeState",
+    ) -> dict:
+        trees = [tree1, tree2]
+        root_cost = np.full((2, 2), np.inf, dtype=np.float32)
+        np.fill_diagonal(root_cost, 0.0)
+        td_01 = float(
+            self._compute_raw_state_temporal_dist_np(
+                tree1.root_node.obs[None].astype(np.float32),
+                tree2.root_node.obs[None].astype(np.float32),
+            )[0]
+        )
+        total_cost_01 = self._compute_source_target_total_cost(
+            source_node=tree1.root_node,
+            target_node=tree2.root_node,
+            t_curr=td_01,
+        )
+        root_cost[0, 1] = total_cost_01
+        root_cost[1, 0] = total_cost_01
+
+        fixed_solver_result = None
+        if self.multi_tree_route_mode == "fixed_temporal":
+            fixed_solver_result = {
+                "feasible": True,
+                "anchor_order": np.asarray([0, 1], dtype=np.int32),
+                "route_text": "S -> G",
+                "total_cost": float(total_cost_01),
+            }
+
+        planner_state = {
+            "trees": trees,
+            "accepted_pair_edges": {},
+            "accepted_neighbors": {0: set(), 1: set()},
+            "best_direct_bridge_raw": root_cost.copy(),
+            "best_direct_bridge_info": {},
+            "effective_pair_cost": root_cost.copy(),
+            "fixed_tentative_solver_result": (
+                None if fixed_solver_result is None else dict(fixed_solver_result)
+            ),
             "tentative_solver_result": {},
         }
         self._compute_tentative_hamiltonian_solution(planner_state)
@@ -5843,6 +5779,10 @@ class DiffusionForcingPlanning(
                 "target_anchor_idx": target_anchor_idx,
                 "source_node": node,
                 "target_node": meeting_target_node,
+                "selection_count": info.get(
+                    "selection_count",
+                    getattr(node, "last_selection_count", None),
+                ),
                 "bridge_cost": float(bridge_cost),
                 "gap": float(gap),
                 "meeting_target_td": (
@@ -5868,6 +5808,34 @@ class DiffusionForcingPlanning(
                 accepted_candidates[pair_key] = candidate
         return accepted_candidates
 
+    def _log_anchor_meeting_accept(
+        self,
+        candidate: dict,
+        loops: int,
+        n_anchors: int,
+    ) -> None:
+        pair_text = self._anchor_pair_text_from_indices(
+            candidate["pair_key"],
+            n_anchors=int(n_anchors),
+        )
+        selection_count = candidate.get("selection_count")
+        if selection_count is None:
+            selection_text = "unknown"
+        else:
+            selection_text = f"{int(selection_count):03d}"
+        print(
+            "[meeting-accept] "
+            f"round={int(loops):03d} "
+            f"selection_count={selection_text} "
+            f"pair={pair_text} "
+            f"source_path={candidate['source_node'].name} "
+            f"meeting_target_path={candidate['target_node'].name} "
+            f"gap={float(candidate['gap']):.6f} "
+            f"meeting_target_td={float(candidate['meeting_target_td']):.6f} "
+            f"bridge_cost={float(candidate['bridge_cost']):.6f}",
+            flush=True,
+        )
+
     def _accept_multi_tree_round_meetings(
         self,
         planner_state: dict,
@@ -5886,6 +5854,11 @@ class DiffusionForcingPlanning(
             }
             planner_state["accepted_neighbors"][a].add(b)
             planner_state["accepted_neighbors"][b].add(a)
+            self._log_anchor_meeting_accept(
+                candidate,
+                loops,
+                n_anchors=len(planner_state["trees"]),
+            )
 
     def _all_multi_tree_anchors_satisfied(self, planner_state: dict) -> bool:
         for anchor_idx in range(len(planner_state["trees"])):
@@ -5957,6 +5930,94 @@ class DiffusionForcingPlanning(
             walk.append(cur)
         walk.reverse()
         return walk
+
+    def _repair_missing_pair_connection(
+        self,
+        planner_state: dict,
+        source_anchor_idx: int,
+        target_anchor_idx: int,
+    ) -> Optional[dict]:
+        source_anchor_idx = int(source_anchor_idx)
+        target_anchor_idx = int(target_anchor_idx)
+        pair_key = self._anchor_pair_key(source_anchor_idx, target_anchor_idx)
+        existing = self._get_connection_info_for_pair(planner_state, pair_key)
+        if existing is not None:
+            return existing
+
+        source_tree = planner_state["trees"][source_anchor_idx]
+        target_tree = planner_state["trees"][target_anchor_idx]
+        source_nodes = [
+            node
+            for node in source_tree.get_all_nodes()
+            if node.obs is not None
+            and len(node.plan_history) > 0
+            and len(node.plan_history[-1]) > 0
+        ]
+        target_nodes = [
+            node
+            for node in target_tree.get_all_nodes()
+            if node.obs is not None
+        ]
+        if not source_nodes or not target_nodes:
+            return None
+
+        target_obs = np.stack([node.obs for node in target_nodes], axis=0).astype(np.float32)
+        best_candidate: Optional[dict] = None
+        for source_node in source_nodes:
+            src_obs_rep = np.repeat(
+                source_node.obs[None].astype(np.float32),
+                len(target_nodes),
+                axis=0,
+            )
+            tds = self._compute_raw_state_temporal_dist_np(src_obs_rep, target_obs)
+            best_local_idx = int(np.argmin(tds))
+            target_node = target_nodes[best_local_idx]
+            t_curr = float(tds[best_local_idx])
+            bridge_cost = self._compute_source_target_total_cost(
+                source_node=source_node,
+                target_node=target_node,
+                t_curr=t_curr,
+            )
+            candidate = {
+                "pair_key": pair_key,
+                "source_anchor_idx": source_anchor_idx,
+                "target_anchor_idx": target_anchor_idx,
+                "source_node": source_node,
+                "target_node": target_node,
+                "bridge_cost": float(bridge_cost),
+                "t_curr": t_curr,
+                "repaired": True,
+            }
+            if best_candidate is None or (
+                candidate["bridge_cost"],
+                candidate["t_curr"],
+                candidate["source_node"].name,
+                candidate["target_node"].name,
+            ) < (
+                best_candidate["bridge_cost"],
+                best_candidate["t_curr"],
+                best_candidate["source_node"].name,
+                best_candidate["target_node"].name,
+            ):
+                best_candidate = candidate
+
+        if best_candidate is None:
+            return None
+
+        planner_state["best_direct_bridge_raw"][pair_key] = float(best_candidate["bridge_cost"])
+        planner_state["best_direct_bridge_raw"][pair_key[::-1]] = float(best_candidate["bridge_cost"])
+        planner_state["effective_pair_cost"][pair_key] = float(best_candidate["bridge_cost"])
+        planner_state["effective_pair_cost"][pair_key[::-1]] = float(best_candidate["bridge_cost"])
+        planner_state["best_direct_bridge_info"][pair_key] = best_candidate
+        print(
+            "[edge-repair] "
+            f"pair={self._anchor_pair_text_from_indices(pair_key, len(planner_state['trees']))} "
+            f"source_path={best_candidate['source_node'].name} "
+            f"target_path={best_candidate['target_node'].name} "
+            f"bridge_cost={float(best_candidate['bridge_cost']):.6f}",
+            flush=True,
+        )
+        return best_candidate
 
     def _materialize_connection_segment(
         self,
@@ -6031,31 +6092,45 @@ class DiffusionForcingPlanning(
                     allowed_anchor_indices=allowed_anchor_indices,
                 )
                 if walk is None or len(walk) < 2:
-                    break_reason = (
-                        f"missing_walk edge={anchor_short_label(src_idx, n_anchors)}->"
-                        f"{anchor_short_label(dst_idx, n_anchors)} "
-                        f"allowed={_route_text(sorted(allowed_anchor_indices))}"
+                    repaired_conn = self._repair_missing_pair_connection(
+                        planner_state=planner_state,
+                        source_anchor_idx=src_idx,
+                        target_anchor_idx=dst_idx,
                     )
-                    break
-                walk_pairs = [
-                    self._anchor_pair_key(int(walk[i]), int(walk[i + 1]))
-                    for i in range(len(walk) - 1)
-                ]
-                connection_sequence = []
-                missing_conn = False
-                for walk_pair in walk_pairs:
-                    conn = self._get_connection_info_for_pair(planner_state, walk_pair)
-                    if conn is None:
-                        missing_conn = True
+                    if repaired_conn is None:
                         break_reason = (
-                            f"walk_missing_conn edge={anchor_short_label(src_idx, n_anchors)}->"
+                            f"missing_walk edge={anchor_short_label(src_idx, n_anchors)}->"
                             f"{anchor_short_label(dst_idx, n_anchors)} "
-                            f"walk={_route_text(walk)} missing={_pair_text(walk_pair)}"
+                            f"allowed={_route_text(sorted(allowed_anchor_indices))}"
                         )
                         break
-                    connection_sequence.append(conn)
-                if missing_conn:
-                    break
+                    connection_sequence = [repaired_conn]
+                else:
+                    walk_pairs = [
+                        self._anchor_pair_key(int(walk[i]), int(walk[i + 1]))
+                        for i in range(len(walk) - 1)
+                    ]
+                    connection_sequence = []
+                    missing_conn = False
+                    for walk_idx, walk_pair in enumerate(walk_pairs):
+                        conn = self._get_connection_info_for_pair(planner_state, walk_pair)
+                        if conn is None:
+                            conn = self._repair_missing_pair_connection(
+                                planner_state=planner_state,
+                                source_anchor_idx=int(walk[walk_idx]),
+                                target_anchor_idx=int(walk[walk_idx + 1]),
+                            )
+                        if conn is None:
+                            missing_conn = True
+                            break_reason = (
+                                f"walk_missing_conn edge={anchor_short_label(src_idx, n_anchors)}->"
+                                f"{anchor_short_label(dst_idx, n_anchors)} "
+                                f"walk={_route_text(walk)} missing={_pair_text(walk_pair)}"
+                            )
+                            break
+                        connection_sequence.append(conn)
+                    if missing_conn:
+                        break
 
             current_src = src_idx
             for conn in connection_sequence:
@@ -6136,254 +6211,54 @@ class DiffusionForcingPlanning(
             ),
         }
 
-    def _resolve_anchor_pairwise_policy(
+    def _run_anchor_policy_loop(
         self,
-        waypoint_xys: Optional[np.ndarray],
-    ) -> str:
-        waypoint_xys = (
-            np.zeros((0, 2), dtype=np.float32)
-            if waypoint_xys is None
-            else np.asarray(waypoint_xys, dtype=np.float32).reshape(-1, 2)
-        )
-        if len(waypoint_xys) > 0:
-            return "native_anchor"
-
-        policy = str(self.anchor_pairwise_policy).strip().lower()
-        if policy not in ("auto", "legacy_compat", "native_anchor"):
-            raise ValueError(
-                f"Unsupported anchor_pairwise_policy={self.anchor_pairwise_policy!r}; "
-                "expected one of: auto, legacy_compat, native_anchor"
-            )
-        if policy == "auto":
-            return "legacy_compat"
-        return policy
-
-    def _annotate_pairwise_anchor_bundle(self, bundle: Optional[dict]) -> Optional[dict]:
-        if bundle is None:
-            return None
-        bundle.setdefault("anchor_order", np.asarray([0, 1], dtype=np.int32))
-        bundle.setdefault("completed_anchor_order", np.asarray([0, 1], dtype=np.int32))
-        bundle.setdefault("route_text", "S -> G")
-        return bundle
-
-    def _run_pairwise_anchor_compat_planner(
-        self,
-        horizon: int,
-        conditions: Optional[Any],
-        start: torch.Tensor,
-        goal: torch.Tensor,
-        goal_normalized: torch.Tensor,
-        initial_sim_state: dict,
-        agent,
-        envs,
-        namespace: str,
+        *,
+        pre_round_check: Optional[Callable[[], Optional[str]]] = None,
+        post_increment_check: Optional[Callable[[], Optional[str]]] = None,
+        run_round: Callable[[int], dict],
     ) -> dict:
-        """Run the legacy-compatible 2-anchor policy behind the anchor-planner entry."""
-        bidir_start_np = start.cpu().numpy()[:, self.obs_dim_indices]
-        bidir_goal_np = goal.cpu().numpy()[:, self.obs_dim_indices]
-
-        goal_sim_state = {
-            "qpos": initial_sim_state["qpos"].copy(),
-            "qvel": np.zeros_like(initial_sim_state["qvel"]),
-        }
-        goal_sim_state["qpos"][:2] = bidir_goal_np[0][self.pos_dim_indices]
-
-        bidir_tree1 = self._init_mcts_tree(
-            horizon,
-            tag="anchor_pairwise_start",
-            root_obs=bidir_start_np[0],
-            root_sim_state=initial_sim_state,
-            anchor_idx=0,
-            anchor_name="S",
-            anchor_xy=bidir_start_np[0][self.pos_dim_indices],
-        )
-        bidir_tree2 = self._init_mcts_tree(
-            horizon,
-            tag="anchor_pairwise_goal",
-            root_obs=bidir_goal_np[0],
-            root_sim_state=goal_sim_state,
-            is_tree1=False,
-            anchor_idx=1,
-            anchor_name="G",
-            anchor_xy=bidir_goal_np[0][self.pos_dim_indices],
-        )
-
         loops = 0
-        best_node: Optional["TreeNode"] = None
-        selected_plan_bundle: Optional[dict] = None
-        last_reverse_output = False
-        active_tree: Optional["MCTSTreeState"] = bidir_tree1
-        global_search_pbar = None
-
-        if self.use_uncertainty_as_value:
-            global_search_pbar = tqdm(
-                total=self.mctd_max_search_num,
-                desc="MCTS (anchor-compat)",
-                leave=True,
-                dynamic_ncols=True,
-            )
-            if self.use_cluster_subplan_as_expansion:
-                root_uncertainty_infos = self._ensure_uncertainty_roots_initialized(
-                    bidir_tree1,
-                    bidir_tree2,
-                    horizon,
-                    conditions,
-                )
-                self._log_root_uncertainty_videos(
-                    root_uncertainty_infos,
-                    [bidir_tree1, bidir_tree2],
-                    start,
-                    goal,
-                    loops,
-                    namespace=namespace,
-                )
-
-        expanded_tree_idx = 0
-        terminate = False
-        is_meeting = False
-        while not terminate and loops < self.val_max_loops and not is_meeting:
-            loops += 1
-
-            if (
-                not bidir_tree1.root_node.is_expandable_flag
-                and not bidir_tree2.root_node.is_expandable_flag
-            ):
-                terminate = True
-                break
-            if self.use_uncertainty_as_value and (
-                self.global_search_num >= self.mctd_max_search_num
-            ):
-                terminate = True
-                break
-
-            start_np = start.cpu().numpy()[:, self.obs_dim_indices]
-            goal_np = goal.cpu().numpy()
-
-            if self.use_uncertainty_as_value:
-                selected_parent_infos = self._select_global_expansion_parents(
-                    bidir_tree1,
-                    bidir_tree2,
-                )
-                if not selected_parent_infos:
-                    terminate = True
+        termination_reason = "unknown"
+        while loops < self.val_max_loops:
+            if pre_round_check is not None:
+                pre_round_reason = pre_round_check()
+                if pre_round_reason is not None:
+                    termination_reason = str(pre_round_reason)
                     break
 
-                self.global_search_num += len(selected_parent_infos)
-                if global_search_pbar is not None:
-                    global_search_pbar.update(len(selected_parent_infos))
+            loops += 1
 
-                mixed_round_result = self._run_global_uncertainty_expansion_round(
-                    selected_parent_infos=selected_parent_infos,
-                    horizon=horizon,
-                    conditions=conditions,
-                    start=start_np,
-                    goal=goal_np,
-                )
-                combined_expanded_node_infos = mixed_round_result["expanded_node_infos"]
-                self._postprocess_tree_local_expansions(
-                    mixed_round_result["tree_batches"],
-                    agent,
-                    envs,
-                    start,
-                    goal,
-                    loops,
-                    namespace=namespace,
-                )
+            if post_increment_check is not None:
+                post_increment_reason = post_increment_check()
+                if post_increment_reason is not None:
+                    termination_reason = str(post_increment_reason)
+                    break
 
-                round_selection = self._select_round_plan_candidate(
-                    combined_expanded_node_infos,
-                    goal_normalized=goal_normalized,
-                )
-                meeting_winner = round_selection["meeting_winner"]
-                round_fallback = round_selection["round_fallback"]
-                trees_exhausted = (
-                    not bidir_tree1.root_node.is_expandable_flag
-                    and not bidir_tree2.root_node.is_expandable_flag
-                )
-                if meeting_winner is not None:
-                    best_node = meeting_winner["node"]
-                    active_tree = meeting_winner["selected_tree"]
-                    last_reverse_output = meeting_winner["reverse_output"]
-                    selected_plan_bundle = self._annotate_pairwise_anchor_bundle(meeting_winner)
-                    is_meeting = True
-                else:
-                    if round_fallback is not None:
-                        best_node = round_fallback["node"]
-                        active_tree = round_fallback["selected_tree"]
-                        last_reverse_output = round_fallback["reverse_output"]
-                        selected_plan_bundle = None
-                    is_meeting = False
-                if trees_exhausted:
-                    terminate = True
-            else:
-                active_tree, expanded_node_infos = self._run_mcts_search(
-                    bidir_tree1 if expanded_tree_idx == 0 else bidir_tree2,
-                    bidir_tree2 if expanded_tree_idx == 0 else bidir_tree1,
-                    horizon,
-                    conditions,
-                    start_np,
-                    goal_np,
-                    single_step=True,
-                )
-                self._update_expanded_children_state(
-                    active_tree,
-                    expanded_node_infos,
-                    agent,
-                    envs,
-                )
-                self._log_expanded_node_videos(
-                    expanded_node_infos,
-                    active_tree,
-                    start,
-                    goal,
-                    loops,
-                )
-
-                round_selection = self._select_round_plan_candidate(
-                    expanded_node_infos,
-                    goal_normalized=goal_normalized,
-                    default_tree=active_tree,
-                )
-                meeting_winner = round_selection["meeting_winner"]
-                round_fallback = round_selection["round_fallback"]
-                trees_exhausted = (
-                    not bidir_tree1.root_node.is_expandable_flag
-                    and not bidir_tree2.root_node.is_expandable_flag
-                )
-                if meeting_winner is not None:
-                    best_node = meeting_winner["node"]
-                    active_tree = meeting_winner["selected_tree"]
-                    last_reverse_output = meeting_winner["reverse_output"]
-                    selected_plan_bundle = self._annotate_pairwise_anchor_bundle(meeting_winner)
-                    is_meeting = True
-                else:
-                    if round_fallback is not None:
-                        best_node = round_fallback["node"]
-                        active_tree = round_fallback["selected_tree"]
-                        last_reverse_output = round_fallback["reverse_output"]
-                        selected_plan_bundle = None
-                    is_meeting = False
-                if trees_exhausted:
-                    terminate = True
-                expanded_tree_idx = (expanded_tree_idx + 1) % 2
-
-        if bidir_tree1.pbar is not None:
-            bidir_tree1.pbar.close()
-        if bidir_tree2.pbar is not None:
-            bidir_tree2.pbar.close()
-        if global_search_pbar is not None:
-            global_search_pbar.close()
+            round_result = run_round(loops) or {}
+            round_termination = round_result.get("termination_reason")
+            if round_termination is not None:
+                termination_reason = str(round_termination)
+            if bool(round_result.get("stop", False)):
+                break
+        else:
+            termination_reason = "val_max_loops"
 
         return {
-            "planner_kind": "anchor_pairwise_compat",
-            "planner_state": None,
-            "trees": [bidir_tree1, bidir_tree2],
             "loops": loops,
-            "selected_plan_bundle": selected_plan_bundle,
-            "best_node": best_node,
-            "active_tree": active_tree,
-            "last_reverse_output": last_reverse_output,
+            "termination_reason": termination_reason,
         }
+
+    def _close_anchor_search_progress_bars(
+        self,
+        trees: list[Optional["MCTSTreeState"]],
+        global_search_pbar: Optional[tqdm] = None,
+    ) -> None:
+        for tree in trees:
+            if tree is not None and tree.pbar is not None:
+                tree.pbar.close()
+        if global_search_pbar is not None:
+            global_search_pbar.close()
 
     def _run_anchor_planner(
         self,
@@ -6403,19 +6278,6 @@ class DiffusionForcingPlanning(
             if waypoint_xys is None
             else np.asarray(waypoint_xys, dtype=np.float32).reshape(-1, 2)
         )
-        pairwise_policy = self._resolve_anchor_pairwise_policy(waypoint_xys)
-        if pairwise_policy == "legacy_compat":
-            return self._run_pairwise_anchor_compat_planner(
-                horizon=horizon,
-                conditions=conditions,
-                start=start,
-                goal=goal,
-                goal_normalized=goal_normalized,
-                initial_sim_state=initial_sim_state,
-                agent=agent,
-                envs=envs,
-                namespace=namespace,
-            )
 
         fixed_solver_result = None
         if self.multi_tree_route_mode == "fixed_temporal":
@@ -6438,6 +6300,14 @@ class DiffusionForcingPlanning(
             envs=envs,
             namespace=namespace,
         )
+
+    def _anchor_pair_text_from_indices(
+        self,
+        pair: tuple[int, int] | list[int],
+        n_anchors: int,
+    ) -> str:
+        a, b = int(pair[0]), int(pair[1])
+        return f"{anchor_short_label(a, n_anchors)}-{anchor_short_label(b, n_anchors)}"
 
     def _init_root_node_uncertainty(
         self,
@@ -6563,7 +6433,7 @@ class DiffusionForcingPlanning(
         When `single_step=True`, executes exactly one Selection→Expansion→Simulation→
         Backpropagation→EarlyTermination cycle and returns.
 
-        In bidirectional mode, `opposite_tree` provides all nodes from the other tree
+        In two-tree search, `opposite_tree` provides all nodes from the other tree
         so that dynamic goal selection can be performed via HILP across all candidates.
 
         Args:
@@ -7034,8 +6904,8 @@ class DiffusionForcingPlanning(
                         parent_levels_list, axis=0
                     )  # (b, plan_tokens(=t))
 
-                    # Generate bidirectional denoising schedule
-                    expanded_node_noise_levels = self._generate_bidirectional_schedule(
+                    # Generate the tree-conditioned denoising schedule for this batch.
+                    expanded_node_noise_levels = self._generate_tree_conditioned_schedule(
                         parent_levels,
                         prefix_len_per_batch=np.array(prefix_len_list, dtype=int),
                     )  # (b, m, plan_tokens(=t))
@@ -7234,7 +7104,7 @@ class DiffusionForcingPlanning(
                         for i in range(len(expanded_node_candidates))
                     ], dtype=int)
                     replan_noise_levels = (
-                        self._generate_bidirectional_schedule(
+                        self._generate_tree_conditioned_schedule(
                             replan_initial_levels,
                             prefix_len_per_batch=replan_prefix_len_per_batch,
                             is_replanning=True,
@@ -7786,7 +7656,7 @@ class DiffusionForcingPlanning(
         return tree, expanded_node_infos
 
     # =========================================================================
-    # Helper functions for bidirectional alternating MCTS
+    # Helper functions for alternating tree expansion and scheduling
     # =========================================================================
 
     def _sample_clamped_noise(self, n_tokens: int, batch_size: int = 1) -> torch.Tensor:
@@ -7799,58 +7669,6 @@ class DiffusionForcingPlanning(
         if self.leaf_parallelization:
             return self.parallel_search_num // len(self.mctd_guidance_scales)
         return self.parallel_search_num
-
-    def _collect_global_expansion_candidates(
-        self,
-        tree: MCTSTreeState,
-        opposite_tree: MCTSTreeState,
-    ) -> List[dict]:
-        """Collect expandable nodes from one tree for uncertainty-mode global ranking."""
-        candidates: List[dict] = []
-        for node in tree.get_all_nodes():
-            if node.obs is None or node.is_terminal():
-                continue
-            if not node.is_expandable(
-                consider_virtually_visited=(not self.parallel_multiple_visits)
-            ):
-                continue
-            candidates.append(
-                {
-                    "node": node,
-                    "tree": tree,
-                    "opposite_tree": opposite_tree,
-                    "value": node.value if node.value is not None else float("-inf"),
-                }
-            )
-        return candidates
-
-    def _select_global_expansion_parents(
-        self,
-        tree1: MCTSTreeState,
-        tree2: MCTSTreeState,
-    ) -> List[dict]:
-        """Select top-K expandable parents globally across both trees."""
-        remaining_budget = max(self.mctd_max_search_num - self.global_search_num, 0)
-        selection_budget = min(self._parent_selection_budget(), remaining_budget)
-        if selection_budget <= 0:
-            return []
-
-        candidate_pool = self._collect_global_expansion_candidates(tree1, tree2)
-        candidate_pool.extend(self._collect_global_expansion_candidates(tree2, tree1))
-        candidate_pool.sort(
-            key=lambda item: (
-                -float(item["value"]),
-                -int(item["node"].depth),
-                item["node"].name,
-            )
-        )
-        selected_parent_infos = candidate_pool[:selection_budget]
-        for parent_info in selected_parent_infos:
-            self.global_selection_count += 1
-            selection_count = self.global_selection_count
-            parent_info["selection_count"] = selection_count
-            parent_info["node"].last_selection_count = selection_count
-        return selected_parent_infos
 
     def _run_global_uncertainty_expansion_round(
         self,
@@ -8139,7 +7957,7 @@ class DiffusionForcingPlanning(
                         )
 
                 parent_levels = np.concatenate(parent_levels_list, axis=0)
-                expanded_node_noise_levels = self._generate_bidirectional_schedule(
+                expanded_node_noise_levels = self._generate_tree_conditioned_schedule(
                     parent_levels,
                     prefix_len_per_batch=np.array(prefix_len_list, dtype=int),
                 )
@@ -8303,7 +8121,7 @@ class DiffusionForcingPlanning(
                     ],
                     dtype=int,
                 )
-                replan_noise_levels = self._generate_bidirectional_schedule(
+                replan_noise_levels = self._generate_tree_conditioned_schedule(
                     replan_initial_levels,
                     prefix_len_per_batch=replan_prefix_len_per_batch,
                     is_replanning=True,
@@ -9292,98 +9110,6 @@ class DiffusionForcingPlanning(
         
         return best_info
 
-    def _select_round_plan_candidate(
-        self,
-        expanded_node_infos: dict[str, dict],
-        goal_normalized: Optional[torch.Tensor],
-        default_tree: Optional["MCTSTreeState"] = None,
-    ) -> dict:
-        """Evaluate this round's expanded children for meeting/fallback selection.
-
-        Selection policy:
-          1. Compute finite plan gaps for the round's expanded children only.
-          2. Fallback candidate = smallest gap among finite-gap candidates.
-          3. Meeting shortlist = candidates with gap < meeting_delta.
-          4. For shortlist only, build postprocessed plans and pick the shortest one.
-             Ties break on smaller total depth, then smaller gap.
-        """
-        result = {
-            "meeting_winner": None,
-            "round_fallback": None,
-            "meeting_candidates": [],
-            "finite_gap_candidates": [],
-        }
-        if not expanded_node_infos:
-            return result
-
-        plan_tokens = self._require_current_plan_tokens()
-        finite_gap_candidates: list[dict] = []
-        meeting_candidates: list[dict] = []
-
-        for info in expanded_node_infos.values():
-            node: Optional["TreeNode"] = info.get("node")
-            if node is None:
-                continue
-
-            selected_tree = info.get("selected_tree", default_tree)
-            if selected_tree is None:
-                continue
-
-            reverse_output = not self._tree_uses_forward_prefix_semantics(selected_tree)
-            gap = self._compute_plan_gap(
-                node,
-                plan_tokens,
-            )
-            if gap is None or not np.isfinite(gap):
-                continue
-
-            target_depth = node.target_node.depth if node.target_node is not None else 0
-            candidate_eval = {
-                "info": info,
-                "node": node,
-                "selected_tree": selected_tree,
-                "reverse_output": reverse_output,
-                "gap": float(gap),
-                "total_depth": int(node.depth + target_depth),
-            }
-            finite_gap_candidates.append(candidate_eval)
-
-            if gap < self.meeting_delta:
-                candidate_eval.update(
-                    self._build_postprocessed_plan_from_node(
-                        node,
-                        plan_tokens=plan_tokens,
-                        reverse_output=reverse_output,
-                        goal_normalized=goal_normalized,
-                    )
-                )
-                meeting_candidates.append(candidate_eval)
-
-        if finite_gap_candidates:
-            result["round_fallback"] = min(
-                finite_gap_candidates,
-                key=lambda cand: (
-                    cand["gap"],
-                    cand["total_depth"],
-                    cand["node"].name,
-                ),
-            )
-
-        if meeting_candidates:
-            result["meeting_winner"] = min(
-                meeting_candidates,
-                key=lambda cand: (
-                    cand["postprocessed_len"],
-                    cand["total_depth"],
-                    cand["gap"],
-                    cand["node"].name,
-                ),
-            )
-
-        result["meeting_candidates"] = meeting_candidates
-        result["finite_gap_candidates"] = finite_gap_candidates
-        return result
-
     def _run_multi_tree_online_hamiltonian_planner(
         self,
         horizon: int,
@@ -9435,22 +9161,20 @@ class DiffusionForcingPlanning(
 
         loops = 0
         termination_reason = "unknown"
-        while loops < self.val_max_loops:
-            if self.time_limit is not None and (time.time() - self.start_time > self.time_limit):
-                termination_reason = "time_limit"
-                break
-            if self.global_search_num >= self.mctd_max_search_num:
-                termination_reason = "search_budget"
-                break
-            if self._all_multi_tree_anchors_satisfied(planner_state):
-                termination_reason = "all_anchors_satisfied"
-                break
 
-            loops += 1
+        def _multi_tree_pre_round_check() -> Optional[str]:
+            if self.time_limit is not None and (time.time() - self.start_time > self.time_limit):
+                return "time_limit"
+            if self.global_search_num >= self.mctd_max_search_num:
+                return "search_budget"
+            if self._all_multi_tree_anchors_satisfied(planner_state):
+                return "all_anchors_satisfied"
+            return None
+
+        def _multi_tree_run_round(current_loop: int) -> dict:
             selected_parent_infos = self._select_multi_tree_expansion_parents(planner_state)
             if not selected_parent_infos:
-                termination_reason = "no_selected_parents"
-                break
+                return {"stop": True, "termination_reason": "no_selected_parents"}
 
             self.global_search_num += len(selected_parent_infos)
             global_search_pbar.update(len(selected_parent_infos))
@@ -9468,7 +9192,7 @@ class DiffusionForcingPlanning(
                 envs,
                 start,
                 goal,
-                loops,
+                current_loop,
                 namespace=namespace,
                 log_videos_and_viz=False,
             )
@@ -9487,7 +9211,7 @@ class DiffusionForcingPlanning(
             self._accept_multi_tree_round_meetings(
                 planner_state=planner_state,
                 accepted_candidates=accepted_candidates,
-                loops=loops,
+                loops=current_loop,
             )
             self._compute_tentative_hamiltonian_solution(planner_state)
             original_step_captures = getattr(self, "_expansion_step_captures_by_name", {})
@@ -9497,18 +9221,25 @@ class DiffusionForcingPlanning(
                         tree_batch,
                         start,
                         goal,
-                        loops,
+                        current_loop,
                         namespace=namespace,
                     )
             finally:
                 self._expansion_step_captures_by_name = original_step_captures
-        else:
-            termination_reason = "val_max_loops"
+            return {"stop": False}
 
-        for tree in planner_state["trees"]:
-            if tree.pbar is not None:
-                tree.pbar.close()
-        global_search_pbar.close()
+        try:
+            loop_result = self._run_anchor_policy_loop(
+                pre_round_check=_multi_tree_pre_round_check,
+                run_round=_multi_tree_run_round,
+            )
+            loops = int(loop_result["loops"])
+            termination_reason = str(loop_result["termination_reason"])
+        finally:
+            self._close_anchor_search_progress_bars(
+                list(planner_state["trees"]),
+                global_search_pbar=global_search_pbar,
+            )
 
         selected_plan_bundle = self._assemble_multi_tree_plan_bundle(planner_state)
         accepted_pairs_text = ", ".join(
@@ -9546,8 +9277,7 @@ class DiffusionForcingPlanning(
     ) -> str:
         """Build a human-readable path label for plan visualization.
 
-        Multi-tree mode uses anchor-name-prefixed labels. Legacy bidirectional
-        mode keeps the forward/backward presentation used by existing videos.
+        All active planning paths now use anchor-name-prefixed labels.
 
         Args:
             expanding_node: The TreeNode just expanded.
@@ -9557,42 +9287,16 @@ class DiffusionForcingPlanning(
         Returns:
             Label string for video/log keys.
         """
-        exp_parts = expanding_node.name.split("-")  # e.g. ["0","1","3"]
-
-        if self._is_multi_tree_anchor_tree(active_tree):
-            if exp_parts:
-                exp_parts[-1] = f"({exp_parts[-1]})"
-            expanding_label = "-".join(exp_parts) if exp_parts else "(?)"
-            source_anchor = self._node_anchor_name(
-                expanding_node,
-                getattr(active_tree, "anchor_name", "?") if active_tree is not None else "?",
-            )
-            if target_node is None:
-                return f"{source_anchor}:{expanding_label}"
-            target_anchor = self._node_anchor_name(target_node)
-            target_label = "-".join(target_node.name.split("-"))
-            return f"{source_anchor}:{expanding_label}__{target_anchor}:{target_label}"
-
-        if target_node is not None:
-            tgt_parts = target_node.name.split("-")  # e.g. ["0","2","5"]
-        else:
-            tgt_parts = ["?"]
-
-        is_forward_tree = self._tree_uses_forward_prefix_semantics(active_tree)
-        if is_forward_tree:
-            # Forward side: root → ... → (expanding_node)  e.g. "0-2-(5)"
-            fwd_parts = exp_parts[:-1] + [f"({exp_parts[-1]})"]
-            fwd_label = "-".join(fwd_parts)
-
-            # Backward side: target_node → ... → backward_root  e.g. "3-1-0"
-            bwd_label = "-".join(reversed(tgt_parts))
-        else:
-            # Forward side: root → ... → target_node  e.g. "0-2-5"
-            fwd_label = "-".join(tgt_parts)
-
-            # Backward side: (expanding_node) → ... → backward_root  e.g. "(3)-1-0"
-            bwd_parts = list(reversed(exp_parts))
-            bwd_parts[0] = f"({bwd_parts[0]})"
-            bwd_label = "-".join(bwd_parts)
-
-        return f"{fwd_label}_{bwd_label}"
+        exp_parts = expanding_node.name.split("-")
+        if exp_parts:
+            exp_parts[-1] = f"({exp_parts[-1]})"
+        expanding_label = "-".join(exp_parts) if exp_parts else "(?)"
+        source_anchor = self._node_anchor_name(
+            expanding_node,
+            getattr(active_tree, "anchor_name", "?") if active_tree is not None else "?",
+        )
+        if target_node is None:
+            return f"{source_anchor}:{expanding_label}"
+        target_anchor = self._node_anchor_name(target_node)
+        target_label = "-".join(target_node.name.split("-"))
+        return f"{source_anchor}:{expanding_label}__{target_anchor}:{target_label}"

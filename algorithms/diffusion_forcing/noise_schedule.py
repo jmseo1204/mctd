@@ -3,7 +3,7 @@ Noise schedule construction utilities for Diffusion Forcing planning.
 
 Provides NoiseScheduleMixin — a mixin class whose methods handle:
   - Building per-step noise level tensors (_construct_noise_levels)
-  - Generating bidirectional denoising schedules (_generate_bidirectional_schedule)
+  - Generating tree-conditioned denoising schedules (_generate_tree_conditioned_schedule)
   - Overriding the base noise level sampler for training (_generate_noise_levels)
 
 Intended to be inherited by DiffusionForcingPlanning alongside DiffusionForcingBase.
@@ -41,7 +41,7 @@ class NoiseScheduleMixin:
             batch_size: Batch size
             stabilization: Noise level for parent obs token (typically 0-2)
             pad_tokens: Number of padding tokens
-            include_final_token: Whether to include final_token (bidirectional mode)
+            include_final_token: Whether to include final_token
             include_init_token: Whether to prepend init_token slot (pre-built format always False).
 
         Returns:
@@ -70,7 +70,7 @@ class NoiseScheduleMixin:
 
         return result
 
-    def _generate_bidirectional_schedule(
+    def _generate_tree_conditioned_schedule(
         self,
         start_levels: np.ndarray,
         prefix_len_per_batch: Optional[np.ndarray] = None,
@@ -78,7 +78,7 @@ class NoiseScheduleMixin:
         num_denoising_steps_override: Optional[int] = None,
     ) -> np.ndarray:
         """
-        Generates the N-step denoising schedule for bidirectional search.
+        Generates the N-step denoising schedule for tree-conditioned search.
         Returns a tensor of shape (B, Steps, T) representing the sequence of noise levels.
 
         If complete_denoising=True, continues denoising all remaining segments until all

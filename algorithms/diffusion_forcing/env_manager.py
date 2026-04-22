@@ -1,5 +1,5 @@
 """
-Environment Manager for bidirectional planning.
+Environment Manager for two-tree planning.
 
 This module manages the creation and maintenance of dual environments:
 - envs_forward: for tree1 planning (start -> goal)
@@ -17,7 +17,7 @@ to auto-reset.
 SOLUTION IMPLEMENTED:
 - For backward planning, we need to swap the internal goal to be the start position.
 - Since OGBench doesn't allow goal modification after set_task(), we use a state tracking
-  approach: before executing plans in the backward environment, we save the intended final
+  approach: before executing plans in the goal-rooted environment, we save the intended final
   position and skip the done-triggered auto-reset logic in the planning code.
 
 FUTURE IMPROVEMENT:
@@ -41,7 +41,7 @@ OGBENCH_ENVS = [
 
 class EnvironmentManager:
     """
-    Manages dual environments for bidirectional planning.
+    Manages dual environments for two-tree planning.
     
     - envs_forward: start -> goal (tree1)
     - envs_backward: goal -> start (tree2)
@@ -79,7 +79,8 @@ class EnvironmentManager:
         env_fns,
     ) -> Tuple[DummyVecEnv, DummyVecEnv]:
         """
-        Create two environments: one for forward planning, one for backward.
+        Create two environments: one for the start-rooted tree and one for the
+        goal-rooted tree.
         
         Args:
             env_fns: List of environment factory functions
@@ -90,7 +91,7 @@ class EnvironmentManager:
         # Create forward environment (tree1: start -> goal)
         self.envs_forward = DummyVecEnv(env_fns)
         
-        # Create backward environment (tree2: goal -> start)
+        # Create the goal-rooted environment (tree2: goal -> start)
         # Use the same factory functions
         self.envs_backward = DummyVecEnv(env_fns)
         
@@ -111,8 +112,8 @@ class EnvironmentManager:
     
     def _configure_ogbench_envs(self) -> None:
         """Configure OGBench environments with task IDs."""
-        # Both forward and backward envs get the same task
-        # (the direction difference comes from goal-setting in planning code)
+        # Both environments get the same task.
+        # Directionality comes from the planning-side goal handling.
         for env_set in [self.envs_forward, self.envs_backward]:
             for i, env in enumerate(env_set.envs):
                 actual_task_id = self.task_id + i

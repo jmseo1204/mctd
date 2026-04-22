@@ -393,7 +393,7 @@ def main():
     parser.add_argument("--segment_episode_len", type=int, default=None,
                         help="Override segment_episode_len (raw, pre-jump). Defaults to value in df_planning.yaml.")
     parser.add_argument("--use_anchor_planner", action="store_true",
-                        help="Enable the anchor-planner path (2-anchor compat or multi-anchor native).")
+                        help="Enable the native anchor-planner path.")
     parser.add_argument("--task_override_path", type=str, default=None,
                         help="Optional task override YAML path relative to repo root.")
     parser.add_argument("--task_override_waypoint_group_idx", type=int, default=None,

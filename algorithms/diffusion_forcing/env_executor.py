@@ -167,7 +167,7 @@ class PlanExecutorMixin:
             plan_slice_np = plan_frame_format[:, 0, :].detach().cpu().numpy()  # (T*fs, c)
             # Find the plan frame nearest to the agent's current position, then start
             # sub_goal_interval ahead of it.  This handles the case where plan_frame_format
-            # is an accumulated FWD+BWD plan that starts from the episode origin (52, 28),
+            # is an accumulated assembled plan that starts from the episode origin (52, 28),
             # while the agent has already advanced deep into the maze.
             _n_frames = plan_slice_np.shape[0]
             _plan_obs = plan_slice_np[:, self.obs_bundle_indices]  # (T*fs, n_obs)

@@ -40,6 +40,19 @@ def _fmt_sci(v: float) -> str:
     return s
 
 
+def _fmt_optional_float(v: Optional[float]) -> str:
+    """Format optional float for debug logging."""
+    if v is None:
+        return "None"
+    try:
+        v_float = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if not math.isfinite(v_float):
+        return str(v_float)
+    return f"{v_float:.6f}"
+
+
 class PlanVizMixin:
     """Mixin providing plan visualization methods."""
 
@@ -319,6 +332,15 @@ class PlanVizMixin:
         alen = self._get_denoised_frame_prefix_len(vnode.depth, seg_size, hist.shape[1])
         target_node = getattr(vnode, "target_node", None) or vinfo.get("target_node")
         meeting_target_node = vinfo.get("meeting_target_node")
+        pairwise_meeting_alias = (
+            meeting_target_node is None
+            and target_node is not None
+            and not self._is_multi_tree_anchor_tree(active_tree)
+        )
+        if pairwise_meeting_alias:
+            # Pairwise two-anchor visualization may not store a separate
+            # meeting_target_node; reuse vnode.target_node in that case.
+            meeting_target_node = target_node
 
         if is_uncertainty_viz and plan_hist_override is not None:
             # In uncertainty mode the endpoint is the NEXT segment boundary.
@@ -423,7 +445,10 @@ class PlanVizMixin:
                 or getattr(meeting_target_node, "anchor_name", None)
                 or "?"
             )
-            meeting_target_label = f"Meeting Target ({meeting_target_anchor})"
+            if pairwise_meeting_alias:
+                meeting_target_label = f"Meeting Target (= Target, {meeting_target_anchor})"
+            else:
+                meeting_target_label = f"Meeting Target ({meeting_target_anchor})"
 
         # Heatmap & grad-field for this candidate's target, cached by target name.
         cand_heatmap = None
@@ -721,14 +746,37 @@ class PlanVizMixin:
             if log_namespace
             else log_prefix
         )
+        video_key = f"{video_key_prefix}/plan_at_{label_with_count}"
+        plan_tokens = self._require_current_plan_tokens()
+        value_target_gap = self._compute_plan_gap_to_target(
+            vnode,
+            target_node,
+            plan_tokens,
+        )
+        meeting_gap = self._compute_plan_gap_to_target(
+            vnode,
+            meeting_target_node,
+            plan_tokens,
+        )
+        print(
+            "[meeting-debug] "
+            f"video_key={video_key} "
+            f"selection_count={selection_count:03d} "
+            f"node={getattr(vnode, 'name', None)} "
+            f"value_target={getattr(target_node, 'name', None)} "
+            f"meeting_target={getattr(meeting_target_node, 'name', None)} "
+            f"value_target_gap={_fmt_optional_float(value_target_gap)} "
+            f"meeting_gap={_fmt_optional_float(meeting_gap)}",
+            flush=True,
+        )
         video_step = self.reserve_wandb_step(min_step=loops)
         print(
-            f"[wandb-video-debug] key={video_key_prefix}/plan_at_{label_with_count} shape={video.shape} "
+            f"[wandb-video-debug] key={video_key} shape={video.shape} "
             f"dtype={video.dtype} fps=4 step={video_step}",
             flush=True,
         )
         self.log_video(
-            f"{video_key_prefix}/plan_at_{label_with_count}",
+            video_key,
             video,
             fps=4,
             step=video_step,

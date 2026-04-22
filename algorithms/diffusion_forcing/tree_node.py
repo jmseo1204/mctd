@@ -47,8 +47,8 @@ class TreeNode():
         # Child nodes: set after _rollout_leaf_plan() in the interact loop.
         self.obs: Optional[np.ndarray] = obs
         self.sim_state: Optional[dict] = sim_state
-        # The opposite tree's leaf node that this node targets during bidirectional search.
-        # Set by _select_dynamic_goal() in _run_mcts_search().
+        # The opposite tree's leaf node that this node currently targets in paired-tree search.
+        # Set by dynamic target selection during planning.
         self.target_node: Optional['TreeNode'] = target_node
         # Global selection-event counter bookkeeping.
         # selection_count: count at which this node itself was created.

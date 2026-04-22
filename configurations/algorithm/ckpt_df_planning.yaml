@@ -8,7 +8,7 @@
 
 # ── Training data identity ────────────────────────────────────────────────────
 # train_dataset_config: Hydra dataset config name (configurations/dataset/<name>.yaml)
-train_dataset_config: "antmaze_teleport_stitch"
+train_dataset_config: "antmaze_medium_stitch"
 # jump: frame stride for training data. Saved to ckpt for eval-time recovery.
 jump: 5
 
