@@ -172,7 +172,11 @@ class PlanExecutorMixin:
             _n_frames = plan_slice_np.shape[0]
             _plan_obs = plan_slice_np[:, self.obs_bundle_indices]  # (T*fs, n_obs)
             _cur_rep = np.broadcast_to(obs_flat.reshape(1, -1), (_n_frames, _plan_obs.shape[1])).copy()
-            dists_to_plan = self._compute_distance(_plan_obs, _cur_rep)
+            dists_to_plan = self._compute_distance(
+                _cur_rep,
+                _plan_obs,
+                mode="execution_sequence",
+            )
             nearest_frame = int(np.argmin(dists_to_plan))
             sub_goal_idx = min(nearest_frame + self.sub_goal_interval, plan_frame_format.shape[0] - 1)
             sub_goal_pos = plan_slice_np[sub_goal_idx, self.pos_dim_indices]
@@ -209,7 +213,13 @@ class PlanExecutorMixin:
                 _dist_t0 = time.time()
                 _cur_obs = np.concatenate([current_sim_state["qpos"], current_sim_state["qvel"]])[self.obs_dim_indices].reshape(1, -1)
                 _sg_obs = np.concatenate([sub_goal_sim_state["qpos"], sub_goal_sim_state["qvel"]])[self.obs_dim_indices].reshape(1, -1)
-                dist_to_sg = float(self._compute_distance(_cur_obs, _sg_obs)[0])
+                dist_to_sg = float(
+                    self._compute_distance(
+                        _cur_obs,
+                        _sg_obs,
+                        mode="execution_sequence",
+                    )[0]
+                )
                 _dist_ms.append((time.time() - _dist_t0) * 1000)
 
                 if dist_to_sg < self.meeting_delta:

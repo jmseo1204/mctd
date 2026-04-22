@@ -13,9 +13,12 @@ class TreeNode():
                  obs: Optional[np.ndarray] = None,
                  sim_state: Optional[dict] = None,
                  target_node: Optional['TreeNode'] = None,
+                 source_is_left: bool = True,
                  selection_count: Optional[int] = None,
                  cluster_subplans: Optional[list] = None,
-                 cum_temporal_dist_from_root: float = 0.0):
+                 cum_temporal_dist_from_root: float = 0.0,
+                 cum_temporal_dist_to_root: float = 0.0,
+                 direction_reason: Optional[str] = None):
         self.name = name
         self.depth = depth
         self._parent_node = parent_node
@@ -50,6 +53,11 @@ class TreeNode():
         # The opposite tree's leaf node that this node currently targets in paired-tree search.
         # Set by dynamic target selection during planning.
         self.target_node: Optional['TreeNode'] = target_node
+        # Route-direction context for this node's current target relation.
+        # Symmetric HILP ignores this, but directional HILP reuses it in guidance,
+        # postprocessing, and debugging without creating a separate pipeline.
+        self.source_is_left: bool = bool(source_is_left)
+        self.direction_reason: Optional[str] = direction_reason
         # Global selection-event counter bookkeeping.
         # selection_count: count at which this node itself was created.
         # last_selection_count: latest count at which this node was selected as a parent.
@@ -58,6 +66,9 @@ class TreeNode():
         # Running temporal distance from this tree's root to the node.
         # Root nodes start at 0.0; children are updated after obs is materialized.
         self.cum_temporal_dist_from_root: float = float(cum_temporal_dist_from_root)
+        # Running temporal distance from the node back to this tree's root.
+        # For symmetric HILP this equals cum_temporal_dist_from_root.
+        self.cum_temporal_dist_to_root: float = float(cum_temporal_dist_to_root)
 
         # Per-cluster sub-plans derived from uncertainty sampling.
         # Populated after _compute_node_uncertainty when use_cluster_subplan_as_expansion=True.

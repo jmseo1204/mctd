@@ -27,6 +27,26 @@ from typing import List, Optional
 import numpy as np
 
 
+def resolve_hilp_aggregator(
+    checkpoint_path: str,
+    cfg_value: Optional[str] = None,
+) -> str:
+    """Resolve the HILP aggregator for a checkpoint.
+
+    Teleport checkpoints are assumed to use directional quasimetric HILP.
+    Non-teleport checkpoints keep the legacy symmetric default unless an
+    explicit override is provided.
+    """
+    if cfg_value is not None:
+        value = str(cfg_value).strip()
+        if value:
+            return value
+    ckpt_name = os.path.basename(str(checkpoint_path)).lower()
+    if "teleport" in ckpt_name:
+        return "quasimetric"
+    return "neg_l2"
+
+
 # ---------------------------------------------------------------------------
 # HILPMemoizedWrapper
 # ---------------------------------------------------------------------------
@@ -95,6 +115,10 @@ class HILPMemoizedWrapper:
         """Compute scalar value from embeddings → (N,) float32."""
         if self._aggregator == "neg_l2":
             dist_sq = ((psi - phi_g) ** 2).sum(axis=-1)
+            return -np.sqrt(np.maximum(dist_sq, 1e-6)).astype(np.float32)
+        if self._aggregator == "quasimetric":
+            relu_diff = np.maximum(psi - phi_g, 0.0)
+            dist_sq = (relu_diff ** 2).sum(axis=-1)
             return -np.sqrt(np.maximum(dist_sq, 1e-6)).astype(np.float32)
         else:  # inner_prod
             return (psi * phi_g).sum(axis=-1).astype(np.float32)
@@ -174,6 +198,38 @@ class HILPMemoizedWrapper:
             grads[:, dim] = (self._aggregate(psi_p, phi_g) - self._aggregate(psi_m, phi_g)) / (2 * eps)
         return grads
 
+    def compute_grads_wrt_second_arg(
+        self,
+        obs_np: np.ndarray,
+        goal_np: np.ndarray,
+        eps: float = 0.5,
+    ) -> np.ndarray:
+        """∂V(obs, goal)/∂goal[:2] via finite differences on the memoized grid."""
+        N = obs_np.shape[0]
+        obs_np = obs_np.astype(np.float32)
+        if goal_np.shape[0] == 1:
+            goal_rep = np.broadcast_to(goal_np[:1], (N, goal_np.shape[-1])).copy()
+        else:
+            if goal_np.shape[0] != N:
+                raise ValueError(
+                    f"goal_np.shape[0]={goal_np.shape[0]} must be 1 or match obs batch size {N}"
+                )
+            goal_rep = goal_np.copy()
+        goal_rep = goal_rep.astype(np.float32)
+        xi_s, yi_s = self._xy_to_fidx(obs_np)
+        psi = self._bilinear(self._psi_grids[0], xi_s, yi_s)
+
+        grads = np.zeros((N, 2), dtype=np.float32)
+        for dim in range(2):
+            goal_p = goal_rep.copy(); goal_p[:, dim] += eps
+            goal_m = goal_rep.copy(); goal_m[:, dim] -= eps
+            phi_g_p = self._bilinear(self._phi_g_grids[0], *self._xy_to_fidx(goal_p))
+            phi_g_m = self._bilinear(self._phi_g_grids[0], *self._xy_to_fidx(goal_m))
+            grads[:, dim] = (
+                self._aggregate(psi, phi_g_p) - self._aggregate(psi, phi_g_m)
+            ) / (2 * eps)
+        return grads
+
 
 # ---------------------------------------------------------------------------
 # Raw model loader
@@ -184,6 +240,7 @@ def load_raw_hilp_model(
     device,
     hilp_obs_dim: int = 29,
     hilp_skill_dim: int = 256,
+    hilp_aggregator: Optional[str] = None,
 ):
     """Load raw HILP (.pt) or HILPJax (.pkl) from checkpoint.
 
@@ -207,7 +264,11 @@ def load_raw_hilp_model(
         os.makedirs(os.path.join(_jax_cache, "xla_gpu_per_fusion_autotune_cache_dir"), exist_ok=True)
         jax.config.update("jax_compilation_cache_dir", _jax_cache)
         from td_models.hilp import HILPJax
-        model = HILPJax(checkpoint_path, device)
+        model = HILPJax(
+            checkpoint_path,
+            device,
+            aggregator=resolve_hilp_aggregator(checkpoint_path, hilp_aggregator),
+        )
     else:
         from td_models.hilp import HILP
         import torch
@@ -301,7 +362,7 @@ def _load_memo_from_cache(cache_path: str, device) -> HILPMemoizedWrapper:
         x_max=float(data["x_max"]),
         y_min=float(data["y_min"]),
         y_max=float(data["y_max"]),
-        aggregator="neg_l2",
+        aggregator=str(data["aggregator"]) if "aggregator" in data else "neg_l2",
         device=device,
     )
 
@@ -311,7 +372,7 @@ def _save_memo_cache(wrapper: HILPMemoizedWrapper, cache_path: str) -> None:
     save_dict = {
         "psi_grid_0":   wrapper._psi_grids[0],
         "phi_g_grid_0": wrapper._phi_g_grids[0],
-        "aggregator":   np.array("neg_l2"),
+        "aggregator":   np.array(wrapper._aggregator),
         "x_min": np.float32(wrapper._x_min),
         "x_max": np.float32(wrapper._x_max),
         "y_min": np.float32(wrapper._y_min),
@@ -335,6 +396,7 @@ def get_hilp_fn(
     # raw model params (ignored when cache hit)
     hilp_obs_dim: int = 29,
     hilp_skill_dim: int = 256,
+    hilp_aggregator: Optional[str] = None,
     # memoization params
     grid_size: int = 100,
     x_min: float = 0.0, x_max: float = 1.0,
@@ -359,13 +421,24 @@ def get_hilp_fn(
         Raw HILP / HILPJax model  OR  HILPMemoizedWrapper.
         Both expose .value(obs_t, goal_t) → (v1, v2) and .eval() / .parameters().
     """
+    resolved_aggregator = resolve_hilp_aggregator(checkpoint_path, hilp_aggregator)
+
     if not use_memoization:
-        return load_raw_hilp_model(checkpoint_path, device, hilp_obs_dim, hilp_skill_dim)
+        return load_raw_hilp_model(
+            checkpoint_path,
+            device,
+            hilp_obs_dim,
+            hilp_skill_dim,
+            hilp_aggregator=resolved_aggregator,
+        )
 
     # Derive cache path: <ckpt_dir>/<ckpt_stem>_memo_G<G>.npz
     ckpt_dir  = os.path.dirname(os.path.abspath(checkpoint_path))
     ckpt_stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
-    cache_path = os.path.join(ckpt_dir, f"{ckpt_stem}_memo_G{grid_size}.npz")
+    cache_path = os.path.join(
+        ckpt_dir,
+        f"{ckpt_stem}_memo_G{grid_size}_{resolved_aggregator}.npz",
+    )
 
     if os.path.exists(cache_path):
         print(f"[HILP memo] Loading grid cache  G={grid_size}  {cache_path}", flush=True)
@@ -373,7 +446,13 @@ def get_hilp_fn(
 
     # Cache miss — build from loaded model
     print(f"[HILP memo] Cache not found — building G={grid_size} grid → {cache_path}", flush=True)
-    hilp_model = load_raw_hilp_model(checkpoint_path, device, hilp_obs_dim, hilp_skill_dim)
+    hilp_model = load_raw_hilp_model(
+        checkpoint_path,
+        device,
+        hilp_obs_dim,
+        hilp_skill_dim,
+        hilp_aggregator=resolved_aggregator,
+    )
     wrapper = _build_memo_grids(
         hilp_model,
         grid_size=grid_size,

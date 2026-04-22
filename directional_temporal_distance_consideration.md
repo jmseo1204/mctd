@@ -15,6 +15,388 @@ hilp가 사용되는 코드 범위를 리스팅했다면, 다음으로 해야할
 
 ---
 
+## 2026-04-23 감사 결과 / 구현 계획 보강
+
+이 절은 아래 기존 계획 중
+
+- `execution_sequence`
+- `unordered_equivalence`
+- `source_is_left propagation`
+- `_check_plan_batch_feasibility`
+
+관련 항목을 **supersede**한다. 이유는 현재 코드가 `route edge` 방향 주입은 일부 반영했지만,
+`plan/frame sequence` 계층과 `source_is_left 유실 경로`에는 아직 prompt의 일반 multi-waypoint
+가정이 완전히 반영되지 않았기 때문이다.
+
+### 1. 감사 결론
+
+현재 구현은 아래 두 부분으로 나뉜다.
+
+- **이미 방향성이 잘 반영된 축**
+  - ordered anchor-pair repository
+  - directional root-cost / bridge-cost matrix
+  - target selection / dynamic goal selection의 `source_is_left`
+  - guidance의 backward mask
+  - meeting acceptance에서 left/right node 재정렬
+  - fixed temporal route용 ordered temporal matrix
+
+- **아직 prompt를 완전히 반영하지 못한 축**
+  - `check feasibility`와 그 caller들
+  - `_compute_node_uncertainty`
+  - `plan_history` / segment slice를 읽는 frame-order-sensitive helper들
+  - active anchor runtime 내부의 `source_is_left` silent fallback
+  - sibling dedup / tail clustering의 `unordered_equivalence` 사용
+
+핵심 원인은 다음이다.
+
+- 현재 multi-anchor runtime은 tree storage를 모두 `anchor-root -> outward`의 **local canonical order**로 유지한다.
+- 이 자체는 맞다. prompt도 "별도 backward pipeline"이 아니라 "기존 pipeline + 방향 정보 주입"을 요구한다.
+- 하지만 몇몇 HILP call site는 여전히
+  - 저장된 tensor/frame 순서를 곧바로 TD 방향으로 간주하거나,
+  - `source_is_left`가 비어 있으면 `_tree_uses_forward_prefix_semantics(...)`로 대체하거나,
+  - 방향이 정의되지 않는 pairwise equivalence를 임시로 symmetric reduction(`max(TD(a→b), TD(b→a))`)으로 처리한다.
+
+즉, 현재 구현은 `route-level direction injection`은 들어갔지만, `frame-level sequence direction`
+과 `fallback-less propagation contract`는 아직 완성되지 않았다.
+
+### 2. 수정이 필요한 코드 범위
+
+아래는 현재 코드 감사 기준의 **전체 HILP/TD 관련 범위**와 상태다.
+
+#### 2-1. 이미 prompt와 합치되는 지점
+
+- `df_planning.py::_init_multi_tree_planner_state`
+  - ordered `(i, j)` root cost를 모두 계산한다.
+- `df_planning.py::_build_pairwise_anchor_selection_state`
+  - 2-anchor case도 ordered cost를 유지한다.
+- `df_planning.py::_select_multi_tree_target_node`
+  - target tree가 정해진 뒤 `source_anchor_idx`, `target_anchor_idx` 기준으로 방향을 계산한다.
+- `df_planning.py::_select_dynamic_goal`
+  - `source_is_left`를 받아 `V(source, target)` / `V(target, source)`를 구분한다.
+- `df_planning.py::_update_multi_tree_direct_bridges_from_expansions`
+  - 양 방향 ordered bridge를 따로 업데이트한다.
+- `df_planning.py::_repair_missing_pair_connection`
+  - ordered pair 기준으로 repair한다.
+- `df_planning.py::_select_multi_tree_round_meetings`
+  - meeting candidate를 left/right node로 재정렬한 뒤 route 방향으로 TD를 계산한다.
+- `guidance.py`
+  - backward guidance mask와 `compute_grads_wrt_second_arg`가 들어가 있다.
+- `plan_viz.py`
+  - heatmap / grad-field가 `source_is_left`를 받는다.
+- `env_executor.py`
+  - 이미 assembled S→G plan을 기준으로 nearest-frame / sub-goal matching을 한다.
+- `utils/route_metric_utils.py::compute_pairwise_temporal_distance_matrix`
+  - ordered `src -> dst` temporal matrix를 만든다.
+
+#### 2-2. prompt 기준으로 추가 수정이 필요한 지점
+
+- `df_planning.py::_check_plan_batch_feasibility`
+  - 현재는 저장된 frame order를 그대로 `state_t -> state_{t+1}`로 본다.
+  - reverse-edge candidate의 sequence direction contract가 없다.
+- `df_planning.py::_compute_node_uncertainty`
+  - 아직 `source_is_left`를 받지 않고 `TD(curr_obs -> target_obs)`를 하드코딩한다.
+- `df_planning.py::_compute_uncertainty_and_clusters`
+  - `_check_plan_batch_feasibility(...)` 호출 시 sequence direction을 넘기지 않는다.
+  - `_compute_node_uncertainty(...)` 호출 시도 direction-less다.
+- `df_planning.py::_run_global_uncertainty_expansion_round`
+  - expansion/replan feasibility 호출에 direction flag를 넘기지 않는다.
+  - uncertainty sampling / uncertainty compute 경로는 `source_is_left`를 가지고 있으나 일부 fallback이 남아 있다.
+- `df_planning.py::_run_multi_tree_online_hamiltonian_planner`
+  - mixed-parent expansion path에서도 feasibility / uncertainty call에 direction 주입이 빠져 있다.
+- `df_planning.py::_ensure_uncertainty_roots_initialized_multi`
+  - 현재는 `target_info["source_is_left"]`를 받지만, 이후 uncertainty 하위 helper까지 mandatory contract로 강제되지 않는다.
+- `plan_postproc.py::_extract_new_segment_obs`
+  - 여전히 "모든 tree가 uniform forward prefix semantics"라는 가정이 주석/contract에 남아 있다.
+  - storage는 그대로 두되, frame-order-sensitive caller가 execution-view를 요청할 수 있어야 한다.
+- `plan_postproc.py::_extract_node_obs_slice`
+  - `reverse`는 있지만 route/sequence contract 이름이 아니다.
+  - left/right route semantics를 더 명시적으로 받는 wrapper가 필요하다.
+- `plan_postproc.py::_deduplicate_by_endpoint`
+  - 현재 duplicate 판정은 `mode="unordered_equivalence"`를 쓴다.
+  - 이는 earlier user decision인 "그쪽도 directional TD 사용"과 충돌한다.
+- `df_planning.py::_compute_node_uncertainty`
+  - tail clustering에서 `_compute_unordered_equivalence_temporal_dist_np`를 쓴다.
+  - 이것도 같은 이유로 재검토 대상이다.
+
+### 3. 이번 보강에서 확정하는 설계 불변식
+
+#### 3-1. Storage invariant
+
+- `TreeNode.plan_history`와 `parallel_plan()`의 출력 tensor는 계속 **anchor-root local canonical order**로 저장한다.
+- 즉, multi-waypoint directional 지원을 위해 tree 자체를 backward tree로 바꾸지 않는다.
+- prompt의 요구대로 기존 pipeline을 유지하고, 방향 정보는 **읽는 쪽 helper**에서 주입한다.
+
+#### 3-2. Route-direction invariant
+
+- route-edge HILP 호출은 모두 `source_tree`, `target_tree`의 anchor 인덱스와 현재 tentative route를 통해
+  direction을 계산한다.
+- `reliable_TD_threshold` 때문에 non-neighbor target을 잡은 경우의 fallback rule은 아래 helper 하나에 모은다.
+
+```text
+resolve_route_direction(source_anchor, target_anchor):
+  1. tentative route 상 adjacent면 route order를 따른다.
+  2. source == S 이면 forward
+  3. target == G 이면 forward
+  4. source == G 이면 backward
+  5. target == S 이면 backward
+  6. 둘 다 waypoint면 forward 고정
+```
+
+즉, prompt에서 말한 예외사항은 `_is_source_left_of_target(...)`의 계약으로 **명시화**하고,
+"왜 이 방향이 선택되었는지"도 debug log에 남긴다.
+
+#### 3-3. Sequence-direction invariant
+
+- frame-to-frame / prefix-to-tail / plan-history slice 같은 **sequence-sensitive** TD 호출은
+  더 이상 저장된 tensor 순서만으로 방향을 정하지 않는다.
+- 각 call site는 아래 둘 중 하나를 명시해야 한다.
+  - `route_execution`
+    - 현재 candidate가 global route에서 left side인지 right side인지에 따라 TD argument order를 정함
+  - `local_generation`
+    - diffusion output의 local forward order 그대로 TD argument order를 정함
+
+이 둘은 현재 코드에서 분리돼 있지 않다. 이 부분은 아래 Open Questions에 적은 확인이 필요하다.
+
+#### 3-4. No-silent-fallback invariant
+
+- active anchor planner runtime에서는 target이 정해진 이후 `source_is_left`가 비어 있으면 **bug**다.
+- `_tree_uses_forward_prefix_semantics(...)`는 legacy two-tree / non-anchor compatibility용으로만 남기고,
+  anchor runtime 내부의 route-edge HILP call site에서는 default fallback으로 쓰지 않는다.
+
+### 4. 기존 계획 대비 수정되는 핵심 구현 항목
+
+#### 단계 A: route direction helper를 selection-reason contract로 고정
+
+**대상**
+
+- `df_planning.py::_is_source_left_of_target`
+- `df_planning.py::_select_multi_tree_target_node`
+- `df_planning.py::_select_multi_tree_expansion_parents`
+- `df_planning.py::_ensure_uncertainty_roots_initialized_multi`
+
+**수정 내용**
+
+- `_is_source_left_of_target(...)`를 단순 route-order helper가 아니라
+  prompt의 fallback rule을 문서화한 **single source of truth**로 고정한다.
+- `_select_multi_tree_target_node(...)`는 반환 dict에 아래 provenance를 추가한다.
+  - `source_is_left`
+  - `direction_reason`
+    - `tentative_neighbor`
+    - `reliable_threshold_far_fallback`
+    - `start_anchor_fallback`
+    - `goal_anchor_fallback`
+    - `waypoint_waypoint_forward_fallback`
+- 이후 parent selection / root uncertainty init / expansion candidate construction은
+  이 provenance를 그대로 넘기고, 같은 pair에 대해 다시 tree-local default를 쓰지 않는다.
+
+#### 단계 B: `source_is_left` propagation을 mandatory로 변경
+
+**대상**
+
+- `df_planning.py::_run_global_uncertainty_expansion_round`
+- `df_planning.py::_run_multi_tree_online_hamiltonian_planner` 내부 mixed expansion path
+- `df_planning.py::_run_fast_uncertainty_sampling`
+- `df_planning.py::_compute_uncertainty_and_clusters`
+- `df_planning.py::_init_root_node_uncertainty`
+- `tree_node.py::TreeNode`
+
+**수정 내용**
+
+- active anchor runtime에서 candidate / child / root uncertainty vinfo는 모두 `source_is_left`를 반드시 가진다.
+- 아래 형태의 코드는 anchor runtime에서 제거한다.
+
+```python
+info.get("source_is_left", self._tree_uses_forward_prefix_semantics(...))
+```
+
+- 대신
+  - selection 단계에서 값을 채운다
+  - child node에도 저장한다
+  - uncertainty / feasibility / visualization call까지 그대로 전달한다
+- 즉, active anchor runtime에서는 `source_is_left is None`을 허용하지 않는다.
+
+#### 단계 C: sequence-sensitive TD helper를 분리
+
+**대상**
+
+- `df_planning.py::_check_plan_batch_feasibility`
+- `plan_postproc.py::_extract_new_segment_obs`
+- `plan_postproc.py::_extract_node_obs_slice`
+- future frame-order-sensitive helper 전부
+
+**새 helper**
+
+- `_resolve_sequence_direction(source_is_left: bool, sequence_mode: str) -> bool`
+  - `True`면 stored frame order를 TD order로 사용
+  - `False`면 stored frame order의 TD argument order를 반대로 사용
+- 또는 동등한 의미의 helper로
+  - `_compute_directed_sequence_distance_batch(from_frames, to_frames, source_is_left, sequence_mode)`
+  - `_get_execution_view_of_plan(plan_frames, source_is_left, sequence_mode)`
+
+중요한 점은 `plan_history` storage를 바꾸는 것이 아니라, TD를 계산할 때만 이 helper를 통하게 하는 것이다.
+
+#### 단계 D: feasibility를 direction-aware sequence contract로 변경
+
+**대상**
+
+- `df_planning.py::_check_plan_batch_feasibility`
+- 그 모든 caller
+
+**필수 변경점**
+
+- `_check_plan_batch_feasibility(...)`에
+  - `source_is_left_flags`
+  - `sequence_mode`
+를 추가한다.
+- caller는 아래에서 모두 넘긴다.
+  - expansion round feasibility
+  - mixed expansion round feasibility
+  - `_compute_uncertainty_and_clusters()` 내부 uncertainty sample feasibility
+
+**현재 누락**
+
+- expansion/replan feasibility 호출
+- uncertainty sample feasibility 호출
+- root uncertainty init에서 내려가는 uncertainty feasibility 호출
+
+**검토 대상 규칙**
+
+- continuity
+- progress
+- prior-tail anti-loop
+
+이 세 규칙이 `route_execution`을 따를지 `local_generation`을 따를지는 Open Question 1에 명시한다.
+
+#### 단계 E: uncertainty의 `T_curr` 방향을 route-aware로 변경
+
+**대상**
+
+- `df_planning.py::_compute_node_uncertainty`
+- `df_planning.py::_compute_uncertainty_and_clusters`
+
+**수정 내용**
+
+- `_compute_node_uncertainty(...)`에 `source_is_left: bool`를 추가한다.
+- directional model이면
+  - `source_is_left=True`  → `TD(curr_obs -> target_obs)`
+  - `source_is_left=False` → `TD(target_obs -> curr_obs)`
+- `_compute_uncertainty_and_clusters(...)`는 이미 `source_is_left_flags`를 갖고 있으므로
+  이를 `_compute_node_uncertainty(...)`까지 그대로 전달한다.
+
+이 단계가 없으면 `expected_root_node_dist`와 `temporal_dist` value는 general multi-waypoint case에서
+여전히 한쪽 방향으로 bias된다.
+
+#### 단계 F: segment / plan-history helper의 contract를 실행 문맥 기준으로 명시
+
+**대상**
+
+- `plan_postproc.py::_extract_new_segment_obs`
+- `plan_postproc.py::_extract_node_obs_slice`
+- `plan_postproc.py::_compute_plan_gap_to_target`
+
+**수정 내용**
+
+- `_extract_new_segment_obs(...)`의 현재 주석
+  - "모든 tree를 uniform forward prefix semantics로 본다"
+  를 제거한다.
+- 새 wrapper를 추가한다.
+  - `_extract_route_ordered_segment_obs(node, plan_tokens, source_is_left, role)`
+  - 여기서 `role`은 `source_segment`, `target_segment`, `meeting_left`, `meeting_right` 등
+    frame order가 왜 필요한지를 설명하는 용도다.
+- `_compute_plan_gap_to_target(...)`는 이미 left/right를 caller가 정렬해서 넘기면 맞게 동작하므로,
+  helper contract도 `best_node/target_node`가 아니라 `left_node/right_node` 문맥으로 문서화한다.
+
+#### 단계 G: `unordered_equivalence` 사용처 재검토
+
+아래 두 곳은 earlier user decision과 충돌 가능성이 있다.
+
+- `plan_postproc.py::_deduplicate_by_endpoint`
+- `df_planning.py::_compute_node_uncertainty` 내부 tail clustering
+
+현재 둘 다 사실상
+
+```text
+max(TD(a→b), TD(b→a))
+```
+
+형태의 symmetric reduction에 기대고 있다.
+
+하지만 user decision은 "그쪽도 directional TD 사용"이었다. 따라서 기존 계획의
+`unordered_equivalence` 항목은 아래 중 하나로 바뀌어야 한다.
+
+- 옵션 1. pairwise predicate 자체를 route-direction-aware로 정의한다.
+  - 예: sibling dedup이면 같은 parent/target을 공유하므로 `source_is_left` 기준 한 방향 TD만 사용
+- 옵션 2. duplicate/equivalence는 여전히 symmetric predicate가 필요하므로
+  - `max`, `min`, `both<thres` 중 어떤 rule을 쓸지 별도 확정한다
+
+이 항목은 Open Question 2에 남긴다.
+
+### 5. 함수 단위 수정 대상 요약
+
+아래 함수들은 문서상 **수정 필수**다.
+
+- `algorithms/diffusion_forcing/df_planning.py`
+  - `_is_source_left_of_target`
+  - `_select_multi_tree_target_node`
+  - `_ensure_uncertainty_roots_initialized_multi`
+  - `_check_plan_batch_feasibility`
+  - `_compute_node_uncertainty`
+  - `_run_fast_uncertainty_sampling`
+  - `_compute_uncertainty_and_clusters`
+  - `_run_global_uncertainty_expansion_round`
+  - `_run_multi_tree_online_hamiltonian_planner`
+
+- `algorithms/diffusion_forcing/plan_postproc.py`
+  - `_extract_node_obs_slice`
+  - `_extract_new_segment_obs`
+  - `_compute_plan_gap_to_target`
+  - `_deduplicate_by_endpoint`
+
+- `algorithms/diffusion_forcing/tree_node.py`
+  - `TreeNode` propagation contract 점검
+
+아래 함수들은 현재 기준 **방향성 설계가 이미 맞는 편**이므로 문서상 유지로 둔다.
+
+- `algorithms/diffusion_forcing/guidance.py`
+- `algorithms/diffusion_forcing/env_executor.py`
+- `algorithms/diffusion_forcing/plan_viz.py`
+- `utils/route_metric_utils.py`
+
+### 6. Open Questions
+
+#### Open Question 1. reverse-edge candidate의 feasibility / frame sequence direction
+
+현재 가장 중요한 판단 포인트다.
+
+- stored plan order는 계속 `anchor-root -> outward` local order로 둔다.
+- 그런데 reverse-edge candidate에서 frame-order-sensitive TD를 계산할 때,
+  아래 둘 중 무엇을 기준으로 할지 확정이 필요하다.
+
+옵션 A. `route_execution`
+- global S→G route에서 실제로 agent가 그 tree segment를 통과하는 방향을 따른다.
+- 즉, reverse-edge candidate는 stored frame pair `(x_t, x_{t+1})`에 대해
+  TD direction을 반대로 본다.
+- 내 권장안이다. prompt의 "agent는 반드시 S에서 G로 향한다"와 가장 직접적으로 맞는다.
+
+옵션 B. `local_generation`
+- diffusion이 실제로 생성한 local sequence order를 따른다.
+- 즉, feasibility는 stored frame pair의 순서를 그대로 TD direction으로 쓴다.
+- route direction은 target selection / value / guidance / assembly에서만 사용한다.
+
+#### Open Question 2. sibling dedup / tail clustering의 directional predicate
+
+earlier user decision상 이쪽도 directional TD를 써야 한다. 다만 duplicate/equivalence는
+본질적으로 pairwise predicate라 아래 중 어떤 규칙을 쓸지 선택이 필요하다.
+
+- 옵션 A. 같은 `source_is_left` 방향의 단일 TD만 사용
+- 옵션 B. `TD(a→b) < thres` and `TD(b→a) < thres`를 모두 만족해야 duplicate
+- 옵션 C. 기존 `max(TD(a→b), TD(b→a)) < thres` 유지
+
+내 권장안은 **sibling dedup은 옵션 A**, **tail clustering은 옵션 B**다.
+이유는 sibling dedup은 이미 동일 parent/target route context가 있고,
+clustering은 truly pairwise equivalence라 한 방향만으로 collapse시키기 위험하기 때문이다.
+
+
 ## 구현 계획
 
 ### 설계 철학 / 호환성 불변식

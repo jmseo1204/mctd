@@ -6,7 +6,7 @@ import torch
 import matplotlib.pyplot as plt
 import cv2
 import matplotlib.pyplot as plt
-from matplotlib.colors import to_rgba
+from matplotlib.colors import PowerNorm, to_rgba
 from matplotlib.patches import FancyArrowPatch
 from tqdm import trange, tqdm
 import matplotlib.animation as animation
@@ -477,10 +477,58 @@ def _render_trajectory_plot(fig, ax, env_id, plot_data, batch_idx, start, goal, 
             Y_p = Y_w / 4 + 1
         else:
             X_p, Y_p = X_w, Y_w
-        vmin, vmax = float(vals.min()), float(vals.max())
-        mesh = ax.pcolormesh(X_p, Y_p, vals, shading="auto", cmap="viridis", alpha=0.5,
-                             zorder=1, vmin=vmin, vmax=vmax)
-        fig.colorbar(mesh, ax=ax, label="HILP V(s,g)", fraction=0.03, pad=0.02)
+        cmap = hilp_heatmap.get("cmap", "inferno")
+        alpha = float(hilp_heatmap.get("alpha", 0.8))
+        vmin = float(hilp_heatmap.get("clip_vmin", np.nanmin(vals)))
+        vmax = float(hilp_heatmap.get("clip_vmax", np.nanmax(vals)))
+        if not np.isfinite(vmin):
+            vmin = float(np.nanmin(vals))
+        if not np.isfinite(vmax):
+            vmax = float(np.nanmax(vals))
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+
+        power_gamma = float(hilp_heatmap.get("power_gamma", 1.0))
+        heatmap_norm = None
+        if abs(power_gamma - 1.0) > 1e-6:
+            heatmap_norm = PowerNorm(
+                gamma=power_gamma,
+                vmin=vmin,
+                vmax=vmax,
+                clip=True,
+            )
+
+        mesh = ax.pcolormesh(
+            X_p,
+            Y_p,
+            vals,
+            shading="auto",
+            cmap=cmap,
+            alpha=alpha,
+            zorder=1,
+            norm=heatmap_norm,
+            vmin=None if heatmap_norm is not None else vmin,
+            vmax=None if heatmap_norm is not None else vmax,
+        )
+
+        contour_levels = np.asarray(hilp_heatmap.get("contour_levels", []), dtype=np.float32)
+        if contour_levels.size >= 3:
+            inner_levels = contour_levels[1:-1]
+            if inner_levels.size > 0:
+                clipped_vals = np.clip(vals, vmin, vmax)
+                ax.contour(
+                    X_p,
+                    Y_p,
+                    clipped_vals,
+                    levels=inner_levels,
+                    colors="white",
+                    linewidths=0.55,
+                    alpha=0.4,
+                    zorder=2,
+                )
+
+        colorbar_label = str(hilp_heatmap.get("colorbar_label", "HILP V(s,g)"))
+        fig.colorbar(mesh, ax=ax, label=colorbar_label, fraction=0.03, pad=0.02)
 
     if plan_trajectory is not None:
         plan_xy = _to_plot_coords(env_id, plan_trajectory[:, batch_idx, :2])

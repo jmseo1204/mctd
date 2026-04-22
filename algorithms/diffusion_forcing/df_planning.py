@@ -45,7 +45,7 @@ from utils.task_override_loader import (
 )
 from .tree_node import TreeNode
 from . import guidance
-from .hilp_loader import HILPMemoizedWrapper, get_hilp_fn
+from .hilp_loader import HILPMemoizedWrapper, get_hilp_fn, resolve_hilp_aggregator
 from .env_executor import PlanExecutorMixin
 from .plan_postproc import PlanPostprocMixin
 from .kde_estimator import KDEEstimatorMixin
@@ -96,6 +96,15 @@ def _coerce_bool(value: Any, *, default: bool) -> bool:
         if lowered in ("0", "false", "f", "no", "n", "off"):
             return False
     return bool(value)
+
+
+def _ordered_pair(a: int, b: int) -> Tuple[int, int]:
+    return (int(a), int(b))
+
+
+def _unordered_pair(a: int, b: int) -> Tuple[int, int]:
+    a_i, b_i = int(a), int(b)
+    return (a_i, b_i) if a_i < b_i else (b_i, a_i)
 
 
 def _find_hilp_matches(td_models_dir: str, tokens: List[str]) -> List[str]:
@@ -498,6 +507,11 @@ class DiffusionForcingPlanning(
 
         # HILP value function guidance
         self.hilp_checkpoint_path = None  # auto-detected lazily on first HILP use
+        _hilp_agg_cfg = cfg.get("hilp_aggregator", None)
+        self.hilp_aggregator_override = (
+            None if _hilp_agg_cfg is None else str(_hilp_agg_cfg).strip() or None
+        )
+        self._resolved_hilp_aggregator: Optional[str] = None
         self.hilp_obs_dim = cfg.get("hilp_obs_dim", 29)    # used only for legacy .pt checkpoints
         self.hilp_skill_dim = cfg.get("hilp_skill_dim", 256)  # used only for legacy .pt checkpoints
         # HILP value function instance will be loaded lazily and stored in _hilp_value_fn_instance
@@ -547,6 +561,10 @@ class DiffusionForcingPlanning(
         self.use_rollout: bool = cfg.get("use_rollout", False)
         self.use_dynamic_obs_padding: bool = cfg.get("use_dynamic_obs_padding", True)
         self.use_segment_wise_sliding_window: bool = cfg.get("use_segment_wise_sliding_window", False)
+        self.directional_debug_logging: bool = _coerce_bool(
+            cfg.get("directional_debug_logging", False),
+            default=False,
+        )
 
         super().__init__(cfg)
         self.plot_end_points = cfg.get("plot_start_goal", False)
@@ -627,6 +645,31 @@ class DiffusionForcingPlanning(
         if self.guidance_tracer is not None:
             self.guidance_tracer.log(tag, data, depth=depth, source=source or "df_planning.py")
 
+    def _log_directional_debug(self, tag: str, **fields: Any) -> None:
+        """[DIRECTIONAL DEBUG] Conditional debug logging for direction-aware plumbing."""
+        if not getattr(self, "directional_debug_logging", False):
+            return
+        payload = " ".join(f"{key}={value}" for key, value in fields.items())
+        print(f"[directional-debug] {tag} {payload}".rstrip(), flush=True)
+
+    def _resolve_hilp_aggregator(self) -> str:
+        if self._resolved_hilp_aggregator is not None:
+            return str(self._resolved_hilp_aggregator)
+        if self.hilp_checkpoint_path is None:
+            self.hilp_checkpoint_path = _detect_hilp_checkpoint_path(self.cfg)
+        resolved = resolve_hilp_aggregator(
+            self.hilp_checkpoint_path,
+            self.hilp_aggregator_override,
+        )
+        self._resolved_hilp_aggregator = str(resolved)
+        return self._resolved_hilp_aggregator
+
+    def _hilp_is_directional(self) -> bool:
+        return self._resolve_hilp_aggregator() == "quasimetric"
+
+    def _hilp_is_symmetric(self) -> bool:
+        return not self._hilp_is_directional()
+
     def _get_hilp_value_fn(self):
         """Lazy loader for HILP value function model (or memoized wrapper).
 
@@ -636,6 +679,7 @@ class DiffusionForcingPlanning(
         if not hasattr(self, '_hilp_value_fn_instance') or self._hilp_value_fn_instance is None:
             if self.hilp_checkpoint_path is None:
                 self.hilp_checkpoint_path = _detect_hilp_checkpoint_path(self.cfg)
+            resolved_aggregator = self._resolve_hilp_aggregator()
             use_memo = bool(self.cfg.get("use_hilp_memoization", False))
             G = int(self.cfg.get("hilp_memoization_grid_size", 100))
 
@@ -661,6 +705,7 @@ class DiffusionForcingPlanning(
                 use_memoization=use_memo,
                 hilp_obs_dim=self.hilp_obs_dim,
                 hilp_skill_dim=self.hilp_skill_dim,
+                hilp_aggregator=resolved_aggregator,
                 grid_size=G,
                 x_min=float(x_min), x_max=float(x_max),
                 y_min=float(y_min), y_max=float(y_max),
@@ -670,13 +715,15 @@ class DiffusionForcingPlanning(
             _hilp_load_elapsed = time.time() - _PROC_T0
             print(f"[LIFECYCLE +{_hilp_load_elapsed:.1f}s] HILP loaded"
                   f"  memo={'yes' if use_memo else 'no'}"
+                  f"  aggregator={resolved_aggregator}"
                   f"  path={self.hilp_checkpoint_path}", flush=True)
             if self.tracer:
                 self.tracer.log(
                     tag="lifecycle.hilp_loaded",
                     data={"elapsed_s": round(_hilp_load_elapsed, 2),
                           "path": self.hilp_checkpoint_path,
-                          "memoized": use_memo},
+                          "memoized": use_memo,
+                          "aggregator": resolved_aggregator},
                     step=0, depth=0,
                 )
 
@@ -811,6 +858,24 @@ class DiffusionForcingPlanning(
         temporal_dist = self.emb_dist_to_temporal_dist((-v).cpu().numpy(), gamma=0.995)
         return np.asarray(temporal_dist, dtype=np.float32)
 
+    def _compute_unordered_equivalence_temporal_dist_np(
+        self,
+        obs_a_np: np.ndarray,
+        obs_b_np: np.ndarray,
+    ) -> np.ndarray:
+        """Return a symmetric compatibility distance for unordered equivalence checks.
+
+        Directional HILP uses max(TD(a->b), TD(b->a)) so that a one-way shortcut
+        does not collapse distinct states. This is equivalent to requiring both
+        directional TDs to be below the threshold in pairwise clustering. Symmetric
+        HILP reduces to the legacy TD.
+        """
+        td_ab = self._compute_raw_state_temporal_dist_np(obs_a_np, obs_b_np)
+        if self._hilp_is_symmetric():
+            return td_ab
+        td_ba = self._compute_raw_state_temporal_dist_np(obs_b_np, obs_a_np)
+        return np.maximum(td_ab, td_ba).astype(np.float32)
+
     def _transform_temporal_dist_for_total_cost(self, temporal_dist: float) -> float:
         temporal_dist = float(temporal_dist)
         return temporal_dist + self.temporal_dist_overestimate_coeff * (temporal_dist ** 2)
@@ -819,6 +884,7 @@ class DiffusionForcingPlanning(
         self,
         state1: np.ndarray,  # (N, d) — full obs (d==obs_dim) or position-only (d==pos_dim)
         state2: np.ndarray,  # (N, d) — same
+        mode: str = "execution_sequence",
     ) -> np.ndarray:          # (N,) — distance array
         """Unified distance computation based on use_TD_metric_as_dist flag.
 
@@ -841,6 +907,8 @@ class DiffusionForcingPlanning(
                 full1[..., self.pos_dim_indices] = state1
                 full2[..., self.pos_dim_indices] = state2
                 state1, state2 = full1, full2
+            if mode == "unordered_equivalence":
+                return self._compute_unordered_equivalence_temporal_dist_np(state1, state2)
             return self._compute_state_temporal_dist_np(state1, state2)
         else:
             if d > pos_len:
@@ -883,6 +951,122 @@ class DiffusionForcingPlanning(
             return True
         return bool(getattr(tree, "is_tree1", True))
 
+    def _require_source_is_left(
+        self,
+        source_is_left: Optional[Any],
+        *,
+        context: str,
+    ) -> bool:
+        """Require explicit direction plumbing in active anchor runtime helpers."""
+        if source_is_left is None:
+            self._log_directional_debug(
+                "source-is-left-missing",
+                context=context,
+            )
+            raise ValueError(
+                f"{context} requires explicit source_is_left in the active anchor pipeline"
+            )
+        return bool(source_is_left)
+
+    def _resolve_sequence_uses_stored_order(
+        self,
+        source_is_left: bool,
+        sequence_mode: str = "route_execution",
+    ) -> bool:
+        """Return whether TD should follow stored local-canonical frame order."""
+        if sequence_mode == "local_generation":
+            return True
+        if sequence_mode == "route_execution":
+            return bool(source_is_left)
+        raise ValueError(f"Unsupported sequence_mode: {sequence_mode}")
+
+    def _compute_sequence_distance(
+        self,
+        state1: np.ndarray,
+        state2: np.ndarray,
+        *,
+        source_is_left: bool,
+        sequence_mode: str = "route_execution",
+        context: str = "",
+    ) -> np.ndarray:
+        """Compute TD/L2 for a sequence edge under the requested execution contract."""
+        uses_stored_order = self._resolve_sequence_uses_stored_order(
+            source_is_left=bool(source_is_left),
+            sequence_mode=sequence_mode,
+        )
+        if not uses_stored_order:
+            self._log_directional_debug(
+                "sequence.distance_swapped",
+                context=context or "sequence",
+                sequence_mode=sequence_mode,
+                source_is_left=bool(source_is_left),
+            )
+        lhs, rhs = (state1, state2) if uses_stored_order else (state2, state1)
+        return self._compute_distance(lhs, rhs, mode="execution_sequence")
+
+    def _resolve_source_target_direction(
+        self,
+        planner_state: dict,
+        source_anchor_idx: int,
+        target_anchor_idx: int,
+    ) -> tuple[bool, str]:
+        """Resolve route direction using tentative neighbors first, then prompt fallback."""
+        source_anchor_idx = int(source_anchor_idx)
+        target_anchor_idx = int(target_anchor_idx)
+        order = list(
+            np.asarray(
+                planner_state.get("tentative_solver_result", {}).get("anchor_order", []),
+                dtype=np.int32,
+            ).tolist()
+        )
+        if source_anchor_idx in order and target_anchor_idx in order:
+            source_pos = order.index(source_anchor_idx)
+            target_pos = order.index(target_anchor_idx)
+            if abs(source_pos - target_pos) == 1:
+                return (source_pos < target_pos), "tentative_neighbor"
+
+        n_anchors = len(planner_state["trees"])
+        if source_anchor_idx == 0:
+            self._log_directional_debug(
+                "source-left-fallback",
+                source=source_anchor_idx,
+                target=target_anchor_idx,
+                rule="start_anchor",
+            )
+            return True, "start_anchor_fallback"
+        if target_anchor_idx == n_anchors - 1:
+            self._log_directional_debug(
+                "source-left-fallback",
+                source=source_anchor_idx,
+                target=target_anchor_idx,
+                rule="goal_target",
+            )
+            return True, "goal_target_fallback"
+        if source_anchor_idx == n_anchors - 1:
+            self._log_directional_debug(
+                "source-left-fallback",
+                source=source_anchor_idx,
+                target=target_anchor_idx,
+                rule="goal_source",
+            )
+            return False, "goal_source_fallback"
+        if target_anchor_idx == 0:
+            self._log_directional_debug(
+                "source-left-fallback",
+                source=source_anchor_idx,
+                target=target_anchor_idx,
+                rule="start_target",
+            )
+            return False, "start_target_fallback"
+
+        self._log_directional_debug(
+            "source-left-fallback",
+            source=source_anchor_idx,
+            target=target_anchor_idx,
+            rule="waypoint_forward_default",
+        )
+        return True, "waypoint_waypoint_forward_fallback"
+
     def _node_anchor_name(
         self,
         node: Optional["TreeNode"],
@@ -904,7 +1088,7 @@ class DiffusionForcingPlanning(
         )
 
     def _anchor_pair_key(self, a: int, b: int) -> Tuple[int, int]:
-        return (int(a), int(b)) if int(a) < int(b) else (int(b), int(a))
+        return _ordered_pair(a, b)
 
     def _required_anchor_degree(self, anchor_idx: int, n_anchors: int) -> int:
         if anchor_idx in (0, n_anchors - 1):
@@ -919,7 +1103,67 @@ class DiffusionForcingPlanning(
         )
 
     def _get_forced_adjacent_pairs(self, planner_state: dict) -> list[tuple[int, int]]:
-        return sorted(planner_state["accepted_pair_edges"].keys())
+        return self._get_solver_forced_pairs_view(planner_state)
+
+    def _get_pair_repository_key(
+        self,
+        pair_key: Tuple[int, int],
+        *,
+        canonicalize_for_symmetric: bool = False,
+    ) -> Tuple[int, int]:
+        a, b = int(pair_key[0]), int(pair_key[1])
+        if canonicalize_for_symmetric and self._hilp_is_symmetric():
+            return _unordered_pair(a, b)
+        return _ordered_pair(a, b)
+
+    def _find_existing_pair_key(
+        self,
+        repository: dict,
+        pair_key: Tuple[int, int],
+        *,
+        allow_symmetric_compat_view: bool = True,
+    ) -> Optional[Tuple[int, int]]:
+        ordered_key = self._get_pair_repository_key(pair_key)
+        if ordered_key in repository:
+            return ordered_key
+        if not allow_symmetric_compat_view or self._hilp_is_directional():
+            return None
+        reverse_key = (ordered_key[1], ordered_key[0])
+        if reverse_key in repository:
+            return reverse_key
+        unordered_key = self._get_pair_repository_key(
+            pair_key,
+            canonicalize_for_symmetric=True,
+        )
+        if unordered_key in repository:
+            return unordered_key
+        if unordered_key[::-1] in repository:
+            return unordered_key[::-1]
+        return None
+
+    def _get_solver_forced_pairs_view(self, planner_state: dict) -> list[tuple[int, int]]:
+        pair_keys = list(planner_state["accepted_pair_edges"].keys())
+        if self._hilp_is_directional():
+            solver_pairs = sorted((_ordered_pair(a, b) for a, b in pair_keys))
+            self._log_directional_debug(
+                "solver.forced_pairs_view",
+                mode="ordered",
+                stored_pairs=pair_keys,
+                solver_pairs=solver_pairs,
+            )
+            return solver_pairs
+        canonical = {
+            _unordered_pair(a, b)
+            for a, b in pair_keys
+        }
+        solver_pairs = sorted(canonical)
+        self._log_directional_debug(
+            "solver.forced_pairs_view",
+            mode="unordered_compat",
+            stored_pairs=pair_keys,
+            solver_pairs=solver_pairs,
+        )
+        return solver_pairs
 
     def _compute_tentative_hamiltonian_solution(self, planner_state: dict) -> dict:
         if self.multi_tree_route_mode == "fixed_temporal":
@@ -933,9 +1177,22 @@ class DiffusionForcingPlanning(
         solver_result = solve_fixed_endpoint_hamiltonian_path_with_forced_adjacency(
             effective_pair_cost,
             forced_adjacent_pairs=self._get_forced_adjacent_pairs(planner_state),
+            ordered_forced_pairs=self._hilp_is_directional(),
         )
         planner_state["tentative_solver_result"] = solver_result
         return solver_result
+
+    def _is_source_left_of_target(
+        self,
+        planner_state: dict,
+        source_anchor_idx: int,
+        target_anchor_idx: int,
+    ) -> bool:
+        return self._resolve_source_target_direction(
+            planner_state,
+            source_anchor_idx,
+            target_anchor_idx,
+        )[0]
 
     def _load_benchmark_override_payload(self) -> dict:
         if self._benchmark_override_payload_cache is None:
@@ -1566,27 +1823,27 @@ class DiffusionForcingPlanning(
             if use_segment_metric and target_anchor_idx not in tentative_neighbor_indices:
                 continue
 
-            if use_segment_metric:
-                target_nodes = [
-                    node
-                    for node in target_tree.get_all_nodes()
-                    if node.obs is not None
-                    and len(node.plan_history) > 0
-                    and len(node.plan_history[-1]) > 0
-                ]
-            else:
-                target_nodes = [
-                    node
-                    for node in target_tree.get_all_nodes()
-                    if node.obs is not None
-                ]
+            target_nodes = [
+                node
+                for node in target_tree.get_all_nodes()
+                if node.obs is not None
+            ]
             if not target_nodes:
                 continue
 
             target_obs = np.stack([node.obs for node in target_nodes], axis=0).astype(np.float32)
             query_rep = np.repeat(query_obs, len(target_nodes), axis=0)
             tgt_rep = np.tile(target_obs, (query_obs.shape[0], 1))
-            temporal_dists = self._compute_raw_state_temporal_dist_np(query_rep, tgt_rep).reshape(
+            is_fwd, direction_reason = self._resolve_source_target_direction(
+                planner_state,
+                source_anchor_idx,
+                target_anchor_idx,
+            )
+            if is_fwd:
+                temporal_dists = self._compute_raw_state_temporal_dist_np(query_rep, tgt_rep)
+            else:
+                temporal_dists = self._compute_raw_state_temporal_dist_np(tgt_rep, query_rep)
+            temporal_dists = temporal_dists.reshape(
                 query_obs.shape[0],
                 len(target_nodes),
             )
@@ -1613,33 +1870,65 @@ class DiffusionForcingPlanning(
         candidate_rows.sort(key=lambda item: (item[0], item[1], item[2]))
         if use_segment_metric:
             best_score, _, _, best_tree, best_node = candidate_rows[0]
+            best_source_is_left, best_direction_reason = self._resolve_source_target_direction(
+                planner_state,
+                source_anchor_idx,
+                best_tree.anchor_idx,
+            )
             return {
                 "target_tree": best_tree,
                 "target_node": best_node,
                 "segment_td": float(best_score),
+                "source_is_left": bool(best_source_is_left),
+                "direction_reason": str(best_direction_reason),
+                "target_endpoint_mode": self._get_node_endpoint_mode(best_node),
             }
 
         for score, _, _, target_tree, target_node in candidate_rows:
             target_anchor_idx = int(target_tree.anchor_idx)
             if score < self.reliable_TD_threshold:
                 if target_anchor_idx in tentative_neighbor_indices:
+                    source_is_left, direction_reason = self._resolve_source_target_direction(
+                        planner_state,
+                        source_anchor_idx,
+                        target_anchor_idx,
+                    )
                     return {
                         "target_tree": target_tree,
                         "target_node": target_node,
                         "score": float(score),
+                        "source_is_left": bool(source_is_left),
+                        "direction_reason": str(direction_reason),
+                        "target_endpoint_mode": self._get_node_endpoint_mode(target_node),
                     }
                 continue
+            source_is_left, direction_reason = self._resolve_source_target_direction(
+                planner_state,
+                source_anchor_idx,
+                target_anchor_idx,
+            )
             return {
                 "target_tree": target_tree,
                 "target_node": target_node,
                 "score": float(score),
+                "source_is_left": bool(source_is_left),
+                "direction_reason": str(direction_reason),
+                "target_endpoint_mode": self._get_node_endpoint_mode(target_node),
             }
 
         fallback_score, _, _, fallback_tree, fallback_node = candidate_rows[0]
+        fallback_source_is_left, fallback_direction_reason = self._resolve_source_target_direction(
+            planner_state,
+            source_anchor_idx,
+            fallback_tree.anchor_idx,
+        )
         return {
             "target_tree": fallback_tree,
             "target_node": fallback_node,
             "score": float(fallback_score),
+            "source_is_left": bool(fallback_source_is_left),
+            "direction_reason": str(fallback_direction_reason),
+            "target_endpoint_mode": self._get_node_endpoint_mode(fallback_node),
         }
 
     def _get_multi_tree_for_node(
@@ -1658,6 +1947,42 @@ class DiffusionForcingPlanning(
             ),
             None,
         )
+
+    def _build_connection_record(
+        self,
+        *,
+        pair_key: Tuple[int, int],
+        source_anchor_idx: int,
+        target_anchor_idx: int,
+        source_node: "TreeNode",
+        target_node: "TreeNode",
+        bridge_cost: float,
+        **extra_fields: Any,
+    ) -> dict:
+        """Build a canonical connection record with explicit endpoint metadata."""
+        source_endpoint_mode = self._get_node_endpoint_mode(source_node)
+        target_endpoint_mode = self._get_node_endpoint_mode(target_node)
+        if source_endpoint_mode is None or target_endpoint_mode is None:
+            raise ValueError(
+                "Connection endpoints must provide observable nodes: "
+                f"source={getattr(source_node, 'name', None)} "
+                f"target={getattr(target_node, 'name', None)}"
+            )
+        return {
+            "pair_key": pair_key,
+            "source_anchor_idx": int(source_anchor_idx),
+            "target_anchor_idx": int(target_anchor_idx),
+            "source_node": source_node,
+            "target_node": target_node,
+            "source_endpoint_mode": str(source_endpoint_mode),
+            "target_endpoint_mode": str(target_endpoint_mode),
+            "connection_kind": f"{source_endpoint_mode}_to_{target_endpoint_mode}",
+            "is_root_connector": bool(
+                source_endpoint_mode == "anchor" or target_endpoint_mode == "anchor"
+            ),
+            "bridge_cost": float(bridge_cost),
+            **extra_fields,
+        }
 
     def _update_multi_tree_meeting_targets_from_expansions(
         self,
@@ -1682,6 +2007,15 @@ class DiffusionForcingPlanning(
                 info["meeting_target_td"] = (
                     None if meeting_info is None else float(meeting_info["segment_td"])
                 )
+                info["meeting_target_endpoint_mode"] = (
+                    None if meeting_info is None else meeting_info.get("target_endpoint_mode")
+                )
+                info["meeting_source_is_left"] = (
+                    None if meeting_info is None else meeting_info.get("source_is_left")
+                )
+                info["meeting_direction_reason"] = (
+                    None if meeting_info is None else meeting_info.get("direction_reason")
+                )
 
     def _check_plan_batch_feasibility(
         self,
@@ -1691,39 +2025,149 @@ class DiffusionForcingPlanning(
         prefix_len_frames_list: Optional[List[int]] = None,
         subplan_tail_depths: Optional[List[int]] = None,
         seg_size: Optional[int] = None,
-    ) -> List[bool]:
-        """Run the planner's full-plan feasibility checks on a batch of plans.
+        source_is_left_flags: Optional[List[bool]] = None,
+        sequence_mode: str = "route_execution",
+        return_diagnostics: bool = False,
+    ) -> List[bool] | tuple[List[bool], dict[str, np.ndarray]]:
+        """Run local-subplan feasibility checks on a batch of plans.
 
-        This intentionally checks the entire reconstructed plan, not just the local
-        subplan. When `use_dynamic_obs_padding=False`, `parallel_plan()` strips the
-        root anchor token from the returned history, so we prepend each candidate's
-        root observation before running continuity checks.
+        Continuity/proximity is evaluated only on the newly expanded local segment:
+        the boundary edge from the already-fixed prefix observation into the first
+        new frame, plus the edges internal to that local segment. This keeps the
+        feasibility scope aligned with the next subplan that will actually be used
+        for expansion / uncertainty clustering.
 
         The progress filter remains a full-plan check: it measures progress between
-        the current boundary observation and the final frame of the full plan.
-        The prior-plan-distance filter is the new local-subplan constraint: it
-        compares the current subplan tail against frames before `prefix_len` in the
-        raw plan sequence (without the synthetic root prepend).
+        the current boundary observation and the final frame of the reconstructed
+        plan. The prior-plan-distance filter also remains unchanged: it compares the
+        current subplan tail against frames before `prefix_len` in the raw plan
+        sequence.
         """
         raw_plans = (
             self._unnormalize_x(plan_hists[-1])[:-1].detach().cpu().numpy()
         )  # (t*fs-1, B, c)
-        plans = raw_plans
+        _, batch_size, channels = raw_plans.shape
+        if source_is_left_flags is None:
+            source_is_left_flags = [True] * batch_size
+        else:
+            source_is_left_flags = [bool(flag) for flag in source_is_left_flags]
+            if len(source_is_left_flags) != batch_size:
+                raise ValueError(
+                    f"source_is_left_flags must have len {batch_size}, got {len(source_is_left_flags)}"
+                )
+        if prefix_len_frames_list is None:
+            prefix_len_frames_list = [0] * batch_size
+        elif len(prefix_len_frames_list) != batch_size:
+            raise ValueError(
+                f"prefix_len_frames_list must have len {batch_size}, got {len(prefix_len_frames_list)}"
+            )
+        if subplan_tail_depths is not None and len(subplan_tail_depths) != batch_size:
+            raise ValueError(
+                f"subplan_tail_depths must have len {batch_size}, got {len(subplan_tail_depths)}"
+            )
 
-        if root_obs_list and all(root_obs is not None for root_obs in root_obs_list):
-            root_obs_np = np.stack(root_obs_list, axis=0)[np.newaxis]  # (1, B, c)
-            plans = np.concatenate([root_obs_np, plans], axis=0)
+        continuity_scope_start_per_sample = np.zeros((batch_size,), dtype=np.int32)
+        continuity_scope_end_per_sample = np.zeros((batch_size,), dtype=np.int32)
+        continuity_edge_count_per_sample = np.zeros((batch_size,), dtype=np.int32)
+        is_proximal = [False] * batch_size
+        progress_values = np.full((batch_size,), np.nan, dtype=np.float32)
+        min_dist_to_prior_values = np.full((batch_size,), np.inf, dtype=np.float32)
+        diffs_per_sample: list[np.ndarray] = []
+        diff_frame_idx_per_sample: list[np.ndarray] = []
+        diff_state1_per_sample: list[np.ndarray] = []
+        diff_state2_per_sample: list[np.ndarray] = []
+        for i in range(batch_size):
+            local_start = max(
+                0,
+                min(int(prefix_len_frames_list[i]), raw_plans.shape[0]),
+            )
+            local_end = raw_plans.shape[0]
+            if subplan_tail_depths is not None and seg_size is not None:
+                local_end = min(
+                    self._get_prefix_len_frames_from_depth(
+                        int(subplan_tail_depths[i]), seg_size
+                    ),
+                    raw_plans.shape[0],
+                )
+            local_end = max(local_start, int(local_end))
+            continuity_scope_start_per_sample[i] = int(local_start)
+            continuity_scope_end_per_sample[i] = int(local_end)
 
-        plan_len, batch_size, channels = plans[:-1].shape
-        diffs = self._compute_distance(
-            plans[:-1].reshape(plan_len * batch_size, channels),
-            plans[1:].reshape(plan_len * batch_size, channels),
-        ).reshape(plan_len, batch_size)
+            diffs_i_parts: list[np.ndarray] = []
+            frame_idx_parts: list[np.ndarray] = []
+            state1_parts: list[np.ndarray] = []
+            state2_parts: list[np.ndarray] = []
 
-        is_proximal = [
-            bool(np.all(diffs[:, i] < self.plan_feasibility_delta))
-            for i in range(batch_size)
-        ]
+            if local_end > local_start:
+                boundary_obs: Optional[np.ndarray] = None
+                if local_start > 0:
+                    if progress_obs_list[i] is not None:
+                        boundary_obs = np.asarray(progress_obs_list[i], dtype=np.float32)
+                    else:
+                        boundary_obs = raw_plans[local_start - 1, i].astype(np.float32)
+                else:
+                    root_obs = (
+                        None
+                        if not root_obs_list
+                        else root_obs_list[i]
+                    )
+                    if root_obs is not None:
+                        boundary_obs = np.asarray(root_obs, dtype=np.float32)
+                    elif progress_obs_list[i] is not None:
+                        boundary_obs = np.asarray(progress_obs_list[i], dtype=np.float32)
+
+                if boundary_obs is not None:
+                    boundary_obs_2d = boundary_obs.reshape(1, -1)
+                    first_local_obs = raw_plans[local_start, i : i + 1].astype(np.float32)
+                    boundary_diff = self._compute_sequence_distance(
+                        boundary_obs_2d,
+                        first_local_obs,
+                        source_is_left=bool(source_is_left_flags[i]),
+                        sequence_mode=sequence_mode,
+                        context=f"feasibility/continuity_boundary[{i}]",
+                    ).astype(np.float32)
+                    diffs_i_parts.append(boundary_diff)
+                    frame_idx_parts.append(
+                        np.asarray([local_start - 1], dtype=np.int32)
+                    )
+                    state1_parts.append(boundary_obs_2d.astype(np.float32))
+                    state2_parts.append(first_local_obs.astype(np.float32))
+
+                if local_end - local_start > 1:
+                    local_state1 = raw_plans[local_start : local_end - 1, i].astype(np.float32)
+                    local_state2 = raw_plans[local_start + 1 : local_end, i].astype(np.float32)
+                    local_diffs = self._compute_sequence_distance(
+                        local_state1,
+                        local_state2,
+                        source_is_left=bool(source_is_left_flags[i]),
+                        sequence_mode=sequence_mode,
+                        context=f"feasibility/continuity[{i}]",
+                    ).astype(np.float32)
+                    diffs_i_parts.append(local_diffs)
+                    frame_idx_parts.append(
+                        np.arange(local_start, local_end - 1, dtype=np.int32)
+                    )
+                    state1_parts.append(local_state1)
+                    state2_parts.append(local_state2)
+
+            if diffs_i_parts:
+                diffs_i = np.concatenate(diffs_i_parts, axis=0).astype(np.float32)
+                diff_frame_idx_i = np.concatenate(frame_idx_parts, axis=0).astype(np.int32)
+                diff_state1_i = np.concatenate(state1_parts, axis=0).astype(np.float32)
+                diff_state2_i = np.concatenate(state2_parts, axis=0).astype(np.float32)
+                is_proximal[i] = bool(np.all(diffs_i < self.plan_feasibility_delta))
+            else:
+                diffs_i = np.zeros((0,), dtype=np.float32)
+                diff_frame_idx_i = np.zeros((0,), dtype=np.int32)
+                diff_state1_i = np.zeros((0, channels), dtype=np.float32)
+                diff_state2_i = np.zeros((0, channels), dtype=np.float32)
+                is_proximal[i] = True
+
+            continuity_edge_count_per_sample[i] = int(diffs_i.shape[0])
+            diffs_per_sample.append(diffs_i)
+            diff_frame_idx_per_sample.append(diff_frame_idx_i)
+            diff_state1_per_sample.append(diff_state1_i)
+            diff_state2_per_sample.append(diff_state2_i)
 
         if self.min_progress_threshold > 0.0:
             is_not_stagnant = [False] * batch_size
@@ -1731,11 +2175,15 @@ class DiffusionForcingPlanning(
                 if progress_obs is None:
                     continue
                 progress = float(
-                    self._compute_distance(
+                    self._compute_sequence_distance(
                         progress_obs[np.newaxis],
-                        plans[-1, i][np.newaxis],
+                        raw_plans[-1, i][np.newaxis],
+                        source_is_left=bool(source_is_left_flags[i]),
+                        sequence_mode=sequence_mode,
+                        context=f"feasibility/progress[{i}]",
                     )[0]
                 )
+                progress_values[i] = progress
                 if progress > self.min_progress_threshold:
                     is_not_stagnant[i] = True
         else:
@@ -1772,15 +2220,170 @@ class DiffusionForcingPlanning(
 
                 tail_rep = np.repeat(tail_obs, prior_obs.shape[0], axis=0)
                 min_dist_to_prior = float(
-                    np.min(self._compute_distance(prior_obs, tail_rep))
+                    np.min(
+                        self._compute_sequence_distance(
+                            prior_obs,
+                            tail_rep,
+                            source_is_left=bool(source_is_left_flags[i]),
+                            sequence_mode=sequence_mode,
+                            context=f"feasibility/prior_tail[{i}]",
+                        )
+                    )
                 )
+                min_dist_to_prior_values[i] = min_dist_to_prior
                 if min_dist_to_prior < self.thres_min_dist_to_prior_plan:
                     is_far_from_prior[i] = False
 
-        return [
+        feasibility_mask = [
             is_proximal[i] and is_not_stagnant[i] and is_far_from_prior[i]
             for i in range(batch_size)
         ]
+        if not return_diagnostics:
+            return feasibility_mask
+
+        continuity_max_per_sample = np.asarray(
+            [
+                float(np.max(diffs_i)) if diffs_i.size > 0 else 0.0
+                for diffs_i in diffs_per_sample
+            ],
+            dtype=np.float32,
+        )
+        continuity_over_threshold_count_per_sample = np.asarray(
+            [
+                int(np.sum(diffs_i >= float(self.plan_feasibility_delta)))
+                if diffs_i.size > 0
+                else 0
+                for diffs_i in diffs_per_sample
+            ],
+            dtype=np.int32,
+        )
+        worst_frame_idx_per_sample = np.asarray(
+            [
+                int(diff_frame_idx_per_sample[i][int(np.argmax(diffs_per_sample[i]))])
+                if diffs_per_sample[i].size > 0
+                else -1
+                for i in range(batch_size)
+            ],
+            dtype=np.int32,
+        )
+        max_continuity_violation_per_sample = np.maximum(
+            continuity_max_per_sample - float(self.plan_feasibility_delta),
+            0.0,
+        ).astype(np.float32)
+
+        flat_diffs = np.concatenate(
+            [diffs_i for diffs_i in diffs_per_sample if diffs_i.size > 0],
+            axis=0,
+        ) if any(diffs_i.size > 0 for diffs_i in diffs_per_sample) else np.zeros((0,), dtype=np.float32)
+        if flat_diffs.size > 0:
+            continuity_quantiles = np.percentile(
+                flat_diffs,
+                [0.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0, 100.0],
+            ).astype(np.float32)
+            worst_sample_idx_global = int(
+                np.argmax(continuity_max_per_sample)
+            )
+            worst_local_idx = int(np.argmax(diffs_per_sample[worst_sample_idx_global]))
+            worst_frame_idx_global = int(
+                diff_frame_idx_per_sample[worst_sample_idx_global][worst_local_idx]
+            )
+            worst_state1 = diff_state1_per_sample[worst_sample_idx_global][worst_local_idx].astype(np.float32)
+            worst_state2 = diff_state2_per_sample[worst_sample_idx_global][worst_local_idx].astype(np.float32)
+            uses_stored_order = self._resolve_sequence_uses_stored_order(
+                source_is_left=bool(source_is_left_flags[worst_sample_idx_global]),
+                sequence_mode=sequence_mode,
+            )
+            eval_obs = worst_state1 if uses_stored_order else worst_state2
+            eval_goal = worst_state2 if uses_stored_order else worst_state1
+            worst_l2 = float(np.linalg.norm(worst_state2 - worst_state1))
+            if self.use_TD_metric_as_dist:
+                worst_hilp_value = float(
+                    self._compute_hilp_values(
+                        eval_obs[np.newaxis],
+                        eval_goal[np.newaxis],
+                    )[0].detach().cpu().item()
+                )
+                worst_emb_dist = float(-worst_hilp_value)
+                gamma = 0.995
+                eps = 1e-8
+                worst_preclip_val = float(1.0 - worst_emb_dist * (1.0 - gamma))
+                worst_clipped_val = float(np.clip(worst_preclip_val, eps, 1.0 - eps))
+                worst_raw_td = float(
+                    self.emb_dist_to_temporal_dist(
+                        np.asarray([worst_emb_dist], dtype=np.float64),
+                        gamma=gamma,
+                    )[0]
+                )
+                worst_scaled_td = float(
+                    self._compute_distance(
+                        eval_obs[np.newaxis],
+                        eval_goal[np.newaxis],
+                        mode="execution_sequence",
+                    )[0]
+                )
+                worst_td_clamped = bool(
+                    (worst_preclip_val <= eps) or (worst_preclip_val >= 1.0 - eps)
+                )
+            else:
+                worst_hilp_value = np.nan
+                worst_emb_dist = np.nan
+                worst_preclip_val = np.nan
+                worst_clipped_val = np.nan
+                worst_raw_td = np.nan
+                worst_scaled_td = float(
+                    self._compute_distance(
+                        eval_obs[np.newaxis],
+                        eval_goal[np.newaxis],
+                        mode="execution_sequence",
+                    )[0]
+                )
+                worst_td_clamped = False
+        else:
+            continuity_quantiles = np.zeros((8,), dtype=np.float32)
+            worst_frame_idx_global = -1
+            worst_sample_idx_global = 0
+            worst_state1 = np.zeros((channels,), dtype=np.float32)
+            worst_state2 = np.zeros((channels,), dtype=np.float32)
+            eval_obs = worst_state1
+            eval_goal = worst_state2
+            worst_l2 = 0.0
+            worst_hilp_value = np.nan
+            worst_emb_dist = np.nan
+            worst_preclip_val = np.nan
+            worst_clipped_val = np.nan
+            worst_raw_td = np.nan
+            worst_scaled_td = 0.0
+            worst_td_clamped = False
+        diagnostics = {
+            "continuity_max_per_sample": continuity_max_per_sample,
+            "continuity_over_threshold_count_per_sample": continuity_over_threshold_count_per_sample,
+            "worst_frame_idx_per_sample": worst_frame_idx_per_sample,
+            "max_continuity_violation_per_sample": max_continuity_violation_per_sample,
+            "continuity_quantiles": continuity_quantiles,
+            "worst_frame_idx_global": np.asarray([worst_frame_idx_global], dtype=np.int32),
+            "worst_sample_idx_global": np.asarray([worst_sample_idx_global], dtype=np.int32),
+            "worst_state1": worst_state1.astype(np.float32),
+            "worst_state2": worst_state2.astype(np.float32),
+            "worst_eval_obs": eval_obs.astype(np.float32),
+            "worst_eval_goal": eval_goal.astype(np.float32),
+            "worst_l2": np.asarray([worst_l2], dtype=np.float32),
+            "worst_hilp_value": np.asarray([worst_hilp_value], dtype=np.float32),
+            "worst_emb_dist": np.asarray([worst_emb_dist], dtype=np.float32),
+            "worst_preclip_val": np.asarray([worst_preclip_val], dtype=np.float32),
+            "worst_clipped_val": np.asarray([worst_clipped_val], dtype=np.float32),
+            "worst_raw_td": np.asarray([worst_raw_td], dtype=np.float32),
+            "worst_scaled_td": np.asarray([worst_scaled_td], dtype=np.float32),
+            "worst_td_clamped": np.asarray([worst_td_clamped], dtype=bool),
+            "progress_per_sample": progress_values,
+            "min_dist_to_prior_per_sample": min_dist_to_prior_values,
+            "is_proximal": np.asarray(is_proximal, dtype=bool),
+            "is_not_stagnant": np.asarray(is_not_stagnant, dtype=bool),
+            "is_far_from_prior": np.asarray(is_far_from_prior, dtype=bool),
+            "continuity_scope_start_per_sample": continuity_scope_start_per_sample,
+            "continuity_scope_end_per_sample": continuity_scope_end_per_sample,
+            "continuity_edge_count_per_sample": continuity_edge_count_per_sample,
+        }
+        return feasibility_mask, diagnostics
 
     def _compute_local_subplan_kde_maximin_scores(
         self,
@@ -3250,6 +3853,7 @@ class DiffusionForcingPlanning(
         particle_guidance_scale: float = 0.0,
         group_ids: Optional[list] = None,
         call_type: str = "expansion",
+        source_is_left_flags: Optional[list[bool]] = None,
     ) -> torch.Tensor:
         """
         Parallel denoising planning with diffusion guidance.
@@ -3352,6 +3956,7 @@ class DiffusionForcingPlanning(
         else:
             _pgs = particle_guidance_scale  # capture for lambda closure
             _gids = group_ids               # capture for lambda closure
+            _source_is_left_flags = source_is_left_flags
 
             # Sliding-window mode: each batch item has a single active frame range
             # covering [window_start_frame, window_end_frame) in half-open form.
@@ -3372,6 +3977,7 @@ class DiffusionForcingPlanning(
                 self, x, goal, horizon, guidance_scale,
                 particle_guidance_scale=_pgs, group_ids=_gids,
                 active_frame_ranges=_active_frame_ranges,
+                source_is_left_flags=_source_is_left_flags,
             )
 
         # [TIMING] Wrap guidance_fn to measure per-step cost and capture last loss values
@@ -4894,14 +5500,15 @@ class DiffusionForcingPlanning(
         curr_obs: np.ndarray,  # (obs_dim,) — unnormalized current observation
         target_node: "TreeNode",
         tail_obs: np.ndarray,  # (G*K, obs_dim) — unnormalized tail observations
+        source_is_left: bool = True,
         gamma: float = 0.995,
         eps: float = 1e-8,
     ) -> dict:
         """Compute node uncertainty from fast-sampled tail states.
 
-        The local entropy terms are computed in HILP embedding space using the
-        radial-angular estimator, while the final multiplier T_curr is obtained
-        by converting the current embedding goal-distance into temporal distance.
+        Symmetric HILP preserves the legacy embedding-space estimator exactly.
+        Directional HILP keeps the same local-geometry pipeline but injects
+        direction-aware temporal distances into T_curr and clustering.
         """
 
         hilp_fn = self._get_hilp_value_fn()
@@ -4921,14 +5528,42 @@ class DiffusionForcingPlanning(
         Z      = Z_all[2:]  # (K, D)
 
         _temporal_dist_fn = lambda emb_d: self.emb_dist_to_temporal_dist(emb_d, gamma)
+        _uses_directional_hilp = self._hilp_is_directional()
 
-        # Cluster tail embeddings by temporal distance (complete-linkage).
-        # cluster_labels: (G*K,) 0-indexed; n_clusters: int
-        cluster_labels = cluster_tail_by_temporal_dist(
-            z_tail=Z,
-            temporal_dist_fn=_temporal_dist_fn,
-            max_intra_dist=self.uncertainty_max_intra_cluster_dist,
+        _emb_dist_curr = float(np.linalg.norm(z_goal - z_curr))
+        _legacy_t_curr = float(
+            np.asarray(_temporal_dist_fn(np.asarray(_emb_dist_curr))).item()
         )
+        _t_curr = _legacy_t_curr
+        if _uses_directional_hilp:
+            _t_curr = float(
+                self._compute_raw_state_temporal_dist_np(
+                    curr_obs[None].astype(np.float32)
+                    if source_is_left
+                    else goal_obs[None].astype(np.float32),
+                    goal_obs[None].astype(np.float32)
+                    if source_is_left
+                    else curr_obs[None].astype(np.float32),
+                )[0]
+            )
+
+        # Symmetric HILP must preserve the legacy embedding-space clustering path.
+        # Directional HILP injects route-agnostic TD into clustering so one-way
+        # shortcuts do not collapse reverse-only states. max(TD(a->b), TD(b->a))
+        # is equivalent to requiring both directional TDs to stay below the
+        # cluster threshold.
+        if _uses_directional_hilp:
+            cluster_labels = cluster_tail_by_temporal_dist(
+                obs_tail=tail_obs,
+                pairwise_temporal_dist_fn=self._compute_unordered_equivalence_temporal_dist_np,
+                max_intra_dist=self.uncertainty_max_intra_cluster_dist,
+            )
+        else:
+            cluster_labels = cluster_tail_by_temporal_dist(
+                z_tail=Z,
+                temporal_dist_fn=_temporal_dist_fn,
+                max_intra_dist=self.uncertainty_max_intra_cluster_dist,
+            )
         n_clusters = int(cluster_labels.max() + 1) if len(cluster_labels) > 0 else 0
 
         min_required_samples = {
@@ -4939,16 +5574,12 @@ class DiffusionForcingPlanning(
         is_degenerate = int(Z.shape[0]) < min_required_samples
 
         if is_degenerate:
-            _emb_dist_curr = float(np.linalg.norm(z_goal - z_curr))
-            _t_curr = float(np.asarray(_temporal_dist_fn(np.asarray(_emb_dist_curr))).item())
             result = {
                 "U": 0.0,
                 "T_curr": _t_curr,
                 "degenerate": True,
             }
         elif self.uncertainty_mode in ("temporal_dist", "expected_root_node_dist"):
-            _emb_dist_curr = float(np.linalg.norm(z_goal - z_curr))
-            _t_curr = float(np.asarray(_temporal_dist_fn(np.asarray(_emb_dist_curr))).item())
             result = {
                 "U": 0.0,
                 "T_curr": _t_curr,
@@ -4962,9 +5593,11 @@ class DiffusionForcingPlanning(
                 lambda_weight=self.uncertainty_lambda,
                 eta_weight=self.uncertainty_eta,
             )
+            if _uses_directional_hilp:
+                _scale = _t_curr / max(_legacy_t_curr, eps)
+                result["U"] = float(result["U"]) * _scale
+                result["T_curr"] = _t_curr
         elif self.uncertainty_mode == "cluster":
-            _emb_dist_curr = float(np.linalg.norm(z_goal - z_curr))
-            _t_curr = float(np.asarray(_temporal_dist_fn(np.asarray(_emb_dist_curr))).item())
             _u = math.log(n_clusters + 1) * _t_curr if n_clusters > 0 else 0.0
             result = {"U": _u, "T_curr": _t_curr}
         else:
@@ -4977,6 +5610,10 @@ class DiffusionForcingPlanning(
                 eta_weight=self.uncertainty_eta,
                 eps=eps,
             )
+            if _uses_directional_hilp:
+                _scale = _t_curr / max(_legacy_t_curr, eps)
+                result["U"] = float(result["U"]) * _scale
+                result["T_curr"] = _t_curr
 
         result["cluster_labels"] = cluster_labels
         result["n_clusters"] = n_clusters
@@ -4989,13 +5626,15 @@ class DiffusionForcingPlanning(
         source_node: "TreeNode",
         target_node: "TreeNode",
         t_curr: float,
+        source_is_left: bool = True,
     ) -> float:
         """Compute the scalar selection value for a source-target pair."""
         if self.uncertainty_mode == "expected_root_node_dist":
-            return -self._compute_source_target_total_cost(
+            return -self._compute_directed_source_target_total_cost(
                 source_node=source_node,
                 target_node=target_node,
                 t_curr=t_curr,
+                source_is_left=source_is_left,
             )
         if self.uncertainty_mode == "temporal_dist":
             return -float(t_curr)
@@ -5008,8 +5647,34 @@ class DiffusionForcingPlanning(
         target_node: "TreeNode",
         t_curr: float,
     ) -> float:
+        """Legacy symmetric-compatible total cost helper.
+
+        This preserves the pre-directional semantics and remains valid for root
+        initialization because roots have zero cumulative distances.
+        """
         source_cum = float(getattr(source_node, "cum_temporal_dist_from_root", 0.0))
         target_cum = float(getattr(target_node, "cum_temporal_dist_from_root", 0.0))
+        return (
+            source_cum
+            + self._transform_temporal_dist_for_total_cost(t_curr)
+            + target_cum
+        )
+
+    def _compute_directed_source_target_total_cost(
+        self,
+        source_node: "TreeNode",
+        target_node: "TreeNode",
+        t_curr: float,
+        source_is_left: bool,
+    ) -> float:
+        if self._hilp_is_symmetric():
+            return self._compute_source_target_total_cost(source_node, target_node, t_curr)
+        if source_is_left:
+            source_cum = float(getattr(source_node, "cum_temporal_dist_from_root", 0.0))
+            target_cum = float(getattr(target_node, "cum_temporal_dist_to_root", 0.0))
+        else:
+            source_cum = float(getattr(source_node, "cum_temporal_dist_to_root", 0.0))
+            target_cum = float(getattr(target_node, "cum_temporal_dist_from_root", 0.0))
         return (
             source_cum
             + self._transform_temporal_dist_for_total_cost(t_curr)
@@ -5031,6 +5696,7 @@ class DiffusionForcingPlanning(
         obs_std_np: np.ndarray,
         opposite_trees: Optional[List["MCTSTreeState"]] = None,
         target_nodes_override: Optional[List["TreeNode"]] = None,
+        source_is_left_flags: Optional[List[bool]] = None,
     ) -> dict:
         """Run fast uncertainty sampling for a batch of non-terminal candidates.
 
@@ -5056,6 +5722,13 @@ class DiffusionForcingPlanning(
             "current_prefix_len_per_batch must have shape "
             f"({B_nt},), got {current_prefix_len_per_batch.shape}"
         )
+        if source_is_left_flags is None:
+            source_is_left_flags = [True] * B_nt
+        else:
+            source_is_left_flags = [bool(flag) for flag in source_is_left_flags]
+            assert len(source_is_left_flags) == B_nt, (
+                f"source_is_left_flags must have len {B_nt}, got {len(source_is_left_flags)}"
+            )
 
         # Build fast noise schedule
         unc_noise_levels_nt = self._generate_tree_conditioned_schedule(
@@ -5102,6 +5775,7 @@ class DiffusionForcingPlanning(
                 _unc_target_node = self._select_dynamic_goal(
                     current_leaf_obs=_tail_obs_unnorm,
                     opposite_tree_all_nodes=all_opposite_nodes_unc,
+                    source_is_left=bool(source_is_left_flags[_ii]),
                 )
             _unc_goal_norm = torch.tensor(
                 (_unc_target_node.obs - obs_mean_np) / obs_std_np,
@@ -5130,6 +5804,11 @@ class DiffusionForcingPlanning(
             for _ii in range(B_nt)
             for _ in range(G * K)
         ]
+        unc_source_is_left_flags = [
+            bool(source_is_left_flags[_ii])
+            for _ii in range(B_nt)
+            for _ in range(G * K)
+        ]
         unc_batch_plan_hists = self.parallel_plan(
             unc_obs,
             unc_goal,
@@ -5140,6 +5819,7 @@ class DiffusionForcingPlanning(
             plans=unc_init_plans_rep,
             prefix_len_list=unc_prefix_len_list,
             call_type="uncertainty",
+            source_is_left_flags=unc_source_is_left_flags,
         )  # (fast_steps+1, plan_tokens*fs, B_nt*G*K, c)
 
         # Split results back per candidate
@@ -5169,6 +5849,7 @@ class DiffusionForcingPlanning(
         unc_noise_levels_per_cand: List[np.ndarray], # B_nt × (G*K, fast_steps+1, plan_tokens)
         unc_guidance_scale_per_cand: List[list],     # B_nt × G*K floats
         target_nodes: List["TreeNode"],              # B_nt
+        source_is_left_flags: Optional[List[bool]] = None,
     ) -> dict:
         """Compute uncertainty values and build cluster_subplans for each candidate.
 
@@ -5178,6 +5859,13 @@ class DiffusionForcingPlanning(
             unc_results: list[dict] of len B_nt (raw _compute_node_uncertainty output)
         """
         B_nt = len(unc_hists_per_cand)
+        if source_is_left_flags is None:
+            source_is_left_flags = [True] * B_nt
+        else:
+            source_is_left_flags = [bool(flag) for flag in source_is_left_flags]
+            assert len(source_is_left_flags) == B_nt, (
+                f"source_is_left_flags must have len {B_nt}, got {len(source_is_left_flags)}"
+            )
         values: list = []
         cluster_subplans: list = []
         unc_results_out: list = []
@@ -5197,7 +5885,7 @@ class DiffusionForcingPlanning(
                 seg_size=seg_size,
             )[0]  # (obs_dim,)
 
-            feasible_mask_i = self._check_plan_batch_feasibility(
+            feasible_mask_i, feasibility_diag_i = self._check_plan_batch_feasibility(
                 plan_hists=unc_hists_i,
                 root_obs_list=[self._get_root_obs(parent_nodes[_ii])] * unc_hists_i.shape[2],
                 progress_obs_list=[curr_obs_i] * unc_hists_i.shape[2],
@@ -5206,11 +5894,346 @@ class DiffusionForcingPlanning(
                 ] * unc_hists_i.shape[2],
                 subplan_tail_depths=[curr_depth_i + 1] * unc_hists_i.shape[2],
                 seg_size=seg_size,
+                source_is_left_flags=[
+                    bool(source_is_left_flags[_ii])
+                ] * unc_hists_i.shape[2],
+                sequence_mode="route_execution",
+                return_diagnostics=True,
             )
             feasible_sample_indices = np.asarray(
                 np.where(np.asarray(feasible_mask_i, dtype=bool))[0],
                 dtype=int,
             )
+            source_root_node = self._get_root_node(parent_nodes[_ii])
+            target_root_node = self._get_root_node(target_nodes[_ii])
+            tree_label = getattr(source_root_node, "anchor_name", source_root_node.name)
+            target_label = getattr(target_root_node, "anchor_name", target_root_node.name)
+            visible_prefix_len = min(
+                self._get_prefix_len_frames_from_depth(curr_depth_i + 1, seg_size),
+                int(unc_hists_i.shape[1]),
+            )
+
+            def _summarize_visible_prefix(
+                subset_hists: torch.Tensor,
+                *,
+                source_is_left: bool,
+            ) -> Optional[dict[str, Any]]:
+                if subset_hists is None or subset_hists.shape[2] == 0 or visible_prefix_len <= 1:
+                    return None
+                vis_pos = self._unnormalize_x(subset_hists[-1])[
+                    :visible_prefix_len, :, self.pos_dim_indices
+                ].detach().cpu().numpy()
+                n_samples = int(vis_pos.shape[1])
+                stored_diffs = np.full((visible_prefix_len - 1, n_samples), np.nan, dtype=np.float32)
+                exec_diffs = np.full((visible_prefix_len - 1, n_samples), np.nan, dtype=np.float32)
+                for _sj in range(n_samples):
+                    stored_diffs[:, _sj] = self._compute_distance(
+                        vis_pos[:-1, _sj],
+                        vis_pos[1:, _sj],
+                        mode="execution_sequence",
+                    )
+                    exec_diffs[:, _sj] = self._compute_sequence_distance(
+                        vis_pos[:-1, _sj],
+                        vis_pos[1:, _sj],
+                        source_is_left=bool(source_is_left),
+                        sequence_mode="route_execution",
+                        context=f"visible_prefix[{tree_label}:{parent_nodes[_ii].name}:{_sj}]",
+                    )
+
+                def _pack(_diffs: np.ndarray) -> dict[str, Any]:
+                    flat = _diffs.reshape(-1)
+                    worst_flat_idx = int(np.nanargmax(_diffs))
+                    worst_frame_idx, worst_sample_idx = np.unravel_index(worst_flat_idx, _diffs.shape)
+                    worst_state1 = vis_pos[worst_frame_idx, worst_sample_idx].astype(np.float32)
+                    worst_state2 = vis_pos[worst_frame_idx + 1, worst_sample_idx].astype(np.float32)
+                    return {
+                        "max_per_sample": np.nanmax(_diffs, axis=0).astype(np.float32),
+                        "quantiles": np.nanpercentile(
+                            flat,
+                            [0.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0, 100.0],
+                        ).astype(np.float32),
+                        "worst_frame_idx": int(worst_frame_idx),
+                        "worst_sample_idx": int(worst_sample_idx),
+                        "worst_state1": worst_state1,
+                        "worst_state2": worst_state2,
+                        "worst_dist": float(_diffs[worst_frame_idx, worst_sample_idx]),
+                    }
+
+                return {
+                    "visible_prefix_len": int(visible_prefix_len),
+                    "stored": _pack(stored_diffs),
+                    "execution": _pack(exec_diffs),
+                }
+
+            def _emit_uncertainty_feasibility_log(
+                tag_suffix: str,
+                diag: dict[str, np.ndarray],
+                sample_indices: np.ndarray,
+                subset_hists: Optional[torch.Tensor] = None,
+            ) -> None:
+                visible_prefix_summary = _summarize_visible_prefix(
+                    subset_hists,
+                    source_is_left=bool(source_is_left_flags[_ii]),
+                )
+                self._log_directional_debug(
+                    f"uncertainty.feasibility{tag_suffix}",
+                    tree=tree_label,
+                    parent=parent_nodes[_ii].name,
+                    depth=int(curr_depth_i),
+                    target=target_label,
+                    metric=("temporal_dist" if self.use_TD_metric_as_dist else "l2"),
+                    source_is_left=bool(source_is_left_flags[_ii]),
+                    num_samples=int(sample_indices.size),
+                    sample_indices="[" + ",".join(str(int(v)) for v in sample_indices) + "]",
+                    max_continuity_violation=f"{float(np.max(diag['max_continuity_violation_per_sample'])):.6f}",
+                    max_continuity_dist=f"{float(np.max(diag['continuity_max_per_sample'])):.6f}",
+                    sample_maxima="[" + ",".join(
+                        f"{float(v):.6f}" for v in diag["continuity_max_per_sample"]
+                    ) + "]",
+                    sample_over_counts="[" + ",".join(
+                        str(int(v)) for v in diag["continuity_over_threshold_count_per_sample"]
+                    ) + "]",
+                    sample_worst_frames="[" + ",".join(
+                        str(int(v)) for v in diag["worst_frame_idx_per_sample"]
+                    ) + "]",
+                    sample_scope_starts="[" + ",".join(
+                        str(int(v)) for v in diag["continuity_scope_start_per_sample"]
+                    ) + "]",
+                    sample_scope_ends="[" + ",".join(
+                        str(int(v)) for v in diag["continuity_scope_end_per_sample"]
+                    ) + "]",
+                    sample_edge_counts="[" + ",".join(
+                        str(int(v)) for v in diag["continuity_edge_count_per_sample"]
+                    ) + "]",
+                    continuity_quantiles="[" + ",".join(
+                        f"{float(v):.6f}" for v in diag["continuity_quantiles"]
+                    ) + "]",
+                    worst_sample_idx=int(diag["worst_sample_idx_global"][0]),
+                    worst_frame_idx=int(diag["worst_frame_idx_global"][0]),
+                    worst_state1="[" + ",".join(
+                        f"{float(v):.6f}" for v in diag["worst_state1"]
+                    ) + "]",
+                    worst_state2="[" + ",".join(
+                        f"{float(v):.6f}" for v in diag["worst_state2"]
+                    ) + "]",
+                    worst_eval_obs="[" + ",".join(
+                        f"{float(v):.6f}" for v in diag["worst_eval_obs"]
+                    ) + "]",
+                    worst_eval_goal="[" + ",".join(
+                        f"{float(v):.6f}" for v in diag["worst_eval_goal"]
+                    ) + "]",
+                    worst_l2=f"{float(diag['worst_l2'][0]):.6f}",
+                    worst_hilp_value=f"{float(diag['worst_hilp_value'][0]):.6f}",
+                    worst_emb_dist=f"{float(diag['worst_emb_dist'][0]):.6f}",
+                    worst_preclip_val=f"{float(diag['worst_preclip_val'][0]):.12f}",
+                    worst_clipped_val=f"{float(diag['worst_clipped_val'][0]):.12f}",
+                    worst_raw_td=f"{float(diag['worst_raw_td'][0]):.6f}",
+                    worst_scaled_td=f"{float(diag['worst_scaled_td'][0]):.6f}",
+                    worst_td_clamped=bool(diag["worst_td_clamped"][0]),
+                    visible_prefix_len=(
+                        0 if visible_prefix_summary is None
+                        else int(visible_prefix_summary["visible_prefix_len"])
+                    ),
+                    visible_stored_quantiles=(
+                        "[]"
+                        if visible_prefix_summary is None
+                        else "[" + ",".join(
+                            f"{float(v):.6f}"
+                            for v in visible_prefix_summary["stored"]["quantiles"]
+                        ) + "]"
+                    ),
+                    visible_stored_max=(
+                        "nan"
+                        if visible_prefix_summary is None
+                        else f"{float(np.max(visible_prefix_summary['stored']['max_per_sample'])):.6f}"
+                    ),
+                    visible_stored_worst_frame=(
+                        -1 if visible_prefix_summary is None
+                        else int(visible_prefix_summary["stored"]["worst_frame_idx"])
+                    ),
+                    visible_stored_worst_state1=(
+                        "[]"
+                        if visible_prefix_summary is None
+                        else "[" + ",".join(
+                            f"{float(v):.6f}"
+                            for v in visible_prefix_summary["stored"]["worst_state1"]
+                        ) + "]"
+                    ),
+                    visible_stored_worst_state2=(
+                        "[]"
+                        if visible_prefix_summary is None
+                        else "[" + ",".join(
+                            f"{float(v):.6f}"
+                            for v in visible_prefix_summary["stored"]["worst_state2"]
+                        ) + "]"
+                    ),
+                    visible_execution_quantiles=(
+                        "[]"
+                        if visible_prefix_summary is None
+                        else "[" + ",".join(
+                            f"{float(v):.6f}"
+                            for v in visible_prefix_summary["execution"]["quantiles"]
+                        ) + "]"
+                    ),
+                    visible_execution_max=(
+                        "nan"
+                        if visible_prefix_summary is None
+                        else f"{float(np.max(visible_prefix_summary['execution']['max_per_sample'])):.6f}"
+                    ),
+                    visible_execution_worst_frame=(
+                        -1 if visible_prefix_summary is None
+                        else int(visible_prefix_summary["execution"]["worst_frame_idx"])
+                    ),
+                    visible_execution_worst_state1=(
+                        "[]"
+                        if visible_prefix_summary is None
+                        else "[" + ",".join(
+                            f"{float(v):.6f}"
+                            for v in visible_prefix_summary["execution"]["worst_state1"]
+                        ) + "]"
+                    ),
+                    visible_execution_worst_state2=(
+                        "[]"
+                        if visible_prefix_summary is None
+                        else "[" + ",".join(
+                            f"{float(v):.6f}"
+                            for v in visible_prefix_summary["execution"]["worst_state2"]
+                        ) + "]"
+                    ),
+                    rejected_by_proximity=int(np.sum(~diag["is_proximal"])),
+                    rejected_by_progress=int(np.sum(~diag["is_not_stagnant"])),
+                    rejected_by_prior=int(np.sum(~diag["is_far_from_prior"])),
+                )
+
+            self._log_directional_debug(
+                "uncertainty.feasibility",
+                tree=tree_label,
+                parent=parent_nodes[_ii].name,
+                depth=int(curr_depth_i),
+                target=target_label,
+                metric=("temporal_dist" if self.use_TD_metric_as_dist else "l2"),
+                source_is_left=bool(source_is_left_flags[_ii]),
+                num_raw_samples=int(unc_hists_i.shape[2]),
+                num_feasible_samples=int(feasible_sample_indices.size),
+                max_continuity_violation=f"{float(np.max(feasibility_diag_i['max_continuity_violation_per_sample'])):.6f}",
+                max_continuity_dist=f"{float(np.max(feasibility_diag_i['continuity_max_per_sample'])):.6f}",
+                sample_maxima="[" + ",".join(
+                    f"{float(v):.6f}" for v in feasibility_diag_i["continuity_max_per_sample"]
+                ) + "]",
+                sample_over_counts="[" + ",".join(
+                    str(int(v)) for v in feasibility_diag_i["continuity_over_threshold_count_per_sample"]
+                ) + "]",
+                sample_worst_frames="[" + ",".join(
+                    str(int(v)) for v in feasibility_diag_i["worst_frame_idx_per_sample"]
+                ) + "]",
+                continuity_quantiles="[" + ",".join(
+                    f"{float(v):.6f}" for v in feasibility_diag_i["continuity_quantiles"]
+                ) + "]",
+                worst_sample_idx=int(feasibility_diag_i["worst_sample_idx_global"][0]),
+                worst_frame_idx=int(feasibility_diag_i["worst_frame_idx_global"][0]),
+                worst_state1="[" + ",".join(
+                    f"{float(v):.6f}" for v in feasibility_diag_i["worst_state1"]
+                ) + "]",
+                worst_state2="[" + ",".join(
+                    f"{float(v):.6f}" for v in feasibility_diag_i["worst_state2"]
+                ) + "]",
+                worst_eval_obs="[" + ",".join(
+                    f"{float(v):.6f}" for v in feasibility_diag_i["worst_eval_obs"]
+                ) + "]",
+                worst_eval_goal="[" + ",".join(
+                    f"{float(v):.6f}" for v in feasibility_diag_i["worst_eval_goal"]
+                ) + "]",
+                worst_l2=f"{float(feasibility_diag_i['worst_l2'][0]):.6f}",
+                worst_hilp_value=f"{float(feasibility_diag_i['worst_hilp_value'][0]):.6f}",
+                worst_emb_dist=f"{float(feasibility_diag_i['worst_emb_dist'][0]):.6f}",
+                worst_preclip_val=f"{float(feasibility_diag_i['worst_preclip_val'][0]):.12f}",
+                worst_clipped_val=f"{float(feasibility_diag_i['worst_clipped_val'][0]):.12f}",
+                worst_raw_td=f"{float(feasibility_diag_i['worst_raw_td'][0]):.6f}",
+                worst_scaled_td=f"{float(feasibility_diag_i['worst_scaled_td'][0]):.6f}",
+                worst_td_clamped=bool(feasibility_diag_i["worst_td_clamped"][0]),
+                rejected_by_proximity=int(np.sum(~feasibility_diag_i["is_proximal"])),
+                rejected_by_progress=int(np.sum(~feasibility_diag_i["is_not_stagnant"])),
+                rejected_by_prior=int(np.sum(~feasibility_diag_i["is_far_from_prior"])),
+            )
+            if getattr(self, "directional_debug_logging", False):
+                all_sample_indices = np.arange(unc_hists_i.shape[2], dtype=int)
+                rejected_sample_indices = all_sample_indices[
+                    ~np.asarray(feasible_mask_i, dtype=bool)
+                ]
+
+                if feasible_sample_indices.size > 0:
+                    _, feasible_diag_i = self._check_plan_batch_feasibility(
+                        plan_hists=unc_hists_i[:, :, feasible_sample_indices, :],
+                        root_obs_list=[
+                            self._get_root_obs(parent_nodes[_ii])
+                        ] * feasible_sample_indices.size,
+                        progress_obs_list=[curr_obs_i] * feasible_sample_indices.size,
+                        prefix_len_frames_list=[
+                            self._get_prefix_len_frames_from_depth(curr_depth_i, seg_size)
+                        ] * feasible_sample_indices.size,
+                        subplan_tail_depths=[curr_depth_i + 1] * feasible_sample_indices.size,
+                        seg_size=seg_size,
+                        source_is_left_flags=[
+                            bool(source_is_left_flags[_ii])
+                        ] * feasible_sample_indices.size,
+                        sequence_mode="route_execution",
+                        return_diagnostics=True,
+                    )
+                    _emit_uncertainty_feasibility_log(
+                        ".feasible",
+                        feasible_diag_i,
+                        feasible_sample_indices,
+                        unc_hists_i[:, :, feasible_sample_indices, :],
+                    )
+                else:
+                    self._log_directional_debug(
+                        "uncertainty.feasibility.feasible",
+                        tree=tree_label,
+                        parent=parent_nodes[_ii].name,
+                        depth=int(curr_depth_i),
+                        target=target_label,
+                        metric=("temporal_dist" if self.use_TD_metric_as_dist else "l2"),
+                        source_is_left=bool(source_is_left_flags[_ii]),
+                        num_samples=0,
+                        sample_indices="[]",
+                    )
+
+                if rejected_sample_indices.size > 0:
+                    _, rejected_diag_i = self._check_plan_batch_feasibility(
+                        plan_hists=unc_hists_i[:, :, rejected_sample_indices, :],
+                        root_obs_list=[
+                            self._get_root_obs(parent_nodes[_ii])
+                        ] * rejected_sample_indices.size,
+                        progress_obs_list=[curr_obs_i] * rejected_sample_indices.size,
+                        prefix_len_frames_list=[
+                            self._get_prefix_len_frames_from_depth(curr_depth_i, seg_size)
+                        ] * rejected_sample_indices.size,
+                        subplan_tail_depths=[curr_depth_i + 1] * rejected_sample_indices.size,
+                        seg_size=seg_size,
+                        source_is_left_flags=[
+                            bool(source_is_left_flags[_ii])
+                        ] * rejected_sample_indices.size,
+                        sequence_mode="route_execution",
+                        return_diagnostics=True,
+                    )
+                    _emit_uncertainty_feasibility_log(
+                        ".rejected",
+                        rejected_diag_i,
+                        rejected_sample_indices,
+                        unc_hists_i[:, :, rejected_sample_indices, :],
+                    )
+                else:
+                    self._log_directional_debug(
+                        "uncertainty.feasibility.rejected",
+                        tree=tree_label,
+                        parent=parent_nodes[_ii].name,
+                        depth=int(curr_depth_i),
+                        target=target_label,
+                        metric=("temporal_dist" if self.use_TD_metric_as_dist else "l2"),
+                        source_is_left=bool(source_is_left_flags[_ii]),
+                        num_samples=0,
+                        sample_indices="[]",
+                    )
 
             if feasible_sample_indices.size == 0:
                 values.append(-np.inf)
@@ -5258,6 +6281,7 @@ class DiffusionForcingPlanning(
                 curr_obs=curr_obs_i,
                 target_node=target_nodes[_ii],
                 tail_obs=tail_obs_i,
+                source_is_left=bool(source_is_left_flags[_ii]),
             )
             unc_result["num_raw_samples"] = int(unc_hists_i.shape[2])
             unc_result["num_feasible_samples"] = int(feasible_sample_indices.size)
@@ -5274,6 +6298,7 @@ class DiffusionForcingPlanning(
                     source_node=parent_nodes[_ii],
                     target_node=target_nodes[_ii],
                     t_curr=float(unc_result["T_curr"]),
+                    source_is_left=bool(source_is_left_flags[_ii]),
                 )
                 values.append(float(selection_value))
             else:
@@ -5490,20 +6515,22 @@ class DiffusionForcingPlanning(
         root_cost = np.full((n_anchors, n_anchors), np.inf, dtype=np.float32)
         np.fill_diagonal(root_cost, 0.0)
         for i in range(n_anchors):
-            for j in range(i + 1, n_anchors):
+            for j in range(n_anchors):
+                if i == j:
+                    continue
                 td_ij = float(
                     self._compute_raw_state_temporal_dist_np(
                         trees[i].root_node.obs[None].astype(np.float32),
                         trees[j].root_node.obs[None].astype(np.float32),
                     )[0]
                 )
-                total_cost_ij = self._compute_source_target_total_cost(
+                total_cost_ij = self._compute_directed_source_target_total_cost(
                     source_node=trees[i].root_node,
                     target_node=trees[j].root_node,
                     t_curr=td_ij,
+                    source_is_left=True,
                 )
                 root_cost[i, j] = total_cost_ij
-                root_cost[j, i] = total_cost_ij
 
         planner_state = {
             "trees": trees,
@@ -5527,19 +6554,22 @@ class DiffusionForcingPlanning(
         trees = [tree1, tree2]
         root_cost = np.full((2, 2), np.inf, dtype=np.float32)
         np.fill_diagonal(root_cost, 0.0)
-        td_01 = float(
-            self._compute_raw_state_temporal_dist_np(
-                tree1.root_node.obs[None].astype(np.float32),
-                tree2.root_node.obs[None].astype(np.float32),
-            )[0]
-        )
-        total_cost_01 = self._compute_source_target_total_cost(
-            source_node=tree1.root_node,
-            target_node=tree2.root_node,
-            t_curr=td_01,
-        )
-        root_cost[0, 1] = total_cost_01
-        root_cost[1, 0] = total_cost_01
+        for i, source_tree in enumerate(trees):
+            for j, target_tree in enumerate(trees):
+                if i == j:
+                    continue
+                td_ij = float(
+                    self._compute_raw_state_temporal_dist_np(
+                        source_tree.root_node.obs[None].astype(np.float32),
+                        target_tree.root_node.obs[None].astype(np.float32),
+                    )[0]
+                )
+                root_cost[i, j] = self._compute_directed_source_target_total_cost(
+                    source_node=source_tree.root_node,
+                    target_node=target_tree.root_node,
+                    t_curr=td_ij,
+                    source_is_left=True,
+                )
 
         fixed_solver_result = None
         if self.multi_tree_route_mode == "fixed_temporal":
@@ -5547,7 +6577,7 @@ class DiffusionForcingPlanning(
                 "feasible": True,
                 "anchor_order": np.asarray([0, 1], dtype=np.int32),
                 "route_text": "S -> G",
-                "total_cost": float(total_cost_01),
+                "total_cost": float(root_cost[0, 1]),
             }
 
         planner_state = {
@@ -5595,6 +6625,16 @@ class DiffusionForcingPlanning(
                 horizon=horizon,
                 conditions=conditions,
                 target_node_override=target_node,
+                source_is_left_override=self._require_source_is_left(
+                    None if target_info is None else target_info.get("source_is_left"),
+                    context=f"root_uncertainty_init:{tree.tag}",
+                ),
+                target_tree_override=(
+                    None if target_info is None else target_info.get("target_tree")
+                ),
+                direction_reason_override=(
+                    None if target_info is None else target_info.get("direction_reason")
+                ),
             )
         return root_uncertainty_infos
 
@@ -5633,22 +6673,40 @@ class DiffusionForcingPlanning(
                 )
                 if target_tree is None:
                     continue
-                target_td = float(
-                    self._compute_raw_state_temporal_dist_np(
-                        node.obs[None].astype(np.float32),
-                        target_node.obs[None].astype(np.float32),
-                    )[0]
+                source_is_left = self._require_source_is_left(
+                    None if target_info is None else target_info.get("source_is_left"),
+                    context=f"select_multi_tree_expansion_parents:{tree.tag}:{node.name}",
                 )
+                direction_reason = (
+                    None if target_info is None else target_info.get("direction_reason")
+                )
+                if source_is_left:
+                    target_td = float(
+                        self._compute_raw_state_temporal_dist_np(
+                            node.obs[None].astype(np.float32),
+                            target_node.obs[None].astype(np.float32),
+                        )[0]
+                    )
+                else:
+                    target_td = float(
+                        self._compute_raw_state_temporal_dist_np(
+                            target_node.obs[None].astype(np.float32),
+                            node.obs[None].astype(np.float32),
+                        )[0]
+                    )
                 candidate_pool.append(
                     {
                         "node": node,
                         "tree": tree,
                         "opposite_tree": target_tree,
                         "target_node": target_node,
+                        "source_is_left": bool(source_is_left),
+                        "direction_reason": direction_reason,
                         "value": self._compute_selection_value_for_target(
                             source_node=node,
                             target_node=target_node,
                             t_curr=target_td,
+                            source_is_left=source_is_left,
                         ),
                     }
                 )
@@ -5697,30 +6755,55 @@ class DiffusionForcingPlanning(
                         len(target_nodes),
                         axis=0,
                     )
-                    tds = self._compute_raw_state_temporal_dist_np(src_obs_rep, target_obs)
-                    best_local_idx = int(np.argmin(tds))
-                    target_node = target_nodes[best_local_idx]
-                    bridge_cost = self._compute_source_target_total_cost(
+                    tds_fwd = self._compute_raw_state_temporal_dist_np(src_obs_rep, target_obs)
+                    best_fwd_idx = int(np.argmin(tds_fwd))
+                    target_node_fwd = target_nodes[best_fwd_idx]
+                    bridge_cost_fwd = self._compute_directed_source_target_total_cost(
                         source_node=source_node,
-                        target_node=target_node,
-                        t_curr=float(tds[best_local_idx]),
+                        target_node=target_node_fwd,
+                        t_curr=float(tds_fwd[best_fwd_idx]),
+                        source_is_left=True,
                     )
-                    pair_key = self._anchor_pair_key(source_anchor_idx, target_anchor_idx)
-                    if bridge_cost >= float(planner_state["best_direct_bridge_raw"][pair_key]):
-                        continue
-                    planner_state["best_direct_bridge_raw"][pair_key] = bridge_cost
-                    planner_state["best_direct_bridge_raw"][pair_key[::-1]] = bridge_cost
-                    planner_state["effective_pair_cost"][pair_key] = bridge_cost
-                    planner_state["effective_pair_cost"][pair_key[::-1]] = bridge_cost
-                    planner_state["best_direct_bridge_info"][pair_key] = {
-                        "pair_key": pair_key,
-                        "source_anchor_idx": source_anchor_idx,
-                        "target_anchor_idx": target_anchor_idx,
-                        "source_node": source_node,
-                        "target_node": target_node,
-                        "bridge_cost": float(bridge_cost),
-                        "t_curr": float(tds[best_local_idx]),
-                    }
+                    pair_key_fwd = self._anchor_pair_key(source_anchor_idx, target_anchor_idx)
+                    if bridge_cost_fwd < float(planner_state["best_direct_bridge_raw"][pair_key_fwd]):
+                        planner_state["best_direct_bridge_raw"][pair_key_fwd] = bridge_cost_fwd
+                        planner_state["effective_pair_cost"][pair_key_fwd] = bridge_cost_fwd
+                        planner_state["best_direct_bridge_info"][pair_key_fwd] = (
+                            self._build_connection_record(
+                                pair_key=pair_key_fwd,
+                                source_anchor_idx=source_anchor_idx,
+                                target_anchor_idx=target_anchor_idx,
+                                source_node=source_node,
+                                target_node=target_node_fwd,
+                                bridge_cost=float(bridge_cost_fwd),
+                                t_curr=float(tds_fwd[best_fwd_idx]),
+                            )
+                        )
+
+                    tds_rev = self._compute_raw_state_temporal_dist_np(target_obs, src_obs_rep)
+                    best_rev_idx = int(np.argmin(tds_rev))
+                    source_node_rev = target_nodes[best_rev_idx]
+                    bridge_cost_rev = self._compute_directed_source_target_total_cost(
+                        source_node=source_node_rev,
+                        target_node=source_node,
+                        t_curr=float(tds_rev[best_rev_idx]),
+                        source_is_left=True,
+                    )
+                    pair_key_rev = self._anchor_pair_key(target_anchor_idx, source_anchor_idx)
+                    if bridge_cost_rev < float(planner_state["best_direct_bridge_raw"][pair_key_rev]):
+                        planner_state["best_direct_bridge_raw"][pair_key_rev] = bridge_cost_rev
+                        planner_state["effective_pair_cost"][pair_key_rev] = bridge_cost_rev
+                        planner_state["best_direct_bridge_info"][pair_key_rev] = (
+                            self._build_connection_record(
+                                pair_key=pair_key_rev,
+                                source_anchor_idx=target_anchor_idx,
+                                target_anchor_idx=source_anchor_idx,
+                                source_node=source_node_rev,
+                                target_node=source_node,
+                                bridge_cost=float(bridge_cost_rev),
+                                t_curr=float(tds_rev[best_rev_idx]),
+                            )
+                        )
 
     def _select_multi_tree_round_meetings(
         self,
@@ -5746,7 +6829,18 @@ class DiffusionForcingPlanning(
                 continue
             source_anchor_idx = int(selected_tree.anchor_idx)
             target_anchor_idx = int(target_tree.anchor_idx)
-            pair_key = self._anchor_pair_key(source_anchor_idx, target_anchor_idx)
+            is_fwd = self._is_source_left_of_target(
+                planner_state,
+                source_anchor_idx,
+                target_anchor_idx,
+            )
+            if is_fwd:
+                route_left, route_right = source_anchor_idx, target_anchor_idx
+                left_node, right_node = node, meeting_target_node
+            else:
+                route_left, route_right = target_anchor_idx, source_anchor_idx
+                left_node, right_node = meeting_target_node, node
+            pair_key = self._anchor_pair_key(route_left, route_right)
             if pair_key not in forced_pairs:
                 continue
             if target_anchor_idx in planner_state["accepted_neighbors"][source_anchor_idx]:
@@ -5756,43 +6850,46 @@ class DiffusionForcingPlanning(
             if self._is_anchor_satisfied(planner_state, target_anchor_idx):
                 continue
             gap = self._compute_plan_gap_to_target(
-                node,
-                meeting_target_node,
+                left_node,
+                right_node,
                 plan_tokens,
             )
             if gap is None or not np.isfinite(gap) or gap >= self.meeting_delta:
                 continue
             t_curr = float(
                 self._compute_raw_state_temporal_dist_np(
-                    node.obs[None].astype(np.float32),
-                    meeting_target_node.obs[None].astype(np.float32),
+                    left_node.obs[None].astype(np.float32),
+                    right_node.obs[None].astype(np.float32),
                 )[0]
             )
-            bridge_cost = self._compute_source_target_total_cost(
-                source_node=node,
-                target_node=meeting_target_node,
+            bridge_cost = self._compute_directed_source_target_total_cost(
+                source_node=left_node,
+                target_node=right_node,
                 t_curr=t_curr,
+                source_is_left=True,
             )
-            candidate = {
-                "pair_key": pair_key,
-                "source_anchor_idx": source_anchor_idx,
-                "target_anchor_idx": target_anchor_idx,
-                "source_node": node,
-                "target_node": meeting_target_node,
-                "selection_count": info.get(
+            candidate = self._build_connection_record(
+                pair_key=pair_key,
+                source_anchor_idx=route_left,
+                target_anchor_idx=route_right,
+                source_node=left_node,
+                target_node=right_node,
+                bridge_cost=float(bridge_cost),
+                selection_count=info.get(
                     "selection_count",
                     getattr(node, "last_selection_count", None),
                 ),
-                "bridge_cost": float(bridge_cost),
-                "gap": float(gap),
-                "meeting_target_td": (
+                gap=float(gap),
+                meeting_target_td=(
                     float(meeting_target_td)
                     if meeting_target_td is not None
                     else float("inf")
                 ),
-                "selected_tree": selected_tree,
-                "target_tree": target_tree,
-            }
+                selected_tree=selected_tree,
+                target_tree=target_tree,
+                meeting_source_is_left=info.get("meeting_source_is_left"),
+                meeting_direction_reason=info.get("meeting_direction_reason"),
+            )
             incumbent = accepted_candidates.get(pair_key)
             if incumbent is None or (
                 candidate["bridge_cost"],
@@ -5828,6 +6925,7 @@ class DiffusionForcingPlanning(
             f"round={int(loops):03d} "
             f"selection_count={selection_text} "
             f"pair={pair_text} "
+            f"kind={candidate.get('connection_kind', 'unknown')} "
             f"source_path={candidate['source_node'].name} "
             f"meeting_target_path={candidate['target_node'].name} "
             f"gap={float(candidate['gap']):.6f} "
@@ -5843,19 +6941,26 @@ class DiffusionForcingPlanning(
         loops: int,
     ) -> None:
         for pair_key, candidate in accepted_candidates.items():
-            if pair_key in planner_state["accepted_pair_edges"]:
+            existing_pair_key = self._find_existing_pair_key(
+                planner_state["accepted_pair_edges"],
+                pair_key,
+                allow_symmetric_compat_view=True,
+            )
+            if existing_pair_key is not None:
                 continue
             a, b = pair_key
             if self._is_anchor_satisfied(planner_state, a) or self._is_anchor_satisfied(planner_state, b):
                 continue
-            planner_state["accepted_pair_edges"][pair_key] = {
+            repo_pair_key = self._get_pair_repository_key(pair_key)
+            planner_state["accepted_pair_edges"][repo_pair_key] = {
                 **candidate,
+                "pair_key": repo_pair_key,
                 "accepted_round": int(loops),
             }
             planner_state["accepted_neighbors"][a].add(b)
             planner_state["accepted_neighbors"][b].add(a)
             self._log_anchor_meeting_accept(
-                candidate,
+                {**candidate, "pair_key": repo_pair_key},
                 loops,
                 n_anchors=len(planner_state["trees"]),
             )
@@ -5870,10 +6975,23 @@ class DiffusionForcingPlanning(
         self,
         planner_state: dict,
         pair_key: Tuple[int, int],
+        allow_symmetric_compat_view: bool = True,
     ) -> Optional[dict]:
-        if pair_key in planner_state["accepted_pair_edges"]:
-            return planner_state["accepted_pair_edges"][pair_key]
-        return planner_state["best_direct_bridge_info"].get(pair_key)
+        accepted_key = self._find_existing_pair_key(
+            planner_state["accepted_pair_edges"],
+            pair_key,
+            allow_symmetric_compat_view=allow_symmetric_compat_view,
+        )
+        if accepted_key is not None:
+            return planner_state["accepted_pair_edges"][accepted_key]
+        bridge_key = self._find_existing_pair_key(
+            planner_state["best_direct_bridge_info"],
+            pair_key,
+            allow_symmetric_compat_view=allow_symmetric_compat_view,
+        )
+        if bridge_key is None:
+            return None
+        return planner_state["best_direct_bridge_info"][bridge_key]
 
     def _find_restricted_anchor_walk(
         self,
@@ -5950,8 +7068,6 @@ class DiffusionForcingPlanning(
             node
             for node in source_tree.get_all_nodes()
             if node.obs is not None
-            and len(node.plan_history) > 0
-            and len(node.plan_history[-1]) > 0
         ]
         target_nodes = [
             node
@@ -5973,21 +7089,22 @@ class DiffusionForcingPlanning(
             best_local_idx = int(np.argmin(tds))
             target_node = target_nodes[best_local_idx]
             t_curr = float(tds[best_local_idx])
-            bridge_cost = self._compute_source_target_total_cost(
+            bridge_cost = self._compute_directed_source_target_total_cost(
                 source_node=source_node,
                 target_node=target_node,
                 t_curr=t_curr,
+                source_is_left=True,
             )
-            candidate = {
-                "pair_key": pair_key,
-                "source_anchor_idx": source_anchor_idx,
-                "target_anchor_idx": target_anchor_idx,
-                "source_node": source_node,
-                "target_node": target_node,
-                "bridge_cost": float(bridge_cost),
-                "t_curr": t_curr,
-                "repaired": True,
-            }
+            candidate = self._build_connection_record(
+                pair_key=pair_key,
+                source_anchor_idx=source_anchor_idx,
+                target_anchor_idx=target_anchor_idx,
+                source_node=source_node,
+                target_node=target_node,
+                bridge_cost=float(bridge_cost),
+                t_curr=t_curr,
+                repaired=True,
+            )
             if best_candidate is None or (
                 candidate["bridge_cost"],
                 candidate["t_curr"],
@@ -6005,13 +7122,12 @@ class DiffusionForcingPlanning(
             return None
 
         planner_state["best_direct_bridge_raw"][pair_key] = float(best_candidate["bridge_cost"])
-        planner_state["best_direct_bridge_raw"][pair_key[::-1]] = float(best_candidate["bridge_cost"])
         planner_state["effective_pair_cost"][pair_key] = float(best_candidate["bridge_cost"])
-        planner_state["effective_pair_cost"][pair_key[::-1]] = float(best_candidate["bridge_cost"])
         planner_state["best_direct_bridge_info"][pair_key] = best_candidate
         print(
             "[edge-repair] "
             f"pair={self._anchor_pair_text_from_indices(pair_key, len(planner_state['trees']))} "
+            f"kind={best_candidate.get('connection_kind', 'unknown')} "
             f"source_path={best_candidate['source_node'].name} "
             f"target_path={best_candidate['target_node'].name} "
             f"bridge_cost={float(best_candidate['bridge_cost']):.6f}",
@@ -6041,6 +7157,17 @@ class DiffusionForcingPlanning(
         if stored_source_idx == int(desired_source_idx) and stored_target_idx == int(desired_target_idx):
             return segment
         if stored_source_idx == int(desired_target_idx) and stored_target_idx == int(desired_source_idx):
+            if self._hilp_is_directional():
+                self._log_directional_debug(
+                    "connection.reverse_materialization_blocked",
+                    stored_pair=(stored_source_idx, stored_target_idx),
+                    desired_pair=(int(desired_source_idx), int(desired_target_idx)),
+                )
+                raise ValueError(
+                    "Directional connection cannot be materialized in reverse orientation: "
+                    f"stored=({stored_source_idx},{stored_target_idx}) "
+                    f"desired=({desired_source_idx},{desired_target_idx})"
+                )
             return torch.flip(segment, [0])
         raise ValueError(
             f"Connection orientation mismatch: stored=({stored_source_idx},{stored_target_idx}) "
@@ -6316,6 +7443,9 @@ class DiffusionForcingPlanning(
         horizon: int,
         conditions: Optional[Any],
         target_node_override: Optional["TreeNode"] = None,
+        source_is_left_override: bool = True,
+        target_tree_override: Optional["MCTSTreeState"] = None,
+        direction_reason_override: Optional[str] = None,
     ) -> dict:
         """Initialize root node uncertainty before MCTS search begins.
 
@@ -6371,6 +7501,7 @@ class DiffusionForcingPlanning(
             obs_mean_np=obs_mean_np,
             obs_std_np=obs_std_np,
             target_nodes_override=[target_node_override] if target_node_override is not None else None,
+            source_is_left_flags=[bool(source_is_left_override)],
         )
 
         # 5. Select target node for uncertainty computation (based on root obs)
@@ -6382,6 +7513,7 @@ class DiffusionForcingPlanning(
             target_node = self._select_dynamic_goal(
                 current_leaf_obs=root_node.obs,
                 opposite_tree_all_nodes=all_opposite_nodes,
+                source_is_left=bool(source_is_left_override),
             )
 
         # 6. Compute uncertainty and cluster_subplans
@@ -6394,6 +7526,7 @@ class DiffusionForcingPlanning(
             unc_noise_levels_per_cand=unc_sampling_result["unc_noise_levels_per_cand"],
             unc_guidance_scale_per_cand=unc_sampling_result["unc_guidance_scale_per_cand"],
             target_nodes=[target_node],
+            source_is_left_flags=[bool(source_is_left_override)],
         )
 
         # 7. Set root node cluster_subplans and value
@@ -6401,11 +7534,18 @@ class DiffusionForcingPlanning(
         if root_node.cluster_subplans == []:
             root_node.reset_children_slots(0, [])
         root_node.set_value(unc_compute_result["values"][0])  # values[0] = -U
+        root_node.target_node = target_node
+        root_node.source_is_left = bool(source_is_left_override)
+        setattr(root_node, "target_tree", target_tree_override)
+        setattr(root_node, "direction_reason", direction_reason_override)
         root_vinfo = {
             "node": root_node,
             "depth": int(root_node.depth),
             "value": unc_compute_result["values"][0],
             "target_node": target_node,
+            "target_tree": target_tree_override,
+            "source_is_left": bool(source_is_left_override),
+            "direction_reason": direction_reason_override,
             "selection_count": root_node.selection_count,
             "uncertainty_plan_hist_frame": unc_compute_result["filtered_unc_hists"][0],
             "unc_diagnostics": unc_compute_result["unc_results"][0],
@@ -6766,9 +7906,21 @@ class DiffusionForcingPlanning(
                 target_node = self._select_dynamic_goal(
                     current_leaf_obs=parent_obs,
                     opposite_tree_all_nodes=all_opposite_nodes,
+                    source_is_left=bool(
+                        info.get(
+                            "source_is_left",
+                            self._tree_uses_forward_prefix_semantics(tree),
+                        )
+                    ),
                 )
                 info["target_node"] = (
                     target_node  # Will be propagated to child TreeNode via expand()
+                )
+                info["source_is_left"] = bool(
+                    info.get(
+                        "source_is_left",
+                        self._tree_uses_forward_prefix_semantics(tree),
+                    )
                 )
                 target_pos = target_node.obs
 
@@ -6941,6 +8093,10 @@ class DiffusionForcingPlanning(
                         particle_guidance_scale=self.particle_guidance_scale,
                         group_ids=_group_ids,
                         call_type="expansion",
+                        source_is_left_flags=[
+                            bool(_cand.get("source_is_left", self._tree_uses_forward_prefix_semantics(tree)))
+                            for _cand in expanded_node_candidates
+                        ],
                     )  # (m+1, plan_tokens*fs, B, c)
 
                 # Build per-candidate step captures for video visualization.
@@ -7207,6 +8363,15 @@ class DiffusionForcingPlanning(
                         opposite_tree=opposite_tree,
                         obs_mean_np=obs_mean_np,
                         obs_std_np=obs_std_np,
+                        source_is_left_flags=[
+                            bool(
+                                expanded_node_candidates[_i].get(
+                                    "source_is_left",
+                                    self._tree_uses_forward_prefix_semantics(tree),
+                                )
+                            )
+                            for _i in non_terminal_cand_indices
+                        ],
                     )
 
                     for _ii, _i in enumerate(non_terminal_cand_indices):
@@ -7336,6 +8501,15 @@ class DiffusionForcingPlanning(
                         unc_noise_levels_per_cand=_nt_noise_levels,
                         unc_guidance_scale_per_cand=_nt_guidance_scales,
                         target_nodes=_nt_target_nodes,
+                        source_is_left_flags=[
+                            bool(
+                                expanded_node_candidates[_i].get(
+                                    "source_is_left",
+                                    self._tree_uses_forward_prefix_semantics(tree),
+                                )
+                            )
+                            for _i in non_terminal_cand_indices
+                        ],
                     )
 
                     for _ii, _i in enumerate(non_terminal_cand_indices):
@@ -7741,6 +8915,11 @@ class DiffusionForcingPlanning(
                     expanded_node_candidate["opposite_tree"] = opposite_tree
                     expanded_node_candidate["target_node"] = parent_info.get("target_node")
                     expanded_node_candidate["parent_key"] = parent_key
+                    expanded_node_candidate["source_is_left"] = self._require_source_is_left(
+                        parent_info.get("source_is_left"),
+                        context=f"mixed_round/candidate:{selected_tree.tag}:{expanded_node_candidate['name']}",
+                    )
+                    expanded_node_candidate["direction_reason"] = parent_info.get("direction_reason")
                     selected_nodes.append(selected_node)
                     expanded_node_candidates.append(expanded_node_candidate)
                     if _is_cluster_parent:
@@ -7754,6 +8933,11 @@ class DiffusionForcingPlanning(
                 expanded_node_candidate["opposite_tree"] = opposite_tree
                 expanded_node_candidate["target_node"] = parent_info.get("target_node")
                 expanded_node_candidate["parent_key"] = parent_key
+                expanded_node_candidate["source_is_left"] = self._require_source_is_left(
+                    parent_info.get("source_is_left"),
+                    context=f"mixed_round/candidate:{selected_tree.tag}:{expanded_node_candidate['name']}",
+                )
+                expanded_node_candidate["direction_reason"] = parent_info.get("direction_reason")
                 selected_nodes.append(selected_node)
                 expanded_node_candidates.append(expanded_node_candidate)
 
@@ -7819,6 +9003,11 @@ class DiffusionForcingPlanning(
                         _cand["opposite_tree"] = _opp_tree
                         _cand["target_node"] = _info.get("target_node")
                         _cand["parent_key"] = _parent_key
+                        _cand["source_is_left"] = self._require_source_is_left(
+                            _info.get("source_is_left"),
+                            context=f"mixed_round/cluster_reuse:{_sel_tree.tag}:{_cand['name']}",
+                        )
+                        _cand["direction_reason"] = _info.get("direction_reason")
                         _new_valid.append(_cand)
                         _new_sel.append(_sel)
                         _cluster_reuse_slot_map[
@@ -7852,11 +9041,22 @@ class DiffusionForcingPlanning(
             if target_node is None:
                 all_opposite_nodes = info["opposite_tree"].get_all_nodes()
                 assert len(all_opposite_nodes) > 0, "opposite_tree has no nodes"
+                source_is_left = self._require_source_is_left(
+                    info.get("source_is_left"),
+                    context=f"mixed_round/target_select:{info['selected_tree'].tag}:{info['name']}",
+                )
                 target_node = self._select_dynamic_goal(
                     current_leaf_obs=parent_obs,
                     opposite_tree_all_nodes=all_opposite_nodes,
+                    source_is_left=source_is_left,
+                )
+            else:
+                source_is_left = self._require_source_is_left(
+                    info.get("source_is_left"),
+                    context=f"mixed_round/target_reuse:{info['selected_tree'].tag}:{info['name']}",
                 )
             info["target_node"] = target_node
+            info["source_is_left"] = bool(source_is_left)
             target_pos = target_node.obs
             g_norm = torch.tensor(
                 (target_pos - obs_mean_np) / obs_std_np,
@@ -7867,6 +9067,13 @@ class DiffusionForcingPlanning(
 
         effective_obs_normalized = torch.cat(eff_obs_norm_list, dim=0)
         effective_goal_normalized = torch.cat(eff_goal_norm_list, dim=0)
+        expanded_source_is_left_flags = [
+            self._require_source_is_left(
+                cand.get("source_is_left"),
+                context=f"mixed_round/expanded_flags:{cand['selected_tree'].tag}:{cand['name']}",
+            )
+            for cand in expanded_node_candidates
+        ]
 
         filtered_expanded_node_plan_hists = [None] * len(expanded_node_candidates)
         filtered_replanned_plan_hists = [None] * len(expanded_node_candidates)
@@ -7984,6 +9191,7 @@ class DiffusionForcingPlanning(
                     particle_guidance_scale=self.particle_guidance_scale,
                     group_ids=group_ids,
                     call_type="expansion",
+                    source_is_left_flags=expanded_source_is_left_flags,
                 )
 
             raw_captures = getattr(self, "_parallel_plan_step_captures", None)
@@ -8141,6 +9349,7 @@ class DiffusionForcingPlanning(
                         for i in range(len(expanded_node_candidates))
                     ],
                     call_type="replan",
+                    source_is_left_flags=expanded_source_is_left_flags,
                 )
                 assert replanned_plan_hists.ndim == 4
                 assert replanned_plan_hists.shape[2] == len(expanded_node_candidates)
@@ -8168,6 +9377,8 @@ class DiffusionForcingPlanning(
                     for i in range(len(expanded_node_candidates))
                 ],
                 seg_size=seg_size,
+                source_is_left_flags=expanded_source_is_left_flags,
+                sequence_mode="route_execution",
             )
 
             if non_terminal_cand_indices:
@@ -8209,6 +9420,10 @@ class DiffusionForcingPlanning(
                     ],
                     target_nodes_override=[
                         expanded_node_candidates[i]["target_node"]
+                        for i in non_terminal_cand_indices
+                    ],
+                    source_is_left_flags=[
+                        expanded_source_is_left_flags[i]
                         for i in non_terminal_cand_indices
                     ],
                 )
@@ -8311,6 +9526,10 @@ class DiffusionForcingPlanning(
                 unc_noise_levels_per_cand=nt_noise_levels,
                 unc_guidance_scale_per_cand=nt_guidance_scales,
                 target_nodes=nt_target_nodes,
+                source_is_left_flags=[
+                    expanded_source_is_left_flags[i]
+                    for i in non_terminal_cand_indices
+                ],
             )
             for ii, i in enumerate(non_terminal_cand_indices):
                 values[i] = unc_compute_result["values"][ii]
@@ -8685,15 +9904,25 @@ class DiffusionForcingPlanning(
                 _child.obs = np.concatenate(
                     [_new_sim_state["qpos"], _new_sim_state["qvel"]]
                 )[self.obs_dim_indices]
-                _parent_td = float(
+                _parent_td_fwd = float(
                     self._compute_raw_state_temporal_dist_np(
                         parent_node.obs[None].astype(np.float32),
                         _child.obs[None].astype(np.float32),
                     )[0]
                 )
+                _parent_td_rev = float(
+                    self._compute_raw_state_temporal_dist_np(
+                        _child.obs[None].astype(np.float32),
+                        parent_node.obs[None].astype(np.float32),
+                    )[0]
+                )
                 _child.cum_temporal_dist_from_root = (
                     float(getattr(parent_node, "cum_temporal_dist_from_root", 0.0))
-                    + _parent_td
+                    + _parent_td_fwd
+                )
+                _child.cum_temporal_dist_to_root = (
+                    float(getattr(parent_node, "cum_temporal_dist_to_root", 0.0))
+                    + _parent_td_rev
                 )
         else:
             seg_size: int = self._require_current_plan_tokens() // self.sequence_dividing_factor
@@ -8717,15 +9946,25 @@ class DiffusionForcingPlanning(
                     else:
                         _child.sim_state[k] = v
                 _child.sim_state["qpos"][:2] = _child.obs[self.pos_dim_indices]
-                _parent_td = float(
+                _parent_td_fwd = float(
                     self._compute_raw_state_temporal_dist_np(
                         parent_node.obs[None].astype(np.float32),
                         _child.obs[None].astype(np.float32),
                     )[0]
                 )
+                _parent_td_rev = float(
+                    self._compute_raw_state_temporal_dist_np(
+                        _child.obs[None].astype(np.float32),
+                        parent_node.obs[None].astype(np.float32),
+                    )[0]
+                )
                 _child.cum_temporal_dist_from_root = (
                     float(getattr(parent_node, "cum_temporal_dist_from_root", 0.0))
-                    + _parent_td
+                    + _parent_td_fwd
+                )
+                _child.cum_temporal_dist_to_root = (
+                    float(getattr(parent_node, "cum_temporal_dist_to_root", 0.0))
+                    + _parent_td_rev
                 )
 
     def _log_root_uncertainty_videos(
@@ -9052,18 +10291,21 @@ class DiffusionForcingPlanning(
         self,
         current_leaf_obs: np.ndarray,
         opposite_tree_all_nodes: List["TreeNode"],
+        source_is_left: bool = True,
     ) -> "TreeNode":
         """Select the best goal from the opposite tree's nodes using HILP value.
 
-        Computes V(current_leaf_obs, candidate.obs) for each candidate in
+        Computes the route-consistent HILP value for each candidate in
         `opposite_tree_all_nodes` and returns the node with the highest value
-        (i.e., temporally closest to `current_leaf_obs`).
+        (i.e., temporally closest under the requested direction).
 
         Args:
             current_leaf_obs: Unnormalized observation of the leaf node being expanded,
                               shape (obs_dim,).
             opposite_tree_all_nodes: List of TreeNode objects from the opposite tree
                                  (all nodes, not just leaves).
+            source_is_left: Route direction flag. True keeps the legacy
+                V(current, candidate) ordering; False uses V(candidate, current).
 
         Returns:
             best_node: The TreeNode from opposite_tree_all_nodes with the highest HILP value.
@@ -9072,7 +10314,11 @@ class DiffusionForcingPlanning(
             "All opposite_tree_all_nodes must have obs set before goal selection"
         targets = np.stack([n.obs for n in opposite_tree_all_nodes])  # (N, D) — unnormalized world coords
         obs_expanded = np.tile(current_leaf_obs, (targets.shape[0], 1))  # (N, D)
-        values = self._compute_hilp_values(obs_expanded, targets, use_no_grad=True)
+        values = self._compute_hilp_values(
+            obs_expanded if source_is_left else targets,
+            targets if source_is_left else obs_expanded,
+            use_no_grad=True,
+        )
 
         best_idx = torch.argmax(values).item()
         best_value = values[best_idx].item()

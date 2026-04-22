@@ -183,6 +183,7 @@ def compute_guidance_grad_np(
     obs_np: np.ndarray,
     target_np: np.ndarray,
     hilp_fn,
+    backward_guidance_mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
     """Core guidance gradient logic shared by goal_guidance() and _compute_guidance_grad_fields().
 
@@ -201,6 +202,9 @@ def compute_guidance_grad_np(
         obs_np:     (N, hilp_obs_dim) float32 — observations padded to HILP input dim
         target_np:  (1, hilp_obs_dim) or (N, hilp_obs_dim) float32 — target padded to HILP input dim
         hilp_fn:    HILPJax instance with compute_grads / compute_values_np
+        backward_guidance_mask:
+            Optional boolean mask. When provided under directional HILP, rows
+            marked True use d/dobs V(target, obs) instead of d/dobs V(obs, target).
 
     Returns:
         combined_np:    (N, 2) final guidance direction per observation
@@ -216,9 +220,36 @@ def compute_guidance_grad_np(
         target_xy = target_np[:, :2]
         goal_rep_np = target_np.copy()
 
-    # 1. HILP gradient ∂V/∂obs[:2] via JAX
+    # 1. HILP gradient via JAX
     _t_grad0 = time.time()
-    hilp_grad_np = hilp_fn.compute_grads(obs_np, goal_rep_np)  # (N, 2)
+    n = len(obs_np)
+    use_directional = bool(
+        backward_guidance_mask is not None
+        and hasattr(planner, "_hilp_is_directional")
+        and planner._hilp_is_directional()
+    )
+    if use_directional:
+        backward_guidance_mask = np.asarray(backward_guidance_mask, dtype=bool).reshape(n)
+        forward_guidance_mask = ~backward_guidance_mask
+        hilp_grad_np = np.zeros((n, 2), dtype=np.float32)
+        if np.any(forward_guidance_mask):
+            hilp_grad_np[forward_guidance_mask] = hilp_fn.compute_grads(
+                obs_np[forward_guidance_mask],
+                goal_rep_np[forward_guidance_mask],
+            )
+        if np.any(backward_guidance_mask):
+            if not hasattr(hilp_fn, "compute_grads_wrt_second_arg"):
+                raise AttributeError(
+                    "Directional guidance requires compute_grads_wrt_second_arg on the HILP wrapper."
+                )
+            hilp_grad_np[backward_guidance_mask] = hilp_fn.compute_grads_wrt_second_arg(
+                goal_rep_np[backward_guidance_mask],
+                obs_np[backward_guidance_mask],
+            )
+    else:
+        backward_guidance_mask = np.zeros(n, dtype=bool)
+        forward_guidance_mask = ~backward_guidance_mask
+        hilp_grad_np = hilp_fn.compute_grads(obs_np, goal_rep_np)  # (N, 2)
     hilp_grad_ms = (time.time() - _t_grad0) * 1000
 
     # 2. Normalize: ∇V/|∇V|
@@ -259,7 +290,17 @@ def compute_guidance_grad_np(
     # min(v1,v2) path, same _hilp_ref_obs padding). For HILPJax v1==v2 so min is a no-op,
     # but this keeps the computation identical across heatmap / grad-field / guidance.
     _t_val0 = time.time()
-    hilp_values_np = planner._compute_hilp_values(obs_np, goal_rep_np).cpu().numpy()  # (N,)
+    hilp_values_np = np.zeros(n, dtype=np.float32)
+    if np.any(forward_guidance_mask):
+        hilp_values_np[forward_guidance_mask] = planner._compute_hilp_values(
+            obs_np[forward_guidance_mask],
+            goal_rep_np[forward_guidance_mask],
+        ).cpu().numpy()
+    if np.any(backward_guidance_mask):
+        hilp_values_np[backward_guidance_mask] = planner._compute_hilp_values(
+            goal_rep_np[backward_guidance_mask],
+            obs_np[backward_guidance_mask],
+        ).cpu().numpy()
     hilp_value_ms = (time.time() - _t_val0) * 1000
 
     # 5. TD threshold: switch to RMSE direction for temporally-far elements (V < TD_thres)
@@ -282,6 +323,7 @@ def compute_guidance_grad_np(
 def goal_guidance(
     planner, x: torch.Tensor, goal: torch.Tensor, horizon: int,
     active_frame_ranges: Optional[List[Tuple[int, int]]] = None,
+    source_is_left_flags: Optional[List[bool]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, list, list]:
     """
     Target guidance to reach goal/start.
@@ -307,6 +349,9 @@ def goal_guidance(
             rmse_per_batch_list: per-batch RMSE pseudo-loss values (Python list)
     """
     pred = prepare_pred(planner, x)
+    backward_guidance_mask_batch: Optional[np.ndarray] = None
+    if source_is_left_flags is not None:
+        backward_guidance_mask_batch = ~np.asarray(source_is_left_flags, dtype=bool)
 
     if not planner.use_reward:
         # Temporal consistency guidance via shifted predictions
@@ -355,7 +400,11 @@ def goal_guidance(
 
             _t0 = time.time()
             combined_np, hilp_values_np, far_mask_np, hilp_combined_np, rmse_grad_np, _hilp_grad_ms, _hilp_value_ms = compute_guidance_grad_np(
-                planner, obs_tail_np, target_np, hilp_fn
+                planner,
+                obs_tail_np,
+                target_np,
+                hilp_fn,
+                backward_guidance_mask=backward_guidance_mask_batch,
             )
             _t_hilp_ms = (time.time() - _t0) * 1000
 
@@ -419,11 +468,21 @@ def goal_guidance(
             target_np[:, _obs_idx] = target_tail_raw
 
             _t0 = time.time()
+            backward_guidance_mask_np = None
+            if backward_guidance_mask_batch is not None:
+                backward_guidance_mask_np = np.tile(
+                    backward_guidance_mask_batch[None, :],
+                    (len(tail_pos), 1),
+                ).reshape(-1)
             # Delegate all normalization / KDE / TD-threshold logic to shared helper.
             # Any changes to compute_guidance_grad_np automatically apply here AND
             # to _compute_guidance_grad_fields (plan/plan_at_* visualization).
             combined_np, hilp_values_np, far_mask_np, hilp_combined_np, rmse_grad_np, _hilp_grad_ms, _hilp_value_ms = compute_guidance_grad_np(
-                planner, obs_tail_np, target_np, hilp_fn
+                planner,
+                obs_tail_np,
+                target_np,
+                hilp_fn,
+                backward_guidance_mask=backward_guidance_mask_np,
             )
             _t_hilp_ms = (time.time() - _t0) * 1000
 
@@ -720,7 +779,8 @@ def particle_guidance(
 def combined_guidance(planner, x_start, goal, horizon, guidance_scale,
                       particle_guidance_scale: float = 0.0,
                       group_ids: Optional[list] = None,
-                      active_frame_ranges: Optional[List[Tuple[int, int]]] = None):
+                      active_frame_ranges: Optional[List[Tuple[int, int]]] = None,
+                      source_is_left_flags: Optional[List[bool]] = None):
     """
     Combined guidance signals for diffusion model.
 
@@ -753,6 +813,7 @@ def combined_guidance(planner, x_start, goal, horizon, guidance_scale,
     _hilp_inner, _rmse_inner, _, _ = goal_guidance(
         planner, x_start, goal, horizon,
         active_frame_ranges=active_frame_ranges,
+        source_is_left_flags=source_is_left_flags,
     )  # both (B,) per-batch tensors
     rmse_guidance_scale = getattr(planner, 'rmse_guidance_scale', 1.0)
     goal_loss = (guidance_scale * _hilp_inner + rmse_guidance_scale * _rmse_inner).sum()

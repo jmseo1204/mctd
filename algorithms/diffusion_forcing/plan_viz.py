@@ -99,19 +99,38 @@ class PlanVizMixin:
     # HILP heatmap & gradient field
     # ------------------------------------------------------------------
 
-    def _compute_hilp_heatmap(self, goal_obs_np: np.ndarray, grid_res: int = 40) -> dict:
+    def _compute_hilp_heatmap(
+        self,
+        goal_obs_np: np.ndarray,
+        grid_res: int = 40,
+        source_is_left: bool = True,
+    ) -> dict:
         """
         Compute a HILP value heatmap over the maze for visualization.
 
         Args:
             goal_obs_np: Full goal observation (1D, obs_dim) in world (unnormalized) coords.
-                         First 2 dims are x, y. Used as the fixed goal for V(s, goal).
+                         First 2 dims are x, y. Used as the fixed route endpoint.
             grid_res: Grid resolution per axis (default 40 → 1600 total points).
+            source_is_left: Route direction flag. True visualizes V(grid, goal);
+                False visualizes V(goal, grid).
 
         Returns:
             dict with 'X', 'Y' (world-coord meshgrids, shape grid_res×grid_res) and
             'values' (HILP values, same shape).
         """
+        # Visualization-only knobs. Keep these local so the rendered heatmap is
+        # more legible without changing planner/runtime behavior or config shape.
+        heatmap_grid_res = max(int(grid_res), 80)
+        heatmap_display_mode = "temporal_dist"   # "raw_value" | "temporal_dist"
+        heatmap_percentile_low = 2.0
+        heatmap_percentile_high = 98.0
+        heatmap_power_gamma = 0.6
+        heatmap_alpha = 0.8
+        heatmap_cmap = "inferno"
+        heatmap_contour_count = 7
+        heatmap_td_gamma = 0.995
+
         # --- Determine world-coordinate extent from maze dimensions ---
         if is_grid_env(self.env_id):
             maze_grid = get_maze_grid(self.env_id)
@@ -128,8 +147,8 @@ class PlanVizMixin:
             x_min, x_max = obs_mean_np[0] - 3 * obs_std_np[0], obs_mean_np[0] + 3 * obs_std_np[0]
             y_min, y_max = obs_mean_np[1] - 3 * obs_std_np[1], obs_mean_np[1] + 3 * obs_std_np[1]
 
-        xs = np.linspace(x_min, x_max, grid_res)
-        ys = np.linspace(y_min, y_max, grid_res)
+        xs = np.linspace(x_min, x_max, heatmap_grid_res)
+        ys = np.linspace(y_min, y_max, heatmap_grid_res)
         X, Y = np.meshgrid(xs, ys)             # both shape (grid_res, grid_res)
         grid_xy = np.stack([X.ravel(), Y.ravel()], axis=-1)  # (N, 2)
         N = grid_xy.shape[0]
@@ -141,15 +160,65 @@ class PlanVizMixin:
         # goal_batch: same goal obs repeated for each grid point
         goal_batch = np.tile(goal_obs_np, (N, 1)).astype(np.float32)
 
-        values = self._compute_hilp_values(obs_batch, goal_batch)   # (N,)
-        values = values.cpu().numpy().reshape(X.shape)               # (grid_res, grid_res)
+        raw_values = self._compute_hilp_values(
+            obs_batch if source_is_left else goal_batch,
+            goal_batch if source_is_left else obs_batch,
+        ).cpu().numpy()   # (N,)
 
-        return {'X': X, 'Y': Y, 'values': values}
+        if heatmap_display_mode == "temporal_dist":
+            display_values = self.emb_dist_to_temporal_dist(
+                (-raw_values).astype(np.float64),
+                gamma=heatmap_td_gamma,
+            ).astype(np.float32)
+            colorbar_label = "Temporal Distance"
+        else:
+            display_values = raw_values.astype(np.float32)
+            colorbar_label = "HILP V(s,g)"
+
+        valid_values = display_values[np.isfinite(display_values)]
+        if valid_values.size == 0:
+            clip_vmin, clip_vmax = 0.0, 1.0
+        else:
+            clip_vmin = float(np.percentile(valid_values, heatmap_percentile_low))
+            clip_vmax = float(np.percentile(valid_values, heatmap_percentile_high))
+            full_vmin = float(valid_values.min())
+            full_vmax = float(valid_values.max())
+            if not np.isfinite(clip_vmin):
+                clip_vmin = full_vmin
+            if not np.isfinite(clip_vmax):
+                clip_vmax = full_vmax
+            if clip_vmax <= clip_vmin:
+                clip_vmin, clip_vmax = full_vmin, full_vmax
+            if clip_vmax <= clip_vmin:
+                clip_vmax = clip_vmin + 1e-6
+
+        contour_levels = np.linspace(
+            clip_vmin,
+            clip_vmax,
+            num=max(int(heatmap_contour_count), 2),
+            dtype=np.float32,
+        )
+
+        return {
+            "X": X,
+            "Y": Y,
+            "values": display_values.reshape(X.shape),
+            "raw_values": raw_values.reshape(X.shape),
+            "cmap": heatmap_cmap,
+            "alpha": float(heatmap_alpha),
+            "clip_vmin": float(clip_vmin),
+            "clip_vmax": float(clip_vmax),
+            "power_gamma": float(heatmap_power_gamma),
+            "contour_levels": contour_levels,
+            "colorbar_label": colorbar_label,
+            "display_mode": heatmap_display_mode,
+        }
 
     def _compute_guidance_grad_fields(
         self,
         target_pos: np.ndarray,
         grid_step: float = 2.0,
+        source_is_left: bool = True,
     ) -> Optional[dict]:
         """
         Compute HILP gradient field over the maze for visualization.
@@ -157,6 +226,9 @@ class PlanVizMixin:
         Args:
             target_pos: (2,) world coordinates of the fixed target (green star).
             grid_step: Grid spacing in world coordinates.
+            source_is_left: Route direction flag. True visualizes forward
+                guidance toward the target; False visualizes backward guidance
+                d/dobs V(target, obs).
 
         Returns:
             dict with keys:
@@ -212,8 +284,15 @@ class PlanVizMixin:
             return None
 
         try:
+            backward_mask = None
+            if not source_is_left and hasattr(self, "_hilp_is_directional") and self._hilp_is_directional():
+                backward_mask = np.ones(N, dtype=bool)
             combined_flat, values_flat, _far_mask_flat, _hilp_flat, _rmse_flat, _, _ = guidance.compute_guidance_grad_np(
-                self, obs_np, target_np, hilp_fn
+                self,
+                obs_np,
+                target_np,
+                hilp_fn,
+                backward_guidance_mask=backward_mask,
             )
         except Exception:
             return None
@@ -416,6 +495,16 @@ class PlanVizMixin:
 
         node_traj = self._extract_node_trajectory(vnode)
         is_fwd = self._tree_uses_forward_prefix_semantics(active_tree)
+        source_is_left = bool(
+            vinfo.get(
+                "source_is_left",
+                getattr(vnode, "source_is_left", True),
+            )
+        )
+        direction_reason = vinfo.get(
+            "direction_reason",
+            getattr(vnode, "direction_reason", None),
+        )
         tgt_node_traj = (
             self._extract_node_trajectory(target_node)
             if target_node is not None
@@ -458,19 +547,22 @@ class PlanVizMixin:
             tgt_cache_key = (
                 tgt_name,
                 tuple(np.asarray(tgt_pos).reshape(-1).tolist()),
+                bool(source_is_left),
             )
             if tgt_name is not None and tgt_cache_key in tgt_vis_cache:
                 cand_heatmap, cand_grad_field = tgt_vis_cache[tgt_cache_key]
             else:
                 try:
                     cand_heatmap = self._compute_hilp_heatmap(
-                        tgt_pos.astype(np.float32)  # tgt_pos already indexed by obs_dim_indices
+                        tgt_pos.astype(np.float32),  # tgt_pos already indexed by obs_dim_indices
+                        source_is_left=source_is_left,
                     )
                 except Exception:
                     pass
                 try:
                     cand_grad_field = self._compute_guidance_grad_fields(
-                        tgt_pos[self.pos_dim_indices]
+                        tgt_pos[self.pos_dim_indices],
+                        source_is_left=source_is_left,
                     )
                 except Exception:
                     pass
@@ -734,8 +826,19 @@ class PlanVizMixin:
             or getattr(active_tree, "anchor_name", None)
             or self._node_anchor_name(vnode, "S" if is_fwd else "G")
         )
+        target_tree = vinfo.get(
+            "target_tree",
+            getattr(vnode, "target_tree", None),
+        )
+        target_tree_root = (
+            get_root_node(target_tree.root_node)
+            if target_tree is not None and hasattr(target_tree, "root_node")
+            else target_root
+        )
         target_tree_label = (
-            getattr(target_root, "anchor_name", None)
+            getattr(target_tree_root, "anchor_name", None)
+            or getattr(target_tree, "anchor_name", None)
+            or getattr(target_root, "anchor_name", None)
             or self._node_anchor_name(target_node, "G" if is_fwd else "S")
         )
         label_with_count = (
@@ -748,14 +851,28 @@ class PlanVizMixin:
         )
         video_key = f"{video_key_prefix}/plan_at_{label_with_count}"
         plan_tokens = self._require_current_plan_tokens()
+        value_gap_left = vnode if source_is_left else target_node
+        value_gap_right = target_node if source_is_left else vnode
+        value_target_mode = self._get_node_endpoint_mode(target_node)
+        value_connection_kind = self._describe_connection_kind(
+            value_gap_left,
+            value_gap_right,
+        )
         value_target_gap = self._compute_plan_gap_to_target(
-            vnode,
-            target_node,
+            value_gap_left,
+            value_gap_right,
             plan_tokens,
         )
+        meeting_gap_left = vnode if source_is_left else meeting_target_node
+        meeting_gap_right = meeting_target_node if source_is_left else vnode
+        meeting_target_mode = self._get_node_endpoint_mode(meeting_target_node)
+        meeting_connection_kind = self._describe_connection_kind(
+            meeting_gap_left,
+            meeting_gap_right,
+        )
         meeting_gap = self._compute_plan_gap_to_target(
-            vnode,
-            meeting_target_node,
+            meeting_gap_left,
+            meeting_gap_right,
             plan_tokens,
         )
         print(
@@ -763,8 +880,15 @@ class PlanVizMixin:
             f"video_key={video_key} "
             f"selection_count={selection_count:03d} "
             f"node={getattr(vnode, 'name', None)} "
+            f"source_is_left={int(bool(source_is_left))} "
+            f"direction_reason={direction_reason} "
+            f"target_tree={target_tree_label} "
             f"value_target={getattr(target_node, 'name', None)} "
+            f"value_target_mode={value_target_mode} "
+            f"value_kind={value_connection_kind} "
             f"meeting_target={getattr(meeting_target_node, 'name', None)} "
+            f"meeting_target_mode={meeting_target_mode} "
+            f"meeting_kind={meeting_connection_kind} "
             f"value_target_gap={_fmt_optional_float(value_target_gap)} "
             f"meeting_gap={_fmt_optional_float(meeting_gap)}",
             flush=True,

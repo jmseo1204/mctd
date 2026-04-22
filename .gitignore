@@ -29,6 +29,8 @@ visualizations/
 .serena/
 .vscode/
 .wandb*/
+reports/
+paper/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

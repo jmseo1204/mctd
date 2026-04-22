@@ -175,6 +175,7 @@ def solve_fixed_endpoint_hamiltonian_path_with_second_best(
 def solve_fixed_endpoint_hamiltonian_path_with_forced_adjacency(
     anchor_shortest_dists: np.ndarray,
     forced_adjacent_pairs: list[tuple[int, int]] | None = None,
+    ordered_forced_pairs: bool = False,
 ) -> dict[str, Any]:
     anchor_shortest_dists = np.asarray(anchor_shortest_dists, dtype=np.float32)
     n_anchors = int(anchor_shortest_dists.shape[0])
@@ -190,7 +191,10 @@ def solve_fixed_endpoint_hamiltonian_path_with_forced_adjacency(
         a, b = int(pair[0]), int(pair[1])
         if a == b:
             raise ValueError("Forced adjacency cannot contain identical endpoints")
-        normalized_pairs.append((min(a, b), max(a, b)))
+        if ordered_forced_pairs:
+            normalized_pairs.append((a, b))
+        else:
+            normalized_pairs.append((min(a, b), max(a, b)))
 
     waypoint_indices = list(range(1, n_anchors - 1))
     best_order = None
@@ -199,10 +203,16 @@ def solve_fixed_endpoint_hamiltonian_path_with_forced_adjacency(
 
     for waypoint_order in permutations(waypoint_indices):
         order = np.asarray((0,) + waypoint_order + (n_anchors - 1,), dtype=np.int32)
-        order_pairs = {
-            (min(int(order[i]), int(order[i + 1])), max(int(order[i]), int(order[i + 1])))
-            for i in range(len(order) - 1)
-        }
+        if ordered_forced_pairs:
+            order_pairs = {
+                (int(order[i]), int(order[i + 1]))
+                for i in range(len(order) - 1)
+            }
+        else:
+            order_pairs = {
+                (min(int(order[i]), int(order[i + 1])), max(int(order[i]), int(order[i + 1])))
+                for i in range(len(order) - 1)
+            }
         if any(pair not in order_pairs for pair in normalized_pairs):
             continue
 

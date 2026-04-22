@@ -110,6 +110,23 @@ class PlanPostprocMixin:
         for parent_name, indices in parent_groups.items():
             # All siblings in the same group share the same target_node (set by _select_dynamic_goal)
             target_node = expanded_node_candidates[indices[0]].get("target_node")
+            group_source_flags = [
+                self._require_source_is_left(
+                    expanded_node_candidates[idx].get("source_is_left"),
+                    context=f"endpoint_dedup:{parent_name}:{expanded_node_candidates[idx]['name']}",
+                )
+                for idx in indices
+            ]
+            source_is_left = bool(group_source_flags[0])
+            if any(flag != source_is_left for flag in group_source_flags[1:]):
+                self._log_directional_debug(
+                    "endpoint_dedup.direction_mismatch",
+                    parent=parent_name,
+                    flags=group_source_flags,
+                )
+                raise ValueError(
+                    f"Sibling candidates under '{parent_name}' disagree on source_is_left: {group_source_flags}"
+                )
             if target_node is not None and target_node.obs is not None:
                 # Stack endpoints for this group → compute V(endpoint_i, target) in one batch
                 group_obs = np.stack([candidate_obses[i] for i in indices])  # (G, n_obs)
@@ -117,8 +134,8 @@ class PlanPostprocMixin:
                     target_node.obs, (len(indices), 1)
                 )  # (G, n_obs) — obs already indexed by obs_dim_indices
                 hilp_vals = self._compute_hilp_values(
-                    group_obs,
-                    target_tiled,
+                    group_obs if source_is_left else target_tiled,
+                    target_tiled if source_is_left else group_obs,
                     use_no_grad=True,
                 ).cpu().numpy()  # (G,)
                 group_values = {idx: float(hilp_vals[local_i]) for local_i, idx in enumerate(indices)}
@@ -137,7 +154,15 @@ class PlanPostprocMixin:
                         continue
                     _obs_i = candidate_obses[i].reshape(1, -1).astype(np.float32)
                     _obs_j = candidate_obses[j].reshape(1, -1).astype(np.float32)
-                    dist = float(self._compute_distance(_obs_i, _obs_j)[0])
+                    dist = float(
+                        self._compute_sequence_distance(
+                            _obs_i,
+                            _obs_j,
+                            source_is_left=source_is_left,
+                            sequence_mode="route_execution",
+                            context=f"endpoint_dedup:{parent_name}:{i}->{j}",
+                        )[0]
+                    )
                     if dist < self.diverge_threshold:
                         # Duplicate: kill the one with lower HILP value (farther from target)
                         if group_values[i] >= group_values[j]:
@@ -183,7 +208,11 @@ class PlanPostprocMixin:
             remaining_start = current_idx + 1
             M = n_frames - remaining_start
             _cur_obs_rep = np.broadcast_to(obs_frames[current_idx:current_idx + 1], (M, obs_frames.shape[1])).copy()
-            dists = self._compute_distance(obs_frames[remaining_start:], _cur_obs_rep)
+            dists = self._compute_distance(
+                _cur_obs_rep,
+                obs_frames[remaining_start:],
+                mode="execution_sequence",
+            )
 
             within = np.where(dists <= threshold)[0]            # local indices, ascending
             if len(within) > 0:
@@ -259,6 +288,130 @@ class PlanPostprocMixin:
             plan_slice = torch.flip(plan_slice, [0])
         return self._extract_plan_obs_frames(plan_slice)
 
+    def _node_has_materialized_plan(self, node) -> bool:
+        """Return whether `node` has a materialized plan prefix we can slice."""
+        if node is None:
+            return False
+        plan_history = getattr(node, "plan_history", None)
+        if plan_history is None or len(plan_history) == 0:
+            return False
+        latest_hist = plan_history[-1]
+        return latest_hist is not None and len(latest_hist) > 0
+
+    def _get_node_endpoint_mode(self, node) -> Optional[str]:
+        """Classify a node endpoint as a materialized segment or an anchor point."""
+        if node is None or getattr(node, "obs", None) is None:
+            return None
+        if self._node_has_materialized_plan(node) and int(getattr(node, "depth", 0)) > 0:
+            return "segment"
+        return "anchor"
+
+    def _describe_connection_kind(self, source_node, target_node) -> Optional[str]:
+        source_mode = self._get_node_endpoint_mode(source_node)
+        target_mode = self._get_node_endpoint_mode(target_node)
+        if source_mode is None or target_mode is None:
+            return None
+        return f"{source_mode}_to_{target_mode}"
+
+    def _extract_node_endpoint_obs(
+        self,
+        node,
+        plan_tokens: int,
+        *,
+        source_is_left: bool,
+        role: str,
+    ) -> Optional[np.ndarray]:
+        """Return the execution-ordered endpoint observations for gap checks.
+
+        Materialized nodes contribute their route-ordered prefix segment. Root-only
+        or otherwise unmaterialized nodes fall back to a singleton anchor point.
+        """
+        endpoint_mode = self._get_node_endpoint_mode(node)
+        if endpoint_mode is None:
+            return None
+        if endpoint_mode == "segment":
+            return self._extract_route_ordered_segment_obs(
+                node,
+                plan_tokens=plan_tokens,
+                start_depth=0,
+                end_depth=int(node.depth),
+                source_is_left=source_is_left,
+                role=role,
+            )
+        return np.asarray(node.obs, dtype=np.float32).reshape(1, -1)
+
+    def _build_normalized_obs_frame(self, obs_normalized: torch.Tensor) -> torch.Tensor:
+        """Build a single observation-only normalized frame.
+
+        plan_history stores frames in per-frame (unstacked) format: (T*fs, unstacked_dim).
+        We must match that format here, not the stacked x_stacked_shape[0] dimension.
+        """
+        c = int(self.unstacked_dim)
+        obs_frame = torch.zeros(
+            1, c, dtype=obs_normalized.dtype, device=obs_normalized.device
+        )
+        obs_frame[:, self.obs_bundle_indices] = obs_normalized.unsqueeze(0)
+        return obs_frame
+
+    def _extract_connection_endpoint_frames(
+        self,
+        node,
+        plan_tokens: int,
+        *,
+        role: str,
+    ) -> Optional[torch.Tensor]:
+        """Return normalized connection frames for a source/target endpoint.
+
+        Source endpoints always contribute at least one frame. Target anchor points
+        are omitted here because callers append the target root observation
+        explicitly after assembling the connection.
+        """
+        endpoint_mode = self._get_node_endpoint_mode(node)
+        if endpoint_mode is None:
+            return None
+        if endpoint_mode == "anchor":
+            if role == "target":
+                return None
+            return self._build_normalized_obs_frame(
+                self._normalize_obs_np(np.asarray(node.obs, dtype=np.float32))
+            )
+
+        seg_size: int = plan_tokens // self.sequence_dividing_factor
+        plan_full: torch.Tensor = node.plan_history[-1][-1]
+        prefix_len: int = self._get_prefix_len_frames_from_depth(node.depth, seg_size)
+        prefix = plan_full[:prefix_len]
+        if role == "target":
+            return torch.flip(prefix, [0])
+        return prefix
+
+    def _extract_route_ordered_segment_obs(
+        self,
+        node,
+        plan_tokens: int,
+        start_depth: int,
+        end_depth: int,
+        *,
+        source_is_left: bool,
+        role: str,
+    ) -> Optional[np.ndarray]:
+        """Return a node segment in global route-execution order without changing storage."""
+        reverse = not bool(source_is_left)
+        if reverse:
+            self._log_directional_debug(
+                "segment.reverse_execution_view",
+                role=role,
+                node="?" if node is None else getattr(node, "name", "?"),
+                start_depth=int(start_depth),
+                end_depth=int(end_depth),
+            )
+        return self._extract_node_obs_slice(
+            node,
+            plan_tokens=plan_tokens,
+            start_depth=start_depth,
+            end_depth=end_depth,
+            reverse=reverse,
+        )
+
     def _extract_new_segment_obs(
         self,
         node,
@@ -267,7 +420,9 @@ class PlanPostprocMixin:
         """Extract the newly created segment observations for `node`.
 
         The returned segment contains only the frames added in the round that
-        created `node`, expressed in unnormalized observation space.
+        created `node`, expressed in unnormalized observation space and kept in
+        stored local-canonical order. Order-sensitive callers must explicitly
+        request a route-ordered view via `_extract_route_ordered_segment_obs()`.
         """
         if node is None or node.depth <= 0:
             return None
@@ -289,23 +444,26 @@ class PlanPostprocMixin:
         plan_tokens: int,
     ) -> Optional[float]:
         """
-        Compute the minimum pairwise distance between `best_node`'s segment and
-        `target_node`'s segment in unnormalized space.
+        Compute the minimum pairwise distance between two route-ordered endpoints.
 
-        Returns None if either node lacks a plan segment.
+        Materialized nodes use their prefix segments; root-only endpoints fall back
+        to singleton anchor observations. Returns None only when either node lacks
+        an observable endpoint.
         """
-        seg_a_obs = self._extract_node_obs_slice(
+        if best_node is None or target_node is None:
+            return None
+
+        seg_a_obs = self._extract_node_endpoint_obs(
             best_node,
             plan_tokens=plan_tokens,
-            start_depth=0,
-            end_depth=int(best_node.depth),
+            source_is_left=True,
+            role="meeting_left",
         )
-        seg_b_obs = self._extract_node_obs_slice(
+        seg_b_obs = self._extract_node_endpoint_obs(
             target_node,
             plan_tokens=plan_tokens,
-            start_depth=0,
-            end_depth=0 if target_node is None else int(target_node.depth),
-            reverse=True,
+            source_is_left=False,
+            role="meeting_right",
         )
         if seg_a_obs is None or seg_b_obs is None:
             return None
@@ -314,6 +472,7 @@ class PlanPostprocMixin:
         dists = self._compute_distance(
             np.repeat(seg_a_obs, B, axis=0),
             np.tile(seg_b_obs, (A, 1)),
+            mode="execution_sequence",
         )
         return float(dists.min())
 
@@ -345,25 +504,33 @@ class PlanPostprocMixin:
         target_node,
         plan_tokens: int,
     ) -> torch.Tensor:
-        """Build the canonical source-prefix + reversed target-prefix frame stack."""
-        seg_size: int = plan_tokens // self.sequence_dividing_factor
-
-        if len(source_node.plan_history) == 0 or len(source_node.plan_history[-1]) == 0:
-            raise ValueError("source_node.plan_history must be materialized before edge extraction")
-
-        source_plan_full: torch.Tensor = source_node.plan_history[-1][-1]
-        source_len: int = self._get_prefix_len_frames_from_depth(source_node.depth, seg_size)
-        source_prefix: torch.Tensor = source_plan_full[:source_len]
-
-        if target_node is None or len(target_node.plan_history) == 0:
-            return source_prefix
-
-        target_plan_full: torch.Tensor = target_node.plan_history[-1][-1]
-        target_len: int = self._get_prefix_len_frames_from_depth(target_node.depth, seg_size)
-        target_prefix_reversed: torch.Tensor = torch.flip(
-            target_plan_full[:target_len],
-            [0],
+        """Build the canonical source-endpoint + reversed target-segment frame stack."""
+        source_prefix = self._extract_connection_endpoint_frames(
+            source_node,
+            plan_tokens=plan_tokens,
+            role="source",
         )
+        if source_prefix is None:
+            raise ValueError(
+                "source_node must provide either a materialized prefix or an anchor observation"
+            )
+
+        target_prefix_reversed = self._extract_connection_endpoint_frames(
+            target_node,
+            plan_tokens=plan_tokens,
+            role="target",
+        )
+        if target_prefix_reversed is None:
+            return source_prefix
+        if (
+            source_prefix.dtype != target_prefix_reversed.dtype
+            or source_prefix.device != target_prefix_reversed.device
+        ):
+            source_prefix = source_prefix.to(
+                dtype=target_prefix_reversed.dtype,
+                device=target_prefix_reversed.device,
+            )
+
         return torch.cat([source_prefix, target_prefix_reversed], dim=0)
 
     def _append_normalized_obs_frame(
@@ -372,11 +539,9 @@ class PlanPostprocMixin:
         obs_normalized: torch.Tensor,
     ) -> torch.Tensor:
         """Append a single observation-only frame onto a normalized plan tensor."""
-        c = plan_frames.shape[-1]
-        obs_frame = torch.zeros(
-            1, c, dtype=plan_frames.dtype, device=plan_frames.device
+        obs_frame = self._build_normalized_obs_frame(
+            obs_normalized.to(dtype=plan_frames.dtype, device=plan_frames.device)
         )
-        obs_frame[:, self.obs_bundle_indices] = obs_normalized.unsqueeze(0)
         return torch.cat([plan_frames, obs_frame], dim=0)
 
     def _build_postprocessed_plan_bundle_from_output_plan(

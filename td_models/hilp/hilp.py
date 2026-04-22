@@ -217,7 +217,13 @@ class HILPJax:
       ``value(obs, goal) -> (v, v)``  (duplicate for ensemble compatibility)
     """
 
-    def __init__(self, pkl_path: str, device, hilp_gcrl_path: str = None):
+    def __init__(
+        self,
+        pkl_path: str,
+        device,
+        hilp_gcrl_path: str = None,
+        aggregator: str = "neg_l2",
+    ):
         import sys
         import os
         import pickle
@@ -253,10 +259,7 @@ class HILPJax:
         # share_encoder: separate psi key exists only when share_encoder=False
         share_encoder = "psi" not in net_params["networks_value"]
 
-        # ---- 3. All repository HILP checkpoints use neg_l2 ---------------
-        aggregator = "neg_l2"
-
-        # ---- 4. Build dummy agent and restore weights --------------------
+        # ---- 3. Build dummy agent and restore weights --------------------
         dummy_obs = np.zeros((1, obs_dim), dtype=np.float32)
         dummy_act = np.zeros((1, action_dim), dtype=np.float32)
         agent = DualHILP.create(
@@ -297,6 +300,10 @@ class HILPJax:
 
         if self._aggregator == "neg_l2":
             dist_sq = ((psi_s - phi_g) ** 2).sum(axis=-1)
+            v_np = -np.sqrt(np.maximum(dist_sq, 1e-6))
+        elif self._aggregator == "quasimetric":
+            relu_diff = np.maximum(psi_s - phi_g, 0.0)
+            dist_sq = (relu_diff ** 2).sum(axis=-1)
             v_np = -np.sqrt(np.maximum(dist_sq, 1e-6))
         else:  # inner_prod
             v_np = (psi_s * phi_g).sum(axis=-1)
@@ -350,6 +357,10 @@ class HILPJax:
                 if aggregator == "neg_l2":
                     dist_sq = jnp.sum((psi - phi_g_single) ** 2)
                     return -jnp.sqrt(jnp.maximum(dist_sq, 1e-6))
+                if aggregator == "quasimetric":
+                    relu_diff = jax.nn.relu(psi - phi_g_single)
+                    dist_sq = jnp.sum(relu_diff ** 2)
+                    return -jnp.sqrt(jnp.maximum(dist_sq, 1e-6))
                 else:  # inner_prod
                     return jnp.sum(psi * phi_g_single)
 
@@ -392,8 +403,52 @@ class HILPJax:
         if self._aggregator == "neg_l2":
             dist_sq = ((psi_s - phi_g) ** 2).sum(axis=-1)
             return -np.sqrt(np.maximum(dist_sq, 1e-6)).astype(np.float32)
+        if self._aggregator == "quasimetric":
+            relu_diff = np.maximum(psi_s - phi_g, 0.0)
+            dist_sq = (relu_diff ** 2).sum(axis=-1)
+            return -np.sqrt(np.maximum(dist_sq, 1e-6)).astype(np.float32)
         else:  # inner_prod
             return (psi_s * phi_g).sum(axis=-1).astype(np.float32)
+
+    def compute_grads_wrt_second_arg(
+        self,
+        obs_np: np.ndarray,
+        goal_np: np.ndarray,
+    ) -> np.ndarray:
+        """Compute ∂V(obs, goal)/∂goal[:2] using JAX grad when possible."""
+        try:
+            return self._compute_grads_wrt_goal_jax(obs_np, goal_np)
+        except Exception:
+            return self._compute_grads_wrt_goal_fd(obs_np, goal_np)
+
+    def _compute_grads_wrt_goal_jax(
+        self,
+        obs_np: np.ndarray,
+        goal_np: np.ndarray,
+    ) -> np.ndarray:
+        import jax
+        import jax.numpy as jnp
+
+        if not hasattr(self, "_grad_fn_goal"):
+            aggregator = self._aggregator
+            agent = self._agent
+
+            def value_fn(goal_single, psi_single):
+                phi_g = agent.get_phi_goal(goal_single[None])[0]
+                if aggregator == "neg_l2":
+                    dist_sq = jnp.sum((psi_single - phi_g) ** 2)
+                    return -jnp.sqrt(jnp.maximum(dist_sq, 1e-6))
+                if aggregator == "quasimetric":
+                    relu_diff = jax.nn.relu(psi_single - phi_g)
+                    dist_sq = jnp.sum(relu_diff ** 2)
+                    return -jnp.sqrt(jnp.maximum(dist_sq, 1e-6))
+                return jnp.sum(psi_single * phi_g)
+
+            self._grad_fn_goal = jax.jit(jax.vmap(jax.grad(value_fn, argnums=0)))
+
+        psi_s = np.array(self._agent.get_psi(obs_np.astype(np.float32)))
+        grads_jnp = self._grad_fn_goal(jnp.array(goal_np), jnp.array(psi_s))
+        return np.array(grads_jnp)[:, :2]
 
     def _compute_grads_fd(self, obs_np: np.ndarray, goal_np: np.ndarray,
                           eps: float = 0.5) -> np.ndarray:
@@ -408,5 +463,24 @@ class HILPJax:
             obs_m = obs_np.copy(); obs_m[:, dim] -= eps
             v_p, _ = self.value(torch.from_numpy(obs_p).float().to(self.device), goal_t)
             v_m, _ = self.value(torch.from_numpy(obs_m).float().to(self.device), goal_t)
+            grads[:, dim] = (v_p.cpu().numpy() - v_m.cpu().numpy()) / (2 * eps)
+        return grads
+
+    def _compute_grads_wrt_goal_fd(
+        self,
+        obs_np: np.ndarray,
+        goal_np: np.ndarray,
+        eps: float = 0.5,
+    ) -> np.ndarray:
+        """Central finite-difference fallback for ∂V/∂goal."""
+        N = obs_np.shape[0]
+        obs_t = torch.from_numpy(obs_np.astype(np.float32)).float().to(self.device)
+        goal_rep = np.broadcast_to(goal_np[:1], (N, goal_np.shape[-1])).copy().astype(np.float32)
+        grads = np.zeros((N, 2), dtype=np.float32)
+        for dim in range(2):
+            goal_p = goal_rep.copy(); goal_p[:, dim] += eps
+            goal_m = goal_rep.copy(); goal_m[:, dim] -= eps
+            v_p, _ = self.value(obs_t, torch.from_numpy(goal_p).float().to(self.device))
+            v_m, _ = self.value(obs_t, torch.from_numpy(goal_m).float().to(self.device))
             grads[:, dim] = (v_p.cpu().numpy() - v_m.cpu().numpy()) / (2 * eps)
         return grads

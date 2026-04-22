@@ -20,7 +20,7 @@ This module provides two uncertainty estimators:
 from __future__ import annotations
 
 import math
-from typing import Callable
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -240,9 +240,11 @@ def compute_uncertainty_variance(
 # ---------------------------------------------------------------------------
 
 def cluster_tail_by_temporal_dist(
-    z_tail: np.ndarray,
-    temporal_dist_fn: Callable[[np.ndarray], np.ndarray],
     max_intra_dist: float,
+    z_tail: Optional[np.ndarray] = None,
+    temporal_dist_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    obs_tail: Optional[np.ndarray] = None,
+    pairwise_temporal_dist_fn: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None,
 ) -> np.ndarray:
     """Cluster tail embeddings using complete-linkage hierarchical clustering.
 
@@ -253,11 +255,17 @@ def cluster_tail_by_temporal_dist(
     members within a cluster does not exceed that threshold.
 
     Args:
-        z_tail: Tail embeddings, shape ``(N, D)``.
+        z_tail: Tail embeddings, shape ``(N, D)``. Used by the legacy
+            symmetric-HILP path.
         temporal_dist_fn: Maps embedding L2 distances (scalar or array) to
-            temporal distances.  Should accept arbitrary numpy array shapes.
+            temporal distances. Required when ``z_tail`` is provided.
         max_intra_dist: Cut threshold in temporal-distance units (e.g. 20.0
             means at most 20 planning steps apart within a cluster).
+        obs_tail: Tail observations, shape ``(N, D_obs)``. Used when a caller
+            wants clustering in observation TD space instead of embedding L2.
+        pairwise_temporal_dist_fn: Pairwise TD function that accepts two
+            ``(M, D_obs)`` arrays and returns ``(M,)`` distances. Required when
+            ``obs_tail`` is provided.
 
     Returns:
         cluster_labels: Integer array of shape ``(N,)``, 0-indexed cluster
@@ -266,21 +274,40 @@ def cluster_tail_by_temporal_dist(
     """
     from scipy.cluster.hierarchy import linkage, fcluster
 
-    z_tail = np.asarray(z_tail, dtype=np.float64)
-    n = z_tail.shape[0]
+    if obs_tail is not None:
+        obs_tail = np.asarray(obs_tail, dtype=np.float64)
+        n = obs_tail.shape[0]
+    else:
+        if z_tail is None or temporal_dist_fn is None:
+            raise ValueError(
+                "Either (z_tail, temporal_dist_fn) or "
+                "(obs_tail, pairwise_temporal_dist_fn) must be provided."
+            )
+        z_tail = np.asarray(z_tail, dtype=np.float64)
+        n = z_tail.shape[0]
 
     if n == 1:
         return np.zeros(1, dtype=int)
 
-    # Pairwise L2 distances → upper-triangle condensed form
-    pairwise_sq = _pairwise_squared_distances(z_tail)
     idx_i, idx_j = np.triu_indices(n, k=1)
-    condensed_emb_dist = np.sqrt(np.maximum(pairwise_sq[idx_i, idx_j], 0.0))
+    if obs_tail is not None:
+        if pairwise_temporal_dist_fn is None:
+            raise ValueError(
+                "pairwise_temporal_dist_fn must be provided when obs_tail is used."
+            )
+        condensed_td = np.asarray(
+            pairwise_temporal_dist_fn(obs_tail[idx_i], obs_tail[idx_j]),
+            dtype=np.float64,
+        )
+    else:
+        # Pairwise L2 distances -> upper-triangle condensed form
+        pairwise_sq = _pairwise_squared_distances(z_tail)
+        condensed_emb_dist = np.sqrt(np.maximum(pairwise_sq[idx_i, idx_j], 0.0))
 
-    # Convert to temporal distances
-    condensed_td = np.asarray(
-        temporal_dist_fn(condensed_emb_dist), dtype=np.float64
-    )
+        # Convert to temporal distances
+        condensed_td = np.asarray(
+            temporal_dist_fn(condensed_emb_dist), dtype=np.float64
+        )
 
     # Complete-linkage hierarchical clustering
     Z = linkage(condensed_td, method="complete")
